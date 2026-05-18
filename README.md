@@ -18,11 +18,57 @@ winrsbox -- your-program.exe [args]
 
 ## CLI
 
+### Sandbox run (legacy)
+
 ```
 winrsbox [-d] [-i] [--] <program> [args...]
   -d        show console window (default: hidden)
   -i        init sandbox state dir and exit
 ```
+
+### Policy management commands
+
+```
+winrsbox rule    add [--id ID] --prefix=P [--read=MODE] [--write=MODE] [--depth=N] [--exe=GLOB]
+winrsbox rule    remove --id=ID | --prefix=P
+winrsbox rule    list [--json] [--write=MODE] [--depth-min=N]
+winrsbox rule    show --id=ID [--json]
+winrsbox rule    clear --force
+
+winrsbox mock    add [--id ID] --path=P (--content=STR | --file=F | --stdin | --base64=B64)
+winrsbox mock    remove --path=P
+winrsbox mock    list [--json]
+
+winrsbox mockdir add [--id ID] --prefix=P
+winrsbox mockdir remove --prefix=P
+winrsbox mockdir list [--json]
+
+winrsbox defaults set [--read=MODE] [--write=MODE]
+winrsbox defaults show [--json]
+```
+
+MODE ∈ `{passthrough, deny, cow, redirect}`.
+
+### Why / What-if (policy simulator)
+
+```
+winrsbox why     <path>... [--write] [--depth=N] [--exe=PATH] [--json] [--stdin]
+winrsbox what-if rule add --prefix=... [--write=...] ... -- <path>...
+```
+
+`why` traces the full policy chain for a given path, showing which rules were considered and which matched. Without `--write`, both read and write decisions are shown.
+
+`what-if` simulates adding a hypothetical rule and shows which paths would change.
+
+### Export / Import
+
+```
+winrsbox export  [--json]
+winrsbox import  [--replace]
+winrsbox import  --ktav <file>
+```
+
+All JSON output includes `"schema_version": 1`. Import merges by default; use `--replace` to wipe first.
 
 ## Config
 

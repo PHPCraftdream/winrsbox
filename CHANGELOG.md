@@ -6,6 +6,35 @@ All notable changes to winrsbox are documented in this file.
 
 ### Features
 
+- **CLI policy management commands** — `rule add/remove/list/show/clear`,
+  `mock add/remove/list`, `mockdir add/remove/list`, `defaults set/show`.
+  Back-compatible with legacy `winrsbox -- prog args` invocation.
+  All commands work directly on the persistent `policy.redb` without a running sandbox.
+
+- **`why` policy simulator** — `winrsbox why <path>...` traces the full rule chain,
+  showing which rules matched, were skipped, and why. Supports `--write`, `--depth`,
+  `--exe`, `--json`, `--stdin` for batch JSONL.
+
+- **`what-if` analysis** — `winrsbox what-if rule add --prefix=... -- <paths>...`
+  applies a hypothetical rule to an ephemeral snapshot and shows a diff of decisions.
+  Does not mutate the live database.
+
+- **Export/Import** — `winrsbox export` dumps the full policy state as versioned JSON
+  (`schema_version: 1`). `winrsbox import` merges or replaces from JSON stdin.
+  `winrsbox import --ktav <file>` supports legacy ktav format.
+
+- **Deterministic IDs** — Rules, mocks, and mockdirs get `<kind>-<8hex>` IDs from
+  xxh3 of normalized arguments. Same args always produce the same ID (idempotent upsert).
+
+- **TracedDecision** — `Policy::decide_traced()` returns full chain info with
+  `ConsideredRule` entries (match with specificity, skip with reason).
+
+### Tests
+
+- 37 new unit tests covering rule CRUD, mock CRUD, mockdir CRUD, defaults,
+  why tracing, what-if analysis, export/import roundtrip, and ktav legacy import.
+- Total: 198 tests (was 161).
+
 - **Composite cache key (u128)** — `PolicyInner` cache key extended from `u64`
   to `u128` via bit-concatenation of two independent Xxh3 hashes (path+write,
   depth+exe). Fixes `when` filter correctness: two processes with different
