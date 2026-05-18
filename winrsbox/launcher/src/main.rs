@@ -10,6 +10,7 @@ use clap::Parser;
 use ipc::{read_msg, write_msg, LogLevel, Req, Resp};
 use policy::Policy;
 use rustc_hash::FxHashSet;
+mod cli;
 use std::{
     ffi::OsStr,
     os::windows::ffi::OsStrExt,
@@ -131,6 +132,42 @@ use windows::{
 /// cancel-safe: NO — top-level main is not meant to be cancelled
 #[tokio::main]
 async fn main() -> Result<()> {
+    let raw_args: Vec<String> = std::env::args().collect();
+
+    // Back-compat dispatch: if first arg after binary is a known subcommand,
+    // route to CLI handler. Otherwise, use legacy clap parser for sandbox run.
+    // If WINRSBOX_STATE_DIR is set, always use CLI mode (agents/tests).
+    let force_cli = std::env::var("WINRSBOX_STATE_DIR").is_ok();
+    if raw_args.len() > 1 && (cli::is_cli_command(&raw_args[1..]) || force_cli) {
+        // CLI mode: no console hiding, no tokio runtime needed
+        let state_dir = if let Some(sd) = raw_args.iter().find(|a| a.starts_with("--state-dir=")) {
+            PathBuf::from(&sd["--state-dir=".len()..])
+        } else if let Ok(sd) = std::env::var("WINRSBOX_STATE_DIR") {
+            PathBuf::from(sd)
+        } else {
+            let project_root: PathBuf = std::env::current_dir()
+                .context("failed to get current directory")?;
+            discover_state_dir(&project_root)?
+        };
+        std::fs::create_dir_all(state_dir.join("workdir"))
+            .with_context(|| "create state dir")?;
+        std::fs::create_dir_all(state_dir.join("mock-dirs"))
+            .with_context(|| "create mock-dirs")?;
+
+        // Strip --state-dir from args before passing to CLI
+        let cli_args: Vec<String> = raw_args[1..].iter()
+            .filter(|a| !a.starts_with("--state-dir="))
+            .cloned()
+            .collect();
+        match cli::run_cli(&cli_args, &state_dir) {
+            Ok(()) => std::process::exit(cli::EXIT_OK),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(cli::EXIT_USER_ERROR);
+            }
+        }
+    }
+
     let cli = Cli::parse();
 
     // Hide our console window before any println! when running headless
@@ -716,6 +753,17 @@ fn ensure_state(project_root: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
     }
 
     Ok((cfg_path, workdir, mock_dirs))
+}
+
+/// Discover state directory path (without creating it — CLI mode creates on demand).
+fn discover_state_dir(project_root: &Path) -> Result<PathBuf> {
+    let name = project_root
+        .file_name()
+        .context("cwd has no name (running from drive root?)")?;
+    let parent = project_root
+        .parent()
+        .context("cwd has no parent (running from drive root?)")?;
+    Ok(parent.join(".winrsbox").join(name))
 }
 
 // ─── Stats ───────────────────────────────────────────────────────────────────
