@@ -95,6 +95,54 @@ fn bench_encode_log_long(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_roundtrip_hello(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ipc_msg");
+    let msg = Req::Hello { pid: 42, exe_path: r"c:\program files\myapp\app.exe".into() };
+    group.bench_function("roundtrip_hello", |b| {
+        b.iter(|| {
+            let mut buf = Cursor::new(Vec::new());
+            write_msg(&mut buf, black_box(&msg)).unwrap();
+            buf.set_position(0);
+            let _: Req = read_msg(&mut buf).unwrap();
+        })
+    });
+    group.finish();
+}
+
+fn bench_roundtrip_spawned_child(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ipc_msg");
+    let msg = Req::SpawnedChild {
+        parent_pid: 1234, child_pid: 5678,
+        child_exe: r"c:\windows\system32\cmd.exe".into(),
+    };
+    group.bench_function("roundtrip_spawned_child", |b| {
+        b.iter(|| {
+            let mut buf = Cursor::new(Vec::new());
+            write_msg(&mut buf, black_box(&msg)).unwrap();
+            buf.set_position(0);
+            let _: Req = read_msg(&mut buf).unwrap();
+        })
+    });
+    group.finish();
+}
+
+fn bench_roundtrip_record_overlay(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ipc_msg");
+    let msg = Req::RecordOverlay {
+        orig: r"c:\users\alice\doc.txt".into(),
+        overlay: r"c:\sb\c\users\alice\doc.txt".into(),
+    };
+    group.bench_function("roundtrip_record_overlay", |b| {
+        b.iter(|| {
+            let mut buf = Cursor::new(Vec::new());
+            write_msg(&mut buf, black_box(&msg)).unwrap();
+            buf.set_position(0);
+            let _: Req = read_msg(&mut buf).unwrap();
+        })
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_encode_decide,
@@ -102,5 +150,8 @@ criterion_group!(
     bench_roundtrip_decide,
     bench_encode_log_short,
     bench_encode_log_long,
+    bench_roundtrip_hello,
+    bench_roundtrip_spawned_child,
+    bench_roundtrip_record_overlay,
 );
 criterion_main!(benches);
