@@ -69,6 +69,14 @@ pub enum PolicyError {
     Io(#[from] std::io::Error),
 }
 
+fn ensure_lower(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.bytes().all(|b| !b.is_ascii_uppercase()) {
+        std::borrow::Cow::Borrowed(s)
+    } else {
+        std::borrow::Cow::Owned(s.to_lowercase())
+    }
+}
+
 pub struct Policy {
     inner: Arc<PolicyInner>,
 }
@@ -294,7 +302,7 @@ impl Policy {
         depth: Option<u8>,
         exe_lower: Option<&str>,
     ) -> TracedDecision {
-        let lower = dos_path.to_lowercase();
+        let lower = ensure_lower(dos_path);
 
         // project_root always passthrough
         if lower.starts_with(self.inner.project_root_lower.trim_end_matches('\\')) {
@@ -331,7 +339,7 @@ impl Policy {
                 target_path: Some(overlay),
                 rule_id: None,
                 rule_prefix: None,
-                mock_match: Some(lower.clone()),
+                mock_match: Some(lower.to_string()),
                 mockdir_match: None,
                 chain: vec![],
             };
@@ -467,7 +475,7 @@ impl Policy {
     }
 
     fn compute(&self, dos_path: &str, write_access: bool, depth: Option<u8>, exe_lower: Option<&str>) -> Decision {
-        let lower = dos_path.to_lowercase();
+        let lower = ensure_lower(dos_path);
 
         if lower.starts_with(self.inner.project_root_lower.trim_end_matches('\\')) {
             return Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None };
@@ -509,7 +517,7 @@ impl Policy {
                 if !write_access {
                     if let Ok(txn) = self.inner.db.begin_read() {
                         if let Ok(t) = txn.open_table(db::OVERLAY_IDX) {
-                            if let Ok(Some(v)) = t.get(lower.as_str()) {
+                            if let Ok(Some(v)) = t.get(&*lower) {
                                 let ov = PathBuf::from(v.value());
                                 return Decision { mode: Mode::Cow, overlay: Some(ov), cow_from: None, mock_payload: None };
                             }
@@ -522,7 +530,7 @@ impl Policy {
                 let overlay = path::mirror_into_overlay(&lower, &self.inner.sandbox_root);
                 let existing_overlay = if let Ok(txn) = self.inner.db.begin_read() {
                     if let Ok(t) = txn.open_table(db::OVERLAY_IDX) {
-                        t.get(lower.as_str()).ok().flatten().map(|v| PathBuf::from(v.value()))
+                        t.get(&*lower).ok().flatten().map(|v| PathBuf::from(v.value()))
                     } else { None }
                 } else { None };
                 if let Some(ov) = existing_overlay {
