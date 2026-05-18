@@ -28,6 +28,20 @@ winrsbox [-d] [-i] [--] <program> [args...]
 
 The sandbox config is automatically created at `<parent>/.winrsbox/<project-name>/sandbox.ktav`.
 
+### Pattern matching
+
+Rules use glob patterns with `*` (zero or more chars) and `?` (one char) per path segment:
+
+```
+C:\Users\*\Documents     matches C:\Users\alice\Documents, C:\Users\bob\Documents
+C:\*.log                 matches C:\app.log, C:\error.log
+C:\Users\??\*            matches C:\Users\ab\..., but not C:\Users\alice\...
+```
+
+Matches are prefix-based by default (rules don't require full path), unless used in `mocks` (exact match with globs).
+
+### Example config
+
 ```ktav
 defaults: {
     read: passthrough
@@ -40,18 +54,28 @@ rules: [
         read: passthrough
         write: deny
     }
+    {
+        prefix: C:\\Users\*\AppData\Local\Temp
+        write: deny
+    }
+    {
+        prefix: C:\\Program Files\MyApp\*.log
+        write: redirect
+    }
 ]
 
-# mocks: [
-#     { path: C:\\Users\\Computer\\.config\\app.ini, content_inline: "fake content" }
-# ]
+mocks: [
+    { path: C:\\config.ini, content_inline: "[app]\nkey=value" }
+    { path: C:\\Users\*\secret.txt, content_inline: "FAKE_SECRET" }
+]
 
-# mock_dirs: [
-#     { prefix: C:\\temp }
-# ]
+mock_dirs: [
+    { prefix: C:\\temp }
+    { prefix: C:\\Users\*\\cache }
+]
 ```
 
-Policy modes: `passthrough` (allow), `deny`, `cow` (copy-on-write), `redirect` (copy to overlay).
+Policy modes: `passthrough` (allow), `deny` (reject), `cow` (copy-on-write), `redirect` (copy to overlay).
 
 ## How it works
 
