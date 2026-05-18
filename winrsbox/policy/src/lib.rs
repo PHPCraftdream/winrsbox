@@ -83,7 +83,7 @@ pub struct Policy {
 
 struct PolicyInner {
     db: redb::Database,
-    cache: Cache<u128, Decision>,
+    cache: Cache<u128, Arc<Decision>>,
     snapshot: arc_swap::ArcSwap<Snapshot>,
     sandbox_root: PathBuf,
     mock_dirs_root: PathBuf,
@@ -93,7 +93,8 @@ struct PolicyInner {
 struct Snapshot {
     rules: Vec<SnapshotRule>,
     default_rule: Option<db::RuleRow>,
-    mocks: Vec<(String, Vec<u8>)>,
+    mocks_exact: rustc_hash::FxHashMap<String, Vec<u8>>,
+    mocks_glob: Vec<(String, Vec<u8>)>,
     mock_dirs: Vec<String>,
 }
 
@@ -119,11 +120,18 @@ impl Snapshot {
                 }
             }
         }
-        let mut mocks = Vec::new();
+        let mut mocks_exact = rustc_hash::FxHashMap::default();
+        let mut mocks_glob = Vec::new();
         if let Ok(table) = txn.open_table(db::MOCKS) {
             for entry in table.range::<&str>(..).into_iter().flatten() {
                 let Ok((key, value)) = entry else { continue };
-                mocks.push((key.value().to_owned(), value.value().to_vec()));
+                let pattern = key.value().to_owned();
+                let payload = value.value().to_vec();
+                if pattern.contains('*') || pattern.contains('?') {
+                    mocks_glob.push((pattern, payload));
+                } else {
+                    mocks_exact.insert(pattern, payload);
+                }
             }
         }
         let mut mock_dirs = Vec::new();
@@ -133,16 +141,14 @@ impl Snapshot {
                 mock_dirs.push(key.value().to_owned());
             }
         }
-        Ok(Snapshot { rules, default_rule, mocks, mock_dirs })
+        Ok(Snapshot { rules, default_rule, mocks_exact, mocks_glob, mock_dirs })
     }
 
     fn find_mock_payload(&self, lower_path: &str) -> Option<Vec<u8>> {
-        for (pattern, payload) in &self.mocks {
-            if pattern == lower_path {
-                return Some(payload.clone());
-            }
+        if let Some(payload) = self.mocks_exact.get(lower_path) {
+            return Some(payload.clone());
         }
-        for (pattern, payload) in &self.mocks {
+        for (pattern, payload) in &self.mocks_glob {
             if path::pattern_matches_exact(pattern, lower_path) {
                 return Some(payload.clone());
             }
@@ -257,12 +263,10 @@ impl Policy {
     ) -> Decision {
         let key = cache_key(dos_path, write_access, depth, exe_lower);
         if let Some(d) = self.inner.cache.get(&key) {
-            return d;
+            return (*d).clone();
         }
         let d = self.compute(dos_path, write_access, depth, exe_lower);
-        // NOTE: check-then-insert race is intentional — IPC decisions are idempotent;
-        // duplicate inserts under contention add latency but not incorrectness.
-        self.inner.cache.insert(key, d.clone());
+        self.inner.cache.insert(key, Arc::new(d.clone()));
         d
     }
 

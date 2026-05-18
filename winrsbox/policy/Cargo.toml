@@ -13,6 +13,7 @@ quick_cache = "0.6"
 widestring = { workspace = true }
 thiserror = "1"
 arc-swap = "1.9.1"
+rustc-hash.workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }
