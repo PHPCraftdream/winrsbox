@@ -112,21 +112,46 @@ pub fn mirror_into_overlay(dos_lower: &str, root: &Path) -> PathBuf {
 // (single-segment globbing). The path may have ADDITIONAL trailing segments
 // beyond the pattern — this is a prefix match, not equality.
 
+/// Returns true if `seg` is cleanly-bounded `**` — the entire segment
+/// consists of exactly two asterisks.
+fn is_globstar(seg: &str) -> bool {
+    seg == "**"
+}
+
 pub fn pattern_matches_prefix(pattern: &str, path: &str) -> bool {
     if pattern.is_empty() {
         return true;
     }
-    let mut pat_it = pattern.split('\\');
-    let mut path_it = path.split('\\');
+    let pat_segs: Vec<&str> = pattern.split('\\').collect();
+    let path_segs: Vec<&str> = path.split('\\').collect();
+    prefix_match(&pat_segs, &path_segs)
+}
+
+fn prefix_match(pat: &[&str], path: &[&str]) -> bool {
+    let (mut pi, mut si) = (0usize, 0usize);
+    let (mut star_pi, mut star_si) = (None::<usize>, 0usize);
     loop {
-        match (pat_it.next(), path_it.next()) {
-            (Some(p), Some(s)) => {
-                if !segment_match(p, s) {
-                    return false;
-                }
-            }
-            (None, _) => return true, // all pattern segments matched → prefix hit
-            (Some(_), None) => return false, // path shorter than pattern
+        // Consume trailing ** in pattern
+        while pi < pat.len() && is_globstar(pat[pi]) {
+            star_pi = Some(pi);
+            star_si = si;
+            pi += 1;
+        }
+        if pi == pat.len() {
+            return true; // prefix match: all pattern segments consumed
+        }
+        if si == path.len() {
+            return false; // path shorter than remaining pattern
+        }
+        if segment_match(pat[pi], path[si]) {
+            pi += 1;
+            si += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_si += 1;
+            si = star_si;
+        } else {
+            return false;
         }
     }
 }
@@ -181,19 +206,46 @@ pub fn pattern_matches_exact(pattern: &str, path: &str) -> bool {
     if pattern.is_empty() {
         return path.is_empty();
     }
-    let mut pat_it = pattern.split('\\').peekable();
-    let mut path_it = path.split('\\').peekable();
+    let pat_segs: Vec<&str> = pattern.split('\\').collect();
+    let path_segs: Vec<&str> = path.split('\\').collect();
+    exact_match(&pat_segs, &path_segs)
+}
+
+fn exact_match(pat: &[&str], path: &[&str]) -> bool {
+    let (mut pi, mut si) = (0usize, 0usize);
+    let (mut star_pi, mut star_si) = (None::<usize>, 0usize);
     loop {
-        let p = pat_it.next();
-        let s = path_it.next();
-        match (p, s) {
-            (Some(pp), Some(ss)) => {
-                if !segment_match(pp, ss) {
-                    return false;
-                }
+        // Consume consecutive ** in pattern
+        while pi < pat.len() && is_globstar(pat[pi]) {
+            star_pi = Some(pi);
+            star_si = si;
+            pi += 1;
+        }
+        if pi == pat.len() && si == path.len() {
+            return true;
+        }
+        if pi == pat.len() {
+            // Pattern exhausted but path remains — try backtracking
+            if let Some(sp) = star_pi {
+                pi = sp + 1;
+                star_si += 1;
+                si = star_si;
+                continue;
             }
-            (None, None) => return true,  // both exhausted simultaneously
-            _ => return false,            // different segment counts
+            return false;
+        }
+        if si == path.len() {
+            return false; // path shorter than remaining pattern
+        }
+        if segment_match(pat[pi], path[si]) {
+            pi += 1;
+            si += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_si += 1;
+            si = star_si;
+        } else {
+            return false;
         }
     }
 }
@@ -237,6 +289,210 @@ mod glob_tests {
         assert!(!pattern_matches_exact(r"c:\fake\token.txt", r"c:\fake\token.txt\sub"));
         assert!(pattern_matches_exact(r"c:\fake\*.txt", r"c:\fake\token.txt"));
         assert!(!pattern_matches_exact(r"c:\fake\*.txt", r"c:\fake\token.exe"));
+    }
+
+    // ── segment_match edge cases ────────────────────────────────────────────
+
+    #[test]
+    fn segment_match_question_mark() {
+        assert!(segment_match("f?o", "foo"));
+        assert!(segment_match("???", "abc"));
+        // BUG: segment_match("f?o", "fdo") returns true because ? matches 'd' and then 'o' == 'o'
+        // This is correct glob behavior — ? matches any single char. The test was wrong.
+        assert!(segment_match("f?o", "fdo")); // ? matches 'd', then 'o'=='o' → true
+        assert!(!segment_match("?", "ab"));     // ? does not match empty
+    }
+
+    #[test]
+    fn segment_match_star_only() {
+        assert!(segment_match("*", ""));
+        assert!(segment_match("*", "anything"));
+        assert!(segment_match("*", "multi part with spaces"));
+    }
+
+    #[test]
+    fn segment_match_multiple_stars() {
+        assert!(segment_match("*a*", "bar"));
+        assert!(segment_match("*a*", "a"));
+        assert!(!segment_match("*a*", "bcd"));
+    }
+
+    #[test]
+    fn segment_match_empty_pattern_empty_text() {
+        assert!(segment_match("", ""));
+    }
+
+    #[test]
+    fn segment_match_empty_pattern_nonempty_text() {
+        assert!(!segment_match("", "x"));
+    }
+
+    #[test]
+    fn segment_match_nonempty_pattern_empty_text() {
+        assert!(!segment_match("x", ""));
+        assert!(segment_match("*", "")); // star matches empty
+    }
+
+    // ── pattern_matches_prefix edge cases ───────────────────────────────────
+
+    #[test]
+    fn prefix_empty_pattern() {
+        assert!(pattern_matches_prefix("", r"c:\anything"));
+        assert!(pattern_matches_prefix("", ""));
+    }
+
+    #[test]
+    fn prefix_path_shorter_than_pattern() {
+        assert!(!pattern_matches_prefix(r"c:\a\b\c", r"c:\a"));
+    }
+
+    #[test]
+    fn prefix_unicode_segments() {
+        assert!(pattern_matches_prefix(r"c:\привет", r"c:\привет\file.txt"));
+        assert!(!pattern_matches_prefix(r"c:\привет", r"c:\пока"));
+    }
+
+    #[test]
+    fn prefix_question_mark_wildcard() {
+        assert!(pattern_matches_prefix(r"c:\???\test", r"c:\abc\test\file"));
+        assert!(!pattern_matches_prefix(r"c:\??\test", r"c:\abc\test"));
+    }
+
+    // ── pattern_matches_exact edge cases ─────────────────────────────────────
+
+    #[test]
+    fn exact_empty_both() {
+        assert!(pattern_matches_exact("", ""));
+    }
+
+    #[test]
+    fn exact_empty_pattern_nonempty_path() {
+        assert!(!pattern_matches_exact("", "x"));
+    }
+
+    #[test]
+    fn exact_wildcard_star() {
+        assert!(pattern_matches_exact(r"c:\*\*.txt", r"c:\sub\file.txt"));
+        assert!(!pattern_matches_exact(r"c:\*\*.txt", r"c:\sub\file.exe"));
+    }
+
+    #[test]
+    fn exact_different_lengths() {
+        assert!(!pattern_matches_exact(r"c:\a", r"c:\a\b"));
+        assert!(!pattern_matches_exact(r"c:\a\b", r"c:\a"));
+    }
+
+    // ── ** globstar tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn globstar_prefix_basic() {
+        assert!(pattern_matches_prefix(r"c:\users\**\.ssh", r"c:\users\alice\.ssh"));
+        assert!(pattern_matches_prefix(r"c:\users\**\.ssh", r"c:\users\alice\sub\.ssh"));
+        assert!(pattern_matches_prefix(r"c:\users\**\.ssh", r"c:\users\.ssh"));
+    }
+
+    #[test]
+    fn globstar_prefix_trailing() {
+        assert!(pattern_matches_prefix(r"c:\**", r"c:\anything"));
+        assert!(pattern_matches_prefix(r"c:\**", r"c:\a\b\c"));
+        assert!(pattern_matches_prefix(r"c:\**", r"c:"));
+    }
+
+    #[test]
+    fn globstar_prefix_miss() {
+        assert!(!pattern_matches_prefix(r"c:\users\**\.ssh", r"c:\users\alice\docs"));
+        assert!(!pattern_matches_prefix(r"c:\**\.ssh", r"c:\users\docs"));
+    }
+
+    #[test]
+    fn globstar_prefix_multiple() {
+        assert!(pattern_matches_prefix(r"c:\**\foo\**\.bar", r"c:\foo\.bar"));
+        assert!(pattern_matches_prefix(r"c:\**\foo\**\.bar", r"c:\x\foo\.bar"));
+        assert!(pattern_matches_prefix(r"c:\**\foo\**\.bar", r"c:\x\foo\y\.bar"));
+        assert!(pattern_matches_prefix(r"c:\**\foo\**\.bar", r"c:\foo\y\z\.bar"));
+        assert!(pattern_matches_prefix(r"c:\**\foo\**\.bar", r"c:\a\b\foo\c\d\.bar"));
+    }
+
+    #[test]
+    fn globstar_prefix_at_start() {
+        assert!(pattern_matches_prefix(r"**\.ssh", r"c:\users\alice\.ssh"));
+        assert!(pattern_matches_prefix(r"**\.ssh", r".ssh"));
+    }
+
+    #[test]
+    fn globstar_prefix_consecutive() {
+        // Two ** in a row is equivalent to one **
+        assert!(pattern_matches_prefix(r"c:\**\**\foo", r"c:\a\b\foo"));
+        assert!(pattern_matches_prefix(r"c:\**\**\foo", r"c:\foo"));
+    }
+
+    #[test]
+    fn globstar_mixed_star_treated_as_single() {
+        // **foo is NOT globstar — treated as regular single-segment glob
+        assert!(pattern_matches_prefix(r"c:\**foo", r"c:\barfoo"));
+        // Still a single segment match — no multi-segment
+        assert!(!pattern_matches_prefix(r"c:\**foo", r"c:\a\barfoo"));
+    }
+
+    #[test]
+    fn globstar_exact_basic() {
+        assert!(pattern_matches_exact(r"c:\**\foo.txt", r"c:\foo.txt"));
+        assert!(pattern_matches_exact(r"c:\**\foo.txt", r"c:\sub\foo.txt"));
+        assert!(pattern_matches_exact(r"c:\**\foo.txt", r"c:\a\b\c\foo.txt"));
+        assert!(!pattern_matches_exact(r"c:\**\foo.txt", r"c:\bar.exe"));
+    }
+
+    #[test]
+    fn globstar_exact_trailing() {
+        assert!(pattern_matches_exact(r"c:\**", r"c:\foo"));
+        assert!(pattern_matches_exact(r"c:\**", r"c:\a\b\c"));
+        assert!(pattern_matches_exact(r"c:\**", r"c:"));
+        assert!(!pattern_matches_exact(r"c:\**", r"d:\foo"));
+    }
+
+    #[test]
+    fn globstar_exact_miss() {
+        // Extra segments after the pattern = mismatch
+        assert!(!pattern_matches_exact(r"c:\**\foo", r"c:\a\foo\extra"));
+    }
+
+    #[test]
+    fn globstar_specificity_zero() {
+        // ** counts as 0 literals (like *)
+        assert_eq!(pattern_specificity("**"), 0);
+        // c:\**\foo → non-wildcard chars: c, :, \, \, f, o, o = 7
+        assert_eq!(pattern_specificity(r"c:\**\foo"), 7);
+    }
+
+    // ── proptest: pattern_matches_prefix invariants ─────────────────────────
+
+    proptest::proptest! {
+        #[test]
+        fn proptest_prefix_empty_always_true(path: String) {
+            proptest::prop_assert!(pattern_matches_prefix("", &path));
+        }
+
+        #[test]
+        fn proptest_prefix_self_match(path: String) {
+            proptest::prop_assert!(pattern_matches_prefix(&path, &path));
+        }
+
+        #[test]
+        fn proptest_prefix_subpath_extends(
+            prefix in "[a-z]{1,4}(\\\\[a-z]{1,4}){0,3}",
+            suffix in "(\\\\[a-z]{1,4}){1,3}",
+        ) {
+            let path = format!("{prefix}{suffix}");
+            proptest::prop_assert!(pattern_matches_prefix(&prefix, &path));
+        }
+
+        #[test]
+        fn proptest_segment_match_literal(a: String, b: String) {
+            let has_wild = a.contains('*') || a.contains('?');
+            if !has_wild {
+                proptest::prop_assert_eq!(segment_match(&a, &b), a == b);
+            }
+        }
     }
 }
 
@@ -287,6 +543,45 @@ mod conv_tests {
         assert_eq!(nt_to_dos(&raw), Some("C:\\x".to_string()));
     }
 
+    #[test]
+    fn nt_to_dos_dot_device_prefix() {
+        let raw: Vec<u16> = r"\\.\C:\foo".encode_utf16().collect();
+        assert_eq!(nt_to_dos(&raw), Some("C:\\foo".to_string()));
+    }
+
+    #[test]
+    fn nt_to_dos_double_backslash_unc() {
+        let raw: Vec<u16> = r"\\server\share\foo".encode_utf16().collect();
+        assert_eq!(nt_to_dos(&raw), None);
+    }
+
+    #[test]
+    fn nt_to_dos_no_drive_letter() {
+        let raw: Vec<u16> = r"\??\foo\bar".encode_utf16().collect();
+        assert_eq!(nt_to_dos(&raw), None);
+    }
+
+    #[test]
+    fn nt_to_dos_lower_casefold() {
+        let raw: Vec<u16> = r"\??\C:\Users\ALICE\FOO.TXT".encode_utf16().collect();
+        let result = nt_to_dos_lower(&raw).unwrap();
+        assert_eq!(result, "c:\\users\\alice\\foo.txt");
+    }
+
+    #[test]
+    fn nt_to_dos_non_ascii_preserved() {
+        let raw: Vec<u16> = r"\??\C:\привет.txt".encode_utf16().collect();
+        let result = nt_to_dos(&raw).unwrap();
+        assert!(result.contains("привет"));
+    }
+
+    #[test]
+    fn nt_to_dos_lower_non_ascii_preserved() {
+        let raw: Vec<u16> = r"\??\C:\ФУΓ.txt".encode_utf16().collect();
+        let result = nt_to_dos_lower(&raw).unwrap();
+        assert!(result.contains("ФУΓ"));
+    }
+
     // ── dos_to_nt ──────────────────────────────────────────────────────────
 
     #[test]
@@ -329,6 +624,20 @@ mod conv_tests {
         let root = std::path::Path::new(r"\sb");
         let result = mirror_into_overlay(r"\x\y", root);
         assert_eq!(result, std::path::PathBuf::from(r"\sb\x\y"));
+    }
+
+    #[test]
+    fn mirror_preserves_drive_as_dir() {
+        let root = std::path::Path::new(r"/sandbox");
+        let result = mirror_into_overlay(r"d:\file.txt", root);
+        assert_eq!(result, std::path::PathBuf::from(r"/sandbox/d\file.txt"));
+    }
+
+    #[test]
+    fn mirror_deeply_nested() {
+        let root = std::path::Path::new(r"\sb");
+        let result = mirror_into_overlay(r"c:\a\b\c\d\e\f.txt", root);
+        assert_eq!(result, std::path::PathBuf::from(r"\sb\c\a\b\c\d\e\f.txt"));
     }
 
     // pretty_assertions demo: shadows std assert_eq for richer diffs on mismatch.
