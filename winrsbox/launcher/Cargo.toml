@@ -31,3 +31,5 @@ windows = { version = "0.61", features = [
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossbeam-queue = "0.3"
+papaya = "0.2.4"
+rustc-hash = { workspace = true }

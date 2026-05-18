@@ -599,6 +599,11 @@ dependencies = [
 [[package]]
 name = "integration-tests"
 version = "0.1.0"
+dependencies = [
+ "policy",
+ "pretty_assertions",
+ "tempfile",
+]
 
 [[package]]
 name = "ipc"
@@ -781,6 +786,16 @@ name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
+
+[[package]]
+name = "papaya"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "997ee03cd38c01469a7046643714f0ad28880bcb9e6679ff0666e24817ca19b7"
+dependencies = [
+ "equivalent",
+ "seize",
+]
 
 [[package]]
 name = "parking_lot"
@@ -1166,6 +1181,16 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "seize"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
 
 [[package]]
 name = "semver"
@@ -1695,7 +1720,9 @@ dependencies = [
  "clap",
  "crossbeam-queue",
  "ipc",
+ "papaya",
  "policy",
+ "rustc-hash",
  "tokio",
  "windows",
 ]

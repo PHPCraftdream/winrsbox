@@ -9,6 +9,7 @@ panic = "abort"
 serde = { version = "1", features = ["derive"] }
 bincode = { version = "2", features = ["serde"] }
 widestring = "1"
+rustc-hash = "2"
 
 # Shared dev-dependencies (test/bench infra)
 criterion = { version = "0.5", features = ["html_reports"] }
