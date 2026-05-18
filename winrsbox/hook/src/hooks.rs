@@ -111,12 +111,12 @@ fn cache() -> &'static HookCache {
 }
 
 fn decide(dos_path: &str, write: bool) -> Decision {
+    // dos_path is already lowercase from nt_to_dos_lower in extract_dos_path
     if let Some(d) = cache().get_caseless(dos_path, write) {
         return d;
     }
-    let lower = dos_path.to_ascii_lowercase();
-    let d = ipc_decide(&lower, write);
-    cache().insert(&lower, write, d.clone());
+    let d = ipc_decide(dos_path, write);
+    cache().insert(dos_path, write, d.clone());
     d
 }
 
@@ -265,10 +265,10 @@ unsafe fn extract_dos_path(attrs: *const OBJECT_ATTRIBUTES) -> Option<String> {
         let mut full: Vec<u16> = base;
         full.push(b'\\' as u16);
         full.extend_from_slice(name_slice);
-        return policy::path::nt_to_dos(&full);
+        return policy::path::nt_to_dos_lower(&full);
     }
 
-    policy::path::nt_to_dos(name_slice)
+    policy::path::nt_to_dos_lower(name_slice)
 }
 
 // ---------------------------------------------------------------------------

@@ -4,34 +4,85 @@ use std::path::{Path, PathBuf};
 /// Handles \??\ and \\?\ prefixes.
 /// Returns None for device paths, UNC \Device\... etc.
 pub fn nt_to_dos(raw: &[u16]) -> Option<String> {
-    let s = String::from_utf16_lossy(raw);
-    let s = s.trim_end_matches('\0');
+    _nt_to_dos_impl(raw, false)
+}
 
-    let stripped = if let Some(r) = s.strip_prefix(r"\??\") {
-        r
-    } else if let Some(r) = s.strip_prefix(r"\\?\") {
-        r
-    } else if let Some(r) = s.strip_prefix(r"\\.\\") {
-        r
-    } else {
-        // Absolute NT path without prefix (\Device\..., \BaseNamedObjects\...)
-        if s.starts_with('\\') && !s.starts_with(r"\\") {
-            return None;
-        }
-        s
+/// Same as `nt_to_dos` but ASCII-lowercases the result in-place during
+/// UTF-16 → UTF-8 conversion, avoiding a separate `to_lowercase()` pass.
+/// Non-ASCII bytes are preserved as-is (sufficient for Windows paths which
+/// are overwhelmingly ASCII; rare non-ASCII falls through unchanged).
+pub fn nt_to_dos_lower(raw: &[u16]) -> Option<String> {
+    _nt_to_dos_impl(raw, true)
+}
+
+fn _nt_to_dos_impl(raw: &[u16], lowercase: bool) -> Option<String> {
+    // Trim trailing NUL units
+    let raw = match raw.iter().position(|&u| u == 0) {
+        Some(pos) => &raw[..pos],
+        None => raw,
     };
 
-    // UNC: UNC\server\share
-    if stripped.starts_with("UNC\\") || stripped.starts_with(r"\\") {
+    // Try stripping known NT prefixes by comparing raw u16 values (all ASCII).
+    let stripped = strip_nt_prefix(raw)?;
+
+    // Reject UNC paths
+    if starts_with_u16_ascii(stripped, b"UNC\\") || starts_with_u16_ascii(stripped, b"\\\\") {
         return None;
     }
 
-    // Must look like a drive letter path: X:\...
-    if stripped.len() >= 2 && stripped.chars().nth(1) == Some(':') {
-        Some(stripped.to_string())
+    // Must look like a drive-letter path: second u16 must be ':' (0x3A)
+    if stripped.len() >= 2 && stripped[1] == 0x3A {
+        Some(u16_slice_to_ascii_lower(stripped, lowercase))
     } else {
         None
     }
+}
+
+/// Returns the path slice after stripping `\??\`, `\\?\`, or `\\.\\`.
+/// Returns None for `\Device\...` style paths (single leading backslash).
+fn strip_nt_prefix(raw: &[u16]) -> Option<&[u16]> {
+    // \??\ = [0x5C, 0x3F, 0x3F, 0x5C]
+    if raw.len() > 4 && raw[0] == 0x5C && raw[1] == 0x3F && raw[2] == 0x3F && raw[3] == 0x5C {
+        return Some(&raw[4..]);
+    }
+    // \\?\ = [0x5C, 0x5C, 0x3F, 0x5C]
+    if raw.len() > 4 && raw[0] == 0x5C && raw[1] == 0x5C && raw[2] == 0x3F && raw[3] == 0x5C {
+        return Some(&raw[4..]);
+    }
+    // \\.\\ = [0x5C, 0x5C, 0x2E, 0x5C]
+    if raw.len() > 4 && raw[0] == 0x5C && raw[1] == 0x5C && raw[2] == 0x2E && raw[3] == 0x5C {
+        return Some(&raw[4..]);
+    }
+    // Reject lone \Device\... paths (single backslash not followed by another)
+    if !raw.is_empty() && raw[0] == 0x5C && (raw.len() < 2 || raw[1] != 0x5C) {
+        return None;
+    }
+    Some(raw)
+}
+
+fn starts_with_u16_ascii(slice: &[u16], prefix: &[u8]) -> bool {
+    if slice.len() < prefix.len() {
+        return false;
+    }
+    slice[..prefix.len()].iter().zip(prefix.iter()).all(|(&u, &b)| u == b as u16)
+}
+
+/// Convert UTF-16 slice to String, optionally ASCII-lowercasing in one pass.
+/// Non-ASCII codepoints are passed through to `char::from_u32` unchanged;
+/// if they can't be decoded they become the replacement character (matching
+/// the behaviour of `String::from_utf16_lossy`).
+fn u16_slice_to_ascii_lower(raw: &[u16], lowercase: bool) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for &u in raw {
+        let c = if lowercase && u >= 0x41 && u <= 0x5A {
+            // ASCII A-Z → a-z
+            char::from_u32((u + 0x20) as u32).unwrap()
+        } else {
+            char::from_u32(u as u32).unwrap_or('\u{FFFD}')
+        };
+        out.push(c);
+    }
+    out
 }
 
 /// DOS path → NT path as null-terminated UTF-16.
@@ -65,35 +116,41 @@ pub fn pattern_matches_prefix(pattern: &str, path: &str) -> bool {
     if pattern.is_empty() {
         return true;
     }
-    let pat_segs: Vec<&str> = pattern.split('\\').collect();
-    let path_segs: Vec<&str> = path.split('\\').collect();
-    if path_segs.len() < pat_segs.len() {
-        return false;
+    let mut pat_it = pattern.split('\\');
+    let mut path_it = path.split('\\');
+    loop {
+        match (pat_it.next(), path_it.next()) {
+            (Some(p), Some(s)) => {
+                if !segment_match(p, s) {
+                    return false;
+                }
+            }
+            (None, _) => return true, // all pattern segments matched → prefix hit
+            (Some(_), None) => return false, // path shorter than pattern
+        }
     }
-    pat_segs
-        .iter()
-        .zip(path_segs.iter())
-        .all(|(p, x)| segment_match(p, x))
 }
 
 /// Match a single path segment against a glob pattern that may contain
 /// `*` (zero or more chars) and `?` (one char). Backslash is NOT permitted
 /// inside a segment (segments come from splitting on `\`).
+/// Works on raw bytes — glob wildcards are ASCII, and Windows path segments
+/// are overwhelmingly ASCII.
 pub fn segment_match(pattern: &str, text: &str) -> bool {
+    let p = pattern.as_bytes();
+    let t = text.as_bytes();
     // Fast path: no wildcards → direct equality.
-    if !pattern.contains('*') && !pattern.contains('?') {
-        return pattern == text;
+    if !p.contains(&b'*') && !p.contains(&b'?') {
+        return p == t;
     }
     // Two-pointer with backtrack — standard glob algorithm.
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
     let (mut star_p, mut star_t): (Option<usize>, usize) = (None, 0);
     while ti < t.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == t[ti]) {
             pi += 1;
             ti += 1;
-        } else if pi < p.len() && p[pi] == '*' {
+        } else if pi < p.len() && p[pi] == b'*' {
             star_p = Some(pi);
             star_t = ti;
             pi += 1;
@@ -105,7 +162,7 @@ pub fn segment_match(pattern: &str, text: &str) -> bool {
             return false;
         }
     }
-    while pi < p.len() && p[pi] == '*' {
+    while pi < p.len() && p[pi] == b'*' {
         pi += 1;
     }
     pi == p.len()
@@ -124,15 +181,21 @@ pub fn pattern_matches_exact(pattern: &str, path: &str) -> bool {
     if pattern.is_empty() {
         return path.is_empty();
     }
-    let pat_segs: Vec<&str> = pattern.split('\\').collect();
-    let path_segs: Vec<&str> = path.split('\\').collect();
-    if pat_segs.len() != path_segs.len() {
-        return false;
+    let mut pat_it = pattern.split('\\').peekable();
+    let mut path_it = path.split('\\').peekable();
+    loop {
+        let p = pat_it.next();
+        let s = path_it.next();
+        match (p, s) {
+            (Some(pp), Some(ss)) => {
+                if !segment_match(pp, ss) {
+                    return false;
+                }
+            }
+            (None, None) => return true,  // both exhausted simultaneously
+            _ => return false,            // different segment counts
+        }
     }
-    pat_segs
-        .iter()
-        .zip(path_segs.iter())
-        .all(|(p, x)| segment_match(p, x))
 }
 
 #[cfg(test)]
