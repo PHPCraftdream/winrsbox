@@ -22,6 +22,36 @@ impl HookCache {
         h.digest()
     }
 
+    /// Lowercase-ASCII a byte slice into a stack buffer and hash in one shot.
+    /// Falls back to heap for paths > 512 bytes (exceedingly rare).
+    fn caseless_key(path: &str, write: bool) -> u64 {
+        use xxhash_rust::xxh3::Xxh3;
+        let bytes = path.as_bytes();
+        let mut h = Xxh3::new();
+        if bytes.len() <= 512 {
+            let mut buf = [0u8; 512];
+            for (i, &b) in bytes.iter().enumerate() {
+                buf[i] = b.to_ascii_lowercase();
+            }
+            h.update(&buf[..bytes.len()]);
+        } else {
+            // Rare long path: process in chunks to avoid per-byte update overhead.
+            let mut buf = [0u8; 512];
+            let mut remaining = bytes;
+            while !remaining.is_empty() {
+                let chunk_len = remaining.len().min(512);
+                let chunk = &remaining[..chunk_len];
+                for (i, &b) in chunk.iter().enumerate() {
+                    buf[i] = b.to_ascii_lowercase();
+                }
+                h.update(&buf[..chunk_len]);
+                remaining = &remaining[chunk_len..];
+            }
+        }
+        h.update(&[u8::from(write)]);
+        h.digest()
+    }
+
     pub fn insert(&self, dos_lower: &str, write: bool, decision: Decision) {
         self.inner.insert(Self::key(dos_lower, write), decision);
     }
@@ -35,13 +65,7 @@ impl HookCache {
     /// (ASCII only — Windows paths are ASCII in the overwhelming majority of cases)
     /// without allocating a String.
     pub fn get_caseless(&self, path: &str, write: bool) -> Option<Decision> {
-        use xxhash_rust::xxh3::Xxh3;
-        let mut h = Xxh3::new();
-        for b in path.bytes() {
-            h.update(&[b.to_ascii_lowercase()]);
-        }
-        h.update(&[u8::from(write)]);
-        let k = h.digest();
+        let k = Self::caseless_key(path, write);
         self.inner.get(&k)
     }
 }

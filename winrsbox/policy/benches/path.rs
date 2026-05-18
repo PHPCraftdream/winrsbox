@@ -74,10 +74,46 @@ fn bench_pattern_specificity(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_nt_to_dos_lower_with_prefix(c: &mut Criterion) {
+    let mut group = c.benchmark_group("path");
+    let raw: Vec<u16> = r"\??\C:\Users\alice\foo.txt".encode_utf16().collect();
+
+    group.bench_function("nt_to_dos_lower_with_prefix", |b| {
+        b.iter(|| path::nt_to_dos_lower(black_box(&raw)))
+    });
+    group.finish();
+}
+
+fn bench_nt_to_dos_lower_no_prefix(c: &mut Criterion) {
+    let mut group = c.benchmark_group("path");
+    let raw: Vec<u16> = r"C:\Users\alice\foo.txt".encode_utf16().collect();
+
+    group.bench_function("nt_to_dos_lower_no_prefix", |b| {
+        b.iter(|| path::nt_to_dos_lower(black_box(&raw)))
+    });
+    group.finish();
+}
+
+fn bench_nt_to_dos_plus_lowercase(c: &mut Criterion) {
+    let mut group = c.benchmark_group("path");
+    let raw: Vec<u16> = r"\??\C:\Users\alice\foo.txt".encode_utf16().collect();
+
+    group.bench_function("nt_to_dos_plus_lowercase", |b| {
+        b.iter(|| {
+            let s = path::nt_to_dos(black_box(&raw));
+            s.map(|s| s.to_ascii_lowercase())
+        })
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_nt_to_dos_with_prefix,
     bench_nt_to_dos_no_prefix,
+    bench_nt_to_dos_lower_with_prefix,
+    bench_nt_to_dos_lower_no_prefix,
+    bench_nt_to_dos_plus_lowercase,
     bench_dos_to_nt,
     bench_mirror_into_overlay,
     bench_pattern_matches_prefix_hit,
