@@ -1,5 +1,5 @@
 pub mod path;
-mod db;
+pub mod db;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,6 +21,32 @@ pub struct Decision {
     pub overlay: Option<PathBuf>,
     pub cow_from: Option<PathBuf>,
     pub mock_payload: Option<Vec<u8>>,
+}
+
+// ── Traced decision types for `why` / `what-if` ──────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum Verdict {
+    Match { specificity: usize },
+    Skip { reason: String },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ConsideredRule {
+    pub id: String,
+    pub prefix: String,
+    pub verdict: Verdict,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TracedDecision {
+    pub decision: db::RuleMode,
+    pub target_path: Option<PathBuf>,
+    pub rule_id: Option<String>,
+    pub rule_prefix: Option<String>,
+    pub mock_match: Option<String>,
+    pub mockdir_match: Option<String>,
+    pub chain: Vec<ConsideredRule>,
 }
 
 #[derive(Error, Debug)]
@@ -144,6 +170,186 @@ impl Policy {
 
     pub fn project_root(&self) -> &str {
         &self.inner.project_root_lower
+    }
+
+    /// Traced decision for `why` / `what-if` — no caching, full chain info.
+    pub fn decide_traced(
+        &self,
+        dos_path: &str,
+        write_access: bool,
+        depth: Option<u8>,
+        exe_lower: Option<&str>,
+    ) -> TracedDecision {
+        let lower = dos_path.to_lowercase();
+
+        // project_root always passthrough
+        if lower.starts_with(self.inner.project_root_lower.trim_end_matches('\\')) {
+            return TracedDecision {
+                decision: db::RuleMode::Passthrough,
+                target_path: None,
+                rule_id: None,
+                rule_prefix: None,
+                mock_match: None,
+                mockdir_match: None,
+                chain: vec![],
+            };
+        }
+
+        let txn = match self.inner.db.begin_read() {
+            Ok(t) => t,
+            Err(_) => return TracedDecision {
+                decision: db::RuleMode::Passthrough,
+                target_path: None,
+                rule_id: None,
+                rule_prefix: None,
+                mock_match: None,
+                mockdir_match: None,
+                chain: vec![],
+            },
+        };
+
+        // Check mocks
+        if let Some(payload) = db::find_mock_payload(&txn, &lower) {
+            let _ = payload; // we know it matched
+            let overlay = path::mirror_into_overlay(&lower, &self.inner.sandbox_root);
+            return TracedDecision {
+                decision: db::RuleMode::Cow, // mocks use Cow overlay path
+                target_path: Some(overlay),
+                rule_id: None,
+                rule_prefix: None,
+                mock_match: Some(lower.clone()),
+                mockdir_match: None,
+                chain: vec![],
+            };
+        }
+
+        // Check mock dirs
+        if let Some(matched) = db::matched_mock_dir(&txn, &lower) {
+            let overlay = path::mirror_into_overlay(&lower, &self.inner.mock_dirs_root);
+            return TracedDecision {
+                decision: db::RuleMode::Cow,
+                target_path: Some(overlay),
+                rule_id: None,
+                rule_prefix: None,
+                mock_match: None,
+                mockdir_match: Some(matched),
+                chain: vec![],
+            };
+        }
+
+        // Trace through rules
+        let mut chain = Vec::new();
+        let table = match txn.open_table(db::RULES) {
+            Ok(t) => t,
+            Err(_) => return TracedDecision {
+                decision: db::RuleMode::Passthrough,
+                target_path: None,
+                rule_id: None,
+                rule_prefix: None,
+                mock_match: None,
+                mockdir_match: None,
+                chain: vec![],
+            },
+        };
+
+        let mut best: Option<(usize, db::RuleRow)> = None;
+        let mut best_prefix: Option<String> = None;
+        let mut default_row: Option<db::RuleRow> = None;
+
+        for entry in table.range::<&str>(..).ok().into_iter().flatten() {
+            let Ok((key, value)) = entry else { continue };
+            let pattern = key.value();
+            if pattern.is_empty() {
+                default_row = db::decode_rule(value.value());
+                continue;
+            }
+            let Some(row) = db::decode_rule(value.value()) else { continue };
+
+            // Check prefix match
+            if !path::pattern_matches_prefix(pattern, &lower) {
+                chain.push(ConsideredRule {
+                    id: row.id.clone(),
+                    prefix: pattern.to_owned(),
+                    verdict: Verdict::Skip { reason: "prefix mismatch".into() },
+                });
+                continue;
+            }
+
+            // Check when filter
+            if let Some(ref when) = row.when {
+                if let Some(min_depth) = when.depth {
+                    if depth.is_some() && depth.unwrap() < min_depth {
+                        chain.push(ConsideredRule {
+                            id: row.id.clone(),
+                            prefix: pattern.to_owned(),
+                            verdict: Verdict::Skip { reason: format!("depth filter: need >= {min_depth}"), },
+                        });
+                        continue;
+                    }
+                }
+                if let Some(ref exe_pattern) = when.exe {
+                    if exe_lower.is_none() || !path::pattern_matches_exact(exe_pattern, exe_lower.unwrap()) {
+                        chain.push(ConsideredRule {
+                            id: row.id.clone(),
+                            prefix: pattern.to_owned(),
+                            verdict: Verdict::Skip { reason: "exe filter mismatch".into() },
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            let mut spec = path::pattern_specificity(pattern);
+            if row.when.is_some() { spec += 1; }
+            if let Some(ref when) = row.when {
+                if let Some(ref exe) = when.exe {
+                    spec += path::pattern_specificity(exe);
+                }
+            }
+
+            chain.push(ConsideredRule {
+                id: row.id.clone(),
+                prefix: pattern.to_owned(),
+                verdict: Verdict::Match { specificity: spec },
+            });
+
+            match &best {
+                None => { best_prefix = Some(pattern.to_owned()); best = Some((spec, row)); }
+                Some((s, _)) if spec > *s => { best_prefix = Some(pattern.to_owned()); best = Some((spec, row)); }
+                _ => {}
+            }
+        }
+
+        let matched = best.map(|(_, r)| r).or(default_row);
+        let (decision, rule_id, rule_prefix) = match &matched {
+            Some(row) => {
+                let mode = if write_access { row.mode_write } else { row.mode_read };
+                (mode, Some(row.id.clone()), best_prefix.clone().or_else(|| Some(String::new())))
+            }
+            None => (db::RuleMode::Passthrough, None, None),
+        };
+
+        let target_path = match decision {
+            db::RuleMode::Deny => None,
+            db::RuleMode::Passthrough => None,
+            db::RuleMode::Cow | db::RuleMode::Redirect => {
+                Some(path::mirror_into_overlay(&lower, &self.inner.sandbox_root))
+            }
+        };
+
+        TracedDecision {
+            decision,
+            target_path,
+            rule_id,
+            rule_prefix,
+            mock_match: None,
+            mockdir_match: None,
+            chain,
+        }
+    }
+
+    pub fn db(&self) -> &redb::Database {
+        &self.inner.db
     }
 
     fn compute(&self, dos_path: &str, write_access: bool, depth: Option<u8>, exe_lower: Option<&str>) -> Decision {
