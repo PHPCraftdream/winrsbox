@@ -143,3 +143,55 @@ cargo test --workspace      → 161 passed, 0 failed
 cargo bench --no-run         → compiles
 cargo build --release        → compiles
 ```
+
+---
+
+## ArcSwap in-memory snapshot (replaces redb scan on cache miss)
+
+Policy::compute now reads rules, mocks, mock_dirs from an in-memory `Snapshot`
+served via `arc_swap::ArcSwap` (lock-free atomic pointer load). Redb read
+transaction only for `overlay_idx` lookup.
+
+### Cache miss path — before vs after
+
+| Bench | Before (redb) | After (ArcSwap) | Δ |
+|-------|---------------|-----------------|---|
+| cache_miss_passthrough | 7.6 µs | 2.2 µs | **-71% / 3.5×** |
+| cache_miss_with_depth | 12.6 µs | 2.6 µs | **-79% / 4.8×** |
+| cache_miss_with_exe | 9.4 µs | 2.5 µs | **-73% / 3.8×** |
+| cache_miss_with_both | 17.4 µs | 3.2 µs | **-82% / 5.4×** |
+| cache_miss_deny | 85 µs | 74 µs | **-13%** |
+
+### Rule match at scale
+
+| Bench | Before | After | Δ |
+|-------|--------|-------|---|
+| best_rule_match n=1 | 73 µs | 65 µs | **-11%** |
+| best_rule_match n=10 | 113 µs | 69 µs | **-39% / 1.6×** |
+| best_rule_match n=50 | 116 µs | 85 µs | **-27%** |
+| best_rule_match n=100 | 147 µs | 101 µs | **-31% / 1.5×** |
+
+### Mock lookup
+
+| Bench | Before | After | Δ |
+|-------|--------|-------|---|
+| find_mock_payload hit | 231 ns | 230 ns | ~0% |
+| find_mock_payload miss n=1 | 9.5 µs | 3.3 µs | **-65% / 2.9×** |
+| matched_mock_dir hit | 264 ns | 264 ns | ~0% |
+
+### New P0/P1 benchmarks added
+
+| Bench | Description | Time |
+|-------|-------------|------|
+| best_rule_match_scale/n={1,10,50,100} | Linear scan with N rules | 65–101 µs |
+| find_mock_payload/{hit,miss}_n={1,10,50} | Exact + glob scan | 230 ns – 62 µs |
+| matched_mock_dir/hit_n={1,10,50} | Prefix scan | 264–303 ns |
+| pattern_matches_exact_{hit,miss,globstar} | Mock path glob matching | 877 ns – 1.04 µs |
+
+### Build verification
+
+```
+cargo test --workspace      → 211 passed, 0 failed
+cargo bench --no-run         → compiles
+cargo build --release        → compiles
+```

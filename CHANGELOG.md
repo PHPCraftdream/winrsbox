@@ -73,8 +73,26 @@ All notable changes to winrsbox are documented in this file.
 
 ### Performance
 
-Hot-path optimizations on policy decision, path conversion, and cache lookup.
-All 61 workspace tests pass; full numbers in `BENCH_RESULTS.md`.
+**In-memory ArcSwap snapshot (biggest win):**
+
+- **Policy::compute bypasses redb on cache miss** — rules, mocks, and mock_dirs are
+  loaded into an immutable `Snapshot` and served via `arc_swap::ArcSwap` (load = single
+  atomic instruction, zero locks, zero unsafe). Redb read transaction only needed for
+  overlay_idx lookup. Snapshot is rebuilt atomically on `load_config` / CLI CRUD.
+
+  | Bench | Before (redb scan) | After (ArcSwap) | Speedup |
+  |-------|--------------------|-----------------|---------|
+  | cache_miss_passthrough | 7.6 µs | 2.2 µs | **3.5×** |
+  | cache_miss_with_both | 17.4 µs | 3.2 µs | **5.4×** |
+  | cache_miss_with_depth | 12.6 µs | 2.6 µs | **4.8×** |
+  | cache_miss_with_exe | 9.4 µs | 2.5 µs | **3.8×** |
+  | best_rule_match n=10 | 113 µs | 69 µs | **1.6×** |
+  | best_rule_match n=100 | 147 µs | 101 µs | **1.5×** |
+  | mock miss n=1 | 9.5 µs | 3.3 µs | **2.9×** |
+
+**Earlier hot-path optimizations:**
+
+Full numbers in `BENCH_RESULTS.md`.
 
 - **`nt_to_dos` rewritten on raw `u16` slices with inline ASCII lowercasing** —
   new `nt_to_dos_lower()` eliminates the separate `to_ascii_lowercase()` allocation
