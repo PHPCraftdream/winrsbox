@@ -66,3 +66,80 @@ Baseline: `before-batch`. After: `[u8; 512]` stack buffer → single `h.update()
 
 All gains come from eliminating heap allocations and reducing per-byte overhead.
 Opt 4 (Arc\<Decision\>) deferred — would save 2 clone allocs on cache-miss path.
+
+---
+
+## Feature: depth + exe + `**` globs
+
+New benchmarks added for `**` glob matching and `decide_with_context` (depth/exe filter).
+
+### New benchmarks
+
+| Bench | Description |
+|-------|-------------|
+| `pattern_double_star_short` | `C:\Users\**\.ssh` vs `C:\Users\alice\.ssh` |
+| `pattern_double_star_long` | `C:\**\foo\**\.bar` vs `C:\a\b\c\foo\d\e\f\.bar` |
+| `cache_miss_with_depth` | `decide_with_context(depth=2)` cache miss |
+| `cache_miss_with_exe` | `decide_with_context(exe=...)` cache miss |
+| `cache_miss_with_both` | `decide_with_context(depth=3, exe=...)` cache miss |
+
+### Build verification
+
+```
+cargo test --workspace      → 155 passed, 0 failed
+cargo bench --no-run         → compiles
+cargo build --release        → compiles
+```
+
+---
+
+## Composite cache key + FxHash audit
+
+### Composite cache key (u128)
+
+The `PolicyInner` cache key was extended from `u64` (path+write only) to `u128` via
+bit-concatenation of two independent Xxh3 hashes:
+- **path_hash** (high 64 bits): `Xxh3(path_bytes || write_flag)`
+- **ctx_hash** (low 64 bits): `Xxh3(depth_tag || exe_bytes)` with tag bytes to
+  disambiguate `None` vs `Some(0)` / `Some("")`.
+
+This ensures that two processes with different `(depth, exe)` contexts for the same
+path get independent cache entries, fixing `when` filter correctness.
+
+### New tests
+
+6 dedicated composite cache key tests:
+- `composite_key_different_depth` — same path, depth 0 vs 1 → different keys
+- `composite_key_different_exe` — same path, different exe → different keys
+- `composite_key_none_vs_some_zero_depth` — `None` vs `Some(0)` → different keys (tag byte)
+- `composite_key_none_vs_some_empty_exe` — `None` vs `Some("")` → different keys
+- `composite_key_same_params_equal` — identical inputs → identical key (determinism)
+- `composite_key_collision_sanity` — 500 unique triples → 500 unique keys
+
+### New benchmarks
+
+| Bench | Description |
+|-------|-------------|
+| `cache_key_composite_none` | Key computation with no depth/exe |
+| `cache_key_composite_both` | Key computation with depth + exe |
+| `cache_key_composite_short` | Key computation on short path |
+
+### FxHash audit
+
+Scanned all `.rs` files for `std::collections::HashMap`/`HashSet`/`BTreeMap`/`BTreeSet`:
+
+| File | Change |
+|------|--------|
+| `launcher/src/main.rs:13` | `HashSet<u32>` → `FxHashSet<u32>` |
+| `papaya::HashMap` in launcher | Left as-is (already uses ahash) |
+| Test-only `HashSet` in policy | Left as-is (not production hot path) |
+
+New dependency: `rustc-hash = "2"` added to workspace.
+
+### Build verification
+
+```
+cargo test --workspace      → 161 passed, 0 failed
+cargo bench --no-run         → compiles
+cargo build --release        → compiles
+```

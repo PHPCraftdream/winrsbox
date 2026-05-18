@@ -38,6 +38,14 @@ C:\*.log                 matches C:\app.log, C:\error.log
 C:\Users\??\*            matches C:\Users\ab\..., but not C:\Users\alice\...
 ```
 
+`**` matches zero or more path segments (must be a standalone segment):
+
+```
+C:\Users\**\.ssh         matches C:\Users\alice\.ssh, C:\Users\alice\sub\.ssh, C:\Users\.ssh
+C:\**                     matches C:\anything, C:\a\b\c
+C:\**\foo\**\.bar        matches C:\foo\.bar, C:\x\foo\y\.bar
+```
+
 Matches are prefix-based by default (rules don't require full path), unless used in `mocks` (exact match with globs).
 
 ### Example config
@@ -62,6 +70,14 @@ rules: [
         prefix: C:\\Program Files\MyApp\*.log
         write: redirect
     }
+    {
+        prefix: C:\\Secret
+        write: deny
+        when: {
+            depth: 1
+            exe: c:\\bin\target-app.exe
+        }
+    }
 ]
 
 mocks: [
@@ -76,6 +92,21 @@ mock_dirs: [
 ```
 
 Policy modes: `passthrough` (allow), `deny` (reject), `cow` (copy-on-write), `redirect` (copy to overlay).
+
+### `when` filter
+
+Rules can include an optional `when` filter to restrict them to specific process depths and executables:
+
+```ktav
+when: {
+    depth: 1            # applies at depth >= 1 (children, grandchildren, etc.)
+    exe: c:\bin\app.exe  # glob match on lowercase exe path
+}
+```
+
+- `depth`: rule applies only when the process is at this depth or deeper in the sandbox tree. The root target is depth 0, its children are depth 1, etc.
+- `exe`: glob pattern matched against the lowercase executable path. Supports `*`, `?`, and `**`.
+- Legacy callers (without depth/exe context) are treated as max-permissive: they pass through depth filters.
 
 ## How it works
 
