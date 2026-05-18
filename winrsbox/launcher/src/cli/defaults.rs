@@ -1,13 +1,33 @@
 use anyhow::{bail, Result};
 
+const HELP: &str = "\
+winrsbox defaults — manage default read/write policy
+
+Default modes apply when no specific rule matches a path.
+
+SUBCOMMANDS:
+  set    Set default modes (--read=MODE --write=MODE)
+  show   Show current defaults (--json)
+
+MODES: passthrough | deny | cow | redirect
+
+EXAMPLES:
+  winrsbox defaults set --read=passthrough --write=cow
+  winrsbox defaults set --write=deny
+  winrsbox defaults show --json
+";
+
 pub fn run(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    if args.is_empty() { bail!("defaults: expected subcommand (set, show)"); }
+    if args.is_empty() || has_flag(args, "--help") || has_flag(args, "-h") {
+        print!("{}", HELP);
+        return Ok(());
+    }
     let sub = args[0].to_lowercase();
     let rest = &args[1..];
     match sub.as_str() {
         "set" => run_set(rest, state_dir),
         "show" => run_show(rest, state_dir),
-        _ => bail!("defaults: unknown subcommand '{}'", sub),
+        _ => bail!("defaults: unknown subcommand '{}'. Run 'winrsbox defaults --help'.", sub),
     }
 }
 

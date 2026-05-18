@@ -1,7 +1,43 @@
 use anyhow::{bail, Result};
 use base64::Engine;
 
+const EXPORT_HELP: &str = "\
+winrsbox export — dump current state as versioned JSON to stdout
+
+Outputs all rules, mocks, mockdirs, and defaults as a single JSON object
+with schema_version: 1. Pipe to a file for backup or transfer.
+
+EXAMPLES:
+  winrsbox export > backup.json
+  winrsbox export | jq '.rules[] | select(.write == \"deny\")'
+";
+
+const IMPORT_HELP: &str = "\
+winrsbox import — load state from JSON stdin or legacy ktav file
+
+By default, merges imported data with existing state (upsert).
+Use --replace to wipe existing state before importing.
+
+OPTIONS:
+  --replace          Clear all existing data before importing
+  --ktav=FILE        Import from legacy ktav config file (or --ktav FILE)
+
+JSON FORMAT:
+  Expects schema_version: 1 with fields: defaults, rules[], mocks[], mockdirs[].
+  Same format as 'winrsbox export' output.
+
+EXAMPLES:
+  winrsbox import < backup.json
+  winrsbox import --replace < backup.json
+  winrsbox import --ktav sandbox.ktav
+  winrsbox export | winrsbox import --replace  # clone state
+";
+
 pub fn run_export(args: &[String], state_dir: &std::path::Path) -> Result<()> {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        print!("{}", EXPORT_HELP);
+        return Ok(());
+    }
     let db = super::open_db(state_dir)?;
     let json = has_flag(args, "--json") || true; // export always outputs JSON
 
@@ -43,6 +79,10 @@ pub fn run_export(args: &[String], state_dir: &std::path::Path) -> Result<()> {
 }
 
 pub fn run_import(args: &[String], state_dir: &std::path::Path) -> Result<()> {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        print!("{}", IMPORT_HELP);
+        return Ok(());
+    }
     let db = super::open_db(state_dir)?;
     let replace = has_flag(args, "--replace");
     let ktav_file = find_arg(args, "--ktav=");

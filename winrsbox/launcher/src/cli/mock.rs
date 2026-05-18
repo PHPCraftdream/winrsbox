@@ -1,7 +1,40 @@
 use anyhow::{bail, Result};
 
+const HELP: &str = "\
+winrsbox mock — manage file mocks
+
+Mocks return fake content for specific file paths instead of real filesystem data.
+
+SUBCOMMANDS:
+  add      Add or update a mock file
+  remove   Remove a mock by --path
+  list     List all mocks (--json)
+  show     Show mock content by --path (--json)
+
+MOCK ADD OPTIONS:
+  --path=PATTERN      File path with glob support [required]
+  --content=STRING    Inline UTF-8 content
+  --file=PATH         Read content from file
+  --base64=B64        Base64-encoded content (for binary data)
+  --stdin             Read content from stdin until EOF
+  --id=NAME           Explicit mock id (default: auto-generated)
+
+  Exactly one content source (--content, --file, --base64, --stdin) is required.
+
+EXAMPLES:
+  winrsbox mock add --path='C:\\config.ini' --content='[app]\\nkey=value'
+  winrsbox mock add --path='C:\\Users\\*\\secret.txt' --file=fake_secret.txt
+  winrsbox mock add --path='C:\\cert.der' --base64=MIIBY...
+  echo '{\"key\": 1}' | winrsbox mock add --path='C:\\data.json' --stdin
+  winrsbox mock remove --path='C:\\config.ini'
+  winrsbox mock list --json
+";
+
 pub fn run(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    if args.is_empty() { bail!("mock: expected subcommand (add, remove, list, show)"); }
+    if args.is_empty() || has_flag(args, "--help") || has_flag(args, "-h") {
+        print!("{}", HELP);
+        return Ok(());
+    }
     let sub = args[0].to_lowercase();
     let rest = &args[1..];
     match sub.as_str() {
@@ -9,7 +42,7 @@ pub fn run(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         "remove" => run_remove(rest, state_dir),
         "list" => run_list(rest, state_dir),
         "show" => run_show(rest, state_dir),
-        _ => bail!("mock: unknown subcommand '{}'", sub),
+        _ => bail!("mock: unknown subcommand '{}'. Run 'winrsbox mock --help'.", sub),
     }
 }
 

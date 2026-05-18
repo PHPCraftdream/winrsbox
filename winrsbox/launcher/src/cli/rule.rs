@@ -1,8 +1,38 @@
 use anyhow::{bail, Result};
 use policy::db::{self, RuleMode};
 
+const HELP: &str = "\
+winrsbox rule — manage sandbox rules
+
+SUBCOMMANDS:
+  add      Add or update a rule (upsert by id)
+  remove   Remove a rule by --id or --prefix
+  list     List all rules (--json for machine output)
+  show     Show a single rule by --id (--json)
+  clear    Remove all rules (requires --force)
+
+RULE ADD OPTIONS:
+  --prefix=PATTERN   Path prefix with glob support (* ? **) [required]
+  --read=MODE        Read policy: passthrough|deny|cow|redirect [default: passthrough]
+  --write=MODE       Write policy: passthrough|deny|cow|redirect [default: cow]
+  --depth=N          Only apply at process depth >= N (0 = root target)
+  --exe=GLOB         Only apply when exe path matches glob
+  --id=NAME          Explicit rule id (default: auto-generated from args)
+
+EXAMPLES:
+  winrsbox rule add --prefix='C:\\Users\\*\\AppData' --write=deny
+  winrsbox rule add --id=allow-tmp --prefix='C:\\Temp' --write=cow --depth=1
+  winrsbox rule remove --id=allow-tmp
+  winrsbox rule remove --prefix='C:\\Temp'
+  winrsbox rule list --json
+  winrsbox rule clear --force
+";
+
 pub fn run(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    if args.is_empty() { bail!("rule: expected subcommand (add, remove, list, show, clear)"); }
+    if args.is_empty() || has_flag(args, "--help") || has_flag(args, "-h") {
+        print!("{}", HELP);
+        return Ok(());
+    }
     let sub = args[0].to_lowercase();
     let rest = &args[1..];
     match sub.as_str() {
@@ -11,7 +41,7 @@ pub fn run(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         "list" => run_list(rest, state_dir),
         "show" => run_show(rest, state_dir),
         "clear" => run_clear(rest, state_dir),
-        _ => bail!("rule: unknown subcommand '{}'", sub),
+        _ => bail!("rule: unknown subcommand '{}'. Run 'winrsbox rule --help'.", sub),
     }
 }
 
