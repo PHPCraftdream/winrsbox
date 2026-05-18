@@ -107,6 +107,30 @@ fn bench_nt_to_dos_plus_lowercase(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_pattern_double_star_short(c: &mut Criterion) {
+    let mut group = c.benchmark_group("path");
+
+    group.bench_function("pattern_double_star_short", |b| {
+        b.iter(|| path::pattern_matches_prefix(
+            black_box(r"c:\users\**\.ssh"),
+            black_box(r"c:\users\alice\.ssh"),
+        ))
+    });
+    group.finish();
+}
+
+fn bench_pattern_double_star_long(c: &mut Criterion) {
+    let mut group = c.benchmark_group("path");
+
+    group.bench_function("pattern_double_star_long", |b| {
+        b.iter(|| path::pattern_matches_prefix(
+            black_box(r"c:\**\foo\**\.bar"),
+            black_box(r"c:\a\b\c\foo\d\e\f\.bar"),
+        ))
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_nt_to_dos_with_prefix,
@@ -119,5 +143,7 @@ criterion_group!(
     bench_pattern_matches_prefix_hit,
     bench_pattern_matches_prefix_miss,
     bench_pattern_specificity,
+    bench_pattern_double_star_short,
+    bench_pattern_double_star_long,
 );
 criterion_main!(benches);
