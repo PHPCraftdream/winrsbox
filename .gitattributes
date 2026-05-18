@@ -1,0 +1,43 @@
+# Disable git's "LF will be replaced by CRLF" warning on Windows.
+# Working text is LF-canonical (committed blobs use \n). On Windows
+# `core.autocrlf=true` rewrites checkouts to CRLF and warns on every
+# `git add`/`git diff`. The line below tells git to leave line endings
+# alone — what is on disk is what gets committed.
+* text=auto eol=lf
+
+# Source code
+*.rs    text eol=lf
+*.go    text eol=lf
+
+# Lockfiles and configs that some tools still write CRLF on Windows —
+# normalised to LF by git on commit.
+*.toml  text eol=lf
+*.lock  text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+*.ktav  text eol=lf
+
+# Windows-only shell scripts MUST be CRLF — `goto` / labels in
+# legacy cmd.exe break with LF-only line endings on some systems.
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+
+# Unix scripts always LF.
+*.sh    text eol=lf
+*.bash  text eol=lf
+
+# Generated / minified web bundles — leave bytes alone.
+*.min.js  binary
+*.min.css binary
+
+# Binary fixtures, snapshots, certificates — never touch.
+*.png  binary
+*.jpg  binary
+*.pdf  binary
+*.snap binary
+*.der  binary
+*.exe  binary
+*.dll  binary
+*.redb binary
