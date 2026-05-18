@@ -126,4 +126,65 @@ mod tests {
         let r = cache.get_caseless("c:\\\u{03A9}.txt", false);
         assert!(r.is_some());
     }
+
+    // ── Additional HookCache tests ──────────────────────────────────────────
+
+    #[test]
+    fn get_missing_returns_none() {
+        let cache = HookCache::new();
+        assert!(cache.get_caseless("c:\\nonexistent", false).is_none());
+        assert!(cache.get_caseless("c:\\nonexistent", true).is_none());
+    }
+
+    #[test]
+    fn insert_overwrite() {
+        let cache = HookCache::new();
+        let d1 = Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None };
+        let d2 = Decision { mode: Mode::Deny, overlay: None, cow_from: None, mock_payload: None };
+        cache.insert("c:\\x", false, d1);
+        cache.insert("c:\\x", false, d2);
+        let r = cache.get_caseless("c:\\x", false).unwrap();
+        assert_eq!(r.mode, Mode::Deny);
+    }
+
+    #[test]
+    fn caseless_long_path() {
+        let cache = HookCache::new();
+        let d = Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None };
+        let long: String = "c:\\".to_string() + &"subdir\\".repeat(60) + "file.exe";
+        cache.insert(&long, false, d.clone());
+        let long_upper: String = long.to_ascii_uppercase();
+        assert!(cache.get_caseless(&long_upper, false).is_some());
+    }
+
+    #[test]
+    fn invalidate_nonexistent_is_noop() {
+        let cache = HookCache::new();
+        // Should not panic
+        cache.invalidate("c:\\nonexistent");
+    }
+
+    #[test]
+    fn concurrent_insert_and_read() {
+        use std::sync::Arc;
+        let cache = Arc::new(HookCache::new());
+        let d = Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None };
+        cache.insert("c:\\shared", false, d);
+
+        let mut handles = vec![];
+        for i in 0..4 {
+            let c = cache.clone();
+            handles.push(std::thread::spawn(move || {
+                let path = format!("c:\\thread\\{}", i);
+                let dec = Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None };
+                c.insert(&path, false, dec);
+                assert!(c.get_caseless(&path, false).is_some());
+                // Also read shared entry
+                assert!(c.get_caseless("c:\\shared", false).is_some());
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
 }

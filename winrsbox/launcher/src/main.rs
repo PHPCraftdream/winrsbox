@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ipc::{read_msg, write_msg, LogLevel, Req, Resp};
 use policy::Policy;
+use rustc_hash::FxHashSet;
 use std::{
-    collections::HashSet,
     ffi::OsStr,
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
@@ -19,6 +19,20 @@ use std::{
         Arc,
     },
 };
+
+// ─── Lock-free PID → ProcInfo storage ─────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ProcInfo {
+    pub depth: u8,
+    pub exe_lower: Arc<str>,
+}
+
+static PROC_INFO: std::sync::OnceLock<papaya::HashMap<u32, ProcInfo>> = std::sync::OnceLock::new();
+
+fn global_proc_info() -> &'static papaya::HashMap<u32, ProcInfo> {
+    PROC_INFO.get_or_init(papaya::HashMap::new)
+}
 
 /// Default ktav policy written when auto-discovery creates a fresh state dir.
 const DEFAULT_CONFIG_KTAV: &str = "\
@@ -197,6 +211,15 @@ async fn main() -> Result<()> {
 
     println!("[sandbox] target started (pid {})", proc_info.dwProcessId);
 
+    // Insert root target into PROC_INFO
+    let arg0_lower = target_args.first()
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    global_proc_info().pin().insert(
+        proc_info.dwProcessId,
+        ProcInfo { depth: 0, exe_lower: Arc::from(arg0_lower.as_str()) },
+    );
+
     // ── Wait for target process ───────────────────────────────────────────
     // Offload the blocking wait to spawn_blocking so the tokio executor
     // stays free to service hook IPC requests while the target runs.
@@ -215,7 +238,7 @@ async fn main() -> Result<()> {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // Drain registered child PIDs into a deduplicated set and open handles.
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     let mut child_handles: Vec<HANDLE> = Vec::new();
     while let Some(pid) = child_pids.pop() {
         if seen.insert(pid) {
@@ -377,6 +400,9 @@ fn handle_connection(
     let raw: RawHandle = handle.0 as *mut _;
     let mut file = unsafe { std::fs::File::from_raw_handle(raw) };
 
+    // Track the PID associated with this pipe connection
+    let mut conn_pid: Option<u32> = None;
+
     loop {
         let req: Req = match read_msg(&mut file) {
             Ok(r) => r,
@@ -384,9 +410,56 @@ fn handle_connection(
         };
 
         let resp = match req {
+            Req::Hello { pid, exe_path } => {
+                println!("[sandbox] hello from pid={pid} exe={exe_path}");
+                let exe_lower = exe_path.to_ascii_lowercase();
+                let map = global_proc_info().pin();
+                if let Some(existing) = map.get(&pid) {
+                    // Already have entry (e.g., root target) — keep depth, update exe
+                    let updated = ProcInfo {
+                        depth: existing.depth,
+                        exe_lower: Arc::from(exe_lower.as_str()),
+                    };
+                    map.insert(pid, updated);
+                } else {
+                    // New process — insert with depth 0 (will be updated by SpawnedChild if child)
+                    map.insert(pid, ProcInfo {
+                        depth: 0,
+                        exe_lower: Arc::from(exe_lower.as_str()),
+                    });
+                }
+                conn_pid = Some(pid);
+                Resp::Ok
+            }
+            Req::SpawnedChild { parent_pid, child_pid, child_exe } => {
+                println!("[sandbox] child spawned: parent={parent_pid} child={child_pid} exe={child_exe}");
+                child_pids.push(child_pid);
+                let map = global_proc_info().pin();
+                let parent_depth = map.get(&parent_pid).map(|p| p.depth).unwrap_or(0);
+                let exe_lower = child_exe.to_ascii_lowercase();
+                map.insert(child_pid, ProcInfo {
+                    depth: parent_depth + 1,
+                    exe_lower: Arc::from(exe_lower.as_str()),
+                });
+                Resp::Ok
+            }
             Req::Decide { dos_path, write } => {
                 stats.decide.fetch_add(1, Ordering::Relaxed);
-                let d = policy.decide(&dos_path, write);
+                // Look up depth/exe for this connection's PID
+                let (depth, exe_lower) = if let Some(pid) = conn_pid {
+                    let map = global_proc_info().pin();
+                    map.get(&pid)
+                        .map(|info| (Some(info.depth), Some(Arc::clone(&info.exe_lower))))
+                        .unwrap_or((None, None))
+                } else {
+                    (None, None)
+                };
+                let d = policy.decide_with_context(
+                    &dos_path,
+                    write,
+                    depth,
+                    exe_lower.as_deref(),
+                );
                 match d.mode {
                     policy::Mode::Deny => { stats.deny.fetch_add(1, Ordering::Relaxed); }
                     policy::Mode::Cow => { stats.cow.fetch_add(1, Ordering::Relaxed); }
@@ -654,4 +727,82 @@ struct Stats {
     deny: AtomicU64,
     mock_: AtomicU64,
     cow: AtomicU64,
+}
+
+#[cfg(test)]
+mod proc_info_tests {
+    use super::*;
+
+    #[test]
+    fn insert_and_lookup() {
+        let map: papaya::HashMap<u32, ProcInfo> = papaya::HashMap::new();
+        map.pin().insert(100, ProcInfo { depth: 0, exe_lower: Arc::from("c:\\app.exe") });
+        let info = map.pin().get(&100).cloned().unwrap();
+        assert_eq!(info.depth, 0);
+        assert_eq!(&*info.exe_lower, "c:\\app.exe");
+    }
+
+    #[test]
+    fn lookup_missing_returns_none() {
+        let map: papaya::HashMap<u32, ProcInfo> = papaya::HashMap::new();
+        assert!(map.pin().get(&999).is_none());
+    }
+
+    #[test]
+    fn remove_entry() {
+        let map: papaya::HashMap<u32, ProcInfo> = papaya::HashMap::new();
+        map.pin().insert(200, ProcInfo { depth: 1, exe_lower: Arc::from("child.exe") });
+        assert!(map.pin().remove(&200).is_some());
+        assert!(map.pin().get(&200).is_none());
+    }
+
+    #[test]
+    fn concurrent_insert_and_lookup() {
+        use std::sync::Arc;
+        let map = Arc::new(papaya::HashMap::<u32, ProcInfo>::new());
+        let mut handles = vec![];
+        for i in 0..4 {
+            let m = map.clone();
+            handles.push(std::thread::spawn(move || {
+                let pid = 1000 + i;
+                m.pin().insert(pid, ProcInfo {
+                    depth: i as u8,
+                    exe_lower: Arc::from(format!("proc_{i}.exe").leak() as &str),
+                });
+                assert!(m.pin().get(&pid).is_some());
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // All 4 entries should be visible
+        for i in 0..4u32 {
+            assert!(map.pin().get(&(1000 + i)).is_some());
+        }
+    }
+
+    #[test]
+    fn depth_chain_root_child_grandchild() {
+        let map: papaya::HashMap<u32, ProcInfo> = papaya::HashMap::new();
+        // Root
+        map.pin().insert(10, ProcInfo { depth: 0, exe_lower: Arc::from("root.exe") });
+        // Child
+        map.pin().insert(20, ProcInfo { depth: 1, exe_lower: Arc::from("child.exe") });
+        // Grandchild
+        map.pin().insert(30, ProcInfo { depth: 2, exe_lower: Arc::from("grandchild.exe") });
+
+        assert_eq!(map.pin().get(&10).unwrap().depth, 0);
+        assert_eq!(map.pin().get(&20).unwrap().depth, 1);
+        assert_eq!(map.pin().get(&30).unwrap().depth, 2);
+    }
+
+    #[test]
+    fn overwrite_updates_value() {
+        let map: papaya::HashMap<u32, ProcInfo> = papaya::HashMap::new();
+        map.pin().insert(50, ProcInfo { depth: 0, exe_lower: Arc::from("old.exe") });
+        map.pin().insert(50, ProcInfo { depth: 1, exe_lower: Arc::from("new.exe") });
+        let info = map.pin().get(&50).cloned().unwrap();
+        assert_eq!(info.depth, 1);
+        assert_eq!(&*info.exe_lower, "new.exe");
+    }
 }

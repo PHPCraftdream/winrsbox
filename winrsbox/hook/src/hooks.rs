@@ -100,6 +100,8 @@ static CACHE: OnceLock<HookCache> = OnceLock::new();
 thread_local! {
     static IPC_CLIENT: std::cell::RefCell<Option<ipc::SyncClient>> =
         const { std::cell::RefCell::new(None) };
+    static HELLO_SENT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 static PIPE_NAME: OnceLock<String> = OnceLock::new();
@@ -120,15 +122,38 @@ fn decide(dos_path: &str, write: bool) -> Decision {
     d
 }
 
-fn ipc_decide(dos_lower: &str, write: bool) -> Decision {
-    IPC_CLIENT.with_borrow_mut(|opt| {
+fn ensure_ipc_and<R>(f: impl FnOnce(&mut Option<ipc::SyncClient>) -> R) -> Option<R> {
+    let mut sent = false;
+    let result = IPC_CLIENT.with_borrow_mut(|opt| {
         if opt.is_none() {
             if let Some(name) = PIPE_NAME.get() {
-                // connect() has its own internal retry loop; if it still fails
-                // leave opt = None so the next call retries afresh.
                 *opt = ipc::SyncClient::connect(name).ok();
+                // Send Hello on first connection
+                if opt.is_some() && !HELLO_SENT.get() {
+                    let pid = unsafe { GetCurrentProcessId() };
+                    let exe = get_own_exe_path();
+                    let _ = opt.as_mut().unwrap().send(&ipc::Req::Hello {
+                        pid,
+                        exe_path: exe,
+                    });
+                    sent = true;
+                }
             }
         }
+        if opt.is_some() {
+            Some(f(opt))
+        } else {
+            None
+        }
+    });
+    if sent {
+        HELLO_SENT.set(true);
+    }
+    result
+}
+
+fn ipc_decide(dos_lower: &str, write: bool) -> Decision {
+    ensure_ipc_and(|opt| {
         if let Some(client) = opt.as_mut() {
             let req = ipc::Req::Decide {
                 dos_path: dos_lower.to_owned(),
@@ -139,16 +164,11 @@ fn ipc_decide(dos_lower: &str, write: bool) -> Decision {
             }
         }
         Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None }
-    })
+    }).unwrap_or(Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None })
 }
 
 fn ipc_record_overlay(orig: &str, overlay: &str) {
-    IPC_CLIENT.with_borrow_mut(|opt| {
-        if opt.is_none() {
-            if let Some(name) = PIPE_NAME.get() {
-                *opt = ipc::SyncClient::connect(name).ok();
-            }
-        }
+    let _ = ensure_ipc_and(|opt| {
         if let Some(client) = opt.as_mut() {
             let _ = client.send(&ipc::Req::RecordOverlay {
                 orig: orig.to_owned(),
@@ -159,31 +179,80 @@ fn ipc_record_overlay(orig: &str, overlay: &str) {
 }
 
 fn ipc_register_child(pid: u32) {
-    IPC_CLIENT.with_borrow_mut(|opt| {
-        if opt.is_none() {
-            if let Some(name) = PIPE_NAME.get() {
-                *opt = ipc::SyncClient::connect(name).ok();
-            }
-        }
+    let _ = ensure_ipc_and(|opt| {
         if let Some(client) = opt.as_mut() {
             let _ = client.send(&ipc::Req::RegisterChild { pid });
         }
     });
 }
 
-fn ipc_log(level: ipc::LogLevel, msg: String) {
-    // SAFETY: GetCurrentProcessId is always safe to call; it has no preconditions.
-    let pid = unsafe { GetCurrentProcessId() };
-    IPC_CLIENT.with_borrow_mut(|opt| {
-        if opt.is_none() {
-            if let Some(name) = PIPE_NAME.get() {
-                *opt = ipc::SyncClient::connect(name).ok();
-            }
+fn ipc_spawned_child(parent_pid: u32, child_pid: u32, child_exe: String) {
+    let _ = ensure_ipc_and(|opt| {
+        if let Some(client) = opt.as_mut() {
+            let _ = client.send(&ipc::Req::SpawnedChild {
+                parent_pid,
+                child_pid,
+                child_exe,
+            });
         }
+    });
+}
+
+fn ipc_log(level: ipc::LogLevel, msg: String) {
+    let pid = unsafe { GetCurrentProcessId() };
+    let _ = ensure_ipc_and(|opt| {
         if let Some(client) = opt.as_mut() {
             let _ = client.send(&ipc::Req::Log { pid, level, msg });
         }
     });
+}
+
+/// Get the current process executable path (lowercased).
+fn get_own_exe_path() -> String {
+    let mut buf = [0u16; 512];
+    // SAFETY: buf is valid, len matches. GetModuleFileNameW writes a null-terminated string.
+    let len = unsafe { winapi::um::libloaderapi::GetModuleFileNameW(
+        std::ptr::null_mut(),
+        buf.as_mut_ptr(),
+        buf.len() as u32,
+    )};
+    if len == 0 {
+        return String::new();
+    }
+    let s = String::from_utf16_lossy(&buf[..len as usize]);
+    s.to_ascii_lowercase()
+}
+
+/// Extract the executable path from RTL_USER_PROCESS_PARAMETERS.
+/// Returns empty string if extraction fails.
+unsafe fn extract_child_exe(params: *mut c_void) -> String {
+    if params.is_null() {
+        return String::new();
+    }
+    // RTL_USER_PROCESS_PARAMETERS layout (partial):
+    //   offset 0x00: MaximumLength, Length (ULONG)
+    //   offset 0x08: Flags (ULONG)
+    //   offset 0x0C: ConsoleHandle (HANDLE)
+    //   ...
+    //   offset 0x20: ImagePathName (UNICODE_STRING)
+    //   offset 0x30: CommandLine (UNICODE_STRING)
+    //
+    // We read the ImagePathName at offset 0x20 (pointer-dependent but stable on x64 Windows).
+    // This is the NT path to the child executable.
+    let params_ptr = params as *const u8;
+    // Offset of ImagePathName in RTL_USER_PROCESS_PARAMETERS on x64
+    let image_path_offset = 0x20usize;
+    let ustr_ptr = params_ptr.add(image_path_offset) as *const UNICODE_STRING;
+    if ustr_ptr.is_null() {
+        return String::new();
+    }
+    let ustr = &*ustr_ptr;
+    let char_count = (ustr.Length / 2) as usize;
+    if char_count == 0 || ustr.Buffer.is_null() {
+        return String::new();
+    }
+    let name_slice = std::slice::from_raw_parts(ustr.Buffer, char_count);
+    policy::path::nt_to_dos_lower(name_slice).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -811,7 +880,12 @@ unsafe extern "system" fn hook_nt_create_user_process(
     // SAFETY: proc_h is a valid process handle returned by NtCreateUserProcess.
     let child_pid = GetProcessId(proc_h);
     if child_pid != 0 {
+        let parent_pid = unsafe { GetCurrentProcessId() };
         ipc_register_child(child_pid);
+        // Send SpawnedChild with child exe path extracted from process parameters.
+        // The child exe path is available from the RTL_USER_PROCESS_PARAMETERS.
+        let child_exe = extract_child_exe(process_parameters);
+        ipc_spawned_child(parent_pid, child_pid, child_exe);
     }
 
     // Inject hook.dll via APC. If injection fails the child process ALREADY

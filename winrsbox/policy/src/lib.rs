@@ -4,6 +4,7 @@ mod db;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use quick_cache::sync::Cache;
+use xxhash_rust::xxh3::Xxh3;
 use thiserror::Error;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -48,7 +49,7 @@ pub struct Policy {
 
 struct PolicyInner {
     db: redb::Database,
-    cache: Cache<u64, Decision>,
+    cache: Cache<u128, Decision>,
     sandbox_root: PathBuf,
     mock_dirs_root: PathBuf,
     project_root_lower: String,
@@ -93,13 +94,24 @@ impl Policy {
         Ok(())
     }
 
-    /// Decide what to do with a DOS path (lowercase-normalised before call is fine but not required).
+    /// Decide what to do with a DOS path (legacy — no depth/exe context).
     pub fn decide(&self, dos_path: &str, write_access: bool) -> Decision {
-        let key = cache_key(dos_path, write_access);
+        self.decide_with_context(dos_path, write_access, None, None)
+    }
+
+    /// Decide with optional depth and exe context for when-filter support.
+    pub fn decide_with_context(
+        &self,
+        dos_path: &str,
+        write_access: bool,
+        depth: Option<u8>,
+        exe_lower: Option<&str>,
+    ) -> Decision {
+        let key = cache_key(dos_path, write_access, depth, exe_lower);
         if let Some(d) = self.inner.cache.get(&key) {
             return d;
         }
-        let d = self.compute(dos_path, write_access);
+        let d = self.compute(dos_path, write_access, depth, exe_lower);
         // NOTE: check-then-insert race is intentional — IPC decisions are idempotent;
         // duplicate inserts under contention add latency but not incorrectness.
         self.inner.cache.insert(key, d.clone());
@@ -113,11 +125,12 @@ impl Policy {
             t.insert(orig.to_lowercase().as_str(), overlay)?;
         }
         txn.commit()?;
-        // Invalidate cache entry so next read sees overlay
-        let key_r = cache_key(orig, false);
-        let key_w = cache_key(orig, true);
-        self.inner.cache.remove(&key_r);
-        self.inner.cache.remove(&key_w);
+        // Invalidate cache entries for all possible (depth, exe) combos for this path.
+        // We can't know which combos are cached, so invalidate with None context
+        // (the default-lookup key) — sufficient because record_overlay only runs
+        // after a write decision, which uses the process's actual context.
+        // For safety, we clear the entire cache on overlay recording (rare event).
+        self.inner.cache.clear();
         Ok(())
     }
 
@@ -133,7 +146,7 @@ impl Policy {
         &self.inner.project_root_lower
     }
 
-    fn compute(&self, dos_path: &str, write_access: bool) -> Decision {
+    fn compute(&self, dos_path: &str, write_access: bool, depth: Option<u8>, exe_lower: Option<&str>) -> Decision {
         let lower = dos_path.to_lowercase();
 
         // project_root always passthrough (read AND write)
@@ -173,7 +186,7 @@ impl Policy {
         }
 
         // Best-match rule (glob-aware, picks the most specific pattern).
-        let rule = db::best_rule_match(&txn, &lower);
+        let rule = db::best_rule_match(&txn, &lower, depth, exe_lower);
 
         let (mode_read, mode_write) = rule
             .map(|r| (r.mode_read, r.mode_write))
@@ -222,12 +235,33 @@ fn passthrough() -> Decision {
     Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None }
 }
 
-fn cache_key(path: &str, write: bool) -> u64 {
-    use xxhash_rust::xxh3::Xxh3;
-    let mut h = Xxh3::new();
-    h.update(path.as_bytes());
-    h.update(&[if write { 1u8 } else { 0u8 }]);
-    h.digest()
+/// Compute a composite cache key: `(path_hash u64 || ctx_hash u64)` as u128.
+///
+/// `path_hash` covers the path bytes + write flag.
+/// `ctx_hash` covers depth + exe_lower (the "when" filter context).
+/// Both hashes are produced by independent `Xxh3` instances.
+/// Bit-concatenation (not XOR) preserves full entropy of both hashes.
+fn cache_key(path: &str, write: bool, depth: Option<u8>, exe_lower: Option<&str>) -> u128 {
+    let mut h1 = Xxh3::new();
+    h1.update(path.as_bytes());
+    h1.update(&[if write { 1u8 } else { 0u8 }]);
+    let path_hash = h1.digest();
+
+    let mut h2 = Xxh3::new();
+    if let Some(d) = depth {
+        h2.update(&[1, d]);   // tag byte disambiguates None vs Some(0)
+    } else {
+        h2.update(&[0]);
+    }
+    if let Some(e) = exe_lower {
+        h2.update(&[1]);
+        h2.update(e.as_bytes());
+    } else {
+        h2.update(&[0]);
+    }
+    let ctx_hash = h2.digest();
+
+    ((path_hash as u128) << 64) | (ctx_hash as u128)
 }
 
 #[cfg(test)]
@@ -235,27 +269,99 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn cache_key(path: &str, write: bool) -> u64 {
+    fn cache_key(path: &str, write: bool, depth: Option<u8>, exe_lower: Option<&str>) -> u128 {
         use xxhash_rust::xxh3::Xxh3;
-        let mut h = Xxh3::new();
-        h.update(path.as_bytes());
-        h.update(&[if write { 1u8 } else { 0u8 }]);
-        h.digest()
+        let mut h1 = Xxh3::new();
+        h1.update(path.as_bytes());
+        h1.update(&[if write { 1u8 } else { 0u8 }]);
+        let path_hash = h1.digest();
+
+        let mut h2 = Xxh3::new();
+        if let Some(d) = depth {
+            h2.update(&[1, d]);
+        } else {
+            h2.update(&[0]);
+        }
+        if let Some(e) = exe_lower {
+            h2.update(&[1]);
+            h2.update(e.as_bytes());
+        } else {
+            h2.update(&[0]);
+        }
+        let ctx_hash = h2.digest();
+
+        ((path_hash as u128) << 64) | (ctx_hash as u128)
     }
 
     #[test]
     fn cache_key_write_flag_differs() {
-        assert_ne!(cache_key("foo", false), cache_key("foo", true));
+        assert_ne!(cache_key("foo", false, None, None), cache_key("foo", true, None, None));
     }
 
     #[test]
     fn cache_key_case_sensitive() {
-        assert_ne!(cache_key("FOO", false), cache_key("foo", false));
+        assert_ne!(cache_key("FOO", false, None, None), cache_key("foo", false, None, None));
     }
 
     #[test]
     fn cache_key_deterministic() {
-        assert_eq!(cache_key("a", false), cache_key("a", false));
+        assert_eq!(cache_key("a", false, None, None), cache_key("a", false, None, None));
+    }
+
+    // ── Composite cache key tests ────────────────────────────────────────────
+
+    #[test]
+    fn composite_key_different_depth() {
+        let k1 = cache_key("c:\\test", false, Some(0), None);
+        let k2 = cache_key("c:\\test", false, Some(1), None);
+        assert_ne!(k1, k2, "different depth must produce different keys");
+    }
+
+    #[test]
+    fn composite_key_different_exe() {
+        let k1 = cache_key("c:\\test", false, None, Some("app.exe"));
+        let k2 = cache_key("c:\\test", false, None, Some("other.exe"));
+        assert_ne!(k1, k2, "different exe must produce different keys");
+    }
+
+    #[test]
+    fn composite_key_none_vs_some_zero_depth() {
+        let k_none = cache_key("c:\\test", false, None, None);
+        let k_zero = cache_key("c:\\test", false, Some(0), None);
+        assert_ne!(k_none, k_zero, "None vs Some(0) depth must differ (tag byte)");
+    }
+
+    #[test]
+    fn composite_key_none_vs_some_empty_exe() {
+        let k_none = cache_key("c:\\test", false, None, None);
+        let k_empty = cache_key("c:\\test", false, None, Some(""));
+        assert_ne!(k_none, k_empty, "None vs Some(\"\") exe must differ");
+    }
+
+    #[test]
+    fn composite_key_same_params_equal() {
+        let k1 = cache_key("c:\\path\\file.txt", true, Some(2), Some("app.exe"));
+        let k2 = cache_key("c:\\path\\file.txt", true, Some(2), Some("app.exe"));
+        assert_eq!(k1, k2, "identical params must produce identical keys");
+    }
+
+    #[test]
+    fn composite_key_collision_sanity() {
+        let mut keys = std::collections::HashSet::new();
+        for i in 0u8..250 {
+            for d in [None, Some(i % 5)] {
+                let exe_name = format!("exe{}.bin", i);
+                let exe_opt: Option<&str> = if i % 3 == 0 { None } else { Some(&exe_name) };
+                let k = cache_key(
+                    &format!("c:\\path\\file{}", i),
+                    i % 2 == 0,
+                    d,
+                    exe_opt,
+                );
+                assert!(keys.insert(k), "collision at i={i} d={d:?}");
+            }
+        }
+        assert!(keys.len() >= 400, "expected ~500 unique keys, got {}", keys.len());
     }
 
     #[test]
@@ -430,5 +536,187 @@ mod tests {
         assert_eq!(d.mode, Mode::Cow);
         let expected = mock_dirs.join("c").join("fake").join("sub").join("file.txt");
         assert_eq!(d.overlay.unwrap(), expected);
+    }
+
+    // ── Additional policy integration tests ─────────────────────────────────
+
+    #[test]
+    fn decide_cache_hit_returns_same_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("policy.redb");
+        let sandbox = dir.path().join("sb");
+        let mock_dirs = dir.path().join("md");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(&mock_dirs).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+        let d1 = p.decide(r"c:\some\path", false);
+        let d2 = p.decide(r"c:\some\path", false);
+        assert_eq!(d1.mode, d2.mode);
+        assert_eq!(d1.overlay, d2.overlay);
+    }
+
+    #[test]
+    fn decide_cow_write_nonexistent_file_no_cow_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("policy.redb");
+        let sandbox = dir.path().join("sb");
+        let mock_dirs = dir.path().join("md");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(&mock_dirs).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+        let d = p.decide(r"c:\nonexistent\file.txt", true);
+        assert_eq!(d.mode, Mode::Cow);
+        assert!(d.cow_from.is_none(), "cow_from should be None for non-existent files");
+        assert!(d.overlay.is_some());
+    }
+
+    #[test]
+    fn record_overlay_invalidates_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("policy.redb");
+        let sandbox = dir.path().join("sb");
+        let mock_dirs = dir.path().join("md");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(&mock_dirs).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+
+        // First call: default passthrough for read
+        let d1 = p.decide(r"c:\data.txt", false);
+        assert_eq!(d1.mode, Mode::Passthrough);
+
+        // Record overlay
+        let overlay = dir.path().join("sb").join("c").join("data.txt");
+        p.record_overlay(r"c:\data.txt", overlay.to_str().unwrap()).unwrap();
+
+        // Second call: should see Cow now
+        let d2 = p.decide(r"c:\data.txt", false);
+        assert_eq!(d2.mode, Mode::Cow);
+    }
+
+    #[test]
+    fn sandbox_root_accessor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("policy.redb");
+        let sandbox = dir.path().join("sb");
+        let mock_dirs = dir.path().join("md");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(&mock_dirs).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        let p = Policy::open_or_create(&db_path, sandbox.clone(), mock_dirs, project).unwrap();
+        assert_eq!(p.sandbox_root(), sandbox);
+    }
+
+    #[test]
+    fn mock_dirs_root_accessor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("policy.redb");
+        let sandbox = dir.path().join("sb");
+        let mock_dirs = dir.path().join("md");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(&mock_dirs).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        let p = Policy::open_or_create(&db_path, sandbox, mock_dirs.clone(), project).unwrap();
+        assert_eq!(p.mock_dirs_root(), mock_dirs);
+    }
+
+    #[test]
+    fn project_root_accessor_lowercase() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("policy.redb");
+        let sandbox = dir.path().join("sb");
+        let mock_dirs = dir.path().join("md");
+        let project = dir.path().join("ProjDir");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(&mock_dirs).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+        // project_root should be lowercased
+        assert!(p.project_root().contains("projdir"));
+        assert!(!p.project_root().contains("ProjDir"));
+    }
+
+    #[test]
+    fn decide_with_mock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("policy.redb");
+        let sandbox = dir.path().join("sb");
+        let mock_dirs = dir.path().join("md");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(&mock_dirs).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+
+        let cfg_path = dir.path().join("config.ktv");
+        let mut f = std::fs::File::create(&cfg_path).unwrap();
+        // NOTE: ktav includes the quotes as part of the string value
+        write!(f, "defaults: {{\n\
+            read: passthrough\n\
+            write: cow\n\
+        }}\n\
+        \n\
+        mocks: [\n\
+            {{\n\
+                path: c:\\fake\\token.txt\n\
+                content_inline: secret data\n\
+            }}\n\
+        ]\n\
+        ").unwrap();
+        drop(f);
+        p.load_config(&cfg_path).unwrap();
+
+        let d = p.decide(r"c:\fake\token.txt", false);
+        assert_eq!(d.mode, Mode::Mock);
+        assert_eq!(d.mock_payload.unwrap(), b"secret data");
+    }
+
+    #[test]
+    fn load_config_invalid_ktav_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("policy.redb");
+        let sandbox = dir.path().join("sb");
+        let mock_dirs = dir.path().join("md");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(&mock_dirs).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+
+        let cfg_path = dir.path().join("bad.ktv");
+        std::fs::write(&cfg_path, "{{{{invalid}}}}").unwrap();
+        let result = p.load_config(&cfg_path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_config_missing_file_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("policy.redb");
+        let sandbox = dir.path().join("sb");
+        let mock_dirs = dir.path().join("md");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(&mock_dirs).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+        let result = p.load_config(dir.path().join("nonexistent.ktv").as_path());
+        assert!(result.is_err());
     }
 }

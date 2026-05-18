@@ -12,6 +12,8 @@ pub enum LogLevel { Trace, Info, Warn, Error }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Req {
+    Hello { pid: u32, exe_path: String },
+    SpawnedChild { parent_pid: u32, child_pid: u32, child_exe: String },
     Decide { dos_path: String, write: bool },
     RecordOverlay { orig: String, overlay: String },
     Log { pid: u32, level: LogLevel, msg: String },
@@ -91,6 +93,39 @@ impl SyncClient {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn req_hello_roundtrip() {
+        let msg = Req::Hello { pid: 42, exe_path: r"c:\app.exe".into() };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Req = read_msg(&mut buf).unwrap();
+        match dec {
+            Req::Hello { pid, exe_path } => {
+                assert_eq!(pid, 42);
+                assert_eq!(exe_path, r"c:\app.exe");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn req_spawned_child_roundtrip() {
+        let msg = Req::SpawnedChild { parent_pid: 1, child_pid: 2, child_exe: "child.exe".into() };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Req = read_msg(&mut buf).unwrap();
+        match dec {
+            Req::SpawnedChild { parent_pid, child_pid, child_exe } => {
+                assert_eq!(parent_pid, 1);
+                assert_eq!(child_pid, 2);
+                assert_eq!(child_exe, "child.exe");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 
     #[test]
     fn req_decide_roundtrip() {
