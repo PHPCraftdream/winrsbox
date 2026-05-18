@@ -1,0 +1,42 @@
+# Build artifacts — production binaries live in bin/
+/bin/
+
+# Workdir: test artifacts and build intermediates
+/workdir/
+
+# But track Go helper sources that moved into workdir
+!/workdir/go-chain/
+!/workdir/go-cwd-child/
+!/workdir/target-app/
+
+# Rust target dirs
+/sandbox/target/
+/winrsbox/target/
+
+# Go module cache
+# (go.sum files are tracked for reproducible builds)
+
+# Debug symbols
+*.pdb
+
+# Crush output
+.crush/stdin/*.out
+.crush/stdin/*.err
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Backup / temp files
+*.bak
+*.bak[0-9]*
+*.old
+*.tmp
+*~

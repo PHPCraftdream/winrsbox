@@ -1,0 +1,20 @@
+[package]
+name = "ipc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+bincode = { workspace = true }
+policy = { path = "../policy" }
+thiserror = "1"
+
+[dev-dependencies]
+criterion = { workspace = true }
+pretty_assertions = { workspace = true }
+rstest = { workspace = true }
+proptest = { workspace = true }
+
+[[bench]]
+name = "msg"
+harness = false

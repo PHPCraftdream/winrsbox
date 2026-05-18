@@ -1,0 +1,657 @@
+// Assumed crate versions (pinned from Cargo.toml):
+//   windows = "0.61"  (windows-0.61.3 in registry)
+//   tokio   = "1"     (full features)
+//   anyhow  = "1"
+//   ktav    = "0.3.1"
+//   serde   = "1"
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use ipc::{read_msg, write_msg, LogLevel, Req, Resp};
+use policy::Policy;
+use std::{
+    collections::HashSet,
+    ffi::OsStr,
+    os::windows::ffi::OsStrExt,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
+
+/// Default ktav policy written when auto-discovery creates a fresh state dir.
+const DEFAULT_CONFIG_KTAV: &str = "\
+# winrsbox policy — auto-generated on first run. Edit to customize.
+#
+# Reads pass through to the real filesystem; writes are Copy-on-Write
+# into <state_dir>/workdir/. Add `rules` entries to deny or mock paths.
+
+defaults: {
+    read: passthrough
+    write: cow
+}
+
+rules: [
+    {
+        prefix: C:\\Windows
+        read: passthrough
+        write: deny
+    }
+]
+
+# mock_dirs: [
+#     { prefix: C:\\Users\\Computer\\.config\\fakeapp }
+# ]
+";
+
+/// winrsbox — runs a target process inside a CoW filesystem sandbox.
+///
+/// winrsbox auto-discovers a state directory next to your CWD:
+/// running from `<dir>/<name>/` creates `<dir>/.winrsbox/<name>/` with
+/// `workdir/` (CoW overlay) and `sandbox.ktav` (policy).
+///
+/// Examples:
+///   winrsbox --init                      (create state dir and exit)
+///   winrsbox -- node app.js              (run node inside sandbox)
+///   winrsbox -d wezterm                  (show console for debugging)
+#[derive(Parser, Debug)]
+#[command(
+    name = "winrsbox",
+    version,
+    about = "Run a target process inside a CoW filesystem sandbox.",
+    long_about = None,
+)]
+struct Cli {
+    /// Show the console window. Without this flag the launcher hides its
+    /// own console on startup so the sandbox runs invisibly.
+    #[arg(short = 'd', long = "debug")]
+    debug: bool,
+
+    /// Initialise the state directory (workdir/, mock-dirs/, sandbox.ktav)
+    /// and exit. No target executable is required.
+    #[arg(short = 'i', long = "init")]
+    init: bool,
+
+    /// Target executable followed by its arguments. Everything after `--`
+    /// (or after the last launcher option) is forwarded verbatim.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        required_unless_present = "init",
+        value_name = "TARGET [ARGS...]",
+    )]
+    target: Vec<String>,
+}
+use windows::{
+    core::{HRESULT, PCWSTR},
+    Win32::{
+        Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE},
+        Storage::FileSystem::PIPE_ACCESS_DUPLEX,
+        System::{
+            Console::GetConsoleWindow,
+            Diagnostics::Debug::WriteProcessMemory,
+            LibraryLoader::{GetModuleHandleW, GetProcAddress},
+            Memory::{
+                VirtualAllocEx, VirtualFreeEx,
+                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
+                VIRTUAL_FREE_TYPE,
+            },
+            Pipes::{
+                ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe,
+                PIPE_TYPE_BYTE, PIPE_WAIT,
+            },
+            Threading::{
+                CreateProcessW, CreateRemoteThread, GetExitCodeProcess, GetExitCodeThread,
+                OpenProcess, ResumeThread, WaitForMultipleObjects, WaitForSingleObject,
+                CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION, PROCESS_SYNCHRONIZE,
+                STARTUPINFOW,
+            },
+        },
+        UI::WindowsAndMessaging::{ShowWindow, SW_HIDE},
+    },
+};
+
+// ─── Entry point ─────────────────────────────────────────────────────────────
+
+/// cancel-safe: NO — top-level main is not meant to be cancelled
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Hide our console window before any println! when running headless
+    // (default). With -d we keep the window visible for debugging.
+    maybe_hide_console(cli.debug);
+
+    let project_root: PathBuf = std::env::current_dir()
+        .context("failed to get current directory")?;
+
+    let (cfg_path, sandbox_root, mock_dirs_root) = ensure_state(&project_root)?;
+
+    if cli.init {
+        println!("[sandbox] state dir ready at {}", cfg_path.parent().unwrap().display());
+        return Ok(());
+    }
+
+    let target_args = cli.target;
+
+    // Open / create policy DB
+    let db_path = sandbox_root.join("policy.redb");
+    let policy = Arc::new(
+        Policy::open_or_create(
+            &db_path,
+            sandbox_root.clone(),
+            mock_dirs_root.clone(),
+            project_root.clone(),
+        )?,
+    );
+    policy.load_config(&cfg_path)?;
+
+    // Named pipe name — use launcher PID for uniqueness
+    let pipe_name = format!(r"\\.\pipe\fs-sandbox-{}", std::process::id());
+
+    // Stats — shared between connection handlers (lock-free atomics)
+    let stats = Arc::new(Stats::default());
+
+    // Child PIDs registered from hook via IPC RegisterChild
+    let child_pids: Arc<crossbeam_queue::SegQueue<u32>> = Arc::new(crossbeam_queue::SegQueue::new());
+
+    // ── Pipe server (accept loop in background task) ──────────────────────
+    {
+        let policy = Arc::clone(&policy);
+        let stats = Arc::clone(&stats);
+        let child_pids = Arc::clone(&child_pids);
+        let pipe_name2 = pipe_name.clone();
+
+        tokio::spawn(async move {
+            pipe_accept_loop(&pipe_name2, policy, stats, child_pids).await;
+        });
+    }
+
+    // Small delay so the pipe server starts accepting before the child tries to connect.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // ── Launch target process ─────────────────────────────────────────────
+    let dll_path = find_hook_dll()?;
+
+    // Set env vars for child before CreateProcessW — child inherits them.
+    std::env::set_var("FS_SANDBOX_PIPE", &pipe_name);
+    std::env::set_var("FS_SANDBOX_DLL", &dll_path);
+    // Help GUI terminal emulators (WezTerm, Windows Terminal) that ignore the inherited
+    // CWD and fall back to the home directory when spawning their shell.
+    let cwd_str = project_root.to_string_lossy().into_owned();
+    std::env::set_var("WEZTERM_EXECUTABLE_ARGS_CWD", &cwd_str);
+    std::env::set_var("FS_SANDBOX_CWD", &cwd_str);
+
+    let proc_info = launch_suspended(&project_root, &target_args)?;
+
+    // Inject hook.dll into target before resuming.
+    inject_dll(proc_info.hProcess, &dll_path)?;
+
+    // Resume target main thread.
+    // SAFETY: proc_info.hThread is valid for the lifetime of the child process;
+    //         it was returned by CreateProcessW and has not yet been closed.
+    unsafe { ResumeThread(proc_info.hThread) };
+    // SAFETY: same — close the thread handle after use; the thread continues running.
+    unsafe { CloseHandle(proc_info.hThread).ok() };
+
+    println!("[sandbox] target started (pid {})", proc_info.dwProcessId);
+
+    // ── Wait for target process ───────────────────────────────────────────
+    // Offload the blocking wait to spawn_blocking so the tokio executor
+    // stays free to service hook IPC requests while the target runs.
+    // HANDLE (*mut c_void) is not Send; convert to isize to cross .await.
+    let target_isize = proc_info.hProcess.0 as isize;
+    tokio::task::spawn_blocking(move || {
+        // SAFETY: target_isize is the isize repr of a valid PROCESS_ALL_ACCESS
+        //         handle returned by CreateProcessW; INFINITE is correct here.
+        unsafe { WaitForSingleObject(HANDLE(target_isize as *mut _), INFINITE) };
+    })
+    .await
+    .ok();
+    let target_handle = proc_info.hProcess;
+
+    // Give any remaining child processes a brief window to finish.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Drain registered child PIDs into a deduplicated set and open handles.
+    let mut seen = HashSet::new();
+    let mut child_handles: Vec<HANDLE> = Vec::new();
+    while let Some(pid) = child_pids.pop() {
+        if seen.insert(pid) {
+            if let Ok(h) = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
+                child_handles.push(h);
+            }
+        }
+    }
+
+    if !child_handles.is_empty() {
+        // Convert HANDLE → isize for Send-safety across .await.
+        let ihandles: Vec<isize> = child_handles.iter().map(|h| h.0 as isize).collect();
+        tokio::task::spawn_blocking(move || {
+            let handles: Vec<HANDLE> = ihandles.iter().map(|&i| HANDLE(i as *mut _)).collect();
+            // SAFETY: handles are valid PROCESS_SYNCHRONIZE handles from OpenProcess above.
+            // bWaitAll=true: wait for ALL registered children to exit (or hit the timeout).
+            unsafe { WaitForMultipleObjects(&handles, true, 5000) };
+        })
+        .await
+        .ok();
+        for h in &child_handles {
+            // SAFETY: h is a handle we own from OpenProcess above.
+            unsafe { CloseHandle(*h).ok() };
+        }
+    }
+
+    // Read exit code and print summary.
+    let mut exit_code = 0u32;
+    // SAFETY: target_handle is valid; GetExitCodeProcess fills exit_code on success.
+    unsafe { GetExitCodeProcess(target_handle, &mut exit_code).ok() };
+    // SAFETY: target_handle — we are done with the process.
+    unsafe { CloseHandle(target_handle).ok() };
+
+    let s = &stats;
+    println!(
+        "\n[sandbox] exit={exit_code}  decide={} redirect={} deny={} mock={} cow={}",
+        s.decide.load(Ordering::Relaxed),
+        s.redirect.load(Ordering::Relaxed),
+        s.deny.load(Ordering::Relaxed),
+        s.mock_.load(Ordering::Relaxed),
+        s.cow.load(Ordering::Relaxed),
+    );
+
+    // Exit immediately rather than returning through the tokio runtime drop path.
+    // The pipe-accept loop keeps a spawn_blocking thread blocked on ConnectNamedPipe;
+    // if we let the runtime drop normally it waits 30 s for that thread to finish.
+    std::process::exit(exit_code as i32);
+}
+
+// ─── Pipe accept loop ─────────────────────────────────────────────────────────
+
+/// cancel-safe: NO — individual connection handlers are detached via spawn;
+///              this outer loop itself is not designed for clean cancellation,
+///              it runs for the lifetime of the launcher process.
+async fn pipe_accept_loop(
+    pipe_name: &str,
+    policy: Arc<Policy>,
+    stats: Arc<Stats>,
+    child_pids: Arc<crossbeam_queue::SegQueue<u32>>,
+) {
+    let pipe_name_wide: Vec<u16> = OsStr::new(pipe_name)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    loop {
+        // Create a new pipe instance for each incoming connection.
+        // PIPE_ACCESS_DUPLEX  = FILE_FLAGS_AND_ATTRIBUTES(3)  (from Win32_Storage_FileSystem)
+        // PIPE_TYPE_BYTE | PIPE_WAIT = NAMED_PIPE_MODE(0)
+        // SAFETY: pipe_name_wide is a valid null-terminated UTF-16 string.
+        // Convert HANDLE to isize immediately so it is Send across .await boundaries.
+        // HANDLE is *mut c_void which is not Send; isize is.
+        let ph: isize = unsafe {
+            let h = CreateNamedPipeW(
+                PCWSTR(pipe_name_wide.as_ptr()),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_WAIT,
+                255,    // max instances
+                65536,  // out buffer size
+                65536,  // in buffer size
+                0,      // default timeout
+                None,   // security attributes
+            );
+            if h.is_invalid() {
+                // INVALID_HANDLE_VALUE sentinel
+                -1isize
+            } else {
+                h.0 as isize
+            }
+        };
+
+        if ph == -1 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            continue;
+        }
+
+        // ConnectNamedPipe blocks until a client connects — run in spawn_blocking
+        // to avoid blocking the async executor (§B11).
+        let connect_result = tokio::task::spawn_blocking(move || {
+            // SAFETY: ph is the isize repr of a valid named-pipe HANDLE; converting
+            //         back is safe because the handle is valid for this thread's lifetime.
+            let h = HANDLE(ph as *mut _);
+            // SAFETY: h is a valid server-side pipe handle; None means synchronous wait.
+            match unsafe { ConnectNamedPipe(h, None) } {
+                Ok(()) => true,
+                Err(e)
+                    if e.code()
+                        == HRESULT::from_win32(ERROR_PIPE_CONNECTED.0) =>
+                {
+                    // A client connected between CreateNamedPipeW and ConnectNamedPipe —
+                    // that is still a valid connection.
+                    true
+                }
+                Err(_) => false,
+            }
+        })
+        .await;
+
+        let connected = connect_result.unwrap_or(false);
+        if !connected {
+            // SAFETY: ph is the isize repr of our pipe handle; close on error.
+            unsafe { CloseHandle(HANDLE(ph as *mut _)).ok() };
+            continue;
+        }
+
+        // Handle this connection in a separate blocking task.
+        let policy = Arc::clone(&policy);
+        let stats = Arc::clone(&stats);
+        let child_pids = Arc::clone(&child_pids);
+
+        // Intentional fire-and-forget: spawn_blocking tasks run to completion even
+        // after JoinHandle is dropped — they are not cancelled.
+        tokio::task::spawn_blocking(move || {
+            // SAFETY: ph is the isize repr of the valid pipe handle for this connection.
+            let h = HANDLE(ph as *mut _);
+            handle_connection(h, &policy, &stats, &child_pids);
+            // SAFETY: h — disconnect and close after the connection handler finishes.
+            unsafe { DisconnectNamedPipe(h).ok() };
+            unsafe { CloseHandle(h).ok() };
+        });
+    }
+}
+
+fn handle_connection(
+    handle: HANDLE,
+    policy: &Policy,
+    stats: &Stats,
+    child_pids: &crossbeam_queue::SegQueue<u32>,
+) {
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+
+    // Wrap the pipe HANDLE in a std::fs::File for buffered I/O.
+    // We must NOT let the File's Drop close the handle — the caller (spawn_blocking)
+    // closes it via CloseHandle after DisconnectNamedPipe. Therefore we call
+    // std::mem::forget(file) at the end of this function.
+    //
+    // SAFETY: handle.0 is a valid named-pipe HANDLE for this connection; it is open
+    //         for both read and write; it remains valid for the duration of this call.
+    let raw: RawHandle = handle.0 as *mut _;
+    let mut file = unsafe { std::fs::File::from_raw_handle(raw) };
+
+    loop {
+        let req: Req = match read_msg(&mut file) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+
+        let resp = match req {
+            Req::Decide { dos_path, write } => {
+                stats.decide.fetch_add(1, Ordering::Relaxed);
+                let d = policy.decide(&dos_path, write);
+                match d.mode {
+                    policy::Mode::Deny => { stats.deny.fetch_add(1, Ordering::Relaxed); }
+                    policy::Mode::Cow => { stats.cow.fetch_add(1, Ordering::Relaxed); }
+                    policy::Mode::Mock => { stats.mock_.fetch_add(1, Ordering::Relaxed); }
+                    policy::Mode::Passthrough => {}
+                }
+                Resp::Decision(d)
+            }
+            Req::RecordOverlay { orig, overlay } => {
+                let _ = policy.record_overlay(&orig, &overlay);
+                Resp::Ok
+            }
+            Req::Log { pid, level, msg } => {
+                let level_str = match level {
+                    LogLevel::Trace => "TRACE",
+                    LogLevel::Info => "INFO ",
+                    LogLevel::Warn => "WARN ",
+                    LogLevel::Error => "ERROR",
+                };
+                println!("[hook/{pid}] {level_str} {msg}");
+                Resp::Ok
+            }
+            Req::RegisterChild { pid } => {
+                println!("[sandbox] child registered: pid={pid}");
+                child_pids.push(pid);
+                Resp::Ok
+            }
+        };
+
+        if write_msg(&mut file, &resp).is_err() {
+            break;
+        }
+    }
+
+    // Do NOT let `file` run its Drop (which would call CloseHandle on the underlying HANDLE).
+    // The caller in spawn_blocking closes the handle via DisconnectNamedPipe + CloseHandle.
+    // Double-closing would be UB / use-after-free on the handle.
+    std::mem::forget(file);
+}
+
+// ─── Process launch & injection ──────────────────────────────────────────────
+
+fn launch_suspended(cwd: &std::path::Path, target_args: &[String]) -> Result<PROCESS_INFORMATION> {
+    let cmdline = build_cmdline(target_args);
+    let mut cmdline_wide: Vec<u16> = cmdline.encode_utf16().chain(Some(0)).collect();
+
+    // Pass the current working directory explicitly so that GUI terminal emulators
+    // (WezTerm, Windows Terminal) that re-read lpCurrentDirectory see the right path.
+    let cwd_wide: Vec<u16> = cwd.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    let si = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut pi = PROCESS_INFORMATION::default();
+
+    // SAFETY: cmdline_wide and cwd_wide are valid null-terminated UTF-16 strings.
+    //         si and pi are properly initialized structs.
+    //         None for application name means cmdline is used as-is.
+    unsafe {
+        CreateProcessW(
+            PCWSTR::null(),                                     // lpApplicationName
+            Some(windows::core::PWSTR(cmdline_wide.as_mut_ptr())), // lpCommandLine
+            None,                                               // process security
+            None,                                               // thread security
+            false,                                              // inherit handles
+            CREATE_SUSPENDED,                                   // creation flags
+            None,                                               // environment (inherit)
+            PCWSTR(cwd_wide.as_ptr()),                          // current directory (explicit)
+            &si,
+            &mut pi,
+        )
+    }
+    .context("CreateProcessW failed")?;
+
+    Ok(pi)
+}
+
+fn inject_dll(process: HANDLE, dll_path: &str) -> Result<()> {
+    let dll_wide: Vec<u16> = OsStr::new(dll_path)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let byte_len = dll_wide.len() * 2;
+
+    // Allocate memory in target process to hold the DLL path string.
+    // SAFETY: process is a valid HANDLE with PROCESS_ALL_ACCESS; byte_len > 0.
+    let remote_buf = unsafe {
+        VirtualAllocEx(
+            process,
+            None,
+            byte_len,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
+    anyhow::ensure!(!remote_buf.is_null(), "VirtualAllocEx failed");
+
+    // Write the DLL path into the remote process memory.
+    let mut written = 0usize;
+    // SAFETY: remote_buf was just allocated in `process` with byte_len bytes;
+    //         dll_wide.as_ptr() is valid for byte_len bytes.
+    let write_ok = unsafe {
+        WriteProcessMemory(
+            process,
+            remote_buf,
+            dll_wide.as_ptr() as *const _,
+            byte_len,
+            Some(&mut written),
+        )
+    };
+    if write_ok.is_err() || written != byte_len {
+        // SAFETY: remote_buf was allocated by us; 0 size means VirtualFreeEx treats
+        //         dwSize as irrelevant when dwFreeType is MEM_RELEASE.
+        unsafe { VirtualFreeEx(process, remote_buf, 0, VIRTUAL_FREE_TYPE(0x8000)).ok() };
+        anyhow::bail!("WriteProcessMemory failed (written={written}, expected={byte_len})");
+    }
+
+    // Resolve LoadLibraryW from our own kernel32 — its address is the same in the target
+    // because kernel32.dll is always mapped at the same base across processes on Windows.
+    let k32_wide: Vec<u16> = OsStr::new("kernel32.dll")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: k32_wide is a valid null-terminated UTF-16 module name.
+    let k32 = unsafe { GetModuleHandleW(PCWSTR(k32_wide.as_ptr()))? };
+
+    // SAFETY: k32 is a valid HMODULE for kernel32.dll; "LoadLibraryW\0" is a valid PCSTR.
+    let load_lib = unsafe { GetProcAddress(k32, windows::core::s!("LoadLibraryW")) }
+        .context("GetProcAddress(LoadLibraryW) returned NULL")?;
+
+    // Cast LoadLibraryW to the LPTHREAD_START_ROUTINE signature required by CreateRemoteThread.
+    // SAFETY: LoadLibraryW has the ABI `unsafe extern "system" fn(*mut c_void) -> u32`
+    //         which is identical to LPTHREAD_START_ROUTINE; both are __stdcall on x86_64.
+    //         The pointer was obtained from GetProcAddress and is non-null (checked above).
+    let thread_start: Option<unsafe extern "system" fn(*mut core::ffi::c_void) -> u32> =
+        Some(unsafe { std::mem::transmute(load_lib) });
+
+    // Create a remote thread in the target process that calls LoadLibraryW(dll_path).
+    // SAFETY: process is valid; remote_buf is the DLL path allocated above;
+    //         thread_start is a valid LPTHREAD_START_ROUTINE pointing to LoadLibraryW.
+    let thread = unsafe {
+        CreateRemoteThread(
+            process,
+            None,       // security attributes
+            0,          // stack size (use default)
+            thread_start,
+            Some(remote_buf),
+            0,          // creation flags (run immediately)
+            None,       // thread ID output (not needed)
+        )?
+    };
+
+    // Wait for LoadLibraryW to complete (up to 10 seconds).
+    // SAFETY: thread is a valid HANDLE returned by CreateRemoteThread.
+    unsafe { WaitForSingleObject(thread, 10_000) };
+
+    let mut exit_code = 0u32;
+    // SAFETY: thread handle is valid; exit_code will be set to the return value of
+    //         LoadLibraryW (the HMODULE of the loaded DLL, or 0 on failure).
+    unsafe { GetExitCodeThread(thread, &mut exit_code).ok() };
+    // SAFETY: done with thread handle.
+    unsafe { CloseHandle(thread).ok() };
+
+    // Free the remote buffer regardless of outcome.
+    // SAFETY: remote_buf was allocated by VirtualAllocEx; MEM_RELEASE = 0x8000.
+    unsafe { VirtualFreeEx(process, remote_buf, 0, VIRTUAL_FREE_TYPE(0x8000)).ok() };
+
+    anyhow::ensure!(
+        exit_code != 0,
+        "LoadLibraryW returned NULL — hook.dll failed to load (path: {dll_path})"
+    );
+    Ok(())
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Hide the console window unconditionally unless -d is set. Called once at
+/// startup before any other output. When stdio is piped (no console attached)
+/// GetConsoleWindow returns NULL and this is a no-op.
+fn maybe_hide_console(debug: bool) {
+    if debug {
+        return;
+    }
+    // SAFETY: GetConsoleWindow and ShowWindow have no documented preconditions
+    //         and are safe to call from any thread; both handle null/invalid
+    //         input by returning an error code we ignore.
+    unsafe {
+        let hwnd = GetConsoleWindow();
+        if !hwnd.is_invalid() {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
+/// Build a Windows command line string from an argument list.
+/// Arguments that contain spaces are quoted.
+fn build_cmdline(args: &[String]) -> String {
+    args.iter()
+        .map(|a| {
+            if a.contains(' ') || a.contains('"') {
+                let escaped = a.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{}\"", escaped)
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Find hook.dll alongside the launcher executable.
+fn find_hook_dll() -> Result<String> {
+    let exe = std::env::current_exe()?;
+    let dll = exe
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("hook.dll");
+    anyhow::ensure!(
+        dll.exists(),
+        "hook.dll not found at {}",
+        dll.display()
+    );
+    Ok(dll.to_string_lossy().into_owned())
+}
+
+/// Ensure the auto-discovered state directory exists and return the paths
+/// `(cfg_path, sandbox_root, mock_dirs_root)`.
+///
+/// State dir layout: `<parent>/.winrsbox/<cwd-name>/`
+///   - `workdir/`       — CoW overlay root
+///   - `mock-dirs/`     — mocked directory root
+///   - `sandbox.ktav`   — policy config (default-written if absent)
+fn ensure_state(project_root: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
+    let name = project_root
+        .file_name()
+        .context("cwd has no name (running from drive root?)")?;
+    let parent = project_root
+        .parent()
+        .context("cwd has no parent (running from drive root?)")?;
+    let state_dir = parent.join(".winrsbox").join(name);
+    let workdir = state_dir.join("workdir");
+    let mock_dirs = state_dir.join("mock-dirs");
+    let cfg_path = state_dir.join("sandbox.ktav");
+
+    std::fs::create_dir_all(&workdir)
+        .with_context(|| format!("create state dir {}", workdir.display()))?;
+    std::fs::create_dir_all(&mock_dirs)
+        .with_context(|| format!("create mock-dirs {}", mock_dirs.display()))?;
+
+    if !cfg_path.exists() {
+        std::fs::write(&cfg_path, DEFAULT_CONFIG_KTAV)
+            .with_context(|| format!("write default config {}", cfg_path.display()))?;
+    }
+
+    Ok((cfg_path, workdir, mock_dirs))
+}
+
+// ─── Stats ───────────────────────────────────────────────────────────────────
+
+#[derive(Default)]
+struct Stats {
+    decide: AtomicU64,
+    redirect: AtomicU64,
+    deny: AtomicU64,
+    mock_: AtomicU64,
+    cow: AtomicU64,
+}
