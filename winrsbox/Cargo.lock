@@ -933,6 +933,7 @@ dependencies = [
  "quick_cache",
  "redb",
  "rstest",
+ "rustc-hash",
  "serde",
  "tempfile",
  "thiserror",
