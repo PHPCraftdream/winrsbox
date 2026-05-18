@@ -12,6 +12,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 quick_cache = "0.6"
 widestring = { workspace = true }
 thiserror = "1"
+arc-swap = "1.9.1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -76,9 +76,120 @@ pub struct Policy {
 struct PolicyInner {
     db: redb::Database,
     cache: Cache<u128, Decision>,
+    snapshot: arc_swap::ArcSwap<Snapshot>,
     sandbox_root: PathBuf,
     mock_dirs_root: PathBuf,
     project_root_lower: String,
+}
+
+struct Snapshot {
+    rules: Vec<SnapshotRule>,
+    default_rule: Option<db::RuleRow>,
+    mocks: Vec<(String, Vec<u8>)>,
+    mock_dirs: Vec<String>,
+}
+
+struct SnapshotRule {
+    pattern: String,
+    row: db::RuleRow,
+}
+
+impl Snapshot {
+    fn load_from_db(db: &redb::Database) -> Result<Self, PolicyError> {
+        let txn = db.begin_read()?;
+        let mut rules = Vec::new();
+        let mut default_rule = None;
+        if let Ok(table) = txn.open_table(db::RULES) {
+            for entry in table.range::<&str>(..).into_iter().flatten() {
+                let Ok((key, value)) = entry else { continue };
+                let pattern = key.value().to_owned();
+                let Some(row) = db::decode_rule(value.value()) else { continue };
+                if pattern.is_empty() {
+                    default_rule = Some(row);
+                } else {
+                    rules.push(SnapshotRule { pattern, row });
+                }
+            }
+        }
+        let mut mocks = Vec::new();
+        if let Ok(table) = txn.open_table(db::MOCKS) {
+            for entry in table.range::<&str>(..).into_iter().flatten() {
+                let Ok((key, value)) = entry else { continue };
+                mocks.push((key.value().to_owned(), value.value().to_vec()));
+            }
+        }
+        let mut mock_dirs = Vec::new();
+        if let Ok(table) = txn.open_table(db::MOCK_DIRS) {
+            for entry in table.range::<&str>(..).into_iter().flatten() {
+                let Ok((key, _)) = entry else { continue };
+                mock_dirs.push(key.value().to_owned());
+            }
+        }
+        Ok(Snapshot { rules, default_rule, mocks, mock_dirs })
+    }
+
+    fn find_mock_payload(&self, lower_path: &str) -> Option<Vec<u8>> {
+        for (pattern, payload) in &self.mocks {
+            if pattern == lower_path {
+                return Some(payload.clone());
+            }
+        }
+        for (pattern, payload) in &self.mocks {
+            if path::pattern_matches_exact(pattern, lower_path) {
+                return Some(payload.clone());
+            }
+        }
+        None
+    }
+
+    fn matched_mock_dir(&self, lower_path: &str) -> Option<&str> {
+        let mut best: Option<(usize, &str)> = None;
+        for pattern in &self.mock_dirs {
+            if !path::pattern_matches_prefix(pattern, lower_path) { continue; }
+            let spec = path::pattern_specificity(pattern);
+            match &best {
+                None => best = Some((spec, pattern)),
+                Some((s, _)) if spec > *s => best = Some((spec, pattern)),
+                _ => {}
+            }
+        }
+        best.map(|(_, p)| p.as_ref())
+    }
+
+    fn best_rule_match(&self, lower_path: &str, depth: Option<u8>, exe_lower: Option<&str>) -> Option<&db::RuleRow> {
+        let mut best: Option<(usize, &db::RuleRow)> = None;
+        for sr in &self.rules {
+            if !path::pattern_matches_prefix(&sr.pattern, lower_path) { continue; }
+            if let Some(ref when) = sr.row.when {
+                if let Some(min_depth) = when.depth {
+                    match depth {
+                        Some(d) if d < min_depth => continue,
+                        None => {}
+                        _ => {}
+                    }
+                }
+                if let Some(ref exe_pattern) = when.exe {
+                    match exe_lower {
+                        Some(exe) if path::pattern_matches_exact(exe_pattern, exe) => {}
+                        _ => continue,
+                    }
+                }
+            }
+            let mut spec = path::pattern_specificity(&sr.pattern);
+            if sr.row.when.is_some() { spec += 1; }
+            if let Some(ref when) = sr.row.when {
+                if let Some(ref exe) = when.exe {
+                    spec += path::pattern_specificity(exe);
+                }
+            }
+            match &best {
+                None => best = Some((spec, &sr.row)),
+                Some((s, _)) if spec > *s => best = Some((spec, &sr.row)),
+                _ => {}
+            }
+        }
+        best.map(|(_, r)| r).or(self.default_rule.as_ref())
+    }
 }
 
 impl Policy {
@@ -99,10 +210,12 @@ impl Policy {
             txn.commit()?;
         }
         let project_root_lower = project_root.to_string_lossy().to_lowercase();
+        let snapshot = Arc::new(Snapshot::load_from_db(&db)?);
         Ok(Self {
             inner: Arc::new(PolicyInner {
                 db,
                 cache: Cache::new(16384),
+                snapshot: arc_swap::ArcSwap::from(snapshot),
                 sandbox_root,
                 mock_dirs_root,
                 project_root_lower,
@@ -115,7 +228,8 @@ impl Policy {
         let cfg: db::Config = ktav::from_str(&src)
             .map_err(|e| PolicyError::Ktav(e.to_string()))?;
         db::apply_config(&self.inner.db, &cfg)?;
-        // Invalidate cache after reload — create new cache by dropping old entries via clear
+        let new_snap = Arc::new(Snapshot::load_from_db(&self.inner.db)?);
+        self.inner.snapshot.store(new_snap);
         self.inner.cache.clear();
         Ok(())
     }
@@ -355,19 +469,13 @@ impl Policy {
     fn compute(&self, dos_path: &str, write_access: bool, depth: Option<u8>, exe_lower: Option<&str>) -> Decision {
         let lower = dos_path.to_lowercase();
 
-        // project_root always passthrough (read AND write)
         if lower.starts_with(self.inner.project_root_lower.trim_end_matches('\\')) {
             return Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None };
         }
 
-        // Check deny / mock via DB
-        let txn = match self.inner.db.begin_read() {
-            Ok(t) => t,
-            Err(_) => return passthrough(),
-        };
+        let snap = self.inner.snapshot.load();
 
-        // File mock (exact match with glob support on the mock key).
-        if let Some(payload) = db::find_mock_payload(&txn, &lower) {
+        if let Some(payload) = snap.find_mock_payload(&lower) {
             let overlay = path::mirror_into_overlay(&lower, &self.inner.sandbox_root);
             return Decision {
                 mode: Mode::Mock,
@@ -377,11 +485,7 @@ impl Policy {
             };
         }
 
-        // Mock dir (glob prefix match) — entire subtree is redirected to
-        // <mock_dirs_root>/<mirror>/. Behaves like Cow with pre-populated
-        // overlay: reads see whatever the user put there; writes land there
-        // too (and persist across runs unless the user wipes mock-dirs/).
-        if db::matched_mock_dir(&txn, &lower).is_some() {
+        if snap.matched_mock_dir(&lower).is_some() {
             let overlay = path::mirror_into_overlay(&lower, &self.inner.mock_dirs_root);
             return Decision {
                 mode: Mode::Cow,
@@ -391,8 +495,7 @@ impl Policy {
             };
         }
 
-        // Best-match rule (glob-aware, picks the most specific pattern).
-        let rule = db::best_rule_match(&txn, &lower, depth, exe_lower);
+        let rule = snap.best_rule_match(&lower, depth, exe_lower);
 
         let (mode_read, mode_write) = rule
             .map(|r| (r.mode_read, r.mode_write))
@@ -403,13 +506,13 @@ impl Policy {
         match effective_mode {
             db::RuleMode::Deny => Decision { mode: Mode::Deny, overlay: None, cow_from: None, mock_payload: None },
             db::RuleMode::Passthrough => {
-                // Даже при passthrough-read проверяем overlay_idx: файл мог быть
-                // перенаправлен в overlay предыдущей записью (в т.ч. из дочернего процесса).
                 if !write_access {
-                    if let Ok(t) = txn.open_table(db::OVERLAY_IDX) {
-                        if let Ok(Some(v)) = t.get(lower.as_str()) {
-                            let ov = PathBuf::from(v.value());
-                            return Decision { mode: Mode::Cow, overlay: Some(ov), cow_from: None, mock_payload: None };
+                    if let Ok(txn) = self.inner.db.begin_read() {
+                        if let Ok(t) = txn.open_table(db::OVERLAY_IDX) {
+                            if let Ok(Some(v)) = t.get(lower.as_str()) {
+                                let ov = PathBuf::from(v.value());
+                                return Decision { mode: Mode::Cow, overlay: Some(ov), cow_from: None, mock_payload: None };
+                            }
                         }
                     }
                 }
@@ -417,12 +520,11 @@ impl Policy {
             }
             db::RuleMode::Cow | db::RuleMode::Redirect => {
                 let overlay = path::mirror_into_overlay(&lower, &self.inner.sandbox_root);
-                // Check overlay index (read path: does overlay already exist?)
-                let existing_overlay = if let Ok(t) = txn.open_table(db::OVERLAY_IDX) {
-                    t.get(lower.as_str()).ok().flatten().map(|v| PathBuf::from(v.value()))
-                } else {
-                    None
-                };
+                let existing_overlay = if let Ok(txn) = self.inner.db.begin_read() {
+                    if let Ok(t) = txn.open_table(db::OVERLAY_IDX) {
+                        t.get(lower.as_str()).ok().flatten().map(|v| PathBuf::from(v.value()))
+                    } else { None }
+                } else { None };
                 if let Some(ov) = existing_overlay {
                     return Decision { mode: Mode::Cow, overlay: Some(ov), cow_from: None, mock_payload: None };
                 }
