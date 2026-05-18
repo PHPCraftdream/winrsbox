@@ -26,10 +26,41 @@ pub fn is_cli_command(args: &[String]) -> bool {
     SUBCOMMANDS.contains(&first.as_str())
 }
 
+pub const CLI_HELP: &str = "\
+winrsbox — Windows filesystem sandbox CLI
+
+SUBCOMMANDS:
+  rule       Add, remove, list, show, or clear sandbox rules
+  mock       Add, remove, list, or show file mocks
+  mockdir    Add, remove, or list mocked directories
+  defaults   Set or show default read/write policy modes
+  why        Simulate a path lookup — show decision, target path, and rule chain
+  what-if    Test a hypothetical rule change without mutating state
+  export     Dump current state as JSON to stdout
+  import     Load state from JSON stdin (merge or --replace) or --ktav file
+
+GLOBAL OPTIONS:
+  --state-dir=PATH   Override state directory (default: auto-discover)
+  WINRSBOX_STATE_DIR  env var — same as --state-dir
+
+EXIT CODES:
+  0  Success
+  1  User error (bad args, invalid mode, unknown id)
+  2  System error (IO, permissions, redb)
+
+EXAMPLES:
+  winrsbox rule add --prefix='C:\\Users\\*\\AppData' --write=deny
+  winrsbox why 'C:\\Users\\alice\\doc.txt' --write --depth=1 --json
+  winrsbox what-if rule add --prefix='C:\\Secret' --write=deny -- C:\\foo
+  winrsbox export --json > backup.json
+  winrsbox import --replace < backup.json
+";
+
 /// Dispatch CLI subcommand. `state_dir` is the `.winrsbox/<name>/` path.
 pub fn run_cli(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    if args.is_empty() {
-        anyhow::bail!("no subcommand specified");
+    if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
+        print!("{}", CLI_HELP);
+        return Ok(());
     }
     let cmd = args[0].to_lowercase();
     let rest = &args[1..];
@@ -43,7 +74,7 @@ pub fn run_cli(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         "what-if" => r#why::run_what_if(rest, state_dir),
         "export" => export::run_export(rest, state_dir),
         "import" => export::run_import(rest, state_dir),
-        _ => anyhow::bail!("unknown subcommand: {}", cmd),
+        _ => anyhow::bail!("unknown subcommand '{}'. Run 'winrsbox --help' for usage.", cmd),
     }
 }
 

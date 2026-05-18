@@ -1,7 +1,41 @@
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 
+const HELP: &str = "\
+winrsbox why — simulate a path lookup and explain the decision
+
+Shows which rule matches, the effective mode, the resolved target path
+(overlay for cow/redirect, null for passthrough/deny), and the full chain
+of all considered rules with skip reasons.
+
+OPTIONS:
+  <path>...       One or more paths to simulate
+  --write         Show write decision (default: show both read and write)
+  --depth=N       Process depth for when-filter matching
+  --exe=PATH      Executable path for when-filter matching
+  --json          Output as JSON (one object per path)
+  --stdin         Read paths from stdin (one per line), output JSONL
+
+JSON OUTPUT FIELDS:
+  path            queried path
+  decision        effective mode (passthrough|deny|cow|redirect)
+  target_path     resolved filesystem path (null for passthrough/deny)
+  rule_id         id of the winning rule
+  chain[]         all considered rules: {id, prefix, verdict, reason, specificity}
+  mock_match      matched mock path (if any)
+
+EXAMPLES:
+  winrsbox why 'C:\\Users\\alice\\doc.txt' --write --depth=1 --json
+  winrsbox why 'C:\\Windows\\System32\\kernel32.dll' --json
+  cat paths.txt | winrsbox why --stdin --json
+  winrsbox why 'C:\\foo' 'C:\\bar' --write --json
+";
+
 pub fn run(args: &[String], state_dir: &std::path::Path) -> Result<()> {
+    if has_flag(args, "--help") || has_flag(args, "-h") {
+        print!("{}", HELP);
+        return Ok(());
+    }
     let sandbox_root = state_dir.join("workdir");
     let mock_dirs_root = state_dir.join("mock-dirs");
     let project_root = state_dir.parent()

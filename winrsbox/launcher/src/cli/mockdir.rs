@@ -1,14 +1,39 @@
 use anyhow::{bail, Result};
 
+const HELP: &str = "\
+winrsbox mockdir — manage mocked directories
+
+Mock directories make specific paths appear as existing directories to sandboxed
+processes, even if they don't exist on the real filesystem.
+
+SUBCOMMANDS:
+  add      Add a mocked directory prefix
+  remove   Remove by --prefix
+  list     List all mocked directories (--json)
+
+OPTIONS:
+  --prefix=PATTERN   Directory path prefix with glob support [required]
+  --id=NAME          Explicit id (default: auto-generated)
+
+EXAMPLES:
+  winrsbox mockdir add --prefix='C:\\temp'
+  winrsbox mockdir add --prefix='C:\\Users\\*\\cache'
+  winrsbox mockdir remove --prefix='C:\\temp'
+  winrsbox mockdir list --json
+";
+
 pub fn run(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    if args.is_empty() { bail!("mockdir: expected subcommand (add, remove, list)"); }
+    if args.is_empty() || has_flag(args, "--help") || has_flag(args, "-h") {
+        print!("{}", HELP);
+        return Ok(());
+    }
     let sub = args[0].to_lowercase();
     let rest = &args[1..];
     match sub.as_str() {
         "add" => run_add(rest, state_dir),
         "remove" => run_remove(rest, state_dir),
         "list" => run_list(rest, state_dir),
-        _ => bail!("mockdir: unknown subcommand '{}'", sub),
+        _ => bail!("mockdir: unknown subcommand '{}'. Run 'winrsbox mockdir --help'.", sub),
     }
 }
 
