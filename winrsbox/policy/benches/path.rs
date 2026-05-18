@@ -131,6 +131,39 @@ fn bench_pattern_double_star_long(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_pattern_matches_exact_hit(c: &mut Criterion) {
+    let mut group = c.benchmark_group("path");
+    group.bench_function("pattern_matches_exact_hit", |b| {
+        b.iter(|| path::pattern_matches_exact(
+            black_box(r"c:\users\*\documents\*.txt"),
+            black_box(r"c:\users\alice\documents\report.txt"),
+        ))
+    });
+    group.finish();
+}
+
+fn bench_pattern_matches_exact_miss(c: &mut Criterion) {
+    let mut group = c.benchmark_group("path");
+    group.bench_function("pattern_matches_exact_miss", |b| {
+        b.iter(|| path::pattern_matches_exact(
+            black_box(r"c:\users\*\documents\*.txt"),
+            black_box(r"c:\users\alice\documents\report.exe"),
+        ))
+    });
+    group.finish();
+}
+
+fn bench_pattern_matches_exact_globstar(c: &mut Criterion) {
+    let mut group = c.benchmark_group("path");
+    group.bench_function("pattern_matches_exact_globstar", |b| {
+        b.iter(|| path::pattern_matches_exact(
+            black_box(r"c:\users\**\.ssh\*"),
+            black_box(r"c:\users\alice\sub\deep\.ssh\id_rsa"),
+        ))
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_nt_to_dos_with_prefix,
@@ -145,5 +178,8 @@ criterion_group!(
     bench_pattern_specificity,
     bench_pattern_double_star_short,
     bench_pattern_double_star_long,
+    bench_pattern_matches_exact_hit,
+    bench_pattern_matches_exact_miss,
+    bench_pattern_matches_exact_globstar,
 );
 criterion_main!(benches);

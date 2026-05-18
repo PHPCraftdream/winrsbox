@@ -224,6 +224,121 @@ fn bench_cache_key_composite(c: &mut Criterion) {
     group.finish();
 }
 
+// ─── P0: best_rule_match with N rules (linear scan benchmark) ──────────────
+
+fn make_policy_n_rules(n: usize) -> (tempfile::TempDir, Policy) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&mock_dirs).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+
+    let cfg_path = dir.path().join("config.ktv");
+    let mut f = std::fs::File::create(&cfg_path).unwrap();
+    write!(f, "defaults: {{\n    read: passthrough\n    write: cow\n}}\n\nrules: [\n").unwrap();
+    for i in 0..n {
+        write!(f, "    {{\n        prefix: c:\\\\rule{:04}\n        write: deny\n    }}\n", i).unwrap();
+    }
+    write!(f, "]").unwrap();
+    drop(f);
+    p.load_config(&cfg_path).unwrap();
+    (dir, p)
+}
+
+fn bench_rule_match_scale(c: &mut Criterion) {
+    let mut group = c.benchmark_group("best_rule_match_scale");
+    for n in [1, 10, 50, 100] {
+        let (_dir, policy) = make_policy_n_rules(n);
+        let counter = AtomicU64::new(0);
+        group.bench_function(format!("n={n}"), |b| {
+            b.iter_batched(
+                || {
+                    let i = counter.fetch_add(1, Ordering::Relaxed);
+                    format!("c:\\rule{:04}\\file{}.txt", i % (n as u64), i)
+                },
+                |path| policy.decide(black_box(&path), true),
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
+// ─── P0: find_mock_payload / matched_mock_dir ──────────────────────────────
+
+fn make_policy_n_mocks(n_mocks: usize, n_mockdirs: usize) -> (tempfile::TempDir, Policy) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&mock_dirs).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+
+    let cfg_path = dir.path().join("config.ktv");
+    let mut f = std::fs::File::create(&cfg_path).unwrap();
+    write!(f, "defaults: {{\n    read: passthrough\n    write: cow\n}}\n\nmocks: [\n").unwrap();
+    for i in 0..n_mocks {
+        write!(f, "    {{\n        path: c:\\\\mock{:04}\\\\file.txt\n        content_inline: data{}\n    }}\n", i, i).unwrap();
+    }
+    write!(f, "]\n\nmock_dirs: [\n").unwrap();
+    for i in 0..n_mockdirs {
+        write!(f, "    {{\n        prefix: c:\\\\mockdir{:04}\n    }}\n", i).unwrap();
+    }
+    write!(f, "]").unwrap();
+    drop(f);
+    p.load_config(&cfg_path).unwrap();
+    (dir, p)
+}
+
+fn bench_mock_payload_lookup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("find_mock_payload");
+    for n in [1, 10, 50] {
+        let (_dir, policy) = make_policy_n_mocks(n, 0);
+        let counter = AtomicU64::new(0);
+        group.bench_function(format!("hit_n={n}"), |b| {
+            b.iter_batched(
+                || format!("c:\\mock{:04}\\file.txt", counter.fetch_add(1, Ordering::Relaxed) % (n as u64)),
+                |path| policy.decide(black_box(&path), false),
+                BatchSize::SmallInput,
+            )
+        });
+        let counter2 = AtomicU64::new(0);
+        group.bench_function(format!("miss_n={n}"), |b| {
+            b.iter_batched(
+                || format!("c:\\nomatch\\{}", counter2.fetch_add(1, Ordering::Relaxed)),
+                |path| policy.decide(black_box(&path), false),
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
+fn bench_mock_dir_lookup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("matched_mock_dir");
+    for n in [1, 10, 50] {
+        let (_dir, policy) = make_policy_n_mocks(0, n);
+        let counter = AtomicU64::new(0);
+        group.bench_function(format!("hit_n={n}"), |b| {
+            b.iter_batched(
+                || format!("c:\\mockdir{:04}\\sub\\file.txt", counter.fetch_add(1, Ordering::Relaxed) % (n as u64)),
+                |path| policy.decide(black_box(&path), false),
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_cache_hit,
@@ -234,5 +349,8 @@ criterion_group!(
     bench_cache_miss_with_exe,
     bench_cache_miss_with_both,
     bench_cache_key_composite,
+    bench_rule_match_scale,
+    bench_mock_payload_lookup,
+    bench_mock_dir_lookup,
 );
 criterion_main!(benches);
