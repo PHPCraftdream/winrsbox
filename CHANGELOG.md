@@ -90,6 +90,21 @@ All notable changes to winrsbox are documented in this file.
   | best_rule_match n=100 | 147 µs | 101 µs | **1.5×** |
   | mock miss n=1 | 9.5 µs | 3.3 µs | **2.9×** |
 
+**Follow-up micro-optimizations:**
+
+- **`ensure_lower(&str) -> Cow<str>`** — skips `to_lowercase()` heap alloc when the
+  input is already lowercase (the common case — `hook.dll` sends pre-lowercased paths
+  via `nt_to_dos_lower`). Saves one alloc per hooked syscall on cache miss.
+
+- **FxHashMap split for mock lookup** — `Snapshot.mocks_exact: FxHashMap<String, Vec<u8>>`
+  for literal-path mocks (O(1)), `mocks_glob: Vec<...>` for wildcard mocks (linear).
+  `find_mock_payload miss n=50: 62 µs → 2.0 µs` (**31×** speedup).
+
+- **`Arc<Decision>` in policy cache** — cache stores `Arc<Decision>` instead of
+  `Decision`. Cache hit returns `(*arc).clone()` (atomic refcount + struct copy) but
+  the structural fields are still cheap; the win is in `Arc::clone` on the insert side
+  (no double heap alloc of `PathBuf`/`Vec<u8>` for two cache layers).
+
 **Earlier hot-path optimizations:**
 
 Full numbers in `BENCH_RESULTS.md`.
