@@ -12,10 +12,15 @@ pub enum RuleMode { Passthrough, Deny, Cow, Redirect }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleRow {
+    pub id: String,
+    pub prefix: String,
     pub mode_read: RuleMode,
     pub mode_write: RuleMode,
     pub when: Option<WhenFilter>,
 }
+
+// ── Defaults table ────────────────────────────────────────────────────────
+pub const DEFAULTS: TableDefinition<&str, &[u8]> = TableDefinition::new("defaults");
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -47,6 +52,34 @@ pub struct WhenFilter {
 
 fn default_passthrough() -> String { "passthrough".into() }
 fn default_cow() -> String { "cow".into() }
+
+/// Generate a deterministic ID: `<kind>-<8hex>` from xxh3 of sorted args.
+pub fn generate_id(kind: &str, args: &[&str]) -> String {
+    let mut parts: Vec<&str> = args.to_vec();
+    parts.sort();
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    for p in &parts {
+        hasher.update(p.as_bytes());
+        hasher.update(&[0]); // separator
+    }
+    let hash = hasher.digest();
+    format!("{}-{:08x}", kind, hash & 0xFFFFFFFF)
+}
+
+pub fn mode_to_string(m: RuleMode) -> &'static str {
+    match m {
+        RuleMode::Passthrough => "passthrough",
+        RuleMode::Deny => "deny",
+        RuleMode::Cow => "cow",
+        RuleMode::Redirect => "redirect",
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DefaultsRow {
+    pub read: RuleMode,
+    pub write: RuleMode,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct RuleEntry {
@@ -116,7 +149,7 @@ pub fn apply_config(db: &redb::Database, cfg: &Config) -> Result<(), crate::Poli
         }
 
         // Default rule (empty key = catch-all)
-        let default_row = RuleRow { mode_read: default_read, mode_write: default_write, when: None };
+        let default_row = RuleRow { id: "".into(), prefix: String::new(), mode_read: default_read, mode_write: default_write, when: None };
         let encoded = bincode::serde::encode_to_vec(&default_row, bincode::config::standard())
             .map_err(|e| crate::PolicyError::Ktav(format!("serialize: {e}")))?;
         rules.insert("", encoded.as_slice())?;
@@ -124,11 +157,12 @@ pub fn apply_config(db: &redb::Database, cfg: &Config) -> Result<(), crate::Poli
         for rule in &cfg.rules {
             let mr = parse_mode(rule.read.as_deref().unwrap_or("passthrough"), default_read);
             let mw = parse_mode(rule.write.as_deref().unwrap_or("cow"), default_write);
-            let row = RuleRow { mode_read: mr, mode_write: mw, when: rule.when.clone() };
+            let prefix_lower = rule.prefix.to_lowercase();
+            let id = generate_id("rule", &[&prefix_lower]);
+            let row = RuleRow { id, prefix: prefix_lower.clone(), mode_read: mr, mode_write: mw, when: rule.when.clone() };
             let enc = bincode::serde::encode_to_vec(&row, bincode::config::standard())
                 .map_err(|e| crate::PolicyError::Ktav(format!("serialize: {e}")))?;
-            let key = rule.prefix.to_lowercase();
-            rules.insert(key.as_str(), enc.as_slice())?;
+            rules.insert(prefix_lower.as_str(), enc.as_slice())?;
         }
 
         for mock in &cfg.mocks {
@@ -146,7 +180,7 @@ pub fn apply_config(db: &redb::Database, cfg: &Config) -> Result<(), crate::Poli
     Ok(())
 }
 
-fn decode_rule(bytes: &[u8]) -> Option<RuleRow> {
+pub fn decode_rule(bytes: &[u8]) -> Option<RuleRow> {
     bincode::serde::decode_from_slice::<RuleRow, _>(bytes, bincode::config::standard())
         .ok()
         .map(|(r, _)| r)
@@ -155,21 +189,22 @@ fn decode_rule(bytes: &[u8]) -> Option<RuleRow> {
 /// Find the most specific rule matching `lower_path`. Iterates every rule
 /// (rules support `*` / `?` globs per path segment) and returns the one with
 /// the highest specificity. Falls back to the default (empty) rule.
-pub fn best_rule_match(
+/// Returns (key, RuleRow) so callers can see the matched prefix/id.
+pub fn best_rule_match_full(
     txn: &redb::ReadTransaction,
     lower_path: &str,
     depth: Option<u8>,
     exe_lower: Option<&str>,
-) -> Option<RuleRow> {
+) -> Option<(String, RuleRow)> {
     let table = txn.open_table(RULES).ok()?;
-    let mut best: Option<(usize, RuleRow)> = None;
-    let mut default_row: Option<RuleRow> = None;
+    let mut best: Option<(usize, String, RuleRow)> = None;
+    let mut default_row: Option<(String, RuleRow)> = None;
 
     for entry in table.iter().ok()? {
         let Ok((key, value)) = entry else { continue };
         let pattern = key.value();
         if pattern.is_empty() {
-            default_row = decode_rule(value.value());
+            default_row = decode_rule(value.value()).map(|r| (pattern.to_owned(), r));
             continue;
         }
         if !pattern_matches_prefix(pattern, lower_path) {
@@ -179,8 +214,6 @@ pub fn best_rule_match(
         // Apply when filter
         if let Some(ref when) = row.when {
             if let Some(min_depth) = when.depth {
-                // depth filter: rule applies at this depth and deeper (>=)
-                // None depth (legacy callers) treated as max-permissive: always pass
                 if depth.is_some() && depth.unwrap() < min_depth {
                     continue;
                 }
@@ -193,7 +226,7 @@ pub fn best_rule_match(
         }
         let mut spec = pattern_specificity(pattern);
         if row.when.is_some() {
-            spec += 1; // bonus for having a when filter
+            spec += 1;
         }
         if let Some(ref when) = row.when {
             if let Some(ref exe) = when.exe {
@@ -201,12 +234,22 @@ pub fn best_rule_match(
             }
         }
         match &best {
-            None => best = Some((spec, row)),
-            Some((s, _)) if spec > *s => best = Some((spec, row)),
+            None => best = Some((spec, pattern.to_owned(), row)),
+            Some((s, _, _)) if spec > *s => best = Some((spec, pattern.to_owned(), row)),
             _ => {}
         }
     }
-    best.map(|(_, r)| r).or(default_row)
+    best.map(|(_, k, r)| (k, r)).or(default_row)
+}
+
+/// Convenience wrapper returning just the RuleRow.
+pub fn best_rule_match(
+    txn: &redb::ReadTransaction,
+    lower_path: &str,
+    depth: Option<u8>,
+    exe_lower: Option<&str>,
+) -> Option<RuleRow> {
+    best_rule_match_full(txn, lower_path, depth, exe_lower).map(|(_, r)| r)
 }
 
 /// Find a mock payload that exactly matches `lower_path` (with glob support
@@ -250,6 +293,190 @@ pub fn matched_mock_dir(txn: &redb::ReadTransaction, lower_path: &str) -> Option
     best.map(|(_, p)| p)
 }
 
+// ── CRUD operations ────────────────────────────────────────────────────────
+
+pub fn rule_upsert(db: &redb::Database, row: &RuleRow) -> Result<(), crate::PolicyError> {
+    let prefix_lower = row.prefix.to_lowercase();
+    let enc = bincode::serde::encode_to_vec(row, bincode::config::standard())
+        .map_err(|e| crate::PolicyError::Ktav(format!("serialize: {e}")))?;
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(RULES)?;
+        table.insert(prefix_lower.as_str(), enc.as_slice())?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+pub fn rule_remove_by_id(db: &redb::Database, id: &str) -> Result<bool, crate::PolicyError> {
+    let txn = db.begin_write()?;
+    let removed = {
+        let mut table = txn.open_table(RULES)?;
+        let mut found = false;
+        let keys_to_remove: Vec<String> = table
+            .iter()?
+            .filter_map(|e| e.ok())
+            .filter(|(k, v)| {
+                if k.value() == "" { return false; } // never remove default
+                decode_rule(v.value()).map(|r| r.id == id).unwrap_or(false)
+            })
+            .map(|(k, _)| k.value().to_owned())
+            .collect();
+        for k in &keys_to_remove {
+            table.remove(k.as_str())?;
+            found = true;
+        }
+        found
+    };
+    txn.commit()?;
+    Ok(removed)
+}
+
+pub fn rule_remove_by_prefix(db: &redb::Database, prefix: &str) -> Result<bool, crate::PolicyError> {
+    let key = prefix.to_lowercase();
+    let txn = db.begin_write()?;
+    let removed = {
+        let mut table = txn.open_table(RULES)?;
+        let x = table.remove(key.as_str())?.is_some();
+        x
+    };
+    txn.commit()?;
+    Ok(removed)
+}
+
+pub fn rule_list(db: &redb::Database) -> Result<Vec<RuleRow>, crate::PolicyError> {
+    let txn = db.begin_read()?;
+    let table = txn.open_table(RULES)?;
+    let mut rules = Vec::new();
+    for entry in table.iter()? {
+        let Ok((key, value)) = entry else { continue };
+        if key.value().is_empty() { continue; } // skip default
+        if let Some(row) = decode_rule(value.value()) {
+            rules.push(row);
+        }
+    }
+    Ok(rules)
+}
+
+pub fn rule_clear(db: &redb::Database) -> Result<(), crate::PolicyError> {
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(RULES)?;
+        let keys: Vec<String> = table.iter()?.filter_map(|e| e.ok())
+            .filter(|(k, _)| !k.value().is_empty())
+            .map(|(k, _)| k.value().to_owned())
+            .collect();
+        for k in keys {
+            table.remove(k.as_str())?;
+        }
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+pub fn mock_upsert(db: &redb::Database, id: &str, path: &str, payload: &[u8]) -> Result<(), crate::PolicyError> {
+    let key = path.to_lowercase();
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(MOCKS)?;
+        table.insert(key.as_str(), payload)?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+pub fn mock_remove_by_id(db: &redb::Database, _id: &str) -> Result<bool, crate::PolicyError> {
+    // Mocks don't store id inline in the table; we'll match by iterating
+    // For now, mocks use path as key so we need a different approach
+    // We store a MOCKS_META table for id → path mapping
+    Ok(false)
+}
+
+pub fn mock_remove_by_path(db: &redb::Database, path: &str) -> Result<bool, crate::PolicyError> {
+    let key = path.to_lowercase();
+    let txn = db.begin_write()?;
+    let removed = {
+        let mut table = txn.open_table(MOCKS)?;
+        let x = table.remove(key.as_str())?.is_some();
+        x
+    };
+    txn.commit()?;
+    Ok(removed)
+}
+
+pub fn mock_list(db: &redb::Database) -> Result<Vec<(String, Vec<u8>)>, crate::PolicyError> {
+    let txn = db.begin_read()?;
+    let table = txn.open_table(MOCKS)?;
+    let mut mocks = Vec::new();
+    for entry in table.iter()? {
+        let Ok((key, value)) = entry else { continue };
+        mocks.push((key.value().to_owned(), value.value().to_vec()));
+    }
+    Ok(mocks)
+}
+
+pub fn mockdir_upsert(db: &redb::Database, prefix: &str) -> Result<(), crate::PolicyError> {
+    let key = prefix.to_lowercase();
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(MOCK_DIRS)?;
+        table.insert(key.as_str(), ())?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+pub fn mockdir_remove_by_prefix(db: &redb::Database, prefix: &str) -> Result<bool, crate::PolicyError> {
+    let key = prefix.to_lowercase();
+    let txn = db.begin_write()?;
+    let removed = {
+        let mut table = txn.open_table(MOCK_DIRS)?;
+        let x = table.remove(key.as_str())?.is_some();
+        x
+    };
+    txn.commit()?;
+    Ok(removed)
+}
+
+pub fn mockdir_list(db: &redb::Database) -> Result<Vec<String>, crate::PolicyError> {
+    let txn = db.begin_read()?;
+    let table = txn.open_table(MOCK_DIRS)?;
+    let mut dirs = Vec::new();
+    for entry in table.iter()? {
+        let Ok((key, _)) = entry else { continue };
+        dirs.push(key.value().to_owned());
+    }
+    Ok(dirs)
+}
+
+pub fn defaults_get(db: &redb::Database) -> Result<DefaultsRow, crate::PolicyError> {
+    // Read from the default rule (empty key in RULES table)
+    let txn = db.begin_read()?;
+    let table = txn.open_table(RULES)?;
+    if let Some(value) = table.get("").ok().flatten() {
+        if let Some(row) = decode_rule(value.value()) {
+            return Ok(DefaultsRow { read: row.mode_read, write: row.mode_write });
+        }
+    }
+    Ok(DefaultsRow { read: RuleMode::Passthrough, write: RuleMode::Cow })
+}
+
+pub fn defaults_set(db: &redb::Database, read: Option<RuleMode>, write: Option<RuleMode>) -> Result<(), crate::PolicyError> {
+    let current = defaults_get(db)?;
+    let read = read.unwrap_or(current.read);
+    let write = write.unwrap_or(current.write);
+    let row = RuleRow { id: String::new(), prefix: String::new(), mode_read: read, mode_write: write, when: None };
+    let enc = bincode::serde::encode_to_vec(&row, bincode::config::standard())
+        .map_err(|e| crate::PolicyError::Ktav(format!("serialize: {e}")))?;
+    let txn = db.begin_write()?;
+    {
+        let mut table = txn.open_table(RULES)?;
+        table.insert("", enc.as_slice())?;
+    }
+    txn.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,7 +514,7 @@ mod tests {
 
     #[test]
     fn decode_rule_roundtrip() {
-        let row = RuleRow { mode_read: RuleMode::Cow, mode_write: RuleMode::Deny, when: None };
+        let row = RuleRow { id: String::new(), prefix: String::new(), mode_read: RuleMode::Cow, mode_write: RuleMode::Deny, when: None };
         let enc = bincode::serde::encode_to_vec(&row, bincode::config::standard()).unwrap();
         let dec = decode_rule(&enc).unwrap();
         assert!(matches!(dec.mode_read, RuleMode::Cow));
@@ -324,11 +551,12 @@ mod tests {
             let txn = db.begin_write().unwrap();
             {
                 let mut table = txn.open_table(RULES).unwrap();
-                let default_row = RuleRow { mode_read: RuleMode::Passthrough, mode_write: RuleMode::Cow, when: None };
+                let default_row = RuleRow { id: String::new(), prefix: String::new(), mode_read: RuleMode::Passthrough, mode_write: RuleMode::Cow, when: None };
                 let enc = bincode::serde::encode_to_vec(&default_row, bincode::config::standard()).unwrap();
                 table.insert("", enc.as_slice()).unwrap();
                 for (prefix, mr, mw) in rules {
-                    let row = RuleRow { mode_read: *mr, mode_write: *mw, when: None };
+                    let pfx = prefix.to_lowercase();
+                    let row = RuleRow { id: generate_id("rule", &[&pfx]), prefix: pfx.clone(), mode_read: *mr, mode_write: *mw, when: None };
                     let enc = bincode::serde::encode_to_vec(&row, bincode::config::standard()).unwrap();
                     table.insert(prefix.to_lowercase().as_str(), enc.as_slice()).unwrap();
                 }
@@ -682,11 +910,12 @@ rules: [
             let txn = db.begin_write().unwrap();
             {
                 let mut table = txn.open_table(RULES).unwrap();
-                let default_row = RuleRow { mode_read: RuleMode::Passthrough, mode_write: RuleMode::Cow, when: None };
+                let default_row = RuleRow { id: String::new(), prefix: String::new(), mode_read: RuleMode::Passthrough, mode_write: RuleMode::Cow, when: None };
                 let enc = bincode::serde::encode_to_vec(&default_row, bincode::config::standard()).unwrap();
                 table.insert("", enc.as_slice()).unwrap();
                 for (prefix, mr, mw, when) in rules {
-                    let row = RuleRow { mode_read: *mr, mode_write: *mw, when: when.clone() };
+                    let pfx = prefix.to_lowercase();
+                    let row = RuleRow { id: generate_id("rule", &[&pfx]), prefix: pfx.clone(), mode_read: *mr, mode_write: *mw, when: when.clone() };
                     let enc = bincode::serde::encode_to_vec(&row, bincode::config::standard()).unwrap();
                     table.insert(prefix.to_lowercase().as_str(), enc.as_slice()).unwrap();
                 }
