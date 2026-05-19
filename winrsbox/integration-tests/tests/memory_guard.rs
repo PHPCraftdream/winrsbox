@@ -379,6 +379,93 @@ fn strict_blocks_junction_creation() {
 
 #[test]
 #[serial]
+fn strict_blocks_hardlink_creation() {
+    let r = run_payload("escape_hardlink", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "escape_hardlink should exit 5 (blocked)\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_alpc_com_activation() {
+    let r = run_payload("escape_alpc_com", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "escape_alpc_com should exit 5 (blocked)\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_token_privilege_enable() {
+    let r = run_payload("escape_token_priv", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "escape_token_priv should exit 5 (blocked)\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_denies_fs_system_write() {
+    // Clean any prior canary in real C:\Windows
+    let canary = std::path::Path::new(r"C:\Windows\winrsbox-escape-canary.txt");
+    let _ = std::fs::remove_file(canary);
+    let r = run_payload("escape_fs_system_write", "scan");
+    // Acceptable: exit 5 (deny) or exit 6 (CoW absorbed). Exit 0 = real escape.
+    let code = r.status.code();
+    assert!(code == Some(5) || code == Some(6),
+        "fs_system_write should be denied or CoW-absorbed, got {:?}\nstderr: {}",
+        code, r.stderr);
+    // Verify the real C:\Windows directory is untouched
+    assert!(!canary.exists(),
+        "CANARY LEAKED to real C:\\Windows — CoW isolation failed!");
+}
+
+#[test]
+#[serial]
+fn cow_isolation_keeps_file_in_overlay() {
+    // Clean any prior canary
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        let _ = std::fs::remove_file(
+            std::path::PathBuf::from(home).join("Desktop").join("winrsbox-cow-canary.dat")
+        );
+    }
+    let r = run_payload("escape_cow_isolation", "scan");
+    assert_eq!(r.status.code(), Some(0),
+        "cow_isolation payload should exit 0 (write succeeded into overlay)\nstderr: {}", r.stderr);
+    // Verify the file does NOT appear on the real filesystem
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        let real_path = std::path::PathBuf::from(home).join("Desktop").join("winrsbox-cow-canary.dat");
+        assert!(!real_path.exists(),
+            "canary leaked to real FS at {}", real_path.display());
+    }
+}
+
+#[test]
+#[serial]
+fn wfp_blocks_smb_egress() {
+    let r = run_payload("escape_smb_egress", "scan");
+    // WFP blocks port 445 → either WSAEACCES (exit 5) or timeout (different code).
+    // Either way, the connect must NOT succeed (exit code 0 would be escape).
+    assert_ne!(r.status.code(), Some(0),
+        "SMB egress should be blocked\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_pipe_scm() {
+    let r = run_payload("escape_pipe_scm", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "SCM pipe should be blocked\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_shadow_copy() {
+    let r = run_payload("escape_shadow_copy", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "shadow copy should be blocked\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
 fn wfp_blocks_afd_direct() {
     // escape_afd_direct tries TCP connect to 10.0.0.1:80 via ws2_32.
     // WFP blocks RFC1918 at kernel level → connect fails or times out.

@@ -127,6 +127,38 @@ path = "src/bin/escape_systemquery_write.rs"
 name = "escape_junction"
 path = "src/bin/escape_junction.rs"
 
+[[bin]]
+name = "escape_hardlink"
+path = "src/bin/escape_hardlink.rs"
+
+[[bin]]
+name = "escape_alpc_com"
+path = "src/bin/escape_alpc_com.rs"
+
+[[bin]]
+name = "escape_token_priv"
+path = "src/bin/escape_token_priv.rs"
+
+[[bin]]
+name = "escape_fs_system_write"
+path = "src/bin/escape_fs_system_write.rs"
+
+[[bin]]
+name = "escape_cow_isolation"
+path = "src/bin/escape_cow_isolation.rs"
+
+[[bin]]
+name = "escape_smb_egress"
+path = "src/bin/escape_smb_egress.rs"
+
+[[bin]]
+name = "escape_pipe_scm"
+path = "src/bin/escape_pipe_scm.rs"
+
+[[bin]]
+name = "escape_shadow_copy"
+path = "src/bin/escape_shadow_copy.rs"
+
 [[test]]
 name = "mock_integration"
 path = "tests/mock_integration.rs"
