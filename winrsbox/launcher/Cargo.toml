@@ -6,6 +6,10 @@ description = "Windows filesystem sandbox for AI agents (CoW overlay, ntdll-leve
 license = "MIT"
 repository = "https://github.com/klyde13/winrsbox"
 
+[lib]
+name = "winrsbox"
+path = "src/lib.rs"
+
 [[bin]]
 name = "winrsbox"
 path = "src/main.rs"
@@ -43,3 +47,8 @@ winreg = "0.55"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "shell"
+harness = false

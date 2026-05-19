@@ -289,7 +289,7 @@ fn install_verb(verb: &str, label: &str, command: &str, icon: &str, runas: bool)
     Ok(())
 }
 
-fn extract_target_from_command(cmd: &str) -> &str {
+pub fn extract_target_from_command(cmd: &str) -> &str {
     // Command format: "winrsbox" --cwd "%V" -- "target" args...
     if let Some(after_dashdash) = cmd.split("-- \"").nth(1) {
         after_dashdash.split('"').next().unwrap_or("")
@@ -298,7 +298,7 @@ fn extract_target_from_command(cmd: &str) -> &str {
     }
 }
 
-fn extract_extra_args_from_command(cmd: &str) -> String {
+pub fn extract_extra_args_from_command(cmd: &str) -> String {
     // Extract args after target.exe in the command
     if let Some(after_dashdash) = cmd.split("-- ").nth(1) {
         // Skip the "target" part
@@ -316,7 +316,7 @@ fn extract_extra_args_from_command(cmd: &str) -> String {
     }
 }
 
-fn find_in_path(name: &str) -> Option<PathBuf> {
+pub fn find_in_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var("PATH").ok()?;
     for dir in path_var.split(';') {
         let candidate = Path::new(dir).join(name);
@@ -327,7 +327,7 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-fn extract_flag(args: &[String], flag: &str) -> Option<String> {
+pub fn extract_flag(args: &[String], flag: &str) -> Option<String> {
     for (i, arg) in args.iter().enumerate() {
         if arg == flag {
             return args.get(i + 1).cloned();
