@@ -4,6 +4,7 @@ pub mod reg;
 pub mod reg_overlay;
 pub mod dev;
 pub mod net;
+pub mod mem;
 pub mod scan;
 
 use std::path::{Path, PathBuf};

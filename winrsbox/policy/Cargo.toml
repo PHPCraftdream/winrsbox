@@ -44,3 +44,11 @@ harness = false
 [[bench]]
 name = "dev"
 harness = false
+
+[[bench]]
+name = "net"
+harness = false
+
+[[bench]]
+name = "mem"
+harness = false
