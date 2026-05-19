@@ -936,6 +936,7 @@ name = "policy"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "base64",
  "bincode",
  "criterion",
  "iced-x86",
@@ -947,6 +948,7 @@ dependencies = [
  "rstest",
  "rustc-hash",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "widestring",
