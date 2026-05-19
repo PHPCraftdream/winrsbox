@@ -211,6 +211,29 @@ fn bench_roundtrip_pre_launch_violation(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_roundtrip_context_hijack(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ipc_msg");
+    let msg = Req::InjectionViolation {
+        pid: 1234,
+        exe: r"c:\app\evil.exe".into(),
+        kind: ipc::InjectKind::ContextHijack,
+        target_pid: 5678,
+        start_address: 0xDEADBEEF,
+        caller_pc: 0x7ff8a1234567,
+        caller_module: Some(r"c:\app\evil.exe".into()),
+        stack_top: vec![0x7ff8a1234567, 0x7ff8a1234568],
+    };
+    group.bench_function("roundtrip_context_hijack", |b| {
+        b.iter(|| {
+            let mut buf = Cursor::new(Vec::new());
+            write_msg(&mut buf, black_box(&msg)).unwrap();
+            buf.set_position(0);
+            let _: Req = read_msg(&mut buf).unwrap();
+        })
+    });
+    group.finish();
+}
+
 fn bench_roundtrip_register_child(c: &mut Criterion) {
     let mut group = c.benchmark_group("ipc_msg");
     let msg = Req::RegisterChild { pid: 12345 };
@@ -237,6 +260,7 @@ criterion_group!(
     bench_roundtrip_record_overlay,
     bench_roundtrip_memory_violation,
     bench_roundtrip_injection_violation,
+    bench_roundtrip_context_hijack,
     bench_roundtrip_pre_launch_violation,
     bench_roundtrip_register_child,
 );

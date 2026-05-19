@@ -58,6 +58,31 @@ rules: [
 # mock_dirs: [
 #     { prefix: C:\\Users\\Computer\\.config\\fakeapp }
 # ]
+
+# Registry persistence vectors — deny write to prevent DLL injection
+# via AppInit_DLLs, Image File Execution Options, AppCertDlls.
+regrules: [
+    {
+        prefix: HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows
+        write: deny
+    }
+    {
+        prefix: HKLM\\Software\\Wow6432Node\\Microsoft\\Windows NT\\CurrentVersion\\Windows
+        write: deny
+    }
+    {
+        prefix: HKCU\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows
+        write: deny
+    }
+    {
+        prefix: HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options
+        write: deny
+    }
+    {
+        prefix: HKLM\\System\\CurrentControlSet\\Control\\Session Manager\\AppCertDlls
+        write: deny
+    }
+]
 ";
 
 /// winrsbox — runs a target process inside a CoW filesystem sandbox.

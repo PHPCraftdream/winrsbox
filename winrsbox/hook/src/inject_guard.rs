@@ -328,11 +328,11 @@ const CTX_RIP_OFFSET: usize = 0xF8;
 const CTX_DR0_OFFSET: usize = 0x350;
 const CTX_DR7_OFFSET: usize = 0x370;
 
-unsafe fn read_ctx_u32(ctx: *const c_void, offset: usize) -> u32 {
+pub unsafe fn read_ctx_u32(ctx: *const c_void, offset: usize) -> u32 {
     *(ctx.cast::<u8>().add(offset) as *const u32)
 }
 
-unsafe fn read_ctx_u64(ctx: *const c_void, offset: usize) -> u64 {
+pub unsafe fn read_ctx_u64(ctx: *const c_void, offset: usize) -> u64 {
     *(ctx.cast::<u8>().add(offset) as *const u64)
 }
 
