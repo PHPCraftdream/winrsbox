@@ -46,6 +46,11 @@ type FnNtQueueApcThread = unsafe extern "system" fn(
     HANDLE, *mut c_void, *mut c_void, *mut c_void, *mut c_void,
 ) -> NTSTATUS;
 
+type FnNtSetContextThread = unsafe extern "system" fn(
+    HANDLE,         // ThreadHandle
+    *const c_void,  // Context (CONTEXT*)
+) -> NTSTATUS;
+
 // ---------------------------------------------------------------------------
 // Detour storage
 // ---------------------------------------------------------------------------
@@ -53,6 +58,7 @@ type FnNtQueueApcThread = unsafe extern "system" fn(
 static HOOK_CREATE_THREAD_EX: OnceLock<GenericDetour<FnNtCreateThreadEx>> = OnceLock::new();
 static HOOK_CREATE_THREAD: OnceLock<GenericDetour<FnNtCreateThread>> = OnceLock::new();
 static HOOK_QUEUE_APC: OnceLock<GenericDetour<FnNtQueueApcThread>> = OnceLock::new();
+static HOOK_SET_CONTEXT: OnceLock<GenericDetour<FnNtSetContextThread>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Filter 2: Deferred arming
@@ -311,6 +317,77 @@ unsafe extern "system" fn hook_nt_create_thread(
     call_original()
 }
 
+// ---------------------------------------------------------------------------
+// CONTEXT offsets (x64 Windows)
+// ---------------------------------------------------------------------------
+
+const CONTEXT_CONTROL: u32 = 0x10_0001;
+const CONTEXT_DEBUG_REGISTERS: u32 = 0x10_0010;
+const CTX_FLAGS_OFFSET: usize = 0x30;
+const CTX_RIP_OFFSET: usize = 0xF8;
+const CTX_DR0_OFFSET: usize = 0x350;
+const CTX_DR7_OFFSET: usize = 0x370;
+
+unsafe fn read_ctx_u32(ctx: *const c_void, offset: usize) -> u32 {
+    *(ctx.cast::<u8>().add(offset) as *const u32)
+}
+
+unsafe fn read_ctx_u64(ctx: *const c_void, offset: usize) -> u64 {
+    *(ctx.cast::<u8>().add(offset) as *const u64)
+}
+
+unsafe extern "system" fn hook_nt_set_context_thread(
+    thread_handle: HANDLE,
+    context: *const c_void,
+) -> NTSTATUS {
+    let call_original = || {
+        HOOK_SET_CONTEXT.get().unwrap().call(thread_handle, context)
+    };
+
+    let Some(_guard) = anti_rec::enter() else {
+        return call_original();
+    };
+
+    let owner_pid = thread_owner_pid(thread_handle);
+    let self_pid = GetCurrentProcessId();
+    if owner_pid != 0 && owner_pid != self_pid && should_block(owner_pid) {
+        if !context.is_null() {
+            let flags = read_ctx_u32(context, CTX_FLAGS_OFFSET);
+
+            // Check 1: Rip hijack — setting instruction pointer to outside any module
+            if flags & CONTEXT_CONTROL != 0 {
+                let rip = read_ctx_u64(context, CTX_RIP_OFFSET);
+                if rip != 0 && !crate::memory_guard::is_address_in_module(rip as *const c_void) {
+                    report_and_terminate(
+                        ipc::InjectKind::ContextHijack,
+                        owner_pid,
+                        rip,
+                    );
+                }
+            }
+
+            // Check 2: Hardware breakpoint injection — setting DR0-DR3 via DR7
+            if flags & CONTEXT_DEBUG_REGISTERS != 0 {
+                let dr7 = read_ctx_u64(context, CTX_DR7_OFFSET);
+                // DR7 bits 0,2,4,6 = local enable for DR0-DR3
+                let any_enabled = dr7 & 0x55 != 0;
+                if any_enabled {
+                    let dr0 = read_ctx_u64(context, CTX_DR0_OFFSET);
+                    if dr0 != 0 && !crate::memory_guard::is_address_in_module(dr0 as *const c_void) {
+                        report_and_terminate(
+                            ipc::InjectKind::ContextHijack,
+                            owner_pid,
+                            dr0,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    call_original()
+}
+
 unsafe extern "system" fn hook_nt_queue_apc_thread(
     thread_handle: HANDLE,
     apc_routine: *mut c_void,
@@ -379,6 +456,7 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     install_guard!(HOOK_QUEUE_APC,     "NtQueueApcThread\0",  hook_nt_queue_apc_thread, FnNtQueueApcThread);
+    install_guard!(HOOK_SET_CONTEXT,   "NtSetContextThread\0", hook_nt_set_context_thread, FnNtSetContextThread);
 
     // Hooks installed but NOT armed — will arm after first IPC Hello
     Ok(())
@@ -387,6 +465,7 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
 /// # SAFETY
 /// Must be called from DLL_PROCESS_DETACH only.
 pub unsafe fn uninstall() {
+    if let Some(h) = HOOK_SET_CONTEXT.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_CREATE_THREAD_EX.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_CREATE_THREAD.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_QUEUE_APC.get() { let _ = h.disable(); }
@@ -441,5 +520,32 @@ mod tests {
         ARMED.store(true, Ordering::Release);
         assert!(!should_block(64)); // csrss
         ARMED.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn context_flags_constants() {
+        assert_eq!(CONTEXT_CONTROL, 0x10_0001);
+        assert_eq!(CONTEXT_DEBUG_REGISTERS, 0x10_0010);
+    }
+
+    #[test]
+    fn read_ctx_from_mock_buffer() {
+        let mut buf = vec![0u8; 1024];
+        let flags: u32 = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
+        buf[CTX_FLAGS_OFFSET..CTX_FLAGS_OFFSET + 4].copy_from_slice(&flags.to_le_bytes());
+        let rip: u64 = 0x7FF8A1234567;
+        buf[CTX_RIP_OFFSET..CTX_RIP_OFFSET + 8].copy_from_slice(&rip.to_le_bytes());
+        let dr0: u64 = 0xDEADBEEF;
+        buf[CTX_DR0_OFFSET..CTX_DR0_OFFSET + 8].copy_from_slice(&dr0.to_le_bytes());
+        let dr7: u64 = 0x01;
+        buf[CTX_DR7_OFFSET..CTX_DR7_OFFSET + 8].copy_from_slice(&dr7.to_le_bytes());
+
+        unsafe {
+            let ctx = buf.as_ptr() as *const c_void;
+            assert_eq!(read_ctx_u32(ctx, CTX_FLAGS_OFFSET), flags);
+            assert_eq!(read_ctx_u64(ctx, CTX_RIP_OFFSET), rip);
+            assert_eq!(read_ctx_u64(ctx, CTX_DR0_OFFSET), dr0);
+            assert_eq!(read_ctx_u64(ctx, CTX_DR7_OFFSET), dr7);
+        }
     }
 }

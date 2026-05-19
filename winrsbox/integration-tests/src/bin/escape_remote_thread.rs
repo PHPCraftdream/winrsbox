@@ -12,7 +12,7 @@ fn main() {
     eprintln!("[escape_remote_thread] starting");
 
     let exe = std::env::current_exe().expect("current_exe");
-    let target = exe.parent().unwrap().join("clean_noop.exe");
+    let target = exe.parent().unwrap().join("clean_sleep.exe");
 
     let mut child = match std::process::Command::new(&target)
         .stdin(std::process::Stdio::null())
