@@ -308,7 +308,7 @@ async fn main() -> Result<()> {
         std::env::set_var("FS_SANDBOX_ALLOW_RWX", "1");
     }
 
-    let proc_info = launch_suspended(&project_root, &target_args)?;
+    let proc_info = launch_suspended(&project_root, &target_args, cli.guard)?;
 
     // Pre-launch code integrity scan (full guard + not skipped).
     if cli.guard == GuardLevel::Full && !cli.no_pre_scan {
@@ -759,12 +759,14 @@ fn handle_connection(
 
 // ─── Process launch & injection ──────────────────────────────────────────────
 
-fn launch_suspended(cwd: &std::path::Path, target_args: &[String]) -> Result<PROCESS_INFORMATION> {
+fn launch_suspended(cwd: &std::path::Path, target_args: &[String], _guard: GuardLevel) -> Result<PROCESS_INFORMATION> {
+    // NOTE: mitigations are applied from WITHIN hook.dll (after hooks installed)
+    // via SetProcessMitigationPolicy — not from the launcher via
+    // PROC_THREAD_ATTRIBUTE, because BLOCK_NON_MICROSOFT_BINARIES would
+    // prevent loading our hook.dll in the first place.
+
     let cmdline = build_cmdline(target_args);
     let mut cmdline_wide: Vec<u16> = cmdline.encode_utf16().chain(Some(0)).collect();
-
-    // Pass the current working directory explicitly so that GUI terminal emulators
-    // (WezTerm, Windows Terminal) that re-read lpCurrentDirectory see the right path.
     let cwd_wide: Vec<u16> = cwd.as_os_str().encode_wide().chain(Some(0)).collect();
 
     let si = STARTUPINFOW {
@@ -774,18 +776,14 @@ fn launch_suspended(cwd: &std::path::Path, target_args: &[String]) -> Result<PRO
     let mut pi = PROCESS_INFORMATION::default();
 
     // SAFETY: cmdline_wide and cwd_wide are valid null-terminated UTF-16 strings.
-    //         si and pi are properly initialized structs.
-    //         None for application name means cmdline is used as-is.
     unsafe {
         CreateProcessW(
-            PCWSTR::null(),                                     // lpApplicationName
-            Some(windows::core::PWSTR(cmdline_wide.as_mut_ptr())), // lpCommandLine
-            None,                                               // process security
-            None,                                               // thread security
-            false,                                              // inherit handles
-            CREATE_SUSPENDED,                                   // creation flags
-            None,                                               // environment (inherit)
-            PCWSTR(cwd_wide.as_ptr()),                          // current directory (explicit)
+            PCWSTR::null(),
+            Some(windows::core::PWSTR(cmdline_wide.as_mut_ptr())),
+            None, None, false,
+            CREATE_SUSPENDED,
+            None,
+            PCWSTR(cwd_wide.as_ptr()),
             &si,
             &mut pi,
         )

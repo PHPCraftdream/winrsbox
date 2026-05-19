@@ -1062,9 +1062,61 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         // Network runtime enforcement: best-effort (ws2_32 may not be
         // loaded in target — only matters for net-using software).
         let _ = crate::net_hooks::install();
+
+        // Apply kernel-enforced process mitigations AFTER all hooks installed.
+        // SetProcessMitigationPolicy works on the current process, so it
+        // doesn't block our own hook.dll (already loaded), but subsequent
+        // DLL loads / code generation are restricted.
+        apply_mitigations(&guard);
     }
 
     Ok(())
+}
+
+/// Apply kernel-enforced process mitigations from within the sandboxed process.
+/// Called after all hooks are installed so our detour patching is already done.
+fn apply_mitigations(guard: &str) {
+    if guard == "none" {
+        return;
+    }
+    use winapi::um::processthreadsapi::SetProcessMitigationPolicy;
+    use winapi::um::winnt::PROCESS_MITIGATION_POLICY;
+
+    // ExtensionPointDisablePolicy (6): blocks AppInit_DLLs, SetWindowsHookEx, IFEO
+    // for all guard levels except none.
+    let ext_disable_flags: u32 = 1; // DisableExtensionPoints = bit 0
+    // SAFETY: ext_disable_flags is valid for PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY (4 bytes).
+    unsafe {
+        SetProcessMitigationPolicy(
+            6i32 as PROCESS_MITIGATION_POLICY, // ProcessExtensionPointDisablePolicy
+            &ext_disable_flags as *const u32 as *mut _,
+            std::mem::size_of::<u32>(),
+        );
+    }
+
+    if guard == "full" {
+        // DynamicCodePolicy (2): blocks RWX/JIT
+        let dyn_code_flags: u32 = 1; // ProhibitDynamicCode = bit 0
+        // SAFETY: same — 4-byte struct with Flags DWORD.
+        unsafe {
+            SetProcessMitigationPolicy(
+                2i32 as PROCESS_MITIGATION_POLICY, // ProcessDynamicCodePolicy
+                &dyn_code_flags as *const u32 as *mut _,
+                std::mem::size_of::<u32>(),
+            );
+        }
+
+        // SignaturePolicy (8): only Microsoft-signed DLLs (subsequent loads)
+        let sig_flags: u32 = 1; // MicrosoftSignedOnly = bit 0
+        // SAFETY: same — PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY (4 bytes).
+        unsafe {
+            SetProcessMitigationPolicy(
+                8i32 as PROCESS_MITIGATION_POLICY, // ProcessSignaturePolicy
+                &sig_flags as *const u32 as *mut _,
+                std::mem::size_of::<u32>(),
+            );
+        }
+    }
 }
 
 /// Disable all detours. Called from DllMain(DLL_PROCESS_DETACH).

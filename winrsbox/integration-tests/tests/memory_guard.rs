@@ -103,7 +103,7 @@ impl RunResult {
     }
 }
 
-fn run_payload(payload_name: &str, guard_none: bool) -> RunResult {
+fn run_payload(payload_name: &str, guard: &str) -> RunResult {
     // Clean up any leftover fallback logs
     let tmp = std::env::temp_dir();
     if let Ok(entries) = std::fs::read_dir(&tmp) {
@@ -123,8 +123,8 @@ fn run_payload(payload_name: &str, guard_none: bool) -> RunResult {
 
     let mut cmd = Command::new(&launcher);
     cmd.arg("-d");
-    if guard_none {
-        cmd.args(["--guard", "none"]);
+    if guard != "full" {
+        cmd.args(["--guard", guard]);
     }
     cmd.arg("--").arg(payload.to_str().unwrap());
     cmd.current_dir(&env.project_root);
@@ -148,7 +148,7 @@ fn run_payload(payload_name: &str, guard_none: bool) -> RunResult {
 
 macro_rules! assert_killed {
     ($name:expr, $kind:expr) => {{
-        let r = run_payload($name, false);
+        let r = run_payload($name, "full");
         assert!(!r.status.success(), "{} should have been killed\nstderr: {}", $name, r.stderr);
         let v = r.read_violations();
         assert!(v.contains($kind), "{}: violations should contain {}\nlog: {}\nstderr: {}", $name, $kind, v, r.stderr);
@@ -156,8 +156,8 @@ macro_rules! assert_killed {
 }
 
 macro_rules! assert_alive {
-    ($name:expr, $weak:expr) => {{
-        let r = run_payload($name, $weak);
+    ($name:expr, $guard:expr) => {{
+        let r = run_payload($name, $guard);
         assert!(r.status.success() || r.status.code() == Some(0),
             "{} should not be killed\nstdout: {}\nstderr: {}", $name, r.stdout, r.stderr);
         let v = r.read_violations();
@@ -171,7 +171,10 @@ macro_rules! assert_alive {
 #[test] fn strict_kills_stack_exec()     { assert_killed!("escape_stack_exec", "Protect"); }
 #[test]
 fn strict_kills_map_anon_rwx() {
-    let r = run_payload("escape_map_anon_rwx", false);
+    // Under full guard, kernel's DynamicCodePolicy blocks at kernel level — no
+    // violation IPC (our hook sees the NtMapViewOfSection fail). Under scan, our
+    // user-mode hook catches it.
+    let r = run_payload("escape_map_anon_rwx", "scan");
     assert!(!r.status.success(), "escape_map_anon_rwx should have been killed\nexit={:?}\nstdout: {}\nstderr: {}", r.status.code(), r.stdout, r.stderr);
     let v = r.read_violations();
     assert!(v.contains("MapView") || v.contains("Allocate"),
@@ -196,7 +199,7 @@ fn strict_kills_thread_hijack() { assert_killed!("escape_thread_hijack", "Contex
 
 #[test]
 fn strict_denies_reg_appinit_persistence() {
-    let r = run_payload("escape_reg_appinit", false);
+    let r = run_payload("escape_reg_appinit", "full");
     // Payload exits with code 5 (ERROR_ACCESS_DENIED) when registry write
     // is correctly denied by our hook+IPC.
     let stderr_lower = r.stderr.to_ascii_lowercase();
@@ -211,23 +214,23 @@ fn strict_denies_reg_appinit_persistence() {
 // Strict mode: clean payloads MUST NOT be terminated
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[test] fn strict_allows_clean_noop()    { assert_alive!("clean_noop", false); }
-#[test] fn strict_allows_normal_alloc()  { assert_alive!("clean_normal_alloc", false); }
+#[test] fn strict_allows_clean_noop()    { assert_alive!("clean_noop", "full"); }
+#[test] fn strict_allows_normal_alloc()  { assert_alive!("clean_normal_alloc", "full"); }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Weak mode: escape payloads should NOT be terminated
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[test] fn weak_allows_alloc_rwx()       { assert_alive!("escape_alloc_rwx", true); }
-#[test] fn weak_allows_jit_protect()     { assert_alive!("escape_jit_protect", true); }
+#[test] fn weak_allows_alloc_rwx()       { assert_alive!("escape_alloc_rwx", "none"); }
+#[test] fn weak_allows_jit_protect()     { assert_alive!("escape_jit_protect", "none"); }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Content-aware: clean JIT pattern MUST NOT be terminated
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[test] fn strict_allows_clean_jit()         { assert_alive!("clean_jit_pattern", false); }
-#[test] fn strict_allows_legit_unpacker()   { assert_alive!("legit_unpacker_sim", false); }
-#[test] fn strict_allows_legit_self_patch() { assert_alive!("legit_self_patching", false); }
+#[test] fn strict_allows_clean_jit()         { assert_alive!("clean_jit_pattern", "scan"); }
+#[test] fn strict_allows_legit_unpacker()   { assert_alive!("legit_unpacker_sim", "scan"); }
+#[test] fn strict_allows_legit_self_patch() { assert_alive!("legit_self_patching", "scan"); }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Content-aware: malicious unpacker MUST be terminated
@@ -246,7 +249,7 @@ fn strict_denies_reg_appinit_persistence() {
 
 #[test]
 fn pre_launch_refuses_static_syscall() {
-    let r = run_payload("escape_static_syscall", false);
+    let r = run_payload("escape_static_syscall", "full");
     assert!(!r.status.success(),
         "escape_static_syscall should be refused at launch\nstderr: {}", r.stderr);
     let v = r.read_violations();
@@ -257,14 +260,14 @@ fn pre_launch_refuses_static_syscall() {
 #[test]
 fn pre_launch_promotes_bypass_direct_syscall() {
     // Previously a known-limitation #[ignore]; pre-launch scan now catches it.
-    let r = run_payload("bypass_direct_syscall", false);
+    let r = run_payload("bypass_direct_syscall", "full");
     assert!(!r.status.success(),
         "bypass_direct_syscall must now be caught by pre-launch scan\nstderr: {}", r.stderr);
 }
 
 #[test]
 fn weak_mode_skips_pre_launch_scan() {
-    let r = run_payload("escape_static_syscall", true);
+    let r = run_payload("escape_static_syscall", "none");
     // With --weak, scan is skipped, payload runs (and the syscall itself
     // either returns an invalid SSN error or behaves OS-defined).
     assert!(r.status.success() || r.status.code() == Some(0),
