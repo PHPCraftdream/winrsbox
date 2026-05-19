@@ -24,8 +24,9 @@ pub fn start(
         })
         .build();
 
+    let session_name = format!("winrsbox-etw-{}", std::process::id());
     let (trace, _handle) = UserTrace::new()
-        .named("winrsbox-etw".to_string())
+        .named(session_name)
         .enable(provider)
         .start()
         .map_err(|e| format!("ETW start failed: {e:?}"))?;

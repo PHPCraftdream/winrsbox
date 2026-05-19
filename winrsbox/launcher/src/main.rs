@@ -411,6 +411,9 @@ async fn main() -> Result<()> {
     if cli.trace {
         std::env::set_var("FS_SANDBOX_TRACE", "1");
     }
+    if cli.block_localhost {
+        std::env::set_var("FS_SANDBOX_BLOCK_LOCALHOST", "1");
+    }
 
     // Trust-based guard level override: signed binaries get scan (JIT-friendly)
     // instead of full (kernel blocks JIT). Unsigned stays at user's chosen level.
