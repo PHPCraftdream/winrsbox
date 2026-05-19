@@ -143,6 +143,30 @@ fn bench_roundtrip_record_overlay(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_roundtrip_memory_violation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ipc_msg");
+    let msg = Req::MemoryViolation {
+        pid: 1234,
+        exe: r"c:\app\target.exe".into(),
+        kind: ipc::AllocKind::Allocate,
+        requested_protect: 0x40,
+        region_size: 4096,
+        target_address: 0x7ff800000000,
+        caller_pc: 0x7ff8a1234567,
+        caller_module: Some(r"c:\users\x\evil.dll".into()),
+        stack_top: vec![0x7ff8a1234567, 0x7ff8a1234568, 0x7ff8a1234569, 0x7ff8a123456a],
+    };
+    group.bench_function("roundtrip_memory_violation", |b| {
+        b.iter(|| {
+            let mut buf = Cursor::new(Vec::new());
+            write_msg(&mut buf, black_box(&msg)).unwrap();
+            buf.set_position(0);
+            let _: Req = read_msg(&mut buf).unwrap();
+        })
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_encode_decide,
@@ -153,5 +177,6 @@ criterion_group!(
     bench_roundtrip_hello,
     bench_roundtrip_spawned_child,
     bench_roundtrip_record_overlay,
+    bench_roundtrip_memory_violation,
 );
 criterion_main!(benches);

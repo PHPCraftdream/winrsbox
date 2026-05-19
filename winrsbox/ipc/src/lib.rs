@@ -10,6 +10,38 @@ pub const MAX_MSG_LEN: usize = 16 * 1024 * 1024;
 #[derive(Debug, Serialize, Deserialize)]
 pub enum LogLevel { Trace, Info, Warn, Error }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AllocKind {
+    Allocate,
+    Protect,
+    MapView,
+}
+
+impl std::fmt::Display for AllocKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Allocate => f.write_str("Allocate"),
+            Self::Protect => f.write_str("Protect"),
+            Self::MapView => f.write_str("MapView"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InjectKind {
+    CreateRemoteThread,
+    QueueApc,
+}
+
+impl std::fmt::Display for InjectKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreateRemoteThread => f.write_str("CreateRemoteThread"),
+            Self::QueueApc => f.write_str("QueueApc"),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Req {
     Hello { pid: u32, exe_path: String },
@@ -18,6 +50,32 @@ pub enum Req {
     RecordOverlay { orig: String, overlay: String },
     Log { pid: u32, level: LogLevel, msg: String },
     RegisterChild { pid: u32 },
+    InjectionViolation {
+        pid: u32,
+        exe: String,
+        kind: InjectKind,
+        target_pid: u32,
+        start_address: u64,
+        caller_pc: u64,
+        caller_module: Option<String>,
+        stack_top: Vec<u64>,
+    },
+    PreLaunchViolation {
+        launcher_pid: u32,
+        target_exe: String,
+        hits: Vec<(u64, String)>, // (offset, kind name)
+    },
+    MemoryViolation {
+        pid: u32,
+        exe: String,
+        kind: AllocKind,
+        requested_protect: u32,
+        region_size: u64,
+        target_address: u64,
+        caller_pc: u64,
+        caller_module: Option<String>,
+        stack_top: Vec<u64>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -229,6 +287,34 @@ mod tests {
         let dec: Resp = read_msg(&mut buf).unwrap();
         match dec {
             Resp::Err(e) => assert_eq!(e, "boom"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn req_memory_violation_roundtrip() {
+        let msg = Req::MemoryViolation {
+            pid: 123,
+            exe: r"c:\app.exe".into(),
+            kind: AllocKind::Allocate,
+            requested_protect: 0x40,
+            region_size: 4096,
+            target_address: 0x7ff800000000,
+            caller_pc: 0x7ff8a1234567,
+            caller_module: Some(r"c:\windows\system32\ntdll.dll".into()),
+            stack_top: vec![0x7ff8a1234567, 0x7ff8a1234568],
+        };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Req = read_msg(&mut buf).unwrap();
+        match dec {
+            Req::MemoryViolation { pid, kind, requested_protect, stack_top, .. } => {
+                assert_eq!(pid, 123);
+                assert_eq!(kind, AllocKind::Allocate);
+                assert_eq!(requested_protect, 0x40);
+                assert_eq!(stack_top.len(), 2);
+            }
             _ => panic!("wrong variant"),
         }
     }

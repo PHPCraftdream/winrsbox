@@ -1,5 +1,6 @@
 pub mod path;
 pub mod db;
+pub mod scan;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -14,6 +14,7 @@ widestring = { workspace = true }
 thiserror = "1"
 arc-swap = "1.9.1"
 rustc-hash.workspace = true
+iced-x86 = { version = "1", default-features = false, features = ["std", "decoder"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -28,4 +29,8 @@ harness = false
 
 [[bench]]
 name = "path"
+harness = false
+
+[[bench]]
+name = "scan"
 harness = false

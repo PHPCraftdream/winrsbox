@@ -70,6 +70,16 @@ rules: [
 ///   winrsbox --init                      (create state dir and exit)
 ///   winrsbox -- node app.js              (run node inside sandbox)
 ///   winrsbox -d wezterm                  (show console for debugging)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum GuardLevel {
+    /// No memory protection (FS sandbox only). Same as old --weak.
+    None,
+    /// Content-aware scan: allow executable memory, block direct syscalls in content.
+    Scan,
+    /// Full protection: scan + pre-launch .text scan + DLL .text scan.
+    Full,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "winrsbox",
@@ -87,6 +97,23 @@ struct Cli {
     /// and exit. No target executable is required.
     #[arg(short = 'i', long = "init")]
     init: bool,
+
+    /// Memory protection level.
+    ///   none  — no memory protection (FS sandbox only)
+    ///   scan  — content-aware: scan executable bytes for direct syscalls
+    ///   full  — scan + pre-launch .text scan + DLL scan (default)
+    #[arg(short = 'g', long = "guard", default_value = "full", value_name = "LEVEL")]
+    guard: GuardLevel,
+
+    /// Allow VirtualAlloc(PAGE_EXECUTE_READWRITE) from start.
+    /// Without this, RWX-from-start is blocked (matches W^X best practice).
+    /// Use for legacy packed software (old Themida 2.x).
+    #[arg(long = "allow-rwx")]
+    allow_rwx: bool,
+
+    /// Skip pre-launch .text scan of the target executable.
+    #[arg(long = "no-pre-scan")]
+    no_pre_scan: bool,
 
     /// Target executable followed by its arguments. Everything after `--`
     /// (or after the last launcher option) is forwarded verbatim.
@@ -207,15 +234,19 @@ async fn main() -> Result<()> {
     // Child PIDs registered from hook via IPC RegisterChild
     let child_pids: Arc<crossbeam_queue::SegQueue<u32>> = Arc::new(crossbeam_queue::SegQueue::new());
 
+    // Violations log path
+    let violations_log = cfg_path.parent().unwrap().join("violations.log");
+
     // ── Pipe server (accept loop in background task) ──────────────────────
     {
         let policy = Arc::clone(&policy);
         let stats = Arc::clone(&stats);
         let child_pids = Arc::clone(&child_pids);
         let pipe_name2 = pipe_name.clone();
+        let violations_log2 = violations_log.clone();
 
         tokio::spawn(async move {
-            pipe_accept_loop(&pipe_name2, policy, stats, child_pids).await;
+            pipe_accept_loop(&pipe_name2, policy, stats, child_pids, violations_log2).await;
         });
     }
 
@@ -233,8 +264,41 @@ async fn main() -> Result<()> {
     let cwd_str = project_root.to_string_lossy().into_owned();
     std::env::set_var("WEZTERM_EXECUTABLE_ARGS_CWD", &cwd_str);
     std::env::set_var("FS_SANDBOX_CWD", &cwd_str);
+    // Pass guard configuration to hook DLL via env vars
+    std::env::set_var("FS_SANDBOX_GUARD", match cli.guard {
+        GuardLevel::None => "none",
+        GuardLevel::Scan => "scan",
+        GuardLevel::Full => "full",
+    });
+    if cli.allow_rwx {
+        std::env::set_var("FS_SANDBOX_ALLOW_RWX", "1");
+    }
 
     let proc_info = launch_suspended(&project_root, &target_args)?;
+
+    // Pre-launch code integrity scan (full guard + not skipped).
+    if cli.guard == GuardLevel::Full && !cli.no_pre_scan {
+        if let Err(e) = pre_launch_scan(
+            proc_info.hProcess,
+            &target_args[0],
+            proc_info.dwProcessId,
+            &violations_log,
+        ) {
+            // SAFETY: proc_info.hProcess is valid PROCESS handle from CreateProcessW.
+            unsafe {
+                windows::Win32::System::Threading::TerminateProcess(
+                    proc_info.hProcess,
+                    0xC000_0005,
+                )
+                .ok();
+                CloseHandle(proc_info.hThread).ok();
+                CloseHandle(proc_info.hProcess).ok();
+            }
+            eprintln!("pre-launch scan refused target: {e}");
+            // Exit immediately — don't wait for tokio runtime drop (pipe accept loop blocks).
+            std::process::exit(0xC000_0005u32 as i32);
+        }
+    }
 
     // Inject hook.dll into target before resuming.
     inject_dll(proc_info.hProcess, &dll_path)?;
@@ -310,8 +374,9 @@ async fn main() -> Result<()> {
     unsafe { CloseHandle(target_handle).ok() };
 
     let s = &stats;
+    let viol = s.violations.load(Ordering::Relaxed);
     println!(
-        "\n[sandbox] exit={exit_code}  decide={} redirect={} deny={} mock={} cow={}",
+        "\n[sandbox] exit={exit_code}  decide={} redirect={} deny={} mock={} cow={} violations={viol}",
         s.decide.load(Ordering::Relaxed),
         s.redirect.load(Ordering::Relaxed),
         s.deny.load(Ordering::Relaxed),
@@ -335,6 +400,7 @@ async fn pipe_accept_loop(
     policy: Arc<Policy>,
     stats: Arc<Stats>,
     child_pids: Arc<crossbeam_queue::SegQueue<u32>>,
+    violations_log: PathBuf,
 ) {
     let pipe_name_wide: Vec<u16> = OsStr::new(pipe_name)
         .encode_wide()
@@ -405,13 +471,14 @@ async fn pipe_accept_loop(
         let policy = Arc::clone(&policy);
         let stats = Arc::clone(&stats);
         let child_pids = Arc::clone(&child_pids);
+        let vlog = violations_log.clone();
 
         // Intentional fire-and-forget: spawn_blocking tasks run to completion even
         // after JoinHandle is dropped — they are not cancelled.
         tokio::task::spawn_blocking(move || {
             // SAFETY: ph is the isize repr of the valid pipe handle for this connection.
             let h = HANDLE(ph as *mut _);
-            handle_connection(h, &policy, &stats, &child_pids);
+            handle_connection(h, &policy, &stats, &child_pids, &vlog);
             // SAFETY: h — disconnect and close after the connection handler finishes.
             unsafe { DisconnectNamedPipe(h).ok() };
             unsafe { CloseHandle(h).ok() };
@@ -424,6 +491,7 @@ fn handle_connection(
     policy: &Policy,
     stats: &Stats,
     child_pids: &crossbeam_queue::SegQueue<u32>,
+    violations_log: &Path,
 ) {
     use std::os::windows::io::{FromRawHandle, RawHandle};
 
@@ -522,6 +590,67 @@ fn handle_connection(
             Req::RegisterChild { pid } => {
                 println!("[sandbox] child registered: pid={pid}");
                 child_pids.push(pid);
+                Resp::Ok
+            }
+            Req::PreLaunchViolation { launcher_pid: _, target_exe: _, hits: _ } => {
+                // Launcher emits this directly to violations.log; this variant
+                // exists only for IPC schema completeness. If a hook DLL ever
+                // sends one (it shouldn't), just log and ack.
+                stats.violations.fetch_add(1, Ordering::Relaxed);
+                Resp::Ok
+            }
+            Req::InjectionViolation {
+                pid, exe, kind, target_pid, start_address,
+                caller_pc, caller_module, stack_top,
+            } => {
+                stats.violations.fetch_add(1, Ordering::Relaxed);
+                let caller_str = caller_module.as_deref().unwrap_or("<anonymous>");
+                eprintln!(
+                    "[VIOLATION] pid={pid} kind={kind} target_pid={target_pid} caller={caller_str} pc=0x{caller_pc:x}",
+                );
+                let stack_json: Vec<String> = stack_top.iter().map(|f| format!("\"0x{f:x}\"")).collect();
+                let line = format!(
+                    "{{\"pid\":{pid},\"exe\":\"{}\",\"kind\":\"{kind}\",\"target_pid\":{target_pid},\"start_addr\":\"0x{start_address:x}\",\"caller_pc\":\"0x{caller_pc:x}\",\"caller_module\":{},\"stack\":[{}]}}\n",
+                    exe.replace('\\', "\\\\").replace('"', "\\\""),
+                    match &caller_module {
+                        Some(m) => format!("\"{}\"", m.replace('\\', "\\\\").replace('"', "\\\"")),
+                        None => "null".to_string(),
+                    },
+                    stack_json.join(","),
+                );
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true).open(violations_log)
+                {
+                    let _ = f.write_all(line.as_bytes());
+                }
+                Resp::Ok
+            }
+            Req::MemoryViolation {
+                pid, exe, kind, requested_protect, region_size,
+                target_address, caller_pc, caller_module, stack_top,
+            } => {
+                stats.violations.fetch_add(1, Ordering::Relaxed);
+                let caller_str = caller_module.as_deref().unwrap_or("<anonymous>");
+                eprintln!(
+                    "[VIOLATION] pid={pid} kind={kind} protect=0x{requested_protect:x} caller={caller_str} pc=0x{caller_pc:x}",
+                );
+                let stack_json: Vec<String> = stack_top.iter().map(|f| format!("\"0x{f:x}\"")).collect();
+                let line = format!(
+                    "{{\"pid\":{pid},\"exe\":\"{}\",\"kind\":\"{kind}\",\"protect\":\"0x{requested_protect:x}\",\"size\":{region_size},\"addr\":\"0x{target_address:x}\",\"caller_pc\":\"0x{caller_pc:x}\",\"caller_module\":{},\"stack\":[{}]}}\n",
+                    exe.replace('\\', "\\\\").replace('"', "\\\""),
+                    match &caller_module {
+                        Some(m) => format!("\"{}\"", m.replace('\\', "\\\\").replace('"', "\\\"")),
+                        None => "null".to_string(),
+                    },
+                    stack_json.join(","),
+                );
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true).open(violations_log)
+                {
+                    let _ = f.write_all(line.as_bytes());
+                }
                 Resp::Ok
             }
         };
@@ -672,6 +801,163 @@ fn inject_dll(process: HANDLE, dll_path: &str) -> Result<()> {
     Ok(())
 }
 
+// ─── Pre-launch code integrity scan ──────────────────────────────────────────
+
+/// Scan the main exe's .text section for direct syscall instructions before
+/// resuming the child process. Returns Err if syscall instructions are found.
+fn pre_launch_scan(
+    process: HANDLE,
+    target_exe: &str,
+    target_pid: u32,
+    violations_log: &Path,
+) -> Result<()> {
+    let image_base = get_image_base(process).context("get image base")?;
+    if image_base == 0 {
+        anyhow::bail!("image base is null");
+    }
+
+    // Read PE headers (4 KiB is enough for DOS + NT + section table)
+    let mut pe_headers = vec![0u8; 4096];
+    read_remote_memory(process, image_base, &mut pe_headers)
+        .context("read PE headers")?;
+    let text = policy::scan::pe_text_section(&pe_headers)
+        .context("no .text section in PE")?;
+
+    // Cap to a sane size to avoid pathological inputs
+    let scan_size = (text.virtual_size as usize).min(64 * 1024 * 1024);
+    let mut text_bytes = vec![0u8; scan_size];
+    read_remote_memory(
+        process,
+        image_base + text.virtual_address as usize,
+        &mut text_bytes,
+    )
+    .context("read .text section")?;
+
+    let text_base = (image_base + text.virtual_address as usize) as u64;
+    let hits = policy::scan::find_direct_syscalls(&text_bytes, text_base);
+    if hits.is_empty() {
+        return Ok(());
+    }
+
+    // Log violation
+    log_pre_launch_violation(violations_log, target_pid, target_exe, &hits);
+    eprintln!(
+        "[VIOLATION] pre-launch scan: {} direct syscall(s) in {} (.text)",
+        hits.len(),
+        target_exe,
+    );
+    for h in hits.iter().take(5) {
+        eprintln!("  - {} at offset 0x{:x}", h.kind, h.offset);
+    }
+    anyhow::bail!("direct syscall instructions found in target .text");
+}
+
+fn log_pre_launch_violation(
+    log_path: &Path,
+    target_pid: u32,
+    target_exe: &str,
+    hits: &[policy::scan::SyscallHit],
+) {
+    use std::io::Write;
+    let hit_json: Vec<String> = hits
+        .iter()
+        .map(|h| format!("[\"0x{:x}\",\"{}\"]", h.offset, h.kind))
+        .collect();
+    let line = format!(
+        "{{\"kind\":\"PreLaunchViolation\",\"target_pid\":{target_pid},\"target_exe\":\"{}\",\"hit_count\":{},\"hits\":[{}]}}\n",
+        target_exe.replace('\\', "\\\\").replace('"', "\\\""),
+        hits.len(),
+        hit_json.join(","),
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Get the image base address of the main executable in the target process.
+/// Reads PEB.ImageBaseAddress (offset 0x10 on x64).
+fn get_image_base(process: HANDLE) -> Result<usize> {
+    // NtQueryInformationProcess(ProcessBasicInformation = 0)
+    // Returns PROCESS_BASIC_INFORMATION; PebBaseAddress is at offset 0x08.
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessBasicInformation {
+        exit_status: i32,
+        _pad0: u32,
+        peb_base_address: usize,
+        affinity_mask: usize,
+        base_priority: i32,
+        _pad1: u32,
+        unique_process_id: usize,
+        inherited_from_unique_process_id: usize,
+    }
+
+    // Resolve NtQueryInformationProcess from ntdll
+    type FnNtQueryInformationProcess = unsafe extern "system" fn(
+        HANDLE, u32, *mut core::ffi::c_void, u32, *mut u32,
+    ) -> i32;
+
+    let ntdll: Vec<u16> = OsStr::new("ntdll.dll").encode_wide().chain(Some(0)).collect();
+    // SAFETY: ntdll is always loaded.
+    let hmod = unsafe { GetModuleHandleW(PCWSTR(ntdll.as_ptr()))? };
+    // SAFETY: hmod is valid; literal ASCII null-terminated name.
+    let proc_addr = unsafe {
+        GetProcAddress(hmod, windows::core::s!("NtQueryInformationProcess"))
+    }
+    .context("NtQueryInformationProcess not found")?;
+    // SAFETY: proc_addr is the real NtQueryInformationProcess export.
+    let nt_query: FnNtQueryInformationProcess =
+        unsafe { std::mem::transmute(proc_addr) };
+
+    let mut info = ProcessBasicInformation::default();
+    let mut ret_len: u32 = 0;
+    // SAFETY: info is valid for size_of writes; process is a valid handle.
+    let status = unsafe {
+        nt_query(
+            process,
+            0,
+            &mut info as *mut _ as *mut _,
+            std::mem::size_of::<ProcessBasicInformation>() as u32,
+            &mut ret_len,
+        )
+    };
+    if status < 0 {
+        anyhow::bail!("NtQueryInformationProcess failed: 0x{status:x}");
+    }
+    if info.peb_base_address == 0 {
+        anyhow::bail!("PEB base address is null");
+    }
+
+    // Read ImageBaseAddress at PEB + 0x10 (x64)
+    let mut image_base_bytes = [0u8; 8];
+    read_remote_memory(process, info.peb_base_address + 0x10, &mut image_base_bytes)
+        .context("read PEB.ImageBaseAddress")?;
+    Ok(usize::from_le_bytes(image_base_bytes))
+}
+
+fn read_remote_memory(process: HANDLE, addr: usize, buf: &mut [u8]) -> Result<()> {
+    let mut read: usize = 0;
+    // SAFETY: process is valid; buf is valid for buf.len() writes.
+    let ok = unsafe {
+        windows::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+            process,
+            addr as *const _,
+            buf.as_mut_ptr() as *mut _,
+            buf.len(),
+            Some(&mut read),
+        )
+    };
+    ok.context("ReadProcessMemory failed")?;
+    if read != buf.len() {
+        anyhow::bail!("short read: {read} of {}", buf.len());
+    }
+    Ok(())
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Hide the console window unconditionally unless -d is set. Called once at
@@ -775,6 +1061,7 @@ struct Stats {
     deny: AtomicU64,
     mock_: AtomicU64,
     cow: AtomicU64,
+    violations: AtomicU64,
 }
 
 #[cfg(test)]

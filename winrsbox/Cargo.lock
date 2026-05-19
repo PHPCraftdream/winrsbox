@@ -641,6 +641,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "iced-x86"
+version = "1.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c447cff8c7f384a7d4f741cfcff32f75f3ad02b406432e8d6c878d56b1edf6b"
+dependencies = [
+ "lazy_static",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -657,11 +666,13 @@ name = "integration-tests"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "ntapi",
  "policy",
  "predicates",
  "pretty_assertions",
  "serde_json",
  "tempfile",
+ "winapi",
  "winrsbox",
 ]
 
@@ -927,6 +938,7 @@ dependencies = [
  "arc-swap",
  "bincode",
  "criterion",
+ "iced-x86",
  "ktav",
  "pretty_assertions",
  "proptest",

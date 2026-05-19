@@ -24,6 +24,8 @@ winapi     = { version = "0.3", features = [
     "synchapi",
     "fileapi",
     "processenv",
+    "debugapi",
+    "psapi",
 ] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 once_cell  = "1"
@@ -43,4 +45,8 @@ harness = false
 
 [[bench]]
 name = "is_write"
+harness = false
+
+[[bench]]
+name = "memory_guard"
 harness = false

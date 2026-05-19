@@ -15,6 +15,8 @@ mod anti_rec;
 pub mod cache;
 pub mod hooks;
 mod inject;
+pub mod inject_guard;
+pub mod memory_guard;
 
 #[cfg(not(test))]
 use winapi::shared::minwindef::{BOOL, DWORD, HINSTANCE, LPVOID, TRUE, FALSE};
