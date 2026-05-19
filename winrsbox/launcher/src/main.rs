@@ -312,10 +312,29 @@ async fn main() -> Result<()> {
         std::env::set_var("FS_SANDBOX_ALLOW_RWX", "1");
     }
 
-    let proc_info = launch_suspended(&project_root, &target_args, cli.guard)?;
+    // Trust-based guard level override: signed binaries get scan (JIT-friendly)
+    // instead of full (kernel blocks JIT). Unsigned stays at user's chosen level.
+    let effective_guard = if cli.guard == GuardLevel::Full {
+        let trust = winrsbox::trust::verify_signature(std::path::Path::new(&target_args[0]));
+        if trust.is_trusted() {
+            if let winrsbox::trust::TrustLevel::Signed { ref publisher } = trust {
+                println!("[sandbox] trust: signed by \"{publisher}\" → scan mode (JIT-friendly)");
+            }
+            // Override FS_SANDBOX_GUARD so hook.dll uses scan too
+            std::env::set_var("FS_SANDBOX_GUARD", "scan");
+            GuardLevel::Scan
+        } else {
+            println!("[sandbox] trust: unsigned → full mode (kernel mitigations)");
+            cli.guard
+        }
+    } else {
+        cli.guard
+    };
+
+    let proc_info = launch_suspended(&project_root, &target_args, effective_guard)?;
 
     // Pre-launch code integrity scan (full guard + not skipped).
-    if cli.guard == GuardLevel::Full && !cli.no_pre_scan {
+    if effective_guard == GuardLevel::Full && !cli.no_pre_scan {
         if let Err(e) = pre_launch_scan(
             proc_info.hProcess,
             &target_args[0],
