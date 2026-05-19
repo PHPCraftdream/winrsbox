@@ -39,13 +39,19 @@ pub fn nt_to_device_path(raw: &[u16]) -> Option<String> {
 
 pub fn classify_device(path: &str) -> DeviceKind {
     let lower = path.to_lowercase();
+    // Block volume shadow copies — give access to historical file versions
+    // bypassing current-state deny rules. \Device\HarddiskVolumeShadowCopyN\
+    if lower.contains("shadowcopy") { return DeviceKind::Unknown; }
     if lower.starts_with(r"device\harddiskvolume") { return DeviceKind::HarddiskVolume; }
     if lower.starts_with(r"\device\harddiskvolume") { return DeviceKind::HarddiskVolume; }
     // Named pipes: full form `\Device\NamedPipe\…` and DOS-form short `pipe\…`
-    // (Win32 layer translates `\\.\pipe\name` to `\Device\NamedPipe\name`, but
-    // some callers open via `\??\pipe\name` directly → "pipe\name" after strip).
-    if lower.contains(r"namedpipe") || lower.contains(r"named_pipe") { return DeviceKind::NamedPipe; }
-    if lower.starts_with(r"pipe\") || lower.starts_with(r"\pipe\") { return DeviceKind::NamedPipe; }
+    if lower.contains(r"namedpipe") || lower.contains(r"named_pipe")
+        || lower.starts_with(r"pipe\") || lower.starts_with(r"\pipe\")
+    {
+        // Block pipes to dangerous RPC services (SCM, Task Scheduler, PsExec)
+        if is_dangerous_pipe(&lower) { return DeviceKind::Unknown; }
+        return DeviceKind::NamedPipe;
+    }
     if lower.starts_with(r"device\afd") || lower.starts_with(r"\device\afd") { return DeviceKind::Socket; }
     if lower.starts_with(r"device\tcp") || lower.starts_with(r"\device\tcp") { return DeviceKind::Socket; }
     if lower.starts_with(r"device\udp") || lower.starts_with(r"\device\udp") { return DeviceKind::Socket; }
@@ -74,6 +80,18 @@ pub fn classify_device(path: &str) -> DeviceKind {
         }
     }
     DeviceKind::Unknown
+}
+
+/// Pipes that give access to dangerous system services.
+fn is_dangerous_pipe(lower_path: &str) -> bool {
+    const DANGEROUS_PIPES: &[&str] = &[
+        "svcctl",       // Service Control Manager → start/stop services
+        "atsvc",        // Task Scheduler → create scheduled tasks
+        "psexesvc",     // PsExec remote execution
+        "srvsvc",       // Server service → share management
+        "winreg",       // Remote registry access
+    ];
+    DANGEROUS_PIPES.iter().any(|&p| lower_path.contains(p))
 }
 
 pub fn is_safe_default(kind: DeviceKind) -> bool {
@@ -188,6 +206,23 @@ mod tests {
     fn classify_unknown() {
         assert_eq!(classify_device(r"\device\cldflt"), DeviceKind::Unknown);
         assert_eq!(classify_device(r"device\physicaldrive0"), DeviceKind::Unknown);
+    }
+
+    #[test]
+    fn dangerous_pipes_blocked() {
+        assert_eq!(classify_device(r"\device\namedpipe\svcctl"), DeviceKind::Unknown);
+        assert_eq!(classify_device(r"pipe\atsvc"), DeviceKind::Unknown);
+        assert_eq!(classify_device(r"\device\namedpipe\psexesvc"), DeviceKind::Unknown);
+        // Safe pipes still allowed
+        assert_eq!(classify_device(r"\device\namedpipe\lsarpc"), DeviceKind::NamedPipe);
+        assert_eq!(classify_device(r"pipe\fs-sandbox-1234"), DeviceKind::NamedPipe);
+    }
+
+    #[test]
+    fn classify_shadow_copy_blocked() {
+        assert_eq!(classify_device(r"\device\harddiskvolumeshadowcopy3"), DeviceKind::Unknown);
+        assert_eq!(classify_device(r"device\harddiskvolumeshadowcopy1\windows\system32"), DeviceKind::Unknown);
+        assert!(!is_safe_default(DeviceKind::Unknown));
     }
 
     #[test]

@@ -102,9 +102,14 @@ this is an open gap.
 | WFP registers 0 filters on some configs | ~~High~~ | **Fixed**: wrong condition key + missing sublayer/display |
 | Direct AFD IOCTL bypasses ws2_32 hook | Medium | **Mitigated**: WFP now active (3 RFC1918 filters), kernel-level enforcement |
 | DFS UNC exfiltration | ~~Medium~~ | **Fixed**: WFP blocks TCP ports 445 (SMB) and 139 (NetBIOS) |
-| ETW behavioral detection not wired | Low | P3.1 |
-| Registry CoW (only deny-list) | Medium | P3.2 |
-| cmd.exe /c doesn't work in sandbox | Low | Known limitation |
+| Junction/symlink/hardlink bypass | ~~High~~ | **Fixed**: link_guard blocks NtFsControlFile + NtSetInformationFile |
+| COM/RPC/WMI escape | ~~High~~ | **Fixed**: alpc_guard blocks COM activation ALPC ports |
+| Dangerous named pipes (SCM, TaskSched) | ~~Medium~~ | **Fixed**: pipe name deny-list in classify_device |
+| Volume shadow copies | ~~Medium~~ | **Fixed**: shadowcopy paths classified as Unknown (blocked) |
+| Privilege escalation | ~~Low~~ | **Fixed**: token_guard blocks dangerous NtAdjustPrivilegesToken |
+| ETW behavioral detection not wired | ~~Low~~ | **Fixed**: ETW Kernel-Process listener active |
+| Registry CoW (only deny-list) | Low | P3.2 (silent_ok for HKCU\Software writes) |
+| cmd.exe /c doesn't work in sandbox | Low | Known limitation (DllMain injection) |
 | NtAllocateVirtualMemory uses manual hook | Info | detour2 trampoline bug; manual hook works correctly |
 
 ## Defense in depth (layers)

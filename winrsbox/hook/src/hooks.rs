@@ -1092,6 +1092,9 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         if !skip("alpc") {
             let _ = crate::alpc_guard::install();
         }
+        if !skip("token") {
+            let _ = crate::token_guard::install();
+        }
 
         if !skip("mitigations") {
             apply_mitigations(&guard);
@@ -1156,6 +1159,7 @@ fn apply_mitigations(guard: &str) {
 /// Must be called on DLL_PROCESS_DETACH only. Errors are ignored because
 /// the process is tearing down.
 pub unsafe fn uninstall_hooks() {
+    crate::token_guard::uninstall();
     crate::alpc_guard::uninstall();
     crate::link_guard::uninstall();
     crate::net_hooks::uninstall();
