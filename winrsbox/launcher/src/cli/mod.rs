@@ -10,6 +10,7 @@ pub mod regmock;
 pub mod regdefaults;
 pub mod regwhy;
 pub mod devrule;
+pub mod netrule;
 pub mod shell;
 
 use anyhow::Result;
@@ -24,7 +25,7 @@ pub const EXIT_CONFLICT: i32 = 3;
 pub const SUBCOMMANDS: &[&str] = &[
     "rule", "mock", "mockdir", "defaults", "why", "what-if", "export", "import",
     "regrule", "regmock", "regdefaults", "regwhy",
-    "devrule",
+    "devrule", "netrule",
     "shell",
 ];
 
@@ -50,6 +51,9 @@ SUBCOMMANDS:
 
 EXPLORER INTEGRATION:
   shell      Install/uninstall Explorer right-click context menu entries
+
+NETWORK SANDBOX:
+  netrule    Add, remove, list, or clear network access rules (host+port)
 
 DEVICE SANDBOX:
   devrule    Add, remove, list, or clear device access rules (deny-by-default)
@@ -100,6 +104,7 @@ pub fn run_cli(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         "regdefaults" => regdefaults::run(rest, state_dir),
         "regwhy" => regwhy::run(rest, state_dir),
         "devrule" => devrule::run(rest, state_dir),
+        "netrule" => netrule::run(rest, state_dir),
         "shell" => shell::run(rest),
         _ => anyhow::bail!("unknown subcommand '{}'. Run 'winrsbox --help' for usage.", cmd),
     }
