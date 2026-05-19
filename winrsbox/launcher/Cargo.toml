@@ -32,7 +32,11 @@ windows = { version = "0.61", features = [
     "Win32_System_Console",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_JobObjects",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_System_Rpc",
+    "Wdk_NetworkManagement_WindowsFilteringPlatform",
 ] }
+windows-targets = "0.52"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
@@ -60,4 +64,8 @@ harness = false
 
 [[bench]]
 name = "etw"
+harness = false
+
+[[bench]]
+name = "wfp"
 harness = false

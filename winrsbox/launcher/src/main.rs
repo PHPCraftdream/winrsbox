@@ -376,6 +376,29 @@ async fn main() -> Result<()> {
         job // hold handle alive
     };
 
+    // WFP kernel-level network filtering (best-effort — needs fwpuclnt.dll).
+    let _wfp = if cli.guard != GuardLevel::None {
+        match winrsbox::wfp::WfpEngine::open() {
+            Ok(mut engine) => {
+                let target_path = std::path::Path::new(&target_args[0]);
+                // Block lateral movement to RFC1918 private ranges
+                for cidr_str in winrsbox::wfp::RFC1918 {
+                    if let Some(cidr) = winrsbox::wfp::CidrV4::parse(cidr_str) {
+                        let _ = engine.block_outbound_cidr(target_path, &cidr);
+                    }
+                }
+                println!("[sandbox] WFP: {} outbound filters registered", engine.filter_count());
+                Some(engine)
+            }
+            Err(e) => {
+                eprintln!("[sandbox] WFP unavailable: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Resume target main thread.
     // SAFETY: proc_info.hThread is valid for the lifetime of the child process;
     //         it was returned by CreateProcessW and has not yet been closed.

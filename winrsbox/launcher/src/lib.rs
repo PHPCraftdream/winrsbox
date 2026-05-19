@@ -5,3 +5,4 @@ pub mod cli;
 pub mod etw;
 pub mod jobctl;
 pub mod mitigations;
+pub mod wfp;
