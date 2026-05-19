@@ -7,6 +7,9 @@ pub const MOCKS: TableDefinition<&str, &[u8]> = TableDefinition::new("mocks");
 pub const MOCK_DIRS: TableDefinition<&str, ()> = TableDefinition::new("mock_dirs");
 pub const OVERLAY_IDX: TableDefinition<&str, &str> = TableDefinition::new("overlay_idx");
 
+pub const REG_RULES: TableDefinition<&str, &[u8]> = TableDefinition::new("reg_rules");
+pub const REG_MOCKS: TableDefinition<&str, &[u8]> = TableDefinition::new("reg_mocks");
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum RuleMode { Passthrough, Deny, Cow, Redirect }
 
@@ -1043,4 +1046,82 @@ rules: [
         let rule = best_rule_match(&txn, r"c:\test\file", None, None).unwrap();
         assert!(matches!(rule.mode_read, RuleMode::Deny));
     }
+}
+
+// ─── Registry CRUD ───────────────────────────────────────────────────────────
+
+pub fn reg_rule_upsert(db: &redb::Database, row: &RuleRow) -> Result<(), crate::PolicyError> {
+    let enc = bincode::serde::encode_to_vec(row, bincode::config::standard())
+        .map_err(|e| crate::PolicyError::Ktav(format!("serialize: {e}")))?;
+    let txn = db.begin_write()?;
+    { let mut t = txn.open_table(REG_RULES)?; t.insert(row.prefix.as_str(), enc.as_slice())?; }
+    txn.commit()?;
+    Ok(())
+}
+
+pub fn reg_rule_remove_by_id(db: &redb::Database, id: &str) -> Result<bool, crate::PolicyError> {
+    let txn = db.begin_write()?;
+    let mut found = false;
+    {
+        let mut t = txn.open_table(REG_RULES)?;
+        let keys: Vec<String> = t.range::<&str>(..)?.filter_map(|r| r.ok())
+            .filter_map(|(k, v)| {
+                let row = decode_rule(v.value())?;
+                if row.id == id { Some(k.value().to_owned()) } else { None }
+            }).collect();
+        for k in keys { t.remove(k.as_str())?; found = true; }
+    }
+    txn.commit()?;
+    Ok(found)
+}
+
+pub fn reg_rule_list(db: &redb::Database) -> Result<Vec<RuleRow>, crate::PolicyError> {
+    let txn = db.begin_read()?;
+    let t = txn.open_table(REG_RULES)?;
+    let mut out = Vec::new();
+    for entry in t.range::<&str>(..)?.flatten() {
+        let (_, v) = entry;
+        if let Some(row) = decode_rule(v.value()) {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+pub fn reg_rule_clear(db: &redb::Database) -> Result<(), crate::PolicyError> {
+    let txn = db.begin_write()?;
+    {
+        let mut t = txn.open_table(REG_RULES)?;
+        let keys: Vec<String> = t.range::<&str>(..)?.filter_map(|r| r.ok())
+            .map(|(k, _)| k.value().to_owned()).collect();
+        for k in keys { t.remove(k.as_str())?; }
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+pub fn reg_mock_upsert(db: &redb::Database, path: &str, payload: &[u8]) -> Result<(), crate::PolicyError> {
+    let txn = db.begin_write()?;
+    { let mut t = txn.open_table(REG_MOCKS)?; t.insert(path, payload)?; }
+    txn.commit()?;
+    Ok(())
+}
+
+pub fn reg_mock_remove(db: &redb::Database, path: &str) -> Result<bool, crate::PolicyError> {
+    let txn = db.begin_write()?;
+    let removed;
+    { let mut t = txn.open_table(REG_MOCKS)?; removed = t.remove(path)?.is_some(); }
+    txn.commit()?;
+    Ok(removed)
+}
+
+pub fn reg_mock_list(db: &redb::Database) -> Result<Vec<(String, Vec<u8>)>, crate::PolicyError> {
+    let txn = db.begin_read()?;
+    let t = txn.open_table(REG_MOCKS)?;
+    let mut out = Vec::new();
+    for entry in t.range::<&str>(..)?.flatten() {
+        let (k, v) = entry;
+        out.push((k.value().to_owned(), v.value().to_vec()));
+    }
+    Ok(out)
 }
