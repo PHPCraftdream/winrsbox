@@ -368,3 +368,17 @@ fn strict_blocks_systemquery_write() {
     assert!(r.stderr.contains("blocked"),
         "stderr should contain 'blocked'\nstderr: {}", r.stderr);
 }
+
+#[test]
+#[serial]
+fn wfp_blocks_afd_direct() {
+    // escape_afd_direct tries TCP connect to 10.0.0.1:80 via ws2_32.
+    // WFP blocks RFC1918 at kernel level → connect fails or times out.
+    // Exit code: 5 (WSAEACCES/blocked), 1 (other error), or 2 (timeout).
+    // All non-zero codes mean the attack did NOT succeed.
+    let r = run_payload("escape_afd_direct", "scan");
+    assert!(
+        !r.status.success() || r.stderr.contains("blocked"),
+        "escape_afd_direct should not connect to RFC1918\nstderr: {}", r.stderr,
+    );
+}

@@ -212,6 +212,11 @@ struct Cli {
     #[arg(long = "trace")]
     trace: bool,
 
+    /// JSONL log verbosity: error (violations only), warn (denies), info (default),
+    /// trace (all decides). Lower levels include higher ones.
+    #[arg(long = "log-level", default_value = "info", value_name = "LEVEL")]
+    log_level: String,
+
     /// Per-process memory limit in gigabytes (applied via Job Object).
     #[arg(long = "memory-limit", value_name = "GB")]
     memory_limit: Option<u64>,
@@ -348,7 +353,7 @@ async fn main() -> Result<()> {
     let violations_log = cfg_path.parent().unwrap().join("violations.log");
 
     // JSONL structured log — persistent, machine-parseable
-    jsonl_log::init(cfg_path.parent().unwrap().join("sandbox.log.jsonl"));
+    jsonl_log::init(cfg_path.parent().unwrap().join("sandbox.log.jsonl"), &cli.log_level);
 
     // Hot-stats: aggregates access patterns, flushed to disk at most once per 5s.
     let hot_stats = HotStats::new();

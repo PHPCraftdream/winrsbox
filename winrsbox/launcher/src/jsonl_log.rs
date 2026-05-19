@@ -16,12 +16,34 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_BUFFER: usize = 256;
 
 static LOGGER: std::sync::OnceLock<JsonlLogger> = std::sync::OnceLock::new();
+static LOG_LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2); // info
 
-pub fn init(log_path: PathBuf) {
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum LogLevel {
+    Error = 0,
+    Warn = 1,
+    Info = 2,
+    Trace = 3,
+}
+
+pub fn init(log_path: PathBuf, level: &str) {
+    let lvl = match level.to_ascii_lowercase().as_str() {
+        "error" => LogLevel::Error,
+        "warn" => LogLevel::Warn,
+        "trace" => LogLevel::Trace,
+        _ => LogLevel::Info,
+    };
+    LOG_LEVEL.store(lvl as u8, std::sync::atomic::Ordering::Relaxed);
     let _ = LOGGER.set(JsonlLogger::new(log_path));
 }
 
+fn level_enabled(level: LogLevel) -> bool {
+    level as u8 <= LOG_LEVEL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn log(event: Event) {
+    if !level_enabled(event.level()) { return; }
     if let Some(logger) = LOGGER.get() {
         logger.push(event);
     }
@@ -157,6 +179,16 @@ pub enum Event {
 }
 
 impl Event {
+    pub fn level(&self) -> LogLevel {
+        match self {
+            Event::Violation { .. } => LogLevel::Error,
+            Event::Deny { .. } | Event::DenyDevice { .. } => LogLevel::Warn,
+            Event::Hello { .. } | Event::Child { .. } | Event::Wfp { .. } | Event::Exit { .. }
+            | Event::RegDecide { .. } | Event::NetDecide { .. } => LogLevel::Info,
+            Event::Decide { .. } => LogLevel::Trace,
+        }
+    }
+
     pub fn hello(pid: u32, exe: &str) -> Self {
         Self::Hello { ts: ts(), pid, exe: exe.to_string() }
     }
