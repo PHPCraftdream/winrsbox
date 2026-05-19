@@ -8,6 +8,7 @@ pub mod export;
 pub mod regrule;
 pub mod regmock;
 pub mod regdefaults;
+pub mod regwhy;
 
 use anyhow::Result;
 
@@ -40,8 +41,14 @@ SUBCOMMANDS:
   defaults   Set or show default read/write policy modes
   why        Simulate a path lookup — show decision, target path, and rule chain
   what-if    Test a hypothetical rule change without mutating state
-  export     Dump current state as JSON to stdout
+  export     Dump current state as JSON to stdout (filesystem + registry)
   import     Load state from JSON stdin (merge or --replace) or --ktav file
+
+REGISTRY SANDBOX:
+  regrule    Add, remove, list, or clear registry sandbox rules
+  regmock    Add, remove, or list registry value mocks
+  regdefaults Set or show default registry read/write policy modes
+  regwhy     Simulate a registry key lookup — show decision and source
 
 GLOBAL OPTIONS:
   --state-dir=PATH   Override state directory (default: auto-discover)
@@ -81,6 +88,7 @@ pub fn run_cli(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         "regrule" => regrule::run(rest, state_dir),
         "regmock" => regmock::run(rest, state_dir),
         "regdefaults" => regdefaults::run(rest, state_dir),
+        "regwhy" => regwhy::run(rest, state_dir),
         _ => anyhow::bail!("unknown subcommand '{}'. Run 'winrsbox --help' for usage.", cmd),
     }
 }

@@ -72,6 +72,15 @@ pub fn run_export(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         "mockdirs": mockdirs.iter().map(|d| serde_json::json!({
             "prefix": d,
         })).collect::<Vec<_>>(),
+        "reg_rules": policy::db::reg_rule_list(&db)?.iter().map(|r| serde_json::json!({
+            "id": r.id, "prefix": r.prefix,
+            "read": policy::db::mode_to_string(r.mode_read),
+            "write": policy::db::mode_to_string(r.mode_write),
+            "when": r.when.as_ref().map(|w| serde_json::json!({"depth": w.depth, "exe": w.exe})),
+        })).collect::<Vec<_>>(),
+        "reg_mocks": policy::db::reg_mock_list(&db)?.iter().map(|(path, payload)| {
+            serde_json::json!({ "path": path, "payload_json": serde_json::from_slice::<serde_json::Value>(payload).ok() })
+        }).collect::<Vec<_>>(),
     });
 
     println!("{}", serde_json::to_string_pretty(&out)?);
@@ -180,6 +189,37 @@ pub fn run_import(args: &[String], state_dir: &std::path::Path) -> Result<()> {
             if let Some(prefix) = md.get("prefix").and_then(|v| v.as_str()) {
                 policy::db::mockdir_upsert(&db, prefix)?;
             }
+        }
+    }
+
+    // Import reg_rules
+    if let Some(reg_rules) = val.get("reg_rules").and_then(|v| v.as_array()) {
+        if replace { policy::db::reg_rule_clear(&db)?; }
+        for rule in reg_rules {
+            let id = rule.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let prefix = rule.get("prefix").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let read = rule.get("read").and_then(|v| v.as_str())
+                .map(|s| parse_mode(s)).transpose()?.unwrap_or(policy::db::RuleMode::Passthrough);
+            let write = rule.get("write").and_then(|v| v.as_str())
+                .map(|s| parse_mode(s)).transpose()?.unwrap_or(policy::db::RuleMode::Cow);
+            let when = rule.get("when").and_then(|w| {
+                if w.is_null() { return None; }
+                let depth = w.get("depth").and_then(|v| v.as_u64()).map(|d| d as u8);
+                let exe = w.get("exe").and_then(|v| v.as_str()).map(String::from);
+                if depth.is_none() && exe.is_none() { None } else { Some(policy::db::WhenFilter { depth, exe }) }
+            });
+            policy::db::reg_rule_upsert(&db, &policy::db::RuleRow { id, prefix, mode_read: read, mode_write: write, when })?;
+        }
+    }
+
+    // Import reg_mocks
+    if let Some(reg_mocks) = val.get("reg_mocks").and_then(|v| v.as_array()) {
+        for mock in reg_mocks {
+            let path = mock.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let payload = mock.get("payload_json")
+                .map(|v| serde_json::to_vec(v).unwrap_or_default())
+                .unwrap_or_default();
+            policy::db::reg_mock_upsert(&db, &path.to_lowercase(), &payload)?;
         }
     }
 
