@@ -81,6 +81,11 @@ pub fn run_export(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         "reg_mocks": policy::db::reg_mock_list(&db)?.iter().map(|(path, payload)| {
             serde_json::json!({ "path": path, "payload_json": serde_json::from_slice::<serde_json::Value>(payload).ok() })
         }).collect::<Vec<_>>(),
+        "dev_rules": policy::db::dev_rule_list(&db)?.iter().map(|r| serde_json::json!({
+            "id": r.id, "prefix": r.prefix,
+            "read": policy::db::mode_to_string(r.mode_read),
+            "write": policy::db::mode_to_string(r.mode_write),
+        })).collect::<Vec<_>>(),
     });
 
     println!("{}", serde_json::to_string_pretty(&out)?);
@@ -220,6 +225,20 @@ pub fn run_import(args: &[String], state_dir: &std::path::Path) -> Result<()> {
                 .map(|v| serde_json::to_vec(v).unwrap_or_default())
                 .unwrap_or_default();
             policy::db::reg_mock_upsert(&db, &path.to_lowercase(), &payload)?;
+        }
+    }
+
+    // Import dev_rules
+    if let Some(dev_rules) = val.get("dev_rules").and_then(|v| v.as_array()) {
+        if replace { policy::db::dev_rule_clear(&db)?; }
+        for rule in dev_rules {
+            let id = rule.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let prefix = rule.get("prefix").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let read = rule.get("read").and_then(|v| v.as_str())
+                .map(|s| parse_mode(s)).transpose()?.unwrap_or(policy::db::RuleMode::Deny);
+            let write = rule.get("write").and_then(|v| v.as_str())
+                .map(|s| parse_mode(s)).transpose()?.unwrap_or(policy::db::RuleMode::Deny);
+            policy::db::dev_rule_upsert(&db, &policy::db::RuleRow { id, prefix, mode_read: read, mode_write: write, when: None })?;
         }
     }
 
