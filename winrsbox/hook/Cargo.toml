@@ -54,3 +54,11 @@ harness = false
 [[bench]]
 name = "inject_guard"
 harness = false
+
+[[bench]]
+name = "process_tracker"
+harness = false
+
+[[bench]]
+name = "net_hooks"
+harness = false

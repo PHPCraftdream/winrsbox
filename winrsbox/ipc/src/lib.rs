@@ -15,6 +15,7 @@ pub enum AllocKind {
     Allocate,
     Protect,
     MapView,
+    Write,
 }
 
 impl std::fmt::Display for AllocKind {
@@ -23,6 +24,7 @@ impl std::fmt::Display for AllocKind {
             Self::Allocate => f.write_str("Allocate"),
             Self::Protect => f.write_str("Protect"),
             Self::MapView => f.write_str("MapView"),
+            Self::Write => f.write_str("Write"),
         }
     }
 }
