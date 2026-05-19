@@ -59,6 +59,22 @@ path = "src/bin/escape_static_syscall.rs"
 name = "clean_jit_pattern"
 path = "src/bin/clean_jit_pattern.rs"
 
+[[bin]]
+name = "legit_unpacker_sim"
+path = "src/bin/legit_unpacker_sim.rs"
+
+[[bin]]
+name = "legit_self_patching"
+path = "src/bin/legit_self_patching.rs"
+
+[[bin]]
+name = "escape_unpacker_syscall"
+path = "src/bin/escape_unpacker_syscall.rs"
+
+[[bin]]
+name = "escape_self_modify_syscall"
+path = "src/bin/escape_self_modify_syscall.rs"
+
 [[test]]
 name = "mock_integration"
 path = "tests/mock_integration.rs"
