@@ -50,3 +50,7 @@ harness = false
 [[bench]]
 name = "memory_guard"
 harness = false
+
+[[bench]]
+name = "inject_guard"
+harness = false

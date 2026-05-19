@@ -63,7 +63,7 @@ pub fn is_armed() -> bool {
 
 const SYSTEM_PID_THRESHOLD: u32 = 200;
 
-fn is_system_pid(pid: u32) -> bool {
+pub fn is_system_pid(pid: u32) -> bool {
     pid < SYSTEM_PID_THRESHOLD
 }
 
@@ -77,7 +77,7 @@ const SYSTEM_DLLS: &[&str] = &[
     "hook.dll", // our own DLL — sandbox injection mechanism uses NtQueueApcThread
 ];
 
-fn is_system_caller() -> bool {
+pub fn is_system_caller() -> bool {
     let stack = crate::memory_guard::capture_stack_pub(2, 16);
     if stack.is_empty() {
         return true; // can't determine → assume system
@@ -109,7 +109,7 @@ fn is_system_caller() -> bool {
 
 const NT_CURRENT_PROCESS: isize = -1;
 
-fn is_self_process(handle: HANDLE) -> bool {
+pub fn is_self_process(handle: HANDLE) -> bool {
     if handle as isize == NT_CURRENT_PROCESS {
         return true;
     }
@@ -121,7 +121,7 @@ fn is_self_process(handle: HANDLE) -> bool {
     target_pid != 0 && target_pid == unsafe { GetCurrentProcessId() }
 }
 
-fn thread_owner_pid(thread_handle: HANDLE) -> u32 {
+pub fn thread_owner_pid(thread_handle: HANDLE) -> u32 {
     if thread_handle.is_null() {
         return 0;
     }
