@@ -14,7 +14,7 @@
 
 use std::sync::OnceLock;
 
-use detour::GenericDetour;
+use detour2::GenericDetour;
 use ntapi::winapi::shared::ntdef::{HANDLE, NTSTATUS, OBJECT_ATTRIBUTES, UNICODE_STRING};
 use winapi::ctypes::c_void;
 
@@ -134,8 +134,11 @@ unsafe fn resolve_handle_friendly(key: HANDLE) -> Option<String> {
     policy::reg::nt_to_friendly(&nt)
 }
 
-/// Send RegDecide IPC and return whether write should be denied.
-fn is_write_denied(friendly_key: &str, value_name: Option<String>) -> bool {
+/// Send RegDecide IPC and return the mode string.
+/// "deny" → return STATUS_ACCESS_DENIED
+/// "silent_ok" → return STATUS_SUCCESS without calling original
+/// "passthrough" → call original
+fn check_write_mode(friendly_key: &str, value_name: Option<String>) -> String {
     let req = ipc::Req::RegDecide {
         key_path: friendly_key.to_owned(),
         value_name,
@@ -143,10 +146,10 @@ fn is_write_denied(friendly_key: &str, value_name: Option<String>) -> bool {
     };
     if let Some(resp) = crate::hooks::ipc_send_and_recv(req) {
         if let ipc::Resp::RegDecision { mode, .. } = resp {
-            return mode.eq_ignore_ascii_case("deny");
+            return mode;
         }
     }
-    false
+    "passthrough".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +177,7 @@ unsafe extern "system" fn hook_nt_create_key(
     };
 
     if let Some(friendly) = resolve_attrs_friendly(object_attributes as *const _) {
-        if is_write_denied(&friendly, None) {
+        let mode = check_write_mode(&friendly, None); if mode.eq_ignore_ascii_case("deny") {
             if !key_handle.is_null() {
                 *key_handle = std::ptr::null_mut();
             }
@@ -204,8 +207,11 @@ unsafe extern "system" fn hook_nt_set_value_key(
 
     if let Some(friendly) = resolve_handle_friendly(key_handle) {
         let v_name = ustr_to_string(value_name as *const _);
-        if is_write_denied(&friendly, v_name) {
+        let mode = check_write_mode(&friendly, v_name); if mode.eq_ignore_ascii_case("deny") {
             return STATUS_ACCESS_DENIED;
+        }
+        if mode.eq_ignore_ascii_case("silent_ok") {
+            return 0; // STATUS_SUCCESS — sandbox absorbs the write
         }
     }
     call_original()
@@ -225,8 +231,11 @@ unsafe extern "system" fn hook_nt_delete_value_key(
 
     if let Some(friendly) = resolve_handle_friendly(key_handle) {
         let v_name = ustr_to_string(value_name as *const _);
-        if is_write_denied(&friendly, v_name) {
+        let mode = check_write_mode(&friendly, v_name); if mode.eq_ignore_ascii_case("deny") {
             return STATUS_ACCESS_DENIED;
+        }
+        if mode.eq_ignore_ascii_case("silent_ok") {
+            return 0; // STATUS_SUCCESS — sandbox absorbs the write
         }
     }
     call_original()
@@ -242,8 +251,11 @@ unsafe extern "system" fn hook_nt_delete_key(key_handle: HANDLE) -> NTSTATUS {
     };
 
     if let Some(friendly) = resolve_handle_friendly(key_handle) {
-        if is_write_denied(&friendly, None) {
+        let mode = check_write_mode(&friendly, None); if mode.eq_ignore_ascii_case("deny") {
             return STATUS_ACCESS_DENIED;
+        }
+        if mode.eq_ignore_ascii_case("silent_ok") {
+            return 0; // STATUS_SUCCESS — sandbox absorbs the write
         }
     }
     call_original()

@@ -39,7 +39,7 @@ pub fn run_export(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         return Ok(());
     }
     let db = super::open_db(state_dir)?;
-    let json = has_flag(args, "--json") || true; // export always outputs JSON
+    let _json = has_flag(args, "--json") || true; // export always outputs JSON
 
     let rules = policy::db::rule_list(&db)?;
     let mocks = policy::db::mock_list(&db)?;

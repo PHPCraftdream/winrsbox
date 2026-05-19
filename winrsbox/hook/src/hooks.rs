@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 // Use winapi's c_void to match signatures expected by winapi/ntapi functions.
 use winapi::ctypes::c_void;
 
-use detour::GenericDetour;
+use detour2::GenericDetour;
 use ntapi::ntioapi::IO_STATUS_BLOCK;
 use ntapi::winapi::shared::ntdef::{
     HANDLE, NTSTATUS, OBJECT_ATTRIBUTES, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
@@ -107,6 +107,11 @@ thread_local! {
 static PIPE_NAME: OnceLock<String> = OnceLock::new();
 static DLL_PATH: OnceLock<String> = OnceLock::new();
 static SANDBOX_CWD: OnceLock<String> = OnceLock::new();
+static TRACE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn is_trace() -> bool {
+    TRACE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 fn cache() -> &'static HookCache {
     CACHE.get_or_init(HookCache::new)
@@ -441,7 +446,10 @@ unsafe extern "system" fn hook_nt_create_file(
                 &dev_path.encode_utf16().collect::<Vec<_>>(),
             ) {
                 let kind = policy::dev::classify_device(&device);
-                if !policy::dev::is_safe_default(kind) {
+                if !policy::dev::is_safe_with_access(kind, desired_access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA) != 0) {
+                    if is_trace() {
+                        ipc_log(ipc::LogLevel::Trace, format!("DENY device NtCreateFile: {dev_path} kind={kind:?}"));
+                    }
                     set_io_status(io_status_block, STATUS_ACCESS_DENIED);
                     return STATUS_ACCESS_DENIED;
                 }
@@ -456,6 +464,9 @@ unsafe extern "system" fn hook_nt_create_file(
     match decision.mode {
         Mode::Passthrough => call_original!(),
         Mode::Deny => {
+            if is_trace() {
+                ipc_log(ipc::LogLevel::Trace, format!("DENY NtCreateFile: {dos} write={write}"));
+            }
             if !file_handle.is_null() {
                 *file_handle = std::ptr::null_mut();
             }
@@ -565,7 +576,7 @@ unsafe extern "system" fn hook_nt_open_file(
                 &dev_path.encode_utf16().collect::<Vec<_>>(),
             ) {
                 let kind = policy::dev::classify_device(&device);
-                if !policy::dev::is_safe_default(kind) {
+                if !policy::dev::is_safe_with_access(kind, desired_access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA) != 0) {
                     set_io_status(io_status_block, STATUS_ACCESS_DENIED);
                     return STATUS_ACCESS_DENIED;
                 }
@@ -1010,6 +1021,9 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(dll) = std::env::var("FS_SANDBOX_DLL") {
         let _ = DLL_PATH.set(dll);
     }
+    if std::env::var("FS_SANDBOX_TRACE").is_ok() {
+        TRACE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     if let Ok(cwd) = std::env::var("FS_SANDBOX_CWD") {
         let _ = SANDBOX_CWD.set(cwd.clone());
         // Override the process CWD to the sandbox root. This runs before any
@@ -1041,33 +1055,41 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         }};
     }
 
-    install!(HOOK_NT_CREATE_FILE,              "NtCreateFile\0",              hook_nt_create_file,              FnNtCreateFile);
-    install!(HOOK_NT_OPEN_FILE,                "NtOpenFile\0",                hook_nt_open_file,                FnNtOpenFile);
-    install!(HOOK_NT_QUERY_ATTRIBUTES_FILE,    "NtQueryAttributesFile\0",     hook_nt_query_attributes_file,    FnNtQueryAttributesFile);
-    install!(HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE, "NtQueryFullAttributesFile\0", hook_nt_query_full_attributes_file, FnNtQueryFullAttributesFile);
-    install!(HOOK_NT_CREATE_USER_PROCESS,      "NtCreateUserProcess\0",       hook_nt_create_user_process,      FnNtCreateUserProcess);
-
     let guard = std::env::var("FS_SANDBOX_GUARD").unwrap_or_else(|_| "full".into());
+    let disabled = std::env::var("FS_SANDBOX_DISABLE_HOOKS").unwrap_or_default();
+    let disabled_cats: Vec<String> = disabled.split(',').map(|s| s.trim().to_ascii_lowercase()).collect();
+    let skip = |cat: &str| disabled_cats.iter().any(|d| d == cat);
+
+    if !skip("fs") {
+        install!(HOOK_NT_CREATE_FILE,              "NtCreateFile\0",              hook_nt_create_file,              FnNtCreateFile);
+        install!(HOOK_NT_OPEN_FILE,                "NtOpenFile\0",                hook_nt_open_file,                FnNtOpenFile);
+        install!(HOOK_NT_QUERY_ATTRIBUTES_FILE,    "NtQueryAttributesFile\0",     hook_nt_query_attributes_file,    FnNtQueryAttributesFile);
+        install!(HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE, "NtQueryFullAttributesFile\0", hook_nt_query_full_attributes_file, FnNtQueryFullAttributesFile);
+        install!(HOOK_NT_CREATE_USER_PROCESS,      "NtCreateUserProcess\0",       hook_nt_create_user_process,      FnNtCreateUserProcess);
+    }
+
     if guard != "none" {
         // Hold anti_rec during guard installation so detour's internal
         // VirtualProtect calls (to patch ntdll stubs) pass through the
         // NtProtectVirtualMemory hook without triggering content scans
         // on ntdll's legitimate syscall instructions.
         let _install_guard = anti_rec::enter();
-        crate::memory_guard::install(&guard)?;
-        crate::inject_guard::install()?;
-        // Registry runtime enforcement: best-effort (some Windows builds
-        // may have unusual ntdll layouts that detour can't patch).
-        let _ = crate::reg_hooks::install();
-        // Network runtime enforcement: best-effort (ws2_32 may not be
-        // loaded in target — only matters for net-using software).
-        let _ = crate::net_hooks::install();
+        if !skip("memory") {
+            crate::memory_guard::install(&guard)?;
+        }
+        if !skip("inject") {
+            crate::inject_guard::install()?;
+        }
+        if !skip("reg") {
+            let _ = crate::reg_hooks::install();
+        }
+        if !skip("net") {
+            let _ = crate::net_hooks::install();
+        }
 
-        // Apply kernel-enforced process mitigations AFTER all hooks installed.
-        // SetProcessMitigationPolicy works on the current process, so it
-        // doesn't block our own hook.dll (already loaded), but subsequent
-        // DLL loads / code generation are restricted.
-        apply_mitigations(&guard);
+        if !skip("mitigations") {
+            apply_mitigations(&guard);
+        }
     }
 
     Ok(())

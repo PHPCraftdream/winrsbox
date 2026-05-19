@@ -1,5 +1,4 @@
 use anyhow::{bail, Result};
-use std::path::PathBuf;
 
 const HELP: &str = "\
 winrsbox why — simulate a path lookup and explain the decision

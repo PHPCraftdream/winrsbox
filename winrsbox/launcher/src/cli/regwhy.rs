@@ -1,5 +1,4 @@
 use anyhow::{bail, Result};
-use std::path::PathBuf;
 
 const HELP: &str = "\
 winrsbox regwhy — simulate a registry key lookup and explain the decision

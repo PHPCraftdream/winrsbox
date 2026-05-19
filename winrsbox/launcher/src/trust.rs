@@ -212,7 +212,7 @@ fn extract_publisher(exe_path: &Path) -> Option<String> {
     // Parse CMSG_SIGNER_INFO to get Issuer + SerialNumber, then find cert in store
     // For simplicity: enumerate certs in store and return the first subject CN.
     // SAFETY: cert_store is valid from CryptQueryObject.
-    let mut cert_ctx = unsafe {
+    let cert_ctx = unsafe {
         CertEnumCertificatesInStore(cert_store, None)
     };
     if cert_ctx.is_null() {
@@ -234,7 +234,7 @@ fn extract_publisher(exe_path: &Path) -> Option<String> {
 
     // Cleanup
     unsafe {
-        CertFreeCertificateContext(Some(cert_ctx));
+        let _ = CertFreeCertificateContext(Some(cert_ctx));
         CertCloseStore(Some(cert_store), 0).ok();
     }
 

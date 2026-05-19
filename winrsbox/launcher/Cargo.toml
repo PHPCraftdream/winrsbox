@@ -51,6 +51,7 @@ crossbeam-queue = "0.3"
 papaya = "0.2.4"
 rustc-hash = { workspace = true }
 winreg = "0.55"
+ferrisetw = "1.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -7,7 +7,7 @@
 
 use std::sync::OnceLock;
 
-use detour::GenericDetour;
+use detour2::GenericDetour;
 use winapi::ctypes::c_void;
 
 use crate::anti_rec;

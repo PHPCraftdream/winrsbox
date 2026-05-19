@@ -3,12 +3,16 @@
 // Tests run winrsbox launcher with escape payloads and verify:
 // - Strict mode (default): escape payloads are terminated
 // - Weak mode (--weak): escape payloads run to completion
+//
+// All tests use #[serial] to avoid race conditions between parallel
+// sandbox instances (WFP filter collision, pipe name collision, etc.).
 // - Clean payloads: always run to completion
 //
 // Requires: cargo build -p integration-tests --bins --release
 //           cargo build -p winrsbox --release
 //           cargo build -p hook --release
 
+use serial_test::serial;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -165,11 +169,12 @@ macro_rules! assert_alive {
     }};
 }
 
-#[test] fn strict_kills_alloc_rwx()      { assert_killed!("escape_alloc_rwx", "Allocate"); }
-#[test] fn strict_kills_jit_protect()    { assert_killed!("escape_jit_protect", "Protect"); }
-#[test] fn strict_kills_heap_to_exec()   { assert_killed!("escape_heap_to_exec", "Protect"); }
-#[test] fn strict_kills_stack_exec()     { assert_killed!("escape_stack_exec", "Protect"); }
+#[test] #[serial] fn strict_kills_alloc_rwx()      { assert_killed!("escape_alloc_rwx", "Allocate"); }
+#[test] #[serial] fn strict_kills_jit_protect()    { assert_killed!("escape_jit_protect", "Protect"); }
+#[test] #[serial] fn strict_kills_heap_to_exec()   { assert_killed!("escape_heap_to_exec", "Protect"); }
+#[test] #[serial] fn strict_kills_stack_exec()     { assert_killed!("escape_stack_exec", "Protect"); }
 #[test]
+#[serial]
 fn strict_kills_map_anon_rwx() {
     // Under full guard, kernel's DynamicCodePolicy blocks at kernel level — no
     // violation IPC (our hook sees the NtMapViewOfSection fail). Under scan, our
@@ -180,28 +185,33 @@ fn strict_kills_map_anon_rwx() {
     assert!(v.contains("MapView") || v.contains("Allocate"),
         "violations should contain MapView or Allocate\nlog: {}\nstderr: {}", v, r.stderr);
 }
-#[test] fn strict_kills_ntdll_double_map() { assert_killed!("escape_ntdll_double_map", "MapView"); }
+#[test] #[serial] fn strict_kills_ntdll_double_map() { assert_killed!("escape_ntdll_double_map", "MapView"); }
 #[test]
+#[serial]
 fn strict_kills_remote_thread() { assert_killed!("escape_remote_thread", "CreateRemoteThread"); }
 #[test]
+#[serial]
 fn strict_kills_thread_hijack() { assert_killed!("escape_thread_hijack", "ContextHijack"); }
 #[test]
+#[serial]
 fn strict_kills_hwbp_injection() { assert_killed!("escape_hwbp_injection", "ContextHijack"); }
 #[test]
+#[serial]
 fn strict_kills_apc_injection() { assert_killed!("escape_apc_injection", "QueueApc"); }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // P9-A: Cross-process memory ops on external (non-owned) processes
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[test] fn strict_kills_foreign_alloc_rwx()     { assert_killed!("escape_foreign_alloc_rwx", "Allocate"); }
-#[test] fn strict_kills_foreign_write_syscall() { assert_killed!("escape_foreign_write_syscall", "Write"); }
+#[test] #[serial] fn strict_kills_foreign_alloc_rwx()     { assert_killed!("escape_foreign_alloc_rwx", "Allocate"); }
+#[test] #[serial] fn strict_kills_foreign_write_syscall() { assert_killed!("escape_foreign_write_syscall", "Write"); }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // P9-B: Registry runtime hooks — persistence vector denial
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[serial]
 fn strict_denies_reg_appinit_persistence() {
     let r = run_payload("escape_reg_appinit", "full");
     // Payload exits with code 5 (ERROR_ACCESS_DENIED) when registry write
@@ -218,30 +228,30 @@ fn strict_denies_reg_appinit_persistence() {
 // Strict mode: clean payloads MUST NOT be terminated
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[test] fn strict_allows_clean_noop()    { assert_alive!("clean_noop", "full"); }
-#[test] fn strict_allows_normal_alloc()  { assert_alive!("clean_normal_alloc", "full"); }
+#[test] #[serial] fn strict_allows_clean_noop()    { assert_alive!("clean_noop", "full"); }
+#[test] #[serial] fn strict_allows_normal_alloc()  { assert_alive!("clean_normal_alloc", "full"); }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Weak mode: escape payloads should NOT be terminated
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[test] fn weak_allows_alloc_rwx()       { assert_alive!("escape_alloc_rwx", "none"); }
-#[test] fn weak_allows_jit_protect()     { assert_alive!("escape_jit_protect", "none"); }
+#[test] #[serial] fn weak_allows_alloc_rwx()       { assert_alive!("escape_alloc_rwx", "none"); }
+#[test] #[serial] fn weak_allows_jit_protect()     { assert_alive!("escape_jit_protect", "none"); }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Content-aware: clean JIT pattern MUST NOT be terminated
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[test] fn strict_allows_clean_jit()         { assert_alive!("clean_jit_pattern", "scan"); }
-#[test] fn strict_allows_legit_unpacker()   { assert_alive!("legit_unpacker_sim", "scan"); }
-#[test] fn strict_allows_legit_self_patch() { assert_alive!("legit_self_patching", "scan"); }
+#[test] #[serial] fn strict_allows_clean_jit()         { assert_alive!("clean_jit_pattern", "scan"); }
+#[test] #[serial] fn strict_allows_legit_unpacker()   { assert_alive!("legit_unpacker_sim", "scan"); }
+#[test] #[serial] fn strict_allows_legit_self_patch() { assert_alive!("legit_self_patching", "scan"); }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Content-aware: malicious unpacker MUST be terminated
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[test] fn strict_kills_unpacker_syscall()    { assert_killed!("escape_unpacker_syscall", "Protect"); }
-#[test] fn strict_kills_self_modify_syscall() { assert_killed!("escape_self_modify_syscall", "Protect"); }
+#[test] #[serial] fn strict_kills_unpacker_syscall()    { assert_killed!("escape_unpacker_syscall", "Protect"); }
+#[test] #[serial] fn strict_kills_self_modify_syscall() { assert_killed!("escape_self_modify_syscall", "Protect"); }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // P2: Known bypass — direct syscall (executable documentation)
@@ -252,6 +262,7 @@ fn strict_denies_reg_appinit_persistence() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[serial]
 fn pre_launch_refuses_static_syscall() {
     let r = run_payload("escape_static_syscall", "full");
     assert!(!r.status.success(),
@@ -262,6 +273,7 @@ fn pre_launch_refuses_static_syscall() {
 }
 
 #[test]
+#[serial]
 fn pre_launch_promotes_bypass_direct_syscall() {
     // Previously a known-limitation #[ignore]; pre-launch scan now catches it.
     let r = run_payload("bypass_direct_syscall", "full");
@@ -270,11 +282,13 @@ fn pre_launch_promotes_bypass_direct_syscall() {
 }
 
 #[test]
+#[serial]
 // ═══════════════════════════════════════════════════════════════════════════
 // Network: WFP kernel-level block
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[serial]
 fn wfp_blocks_rfc1918() {
     let r = run_payload("escape_net_rfc1918", "full");
     // Connect should fail (WFP drops or ws2_32 hook denies). Either way, exit != 0.
@@ -287,6 +301,7 @@ fn wfp_blocks_rfc1918() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[serial]
 fn kernel_blocks_dynamic_code_full() {
     let r = run_payload("escape_dynamic_code", "full");
     // Under full: kernel returns error, payload exits non-zero with error code.
@@ -300,6 +315,7 @@ fn kernel_blocks_dynamic_code_full() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
+#[serial]
 fn memory_limit_enforced() {
     // Run with --memory-limit 1 (1 GB). Payload tries to alloc 12.8 GB.
     let launcher = find_launcher();
@@ -337,4 +353,18 @@ fn weak_mode_skips_pre_launch_scan() {
     // either returns an invalid SSN error or behaves OS-defined).
     assert!(r.status.success() || r.status.code() == Some(0),
         "weak mode should not block static syscall\nstderr: {}", r.stderr);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// P2: SystemQuery device write access block
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[serial]
+fn strict_blocks_systemquery_write() {
+    let r = run_payload("escape_systemquery_write", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "escape_systemquery_write should exit 5 (blocked)\nstderr: {}", r.stderr);
+    assert!(r.stderr.contains("blocked"),
+        "stderr should contain 'blocked'\nstderr: {}", r.stderr);
 }
