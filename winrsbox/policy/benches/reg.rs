@@ -89,5 +89,86 @@ fn bench_reg_decide(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_nt_to_friendly, bench_values_json, bench_reg_decide);
+fn bench_overlay_ops(c: &mut Criterion) {
+    let mut group = c.benchmark_group("reg_overlay");
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("workreg");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut ov = policy::reg_overlay::RegOverlay::new(root.clone());
+
+    group.bench_function("set_single", |b| {
+        let counter = AtomicU64::new(0);
+        b.iter(|| {
+            let i = counter.fetch_add(1, Ordering::Relaxed);
+            ov.set(
+                &format!("hklm\\bench\\key{i}"), "val",
+                policy::reg::RegValue { typ: policy::reg::RegType::Dword, data: policy::reg::RegData::U32(i as u32) },
+            ).unwrap();
+        })
+    });
+
+    group.bench_function("get_hit", |b| {
+        ov.set("hklm\\bench\\static", "val",
+            policy::reg::RegValue { typ: policy::reg::RegType::Dword, data: policy::reg::RegData::U32(1) },
+        ).unwrap();
+        b.iter(|| ov.get(black_box("hklm\\bench\\static"), black_box("val")))
+    });
+
+    group.bench_function("get_miss", |b| {
+        b.iter(|| ov.get(black_box("hklm\\nonexistent"), black_box("val")))
+    });
+
+    group.finish();
+
+    let mut group2 = c.benchmark_group("reg_overlay");
+    for n in [10, 100] {
+        let dir2 = tempfile::tempdir().unwrap();
+        let root2 = dir2.path().join("workreg");
+        std::fs::create_dir_all(&root2).unwrap();
+        let mut ov2 = policy::reg_overlay::RegOverlay::new(root2.clone());
+        for i in 0..n {
+            ov2.set(
+                &format!("hklm\\bench\\key{i}"), &format!("val{i}"),
+                policy::reg::RegValue { typ: policy::reg::RegType::Sz, data: policy::reg::RegData::String(format!("data{i}")) },
+            ).unwrap();
+        }
+        drop(ov2);
+        group2.bench_function(format!("load_from_disk_n={n}"), |b| {
+            b.iter(|| policy::reg_overlay::RegOverlay::load_from_disk(black_box(root2.clone())).unwrap())
+        });
+    }
+    group2.finish();
+}
+
+fn bench_reg_decide_scale(c: &mut Criterion) {
+    let mut group = c.benchmark_group("reg_decide");
+    for n in [10, 50] {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("policy.redb");
+        let workreg = dir.path().join("workreg");
+        std::fs::create_dir_all(&workreg).unwrap();
+        let rdb = redb::Database::create(&db_path).unwrap();
+        { let txn = rdb.begin_write().unwrap(); txn.open_table(policy::db::REG_RULES).unwrap(); txn.open_table(policy::db::REG_MOCKS).unwrap(); txn.commit().unwrap(); }
+        let db = std::sync::Arc::new(rdb);
+        for i in 0..n {
+            policy::db::reg_rule_upsert(&db, &policy::db::RuleRow {
+                id: format!("r{i}"), prefix: format!("hklm\\rule{i:04}"),
+                mode_read: policy::db::RuleMode::Passthrough, mode_write: policy::db::RuleMode::Deny,
+                when: None,
+            }).unwrap();
+        }
+        let rp = policy::RegistryPolicy::open(db, workreg).unwrap();
+        let counter = AtomicU64::new(0);
+        group.bench_function(format!("cache_miss_n={n}"), |b| {
+            b.iter_batched(
+                || { let i = counter.fetch_add(1, Ordering::Relaxed); format!("hklm\\rule{:04}\\sub{i}", i % (n as u64)) },
+                |path| rp.decide(black_box(&path), None, true),
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_nt_to_friendly, bench_values_json, bench_reg_decide, bench_overlay_ops, bench_reg_decide_scale);
 criterion_main!(benches);

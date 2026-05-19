@@ -109,10 +109,20 @@ mod tests {
         (dir, state)
     }
 
+    fn setup_rp(state: &std::path::Path) -> (std::sync::Arc<redb::Database>, policy::RegistryPolicy) {
+        let workreg = state.join("workreg");
+        std::fs::create_dir_all(&workreg).unwrap();
+        let db_path = state.join("policy.redb");
+        let rdb = redb::Database::create(&db_path).unwrap();
+        { let txn = rdb.begin_write().unwrap(); txn.open_table(policy::db::REG_RULES).unwrap(); txn.open_table(policy::db::REG_MOCKS).unwrap(); txn.commit().unwrap(); }
+        let db = std::sync::Arc::new(rdb);
+        let rp = policy::RegistryPolicy::open(db.clone(), workreg).unwrap();
+        (db, rp)
+    }
+
     #[test]
     fn regwhy_passthrough_default() {
         let (_dir, state) = tmp_state();
-        // Just verify it doesn't panic
         run(&[r"HKLM\Software\Foo".into(), "--json".into()], &state).unwrap();
     }
 
@@ -120,6 +130,43 @@ mod tests {
     fn regwhy_with_value() {
         let (_dir, state) = tmp_state();
         run(&[r"HKLM\Software\Foo".into(), "--value=bar".into(), "--json".into()], &state).unwrap();
+    }
+
+    #[test]
+    fn regwhy_deny_rule_shows_deny() {
+        let (_dir, state) = tmp_state();
+        {
+            let (db, _rp) = setup_rp(&state);
+            policy::db::reg_rule_upsert(&db, &policy::db::RuleRow {
+                id: "d".into(), prefix: r"hklm\secrets".into(),
+                mode_read: policy::db::RuleMode::Deny, mode_write: policy::db::RuleMode::Deny, when: None,
+            }).unwrap();
+        }
+        run(&[r"HKLM\Secrets\Key".into(), "--value=x".into(), "--json".into()], &state).unwrap();
+    }
+
+    #[test]
+    fn regwhy_mock_shows_mock() {
+        let (_dir, state) = tmp_state();
+        {
+            let (db, _rp) = setup_rp(&state);
+            let val = policy::reg::RegValue { typ: policy::reg::RegType::Sz, data: policy::reg::RegData::String("FAKE".into()) };
+            let payload = serde_json::to_vec(&val).unwrap();
+            policy::db::reg_mock_upsert(&db, r"hklm\crypto\guid", &payload).unwrap();
+        }
+        run(&[r"HKLM\Crypto".into(), "--value=guid".into(), "--json".into()], &state).unwrap();
+    }
+
+    #[test]
+    fn regwhy_overlay_write_then_read() {
+        let (_dir, state) = tmp_state();
+        let (_db, rp) = setup_rp(&state);
+        rp.write_to_overlay("hklm\\test", "val",
+            policy::reg::RegValue { typ: policy::reg::RegType::Dword, data: policy::reg::RegData::U32(42) },
+        ).unwrap();
+        let d = rp.decide(r"hklm\test", Some("val"), false);
+        assert_eq!(d.mode, policy::Mode::Cow);
+        assert!(d.overlay_value.is_some());
     }
 
     #[test]

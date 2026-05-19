@@ -178,4 +178,53 @@ mod tests {
         ], &state);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn regmock_add_qword() {
+        let (_dir, state) = tmp_state();
+        run_add(&["--path=hklm\\t\\q".into(), "--type=REG_QWORD".into(), "--data=18446744073709551614".into()], &state).unwrap();
+        let db = super::super::open_db(&state).unwrap();
+        let mocks = db::reg_mock_list(&db).unwrap();
+        let val: RegValue = serde_json::from_slice(&mocks[0].1).unwrap();
+        assert_eq!(val.data, RegData::U64(u64::MAX - 1));
+    }
+
+    #[test]
+    fn regmock_add_binary_base64() {
+        let (_dir, state) = tmp_state();
+        use base64::Engine;
+        let b64 = base64::prelude::BASE64_STANDARD.encode(&[0xDE, 0xAD]);
+        run_add(&["--path=hklm\\t\\b".into(), "--type=REG_BINARY".into(), format!("--data={b64}")], &state).unwrap();
+        let db = super::super::open_db(&state).unwrap();
+        let mocks = db::reg_mock_list(&db).unwrap();
+        let val: RegValue = serde_json::from_slice(&mocks[0].1).unwrap();
+        assert_eq!(val.data, RegData::Bytes(vec![0xDE, 0xAD]));
+    }
+
+    #[test]
+    fn regmock_add_multi_sz() {
+        let (_dir, state) = tmp_state();
+        run_add(&["--path=hklm\\t\\m".into(), "--type=REG_MULTI_SZ".into(), r"--data=a\0b\0c".into()], &state).unwrap();
+        let db = super::super::open_db(&state).unwrap();
+        let mocks = db::reg_mock_list(&db).unwrap();
+        let val: RegValue = serde_json::from_slice(&mocks[0].1).unwrap();
+        assert_eq!(val.data, RegData::Strings(vec!["a".into(), "b".into(), "c".into()]));
+    }
+
+    #[test]
+    fn regmock_add_expand_sz() {
+        let (_dir, state) = tmp_state();
+        run_add(&["--path=hklm\\t\\e".into(), "--type=REG_EXPAND_SZ".into(), "--data=%SystemRoot%\\foo".into()], &state).unwrap();
+        let db = super::super::open_db(&state).unwrap();
+        let mocks = db::reg_mock_list(&db).unwrap();
+        let val: RegValue = serde_json::from_slice(&mocks[0].1).unwrap();
+        assert_eq!(val.data, RegData::String("%SystemRoot%\\foo".into()));
+    }
+
+    #[test]
+    fn regmock_invalid_dword_data_errors() {
+        let (_dir, state) = tmp_state();
+        let result = run_add(&["--path=hklm\\t\\d".into(), "--type=REG_DWORD".into(), "--data=abc".into()], &state);
+        assert!(result.is_err());
+    }
 }
