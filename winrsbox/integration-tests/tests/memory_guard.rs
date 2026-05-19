@@ -371,6 +371,14 @@ fn strict_blocks_systemquery_write() {
 
 #[test]
 #[serial]
+fn strict_blocks_junction_creation() {
+    let r = run_payload("escape_junction", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "escape_junction should exit 5 (blocked)\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
 fn wfp_blocks_afd_direct() {
     // escape_afd_direct tries TCP connect to 10.0.0.1:80 via ws2_32.
     // WFP blocks RFC1918 at kernel level → connect fails or times out.
