@@ -148,6 +148,7 @@ fn ensure_ipc_and<R>(f: impl FnOnce(&mut Option<ipc::SyncClient>) -> R) -> Optio
     });
     if sent {
         HELLO_SENT.set(true);
+        crate::inject_guard::arm();
     }
     result
 }
@@ -196,6 +197,14 @@ fn ipc_spawned_child(parent_pid: u32, child_pid: u32, child_exe: String) {
             });
         }
     });
+}
+
+pub(crate) fn ipc_log_violation(req: ipc::Req) -> Option<()> {
+    ensure_ipc_and(|opt| {
+        if let Some(client) = opt.as_mut() {
+            let _ = client.send(&req);
+        }
+    })
 }
 
 fn ipc_log(level: ipc::LogLevel, msg: String) {
@@ -922,7 +931,7 @@ unsafe extern "system" fn hook_nt_create_user_process(
 // Resolve an export from ntdll.dll by name.
 // ---------------------------------------------------------------------------
 
-unsafe fn ntdll_export(name: &[u8]) -> Option<*const ()> {
+pub(crate) unsafe fn ntdll_export(name: &[u8]) -> Option<*const ()> {
     use winapi::um::libloaderapi::{GetModuleHandleW, GetProcAddress};
     let ntdll_w: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
     // SAFETY: ntdll_w is null-terminated UTF-16 name of a module always present.
@@ -989,6 +998,17 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
     install!(HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE, "NtQueryFullAttributesFile\0", hook_nt_query_full_attributes_file, FnNtQueryFullAttributesFile);
     install!(HOOK_NT_CREATE_USER_PROCESS,      "NtCreateUserProcess\0",       hook_nt_create_user_process,      FnNtCreateUserProcess);
 
+    let guard = std::env::var("FS_SANDBOX_GUARD").unwrap_or_else(|_| "full".into());
+    if guard != "none" {
+        // Hold anti_rec during guard installation so detour's internal
+        // VirtualProtect calls (to patch ntdll stubs) pass through the
+        // NtProtectVirtualMemory hook without triggering content scans
+        // on ntdll's legitimate syscall instructions.
+        let _install_guard = anti_rec::enter();
+        crate::memory_guard::install(&guard)?;
+        crate::inject_guard::install()?;
+    }
+
     Ok(())
 }
 
@@ -998,6 +1018,8 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
 /// Must be called on DLL_PROCESS_DETACH only. Errors are ignored because
 /// the process is tearing down.
 pub unsafe fn uninstall_hooks() {
+    crate::inject_guard::uninstall();
+    crate::memory_guard::uninstall();
     if let Some(h) = HOOK_NT_CREATE_FILE.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_NT_OPEN_FILE.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_NT_QUERY_ATTRIBUTES_FILE.get() { let _ = h.disable(); }

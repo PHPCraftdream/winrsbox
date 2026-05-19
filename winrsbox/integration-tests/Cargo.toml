@@ -7,13 +7,71 @@ edition = "2021"
 name = "integration-tests"
 path = "src/main.rs"
 
+[[bin]]
+name = "escape_alloc_rwx"
+path = "src/bin/escape_alloc_rwx.rs"
+
+[[bin]]
+name = "escape_jit_protect"
+path = "src/bin/escape_jit_protect.rs"
+
+[[bin]]
+name = "escape_heap_to_exec"
+path = "src/bin/escape_heap_to_exec.rs"
+
+[[bin]]
+name = "escape_stack_exec"
+path = "src/bin/escape_stack_exec.rs"
+
+[[bin]]
+name = "escape_map_anon_rwx"
+path = "src/bin/escape_map_anon_rwx.rs"
+
+[[bin]]
+name = "escape_ntdll_double_map"
+path = "src/bin/escape_ntdll_double_map.rs"
+
+[[bin]]
+name = "escape_remote_thread"
+path = "src/bin/escape_remote_thread.rs"
+
+[[bin]]
+name = "clean_noop"
+path = "src/bin/clean_noop.rs"
+
+[[bin]]
+name = "clean_normal_alloc"
+path = "src/bin/clean_normal_alloc.rs"
+
+[[bin]]
+name = "clean_fileio"
+path = "src/bin/clean_fileio.rs"
+
+[[bin]]
+name = "bypass_direct_syscall"
+path = "src/bin/bypass_direct_syscall.rs"
+
+[[bin]]
+name = "escape_static_syscall"
+path = "src/bin/escape_static_syscall.rs"
+
+[[bin]]
+name = "clean_jit_pattern"
+path = "src/bin/clean_jit_pattern.rs"
+
 [[test]]
 name = "mock_integration"
 path = "tests/mock_integration.rs"
 
+[[test]]
+name = "memory_guard"
+path = "tests/memory_guard.rs"
+
 [dependencies]
 policy = { path = "../policy" }
 serde_json = "1"
+winapi = { version = "0.3", features = ["memoryapi", "winnt", "processthreadsapi", "libloaderapi", "errhandlingapi"] }
+ntapi = "0.4"
 
 [dev-dependencies]
 tempfile = { workspace = true }
