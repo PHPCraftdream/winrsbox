@@ -331,6 +331,32 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn req_injection_violation_roundtrip() {
+        let msg = Req::InjectionViolation {
+            pid: 100,
+            exe: r"c:\app\evil.exe".into(),
+            kind: InjectKind::ContextHijack,
+            target_pid: 200,
+            start_address: 0xDEADBEEF,
+            caller_pc: 0x7ff8a1234567,
+            caller_module: Some(r"c:\app\evil.exe".into()),
+            stack_top: vec![0x7ff8a1234567],
+        };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Req = read_msg(&mut buf).unwrap();
+        match dec {
+            Req::InjectionViolation { pid, kind, target_pid, .. } => {
+                assert_eq!(pid, 100);
+                assert_eq!(kind, InjectKind::ContextHijack);
+                assert_eq!(target_pid, 200);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
     fn read_msg_oversized_returns_decode() {
         let mut buf = Cursor::new(Vec::new());
         let len = (MAX_MSG_LEN as u32) + 1;
