@@ -115,6 +115,10 @@ struct Cli {
     #[arg(long = "no-pre-scan")]
     no_pre_scan: bool,
 
+    /// Override working directory (used by Explorer context menu integration).
+    #[arg(long = "cwd", value_name = "PATH")]
+    cwd: Option<String>,
+
     /// Target executable followed by its arguments. Everything after `--`
     /// (or after the last launcher option) is forwarded verbatim.
     #[arg(
@@ -200,6 +204,11 @@ async fn main() -> Result<()> {
     // Hide our console window before any println! when running headless
     // (default). With -d we keep the window visible for debugging.
     maybe_hide_console(cli.debug);
+
+    if let Some(ref cwd) = cli.cwd {
+        std::env::set_current_dir(cwd)
+            .with_context(|| format!("failed to set working directory to '{cwd}'"))?;
+    }
 
     let project_root: PathBuf = std::env::current_dir()
         .context("failed to get current directory")?;
