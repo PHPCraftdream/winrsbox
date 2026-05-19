@@ -13,7 +13,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-use detour::GenericDetour;
+use detour2::GenericDetour;
 use ntapi::winapi::shared::ntdef::{HANDLE, NTSTATUS, OBJECT_ATTRIBUTES};
 use winapi::ctypes::c_void;
 use winapi::um::processthreadsapi::GetCurrentProcessId;

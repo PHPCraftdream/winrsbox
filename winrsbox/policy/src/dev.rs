@@ -7,6 +7,10 @@ pub enum DeviceKind {
     Socket,
     Console,
     Null,
+    /// Known read-only system query devices (MountPointManager, IPT, etc.).
+    /// Used by Win32 APIs and .NET BCL for system metadata queries. Allowing
+    /// these is safe — they don't grant filesystem or network escape vectors.
+    SystemQuery,
     Unknown,
 }
 
@@ -37,19 +41,55 @@ pub fn classify_device(path: &str) -> DeviceKind {
     let lower = path.to_lowercase();
     if lower.starts_with(r"device\harddiskvolume") { return DeviceKind::HarddiskVolume; }
     if lower.starts_with(r"\device\harddiskvolume") { return DeviceKind::HarddiskVolume; }
+    // Named pipes: full form `\Device\NamedPipe\…` and DOS-form short `pipe\…`
+    // (Win32 layer translates `\\.\pipe\name` to `\Device\NamedPipe\name`, but
+    // some callers open via `\??\pipe\name` directly → "pipe\name" after strip).
     if lower.contains(r"namedpipe") || lower.contains(r"named_pipe") { return DeviceKind::NamedPipe; }
+    if lower.starts_with(r"pipe\") || lower.starts_with(r"\pipe\") { return DeviceKind::NamedPipe; }
     if lower.starts_with(r"device\afd") || lower.starts_with(r"\device\afd") { return DeviceKind::Socket; }
     if lower.starts_with(r"device\tcp") || lower.starts_with(r"\device\tcp") { return DeviceKind::Socket; }
     if lower.starts_with(r"device\udp") || lower.starts_with(r"\device\udp") { return DeviceKind::Socket; }
+    // NSI (Network Store Interface) — required for DNS resolver to query network
+    // configuration (DNS server addresses, interface state). Without it, all
+    // name resolution fails (getaddrinfo → EAI_FAIL).
+    if lower == "nsi" || lower.ends_with(r"\nsi") || lower.contains(r"device\nsi") { return DeviceKind::Socket; }
+    // Console: \Device\ConDrv, "console", and CONIN$/CONOUT$ pseudo-devices.
     if lower.contains("condrv") || lower.contains("console") { return DeviceKind::Console; }
+    if lower == "conin$" || lower == "conout$" || lower.ends_with(r"\conin$") || lower.ends_with(r"\conout$") {
+        return DeviceKind::Console;
+    }
     if lower.contains(r"device\null") || lower == "nul" || lower.ends_with(r"\nul") {
         return DeviceKind::Null;
+    }
+    // Known read-only system query devices used by Win32 / .NET BCL.
+    const SYSTEM_QUERY_DEVICES: &[&str] = &[
+        "mountpointmanager",  // \Device\MountPointManager — volume mount queries
+        "ipt",                // \Device\IPT — Intel Processor Trace
+        "kernelobjects",      // \KernelObjects — synchronization primitive lookup
+        "dfs",                // \Device\Dfs — DFS path resolution
+    ];
+    for name in SYSTEM_QUERY_DEVICES {
+        if lower.contains(name) {
+            return DeviceKind::SystemQuery;
+        }
     }
     DeviceKind::Unknown
 }
 
 pub fn is_safe_default(kind: DeviceKind) -> bool {
-    matches!(kind, DeviceKind::HarddiskVolume | DeviceKind::NamedPipe | DeviceKind::Console | DeviceKind::Null)
+    matches!(kind, DeviceKind::HarddiskVolume | DeviceKind::NamedPipe | DeviceKind::Console | DeviceKind::Null | DeviceKind::Socket)
+}
+
+/// Stricter check for SystemQuery devices: allow read, deny write.
+/// MountPointManager IOCTL_MOUNTMGR_CREATE_POINT needs write access +
+/// SeRestorePrivilege; NSI NsiSetParameter needs write access.
+/// Limiting to read-only access removes these vectors even without
+/// relying on privilege checks.
+pub fn is_safe_with_access(kind: DeviceKind, write: bool) -> bool {
+    match kind {
+        DeviceKind::SystemQuery => !write,
+        _ => is_safe_default(kind),
+    }
 }
 
 #[cfg(test)]
@@ -148,7 +188,27 @@ mod tests {
     fn classify_unknown() {
         assert_eq!(classify_device(r"\device\cldflt"), DeviceKind::Unknown);
         assert_eq!(classify_device(r"device\physicaldrive0"), DeviceKind::Unknown);
-        assert_eq!(classify_device(r"\device\mountpointmanager"), DeviceKind::Unknown);
+    }
+
+    #[test]
+    fn classify_console_pseudo_devices() {
+        assert_eq!(classify_device("conout$"), DeviceKind::Console);
+        assert_eq!(classify_device("conin$"), DeviceKind::Console);
+        assert_eq!(classify_device(r"\??\conout$"), DeviceKind::Console);
+    }
+
+    #[test]
+    fn classify_short_pipe_form() {
+        assert_eq!(classify_device(r"pipe\foo"), DeviceKind::NamedPipe);
+        assert_eq!(classify_device(r"\pipe\bar"), DeviceKind::NamedPipe);
+    }
+
+    #[test]
+    fn classify_system_query_devices() {
+        assert_eq!(classify_device(r"\device\mountpointmanager"), DeviceKind::SystemQuery);
+        assert_eq!(classify_device(r"device\ipt"), DeviceKind::SystemQuery);
+        assert!(is_safe_with_access(DeviceKind::SystemQuery, false));
+        assert!(!is_safe_with_access(DeviceKind::SystemQuery, true));
     }
 
     #[test]
@@ -157,7 +217,16 @@ mod tests {
         assert!(is_safe_default(DeviceKind::NamedPipe));
         assert!(is_safe_default(DeviceKind::Console));
         assert!(is_safe_default(DeviceKind::Null));
-        assert!(!is_safe_default(DeviceKind::Socket));
+        assert!(is_safe_default(DeviceKind::Socket));
+        assert!(!is_safe_default(DeviceKind::SystemQuery));
         assert!(!is_safe_default(DeviceKind::Unknown));
+    }
+
+    #[test]
+    fn system_query_read_only() {
+        assert!(is_safe_with_access(DeviceKind::SystemQuery, false));
+        assert!(!is_safe_with_access(DeviceKind::SystemQuery, true));
+        assert!(is_safe_with_access(DeviceKind::Socket, false));
+        assert!(is_safe_with_access(DeviceKind::Socket, true));
     }
 }

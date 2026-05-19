@@ -379,7 +379,7 @@ pub fn rule_clear(db: &redb::Database) -> Result<(), crate::PolicyError> {
     Ok(())
 }
 
-pub fn mock_upsert(db: &redb::Database, id: &str, path: &str, payload: &[u8]) -> Result<(), crate::PolicyError> {
+pub fn mock_upsert(db: &redb::Database, _id: &str, path: &str, payload: &[u8]) -> Result<(), crate::PolicyError> {
     let key = path.to_lowercase();
     let txn = db.begin_write()?;
     {
@@ -390,7 +390,7 @@ pub fn mock_upsert(db: &redb::Database, id: &str, path: &str, payload: &[u8]) ->
     Ok(())
 }
 
-pub fn mock_remove_by_id(db: &redb::Database, _id: &str) -> Result<bool, crate::PolicyError> {
+pub fn mock_remove_by_id(_db: &redb::Database, _id: &str) -> Result<bool, crate::PolicyError> {
     // Mocks don't store id inline in the table; we'll match by iterating
     // For now, mocks use path as key so we need a different approach
     // We store a MOCKS_META table for id → path mapping

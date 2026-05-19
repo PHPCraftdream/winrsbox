@@ -11,6 +11,8 @@ use ipc::{read_msg, write_msg, LogLevel, Req, Resp};
 use policy::Policy;
 use rustc_hash::FxHashSet;
 use winrsbox::cli;
+use winrsbox::hot_stats::{HotStats, ThrottledFlusher};
+use winrsbox::jsonl_log;
 use std::{
     ffi::OsStr,
     os::windows::ffi::OsStrExt,
@@ -87,6 +89,31 @@ rules: [
         prefix: C:\\Users\\**\\.gradle
         read: passthrough
         write: passthrough
+    }
+    {
+        prefix: C:\\Users\\**\\.claude
+        read: passthrough
+        write: passthrough
+    }
+    {
+        prefix: C:\\Users\\**\\.config
+        read: passthrough
+        write: passthrough
+    }
+    {
+        prefix: C:\\Users\\**\\AppData\\Roaming\\npm
+        read: passthrough
+        write: passthrough
+    }
+    {
+        prefix: C:\\Users\\**\\AppData\\Local\\node
+        read: passthrough
+        write: passthrough
+    }
+    {
+        prefix: C:\\Program Files\\nodejs
+        read: passthrough
+        write: deny
     }
 ]
 
@@ -174,6 +201,16 @@ struct Cli {
     /// Skip pre-launch .text scan of the target executable.
     #[arg(long = "no-pre-scan")]
     no_pre_scan: bool,
+
+    /// Disable specific hook categories for debugging (comma-separated).
+    /// Categories: memory, inject, reg, net, mitigations, fs.
+    /// Example: --disable-hooks inject,mitigations
+    #[arg(long = "disable-hooks", value_name = "CATEGORIES")]
+    disable_hooks: Option<String>,
+
+    /// Enable trace logging from hook.dll (verbose, for debugging).
+    #[arg(long = "trace")]
+    trace: bool,
 
     /// Per-process memory limit in gigabytes (applied via Job Object).
     #[arg(long = "memory-limit", value_name = "GB")]
@@ -310,6 +347,16 @@ async fn main() -> Result<()> {
     // Violations log path
     let violations_log = cfg_path.parent().unwrap().join("violations.log");
 
+    // JSONL structured log — persistent, machine-parseable
+    jsonl_log::init(cfg_path.parent().unwrap().join("sandbox.log.jsonl"));
+
+    // Hot-stats: aggregates access patterns, flushed to disk at most once per 5s.
+    let hot_stats = HotStats::new();
+    let flusher = Arc::new(ThrottledFlusher::new(
+        Arc::clone(&hot_stats),
+        cfg_path.parent().unwrap().join("hot-stats.json"),
+    ));
+
     // ── Pipe server (accept loop in background task) ──────────────────────
     {
         let policy = Arc::clone(&policy);
@@ -317,9 +364,11 @@ async fn main() -> Result<()> {
         let child_pids = Arc::clone(&child_pids);
         let pipe_name2 = pipe_name.clone();
         let violations_log2 = violations_log.clone();
+        let hot_stats2 = Arc::clone(&hot_stats);
+        let flusher2 = Arc::clone(&flusher);
 
         tokio::spawn(async move {
-            pipe_accept_loop(&pipe_name2, policy, stats, child_pids, violations_log2).await;
+            pipe_accept_loop(&pipe_name2, policy, stats, child_pids, violations_log2, hot_stats2, flusher2).await;
         });
     }
 
@@ -345,6 +394,12 @@ async fn main() -> Result<()> {
     });
     if cli.allow_rwx {
         std::env::set_var("FS_SANDBOX_ALLOW_RWX", "1");
+    }
+    if let Some(ref cats) = cli.disable_hooks {
+        std::env::set_var("FS_SANDBOX_DISABLE_HOOKS", cats);
+    }
+    if cli.trace {
+        std::env::set_var("FS_SANDBOX_TRACE", "1");
     }
 
     // Trust-based guard level override: signed binaries get scan (JIT-friendly)
@@ -436,14 +491,48 @@ async fn main() -> Result<()> {
                 // Block lateral movement to RFC1918 private ranges
                 for cidr_str in winrsbox::wfp::RFC1918 {
                     if let Some(cidr) = winrsbox::wfp::CidrV4::parse(cidr_str) {
-                        let _ = engine.block_outbound_cidr(target_path, &cidr);
+                        match engine.block_outbound_cidr(target_path, &cidr) {
+                            Ok(_) => {}
+                            Err(e) => eprintln!("[sandbox] WFP filter {cidr_str} failed: {e}"),
+                        }
                     }
                 }
-                println!("[sandbox] WFP: {} outbound filters registered", engine.filter_count());
+                // Block SMB/NetBIOS egress — prevents DFS UNC exfiltration
+                // to remote servers (\\evil.com\share\stolen.dat).
+                for port in [445u16, 139] {
+                    match engine.block_outbound_port(port) {
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[sandbox] WFP port {port} block failed: {e}"),
+                    }
+                }
+                let fc = engine.filter_count();
+                println!("[sandbox] WFP: {fc} outbound filters registered");
+                jsonl_log::log(jsonl_log::Event::wfp(fc));
                 Some(engine)
             }
             Err(e) => {
                 eprintln!("[sandbox] WFP unavailable: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // ETW Kernel-Process listener (best-effort — needs admin on some builds).
+    let _etw = if cli.guard != GuardLevel::None {
+        let scoreboard = Arc::new(std::sync::Mutex::new(winrsbox::etw::EtwScoreboard::new()));
+        let proc_info_ref = global_proc_info();
+        let pid_checker: Arc<dyn Fn(u32) -> bool + Send + Sync> = Arc::new(move |pid: u32| {
+            proc_info_ref.pin().get(&pid).is_some()
+        });
+        match winrsbox::etw_listener::start(scoreboard, pid_checker) {
+            Ok(h) => {
+                println!("[sandbox] ETW: Kernel-Process listener active");
+                Some(h)
+            }
+            Err(e) => {
+                eprintln!("[sandbox] ETW unavailable: {e}");
                 None
             }
         }
@@ -532,6 +621,15 @@ async fn main() -> Result<()> {
         s.cow.load(Ordering::Relaxed),
     );
 
+    // Final logs and stats
+    jsonl_log::log_immediate(jsonl_log::Event::exit(
+        exit_code,
+        s.decide.load(Ordering::Relaxed),
+        viol,
+    ));
+    jsonl_log::flush();
+    flusher.flush_now();
+
     // Exit immediately rather than returning through the tokio runtime drop path.
     // The pipe-accept loop keeps a spawn_blocking thread blocked on ConnectNamedPipe;
     // if we let the runtime drop normally it waits 30 s for that thread to finish.
@@ -549,6 +647,8 @@ async fn pipe_accept_loop(
     stats: Arc<Stats>,
     child_pids: Arc<crossbeam_queue::SegQueue<u32>>,
     violations_log: PathBuf,
+    hot_stats: Arc<HotStats>,
+    flusher: Arc<ThrottledFlusher>,
 ) {
     let pipe_name_wide: Vec<u16> = OsStr::new(pipe_name)
         .encode_wide()
@@ -620,13 +720,15 @@ async fn pipe_accept_loop(
         let stats = Arc::clone(&stats);
         let child_pids = Arc::clone(&child_pids);
         let vlog = violations_log.clone();
+        let hot_stats2 = Arc::clone(&hot_stats);
+        let flusher2 = Arc::clone(&flusher);
 
         // Intentional fire-and-forget: spawn_blocking tasks run to completion even
         // after JoinHandle is dropped — they are not cancelled.
         tokio::task::spawn_blocking(move || {
             // SAFETY: ph is the isize repr of the valid pipe handle for this connection.
             let h = HANDLE(ph as *mut _);
-            handle_connection(h, &policy, &stats, &child_pids, &vlog);
+            handle_connection(h, &policy, &stats, &child_pids, &vlog, &hot_stats2, &flusher2);
             // SAFETY: h — disconnect and close after the connection handler finishes.
             unsafe { DisconnectNamedPipe(h).ok() };
             unsafe { CloseHandle(h).ok() };
@@ -649,6 +751,8 @@ fn handle_connection(
     stats: &Stats,
     child_pids: &crossbeam_queue::SegQueue<u32>,
     violations_log: &Path,
+    hot_stats: &HotStats,
+    flusher: &ThrottledFlusher,
 ) {
     use std::os::windows::io::{FromRawHandle, RawHandle};
 
@@ -674,6 +778,8 @@ fn handle_connection(
         let resp = match req {
             Req::Hello { pid, exe_path } => {
                 println!("[sandbox] hello from pid={pid} exe={exe_path}");
+                hot_stats.totals.hellos.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                jsonl_log::log(jsonl_log::Event::hello(pid, &exe_path));
                 let exe_lower = exe_path.to_ascii_lowercase();
                 let map = global_proc_info().pin();
                 if let Some(existing) = map.get(&pid) {
@@ -695,6 +801,8 @@ fn handle_connection(
             }
             Req::SpawnedChild { parent_pid, child_pid, child_exe } => {
                 println!("[sandbox] child spawned: parent={parent_pid} child={child_pid} exe={child_exe}");
+                hot_stats.totals.children.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                jsonl_log::log(jsonl_log::Event::child(parent_pid, child_pid, &child_exe));
                 child_pids.push(child_pid);
                 let map = global_proc_info().pin();
                 let parent_depth = map.get(&parent_pid).map(|p| p.depth).unwrap_or(0);
@@ -722,12 +830,26 @@ fn handle_connection(
                     depth,
                     exe_lower.as_deref(),
                 );
+                hot_stats.totals.fs_decides.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let denied = matches!(d.mode, policy::Mode::Deny);
                 match d.mode {
-                    policy::Mode::Deny => { stats.deny.fetch_add(1, Ordering::Relaxed); }
-                    policy::Mode::Cow => { stats.cow.fetch_add(1, Ordering::Relaxed); }
-                    policy::Mode::Mock => { stats.mock_.fetch_add(1, Ordering::Relaxed); }
+                    policy::Mode::Deny => {
+                        stats.deny.fetch_add(1, Ordering::Relaxed);
+                        hot_stats.totals.fs_denies.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        jsonl_log::log(jsonl_log::Event::deny(&dos_path, write));
+                    }
+                    policy::Mode::Cow => {
+                        stats.cow.fetch_add(1, Ordering::Relaxed);
+                        hot_stats.totals.fs_cows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    policy::Mode::Mock => {
+                        stats.mock_.fetch_add(1, Ordering::Relaxed);
+                        hot_stats.totals.fs_mocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     policy::Mode::Passthrough => {}
                 }
+                hot_stats.record_fs(&dos_path, write, denied);
+                flusher.maybe_flush();
                 Resp::Decision(d)
             }
             Req::RecordOverlay { orig, overlay } => {
@@ -754,6 +876,7 @@ fn handle_connection(
                 // exists only for IPC schema completeness. If a hook DLL ever
                 // sends one (it shouldn't), just log and ack.
                 stats.violations.fetch_add(1, Ordering::Relaxed);
+                hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Resp::Ok
             }
             Req::InjectionViolation {
@@ -761,10 +884,15 @@ fn handle_connection(
                 caller_pc, caller_module, stack_top,
             } => {
                 stats.violations.fetch_add(1, Ordering::Relaxed);
+                hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let caller_str = caller_module.as_deref().unwrap_or("<anonymous>");
                 eprintln!(
                     "[VIOLATION] pid={pid} kind={kind} target_pid={target_pid} caller={caller_str} pc=0x{caller_pc:x}",
                 );
+                jsonl_log::log_immediate(jsonl_log::Event::violation(
+                    pid, &format!("{kind}"),
+                    &format!("target_pid={target_pid} start=0x{start_address:x} pc=0x{caller_pc:x}"),
+                ));
                 let stack_json: Vec<String> = stack_top.iter().map(|f| format!("\"0x{f:x}\"")).collect();
                 let line = format!(
                     "{{\"pid\":{pid},\"exe\":\"{}\",\"kind\":\"{kind}\",\"target_pid\":{target_pid},\"start_addr\":\"0x{start_address:x}\",\"caller_pc\":\"0x{caller_pc:x}\",\"caller_module\":{},\"stack\":[{}]}}\n",
@@ -788,10 +916,15 @@ fn handle_connection(
                 target_address, caller_pc, caller_module, stack_top,
             } => {
                 stats.violations.fetch_add(1, Ordering::Relaxed);
+                hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let caller_str = caller_module.as_deref().unwrap_or("<anonymous>");
                 eprintln!(
                     "[VIOLATION] pid={pid} kind={kind} protect=0x{requested_protect:x} caller={caller_str} pc=0x{caller_pc:x}",
                 );
+                jsonl_log::log_immediate(jsonl_log::Event::violation(
+                    pid, &format!("{kind}"),
+                    &format!("protect=0x{requested_protect:x} addr=0x{target_address:x} pc=0x{caller_pc:x}"),
+                ));
                 let stack_json: Vec<String> = stack_top.iter().map(|f| format!("\"0x{f:x}\"")).collect();
                 let line = format!(
                     "{{\"pid\":{pid},\"exe\":\"{}\",\"kind\":\"{kind}\",\"protect\":\"0x{requested_protect:x}\",\"size\":{region_size},\"addr\":\"0x{target_address:x}\",\"caller_pc\":\"0x{caller_pc:x}\",\"caller_module\":{},\"stack\":[{}]}}\n",
@@ -823,14 +956,24 @@ fn handle_connection(
                     r"\system\currentcontrolset\control\session manager\appcertdlls",
                 ];
                 let key_lower = key_path.to_ascii_lowercase();
-                let mode = if write && PERSISTENCE_DENY_SUFFIXES.iter()
-                    .any(|s| key_lower.contains(s))
-                {
+                let is_persistence = PERSISTENCE_DENY_SUFFIXES.iter().any(|s| key_lower.contains(s));
+                let (mode, denied) = if write && is_persistence {
                     eprintln!("[reg] DENY {key_path} value={value_name:?}");
-                    "deny"
+                    ("deny", true)
+                } else if write && (key_lower.contains(r"\software\") || key_lower.ends_with(r"\software")) {
+                    // Non-persistence HKCU\Software writes → silent success
+                    // (program thinks it wrote, sandbox absorbs it)
+                    ("silent_ok", false)
                 } else {
-                    "passthrough"
+                    ("passthrough", false)
                 };
+                hot_stats.totals.reg_decides.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if denied { hot_stats.totals.reg_denies.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                hot_stats.record_reg(&key_path, write, denied);
+                if denied {
+                    jsonl_log::log(jsonl_log::Event::reg_decide(&key_path, write, mode));
+                }
+                flusher.maybe_flush();
                 Resp::RegDecision { mode: mode.into(), value_json: None }
             }
             Req::RegWrite { key_path, value_name, .. } => {
@@ -852,6 +995,12 @@ fn handle_connection(
                 if !allow {
                     eprintln!("[net] DENY {host}:{port}");
                 }
+                hot_stats.totals.net_decides.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if !allow { hot_stats.totals.net_denies.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                let host_port = format!("{host}:{port}");
+                hot_stats.record_net(&host_port, !allow);
+                jsonl_log::log(jsonl_log::Event::net_decide(&host_port, allow));
+                flusher.maybe_flush();
                 Resp::NetDecision { allow }
             }
             Req::MemDecide { target_pid, op } => {
@@ -1182,19 +1331,51 @@ fn maybe_hide_console(debug: bool) {
 }
 
 /// Build a Windows command line string from an argument list.
-/// Arguments that contain spaces are quoted.
+/// Follows Microsoft CommandLineToArgvW escaping rules.
 fn build_cmdline(args: &[String]) -> String {
-    args.iter()
-        .map(|a| {
-            if a.contains(' ') || a.contains('"') {
-                let escaped = a.replace('\\', "\\\\").replace('"', "\\\"");
-                format!("\"{}\"", escaped)
+    fn quote_arg(a: &str) -> String {
+        if a.is_empty() {
+            return "\"\"".to_string();
+        }
+        if !a.contains(' ') && !a.contains('\t') && !a.contains('"') {
+            return a.to_string();
+        }
+        let mut out = String::with_capacity(a.len() + 4);
+        out.push('"');
+        let bytes = a.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let ch = bytes[i];
+            if ch == b'\\' {
+                let start = i;
+                while i < bytes.len() && bytes[i] == b'\\' { i += 1; }
+                let n = i - start;
+                if i == bytes.len() {
+                    // Trailing backslashes → double them before closing quote
+                    for _ in 0..n * 2 { out.push('\\'); }
+                } else if bytes[i] == b'"' {
+                    // Backslashes before quote → double them + escape the quote
+                    for _ in 0..n * 2 { out.push('\\'); }
+                    out.push('\\');
+                    out.push('"');
+                    i += 1;
+                } else {
+                    // Backslashes not before quote → emit literally
+                    for _ in 0..n { out.push('\\'); }
+                }
+            } else if ch == b'"' {
+                out.push('\\');
+                out.push('"');
+                i += 1;
             } else {
-                a.clone()
+                out.push(ch as char);
+                i += 1;
             }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+        }
+        out.push('"');
+        out
+    }
+    args.iter().map(|a| quote_arg(a)).collect::<Vec<_>>().join(" ")
 }
 
 /// Find hook.dll alongside the launcher executable.
@@ -1342,5 +1523,56 @@ mod proc_info_tests {
         let info = map.pin().get(&50).cloned().unwrap();
         assert_eq!(info.depth, 1);
         assert_eq!(&*info.exe_lower, "new.exe");
+    }
+}
+
+#[cfg(test)]
+mod cmdline_tests {
+    use super::build_cmdline;
+
+    #[test]
+    fn simple_no_quoting() {
+        assert_eq!(build_cmdline(&["foo".into(), "bar".into()]), "foo bar");
+    }
+
+    #[test]
+    fn spaces_get_quoted() {
+        assert_eq!(build_cmdline(&["hello world".into()]), "\"hello world\"");
+    }
+
+    #[test]
+    fn backslash_in_path_not_doubled() {
+        assert_eq!(
+            build_cmdline(&[r"C:\Program Files\app.exe".into()]),
+            r#""C:\Program Files\app.exe""#,
+        );
+    }
+
+    #[test]
+    fn trailing_backslash_doubled_before_close_quote() {
+        // Only relevant when arg needs quoting (has spaces)
+        assert_eq!(
+            build_cmdline(&[r"C:\my dir\".into()]),
+            r#""C:\my dir\\""#,
+        );
+    }
+
+    #[test]
+    fn embedded_quote() {
+        assert_eq!(
+            build_cmdline(&[r#"say "hi""#.into()]),
+            r#""say \"hi\"""#,
+        );
+    }
+
+    #[test]
+    fn empty_arg() {
+        assert_eq!(build_cmdline(&["".into()]), r#""""#);
+    }
+
+    #[test]
+    fn cmd_c_echo() {
+        let args = vec!["cmd.exe".into(), "/c".into(), "echo hello".into()];
+        assert_eq!(build_cmdline(&args), r#"cmd.exe /c "echo hello""#);
     }
 }

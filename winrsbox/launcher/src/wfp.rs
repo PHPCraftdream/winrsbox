@@ -3,7 +3,7 @@
 // Kernel-enforced — direct syscalls cannot bypass.
 // Registers filters via fwpuclnt.dll from user-mode.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -57,14 +57,17 @@ impl WfpEngine {
         use windows::Wdk::NetworkManagement::WindowsFilteringPlatform::FwpmEngineOpen0;
         use windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_SESSION0;
 
-        let session = FWPM_SESSION0::default();
+        let session = FWPM_SESSION0 {
+            flags: 0x0001, // FWPM_SESSION_FLAG_DYNAMIC
+            ..Default::default()
+        };
         let mut handle = windows::Win32::Foundation::HANDLE::default();
 
         // SAFETY: session is a valid zero-initialized struct; handle will be set on success.
         let status = unsafe {
             FwpmEngineOpen0(
                 None, // local engine
-                0x0A, // RPC_C_AUTHN_WINNT
+                0xFFFFFFFF, // RPC_C_AUTHN_DEFAULT
                 None, // default auth
                 Some(&session),
                 &mut handle,
@@ -90,15 +93,13 @@ impl WfpEngine {
         use windows::Wdk::NetworkManagement::WindowsFilteringPlatform::FwpmFilterAdd0;
         use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 
-        // Build FWP_V4_ADDR_AND_MASK for the CIDR
         let addr_mask = FWP_V4_ADDR_AND_MASK {
             addr: cidr.addr,
             mask: cidr.mask(),
         };
 
-        // Condition: match remote address in CIDR
-        let condition = FWPM_FILTER_CONDITION0 {
-            fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS_V4,
+        let mut conditions = [FWPM_FILTER_CONDITION0 {
+            fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
             matchType: FWP_MATCH_EQUAL,
             conditionValue: FWP_CONDITION_VALUE0 {
                 r#type: FWP_V4_ADDR_MASK,
@@ -106,24 +107,26 @@ impl WfpEngine {
                     v4AddrMask: &addr_mask as *const _ as *mut _,
                 },
             },
+        }];
+
+        let display_name_wide: Vec<u16> = format!("winrsbox-{}\0", if block {"block"} else {"permit"})
+            .encode_utf16().collect();
+        let display = FWPM_DISPLAY_DATA0 {
+            name: windows::core::PWSTR(display_name_wide.as_ptr() as *mut _),
+            description: windows::core::PWSTR::null(),
         };
 
-        let action = if block {
-            FWPM_ACTION0 {
-                r#type: FWP_ACTION_BLOCK,
-                ..Default::default()
-            }
-        } else {
-            FWPM_ACTION0 {
-                r#type: FWP_ACTION_PERMIT,
-                ..Default::default()
-            }
+        let action = FWPM_ACTION0 {
+            r#type: if block { FWP_ACTION_BLOCK } else { FWP_ACTION_PERMIT },
+            ..Default::default()
         };
 
         let filter = FWPM_FILTER0 {
+            displayData: display,
             layerKey: FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+            subLayerKey: FWPM_SUBLAYER_UNIVERSAL,
             action,
-            filterCondition: &condition as *const _ as *mut _,
+            filterCondition: conditions.as_mut_ptr(),
             numFilterConditions: 1,
             weight: FWP_VALUE0 {
                 r#type: FWP_UINT8,
@@ -144,6 +147,52 @@ impl WfpEngine {
         Ok(filter_id)
     }
 
+    /// Block all outbound TCP connections to a specific port.
+    pub fn block_outbound_port(&mut self, port: u16) -> Result<u64> {
+        use windows::Wdk::NetworkManagement::WindowsFilteringPlatform::FwpmFilterAdd0;
+        use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
+
+        let mut conditions = [FWPM_FILTER_CONDITION0 {
+            fieldKey: FWPM_CONDITION_IP_REMOTE_PORT,
+            matchType: FWP_MATCH_EQUAL,
+            conditionValue: FWP_CONDITION_VALUE0 {
+                r#type: FWP_UINT16,
+                Anonymous: FWP_CONDITION_VALUE0_0 { uint16: port },
+            },
+        }];
+
+        let name_wide: Vec<u16> = format!("winrsbox-block-port-{port}\0")
+            .encode_utf16().collect();
+        let display = FWPM_DISPLAY_DATA0 {
+            name: windows::core::PWSTR(name_wide.as_ptr() as *mut _),
+            description: windows::core::PWSTR::null(),
+        };
+
+        let filter = FWPM_FILTER0 {
+            displayData: display,
+            layerKey: FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+            subLayerKey: FWPM_SUBLAYER_UNIVERSAL,
+            action: FWPM_ACTION0 { r#type: FWP_ACTION_BLOCK, ..Default::default() },
+            filterCondition: conditions.as_mut_ptr(),
+            numFilterConditions: 1,
+            weight: FWP_VALUE0 {
+                r#type: FWP_UINT8,
+                Anonymous: FWP_VALUE0_0 { uint8: 10 },
+            },
+            ..Default::default()
+        };
+
+        let mut filter_id: u64 = 0;
+        let status = unsafe {
+            FwpmFilterAdd0(self.handle, &filter, None, Some(&mut filter_id))
+        };
+        if status.is_err() {
+            anyhow::bail!("FwpmFilterAdd0 port {port} failed: {:?}", status);
+        }
+        self.filter_ids.push(filter_id);
+        Ok(filter_id)
+    }
+
     /// Number of registered filters.
     pub fn filter_count(&self) -> usize {
         self.filter_ids.len()
@@ -157,10 +206,10 @@ impl Drop for WfpEngine {
         };
         for &fid in &self.filter_ids {
             // SAFETY: engine handle is still valid; filter_id was returned by FwpmFilterAdd0.
-            unsafe { FwpmFilterDeleteById0(self.handle, fid); }
+            unsafe { let _ = FwpmFilterDeleteById0(self.handle, fid); }
         }
         // SAFETY: closing the engine we opened.
-        unsafe { FwpmEngineClose0(self.handle); }
+        unsafe { let _ = FwpmEngineClose0(self.handle); }
     }
 }
 

@@ -10,7 +10,7 @@ crate-type = ["cdylib", "rlib"]
 policy  = { path = "../policy" }
 ipc     = { path = "../ipc" }
 
-detour     = { version = "0.8", default-features = false }
+detour2    = { version = "0.9", default-features = false }
 ntapi      = "0.4"
 winapi     = { version = "0.3", features = [
     "winerror",

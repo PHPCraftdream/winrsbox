@@ -11,7 +11,7 @@
 
 use std::sync::OnceLock;
 
-use detour::GenericDetour;
+use detour2::GenericDetour;
 use ntapi::winapi::shared::ntdef::{HANDLE, NTSTATUS};
 use winapi::ctypes::c_void;
 use winapi::um::processthreadsapi::GetCurrentProcessId;
@@ -69,7 +69,16 @@ type FnNtUnmapViewOfSection = unsafe extern "system" fn(
 // Detour storage
 // ---------------------------------------------------------------------------
 
+// NtAllocateVirtualMemory uses a manual inline hook instead of GenericDetour
+// because detour/detour2 trampoline generation for this specific syscall stub
+// produces broken trampolines on our Windows build (infinite recursion → AV).
+// We write the hook ourselves: copy prologue, patch with JMP rel32, done.
 static HOOK_ALLOC: OnceLock<GenericDetour<FnNtAllocateVirtualMemory>> = OnceLock::new();
+static MANUAL_ALLOC_TRAMPOLINE: OnceLock<FnNtAllocateVirtualMemory> = OnceLock::new();
+static MANUAL_ALLOC_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// TLS index for NtAlloc-specific re-entry guard. Unlike thread_local! Cell<bool>,
+// TlsGetValue/TlsSetValue never allocate, so they can't re-enter our NtAlloc hook.
+static ALLOC_TLS_INDEX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0xFFFFFFFF);
 static HOOK_PROTECT: OnceLock<GenericDetour<FnNtProtectVirtualMemory>> = OnceLock::new();
 static HOOK_MAP_VIEW: OnceLock<GenericDetour<FnNtMapViewOfSection>> = OnceLock::new();
 static HOOK_WRITE_MEM: OnceLock<GenericDetour<FnNtWriteVirtualMemory>> = OnceLock::new();
@@ -420,36 +429,44 @@ unsafe extern "system" fn hook_nt_allocate_virtual_memory(
     protect: u32,
 ) -> NTSTATUS {
     let call_original = || {
-        HOOK_ALLOC.get().unwrap().call(
-            process_handle, base_address, zero_bits,
-            region_size, allocation_type, protect,
-        )
-    };
-
-    let Some(_guard) = anti_rec::enter() else {
-        return call_original();
-    };
-
-    if is_current_process(process_handle) {
-        // RWX-from-start: block only in full mode. In scan mode, allow for
-        // JIT runtimes (.NET CLR, V8). Content scan on VirtualProtect remains.
-        if is_rwx(protect) && !allow_rwx() && is_full_mode() {
-            let size = if region_size.is_null() { 0 } else { *region_size as u64 };
-            let addr = if base_address.is_null() { 0 } else { *base_address as u64 };
-            report_and_terminate(ipc::AllocKind::Allocate, protect, size, addr);
+        if let Some(tramp) = MANUAL_ALLOC_TRAMPOLINE.get() {
+            tramp(process_handle, base_address, zero_bits,
+                  region_size, allocation_type, protect)
+        } else {
+            // Fallback: try GenericDetour (may not be set)
+            HOOK_ALLOC.get().unwrap().call(
+                process_handle, base_address, zero_bits,
+                region_size, allocation_type, protect,
+            )
         }
-    } else {
-        let target_pid = winapi::um::processthreadsapi::GetProcessId(process_handle);
-        if target_pid != 0 && !crate::process_tracker::is_owned_child(target_pid) {
-            if is_executable(protect) {
+    };
+
+    if !alloc_anti_rec_enter() {
+        return call_original();
+    }
+
+    let result = (|| {
+        if is_current_process(process_handle) {
+            if is_rwx(protect) && !allow_rwx() && is_full_mode() {
                 let size = if region_size.is_null() { 0 } else { *region_size as u64 };
                 let addr = if base_address.is_null() { 0 } else { *base_address as u64 };
                 report_and_terminate(ipc::AllocKind::Allocate, protect, size, addr);
             }
+        } else {
+            let target_pid = winapi::um::processthreadsapi::GetProcessId(process_handle);
+            if target_pid != 0 && !crate::process_tracker::is_owned_child(target_pid) {
+                if is_executable(protect) {
+                    let size = if region_size.is_null() { 0 } else { *region_size as u64 };
+                    let addr = if base_address.is_null() { 0 } else { *base_address as u64 };
+                    report_and_terminate(ipc::AllocKind::Allocate, protect, size, addr);
+                }
+            }
         }
-    }
+        call_original()
+    })();
 
-    call_original()
+    alloc_anti_rec_leave();
+    result
 }
 
 unsafe extern "system" fn hook_nt_protect_virtual_memory(
@@ -669,6 +686,150 @@ unsafe extern "system" fn hook_nt_write_virtual_memory(
 }
 
 // ---------------------------------------------------------------------------
+// TLS-based re-entry guard for NtAllocateVirtualMemory
+// ---------------------------------------------------------------------------
+
+unsafe fn alloc_anti_rec_enter() -> bool {
+    let idx = ALLOC_TLS_INDEX.load(std::sync::atomic::Ordering::Relaxed);
+    if idx == 0xFFFFFFFF { return false; }
+    // SAFETY: TlsGetValue never allocates. Returns NULL (0) if not set.
+    let val = winapi::um::processthreadsapi::TlsGetValue(idx);
+    if val as usize != 0 {
+        return false; // already in hook on this thread
+    }
+    // SAFETY: TlsSetValue never allocates.
+    winapi::um::processthreadsapi::TlsSetValue(idx, 1usize as *mut _);
+    true
+}
+
+unsafe fn alloc_anti_rec_leave() {
+    let idx = ALLOC_TLS_INDEX.load(std::sync::atomic::Ordering::Relaxed);
+    if idx != 0xFFFFFFFF {
+        winapi::um::processthreadsapi::TlsSetValue(idx, std::ptr::null_mut());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Manual inline hook for NtAllocateVirtualMemory
+// ---------------------------------------------------------------------------
+
+/// # SAFETY
+/// Must be called once from install(). Patches ntdll in-place.
+unsafe fn alloc_near(target: usize, size: usize) -> *mut c_void {
+    // SAFETY: Try addresses within ±2GB of target in 64KB steps (allocation
+    // granularity). VirtualAlloc returns NULL on failure → safe.
+    let mut addr = (target & !0xFFFF).wrapping_sub(0x7FFF_0000);
+    let end = (target & !0xFFFF).wrapping_add(0x7FFF_0000);
+    while addr < end {
+        let p = winapi::um::memoryapi::VirtualAlloc(
+            addr as *mut _,
+            size,
+            0x1000 | 0x2000, // MEM_COMMIT | MEM_RESERVE
+            0x40,             // PAGE_EXECUTE_READWRITE
+        );
+        if !p.is_null() { return p; }
+        addr = addr.wrapping_add(0x10000);
+    }
+    std::ptr::null_mut()
+}
+
+unsafe fn install_manual_alloc_hook() -> Result<(), Box<dyn std::error::Error>> {
+    // Allocate TLS index for re-entry guard (TlsAlloc never uses NtAlloc).
+    let tls_idx = winapi::um::processthreadsapi::TlsAlloc();
+    if tls_idx == 0xFFFFFFFF {
+        return Err("TlsAlloc failed".into());
+    }
+    ALLOC_TLS_INDEX.store(tls_idx, std::sync::atomic::Ordering::Relaxed);
+
+    let target_addr = crate::hooks::ntdll_export("NtAllocateVirtualMemory\0".as_bytes())
+        .ok_or("NtAllocateVirtualMemory not found")?;
+
+    // Verify expected prologue: 4c 8b d1 b8 XX XX XX XX (8 bytes)
+    let prologue = std::slice::from_raw_parts(target_addr as *const u8, 8);
+    if prologue[0] != 0x4c || prologue[1] != 0x8b || prologue[2] != 0xd1 || prologue[3] != 0xb8 {
+        return Err(format!(
+            "unexpected NtAllocateVirtualMemory prologue: {:02x} {:02x} {:02x} {:02x}",
+            prologue[0], prologue[1], prologue[2], prologue[3]
+        ).into());
+    }
+
+    // Allocate trampoline page NEAR ntdll (within ±2GB for JMP rel32)
+    let tramp_page = alloc_near(target_addr as usize, 4096);
+    if tramp_page.is_null() {
+        return Err("VirtualAlloc for trampoline failed (no space near ntdll)".into());
+    }
+    let tramp = tramp_page as *mut u8;
+
+    // Trampoline: [original 8 bytes] [JMP rel32 to ntdll+8]
+    std::ptr::copy_nonoverlapping(target_addr as *const u8, tramp, 8);
+    let jmp_target = (target_addr as usize) + 8;
+    let jmp_src = (tramp as usize) + 8 + 5;
+    let rel32 = (jmp_target as isize - jmp_src as isize) as i32;
+    *tramp.add(8) = 0xe9;
+    std::ptr::copy_nonoverlapping(&rel32 as *const i32 as *const u8, tramp.add(9), 4);
+
+    // SAFETY: tramp points to valid executable code matching FnNtAllocateVirtualMemory.
+    let trampoline_fn: FnNtAllocateVirtualMemory = std::mem::transmute(tramp_page);
+    let _ = MANUAL_ALLOC_TRAMPOLINE.set(trampoline_fn);
+
+    // Springboard: [JMP rel32 to our hook] lives in the same near-page.
+    // We write it at tramp+64. Then ntdll patch uses JMP rel32 to springboard,
+    // and springboard uses indirect JMP to the real hook address.
+    let spring = tramp.add(64);
+    let hook_addr = hook_nt_allocate_virtual_memory as *const () as usize;
+    // ff 25 00 00 00 00 [8-byte abs addr] = indirect JMP to absolute address
+    *spring = 0xff;
+    *spring.add(1) = 0x25;
+    std::ptr::write_unaligned(spring.add(2) as *mut u32, 0u32); // RIP+0
+    std::ptr::write_unaligned(spring.add(6) as *mut u64, hook_addr as u64);
+
+    // Patch ntdll: JMP rel32 from NtAllocateVirtualMemory to springboard
+    let spring_addr = spring as usize;
+    let patch_src = (target_addr as usize) + 5;
+    let hook_rel32 = (spring_addr as isize - patch_src as isize) as i32;
+
+    let mut old_protect: u32 = 0;
+    winapi::um::memoryapi::VirtualProtect(
+        target_addr as *mut _, 8, 0x40, &mut old_protect,
+    );
+    let target = target_addr as *mut u8;
+    *target = 0xe9;
+    std::ptr::copy_nonoverlapping(&hook_rel32 as *const i32 as *const u8, target.add(1), 4);
+    *target.add(5) = 0x90;
+    *target.add(6) = 0x90;
+    *target.add(7) = 0x90;
+    let mut dummy: u32 = 0;
+    winapi::um::memoryapi::VirtualProtect(
+        target_addr as *mut _, 8, old_protect, &mut dummy,
+    );
+
+    // SAFETY: flush instruction cache for both trampoline and patched ntdll
+    // to ensure CPU doesn't execute stale prefetched instructions.
+    winapi::um::processthreadsapi::FlushInstructionCache(
+        winapi::um::processthreadsapi::GetCurrentProcess(),
+        tramp_page,
+        128,
+    );
+    winapi::um::processthreadsapi::FlushInstructionCache(
+        winapi::um::processthreadsapi::GetCurrentProcess(),
+        target_addr as *mut _,
+        8,
+    );
+
+    MANUAL_ALLOC_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// Unpatch NtAllocateVirtualMemory manual hook.
+unsafe fn uninstall_manual_alloc_hook() {
+    if !MANUAL_ALLOC_ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    // We don't restore original bytes here because DLL_PROCESS_DETACH runs during
+    // process teardown — ntdll patching at that point is unsafe.
+}
+
+// ---------------------------------------------------------------------------
 // Install / Uninstall
 // ---------------------------------------------------------------------------
 
@@ -697,10 +858,22 @@ pub unsafe fn install(guard_level: &str) -> Result<(), Box<dyn std::error::Error
         }};
     }
 
-    install_guard!(HOOK_ALLOC,   "NtAllocateVirtualMemory\0",  hook_nt_allocate_virtual_memory, FnNtAllocateVirtualMemory);
-    install_guard!(HOOK_PROTECT, "NtProtectVirtualMemory\0",   hook_nt_protect_virtual_memory,  FnNtProtectVirtualMemory);
-    install_guard!(HOOK_MAP_VIEW, "NtMapViewOfSection\0",      hook_nt_map_view_of_section,     FnNtMapViewOfSection);
-    install_guard!(HOOK_WRITE_MEM,"NtWriteVirtualMemory\0",    hook_nt_write_virtual_memory,    FnNtWriteVirtualMemory);
+    let disabled = std::env::var("FS_SANDBOX_DISABLE_HOOKS").unwrap_or_default();
+    let disabled_cats: Vec<String> = disabled.split(',').map(|s| s.trim().to_ascii_lowercase()).collect();
+    let skip = |c: &str| disabled_cats.iter().any(|d| d == c);
+
+    if !skip("mem-alloc") {
+        install_manual_alloc_hook()?;
+    }
+    if !skip("mem-protect") {
+        install_guard!(HOOK_PROTECT, "NtProtectVirtualMemory\0",   hook_nt_protect_virtual_memory,  FnNtProtectVirtualMemory);
+    }
+    if !skip("mem-map") {
+        install_guard!(HOOK_MAP_VIEW, "NtMapViewOfSection\0",      hook_nt_map_view_of_section,     FnNtMapViewOfSection);
+    }
+    if !skip("mem-write") {
+        install_guard!(HOOK_WRITE_MEM,"NtWriteVirtualMemory\0",    hook_nt_write_virtual_memory,    FnNtWriteVirtualMemory);
+    }
     // Resolve NtUnmapViewOfSection for cleanup before terminate
     if let Some(addr) = crate::hooks::ntdll_export("NtUnmapViewOfSection\0".as_bytes()) {
         // SAFETY: addr is a valid ntdll export with the FnNtUnmapViewOfSection signature.
@@ -717,7 +890,7 @@ pub unsafe fn install(guard_level: &str) -> Result<(), Box<dyn std::error::Error
 pub unsafe fn uninstall() {
     if let Some(h) = HOOK_WRITE_MEM.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_MAP_VIEW.get() { let _ = h.disable(); }
-    if let Some(h) = HOOK_ALLOC.get() { let _ = h.disable(); }
+    uninstall_manual_alloc_hook();
     if let Some(h) = HOOK_PROTECT.get() { let _ = h.disable(); }
 }
 

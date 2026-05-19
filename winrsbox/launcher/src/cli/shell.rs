@@ -249,7 +249,7 @@ fn install_verb(verb: &str, label: &str, command: &str, icon: &str, runas: bool)
             //
             // And the command itself wraps in: powershell Start-Process ... -Verb RunAs
             // This is the most reliable cross-version approach.
-            let elevated_cmd = format!(
+            let _elevated_cmd = format!(
                 "powershell.exe -WindowStyle Hidden -Command \"Start-Process -FilePath '{command_escaped}' -Verb RunAs\"",
                 command_escaped = command.replace('\'', "''"),
             );

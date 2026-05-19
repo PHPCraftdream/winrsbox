@@ -12,6 +12,7 @@ pub mod regwhy;
 pub mod devrule;
 pub mod netrule;
 pub mod memdefaults;
+pub mod doctor;
 pub mod shell;
 
 use anyhow::Result;
@@ -28,6 +29,7 @@ pub const SUBCOMMANDS: &[&str] = &[
     "regrule", "regmock", "regdefaults", "regwhy",
     "devrule", "netrule", "memdefaults",
     "shell",
+    "doctor",
 ];
 
 /// Check if args represent a CLI subcommand (vs legacy sandbox run).
@@ -49,6 +51,9 @@ SUBCOMMANDS:
   what-if    Test a hypothetical rule change without mutating state
   export     Dump current state as JSON to stdout (filesystem + registry)
   import     Load state from JSON stdin (merge or --replace) or --ktav file
+
+DIAGNOSTICS:
+  doctor     Pre-flight system check (WFP, mitigations, Defender)
 
 EXPLORER INTEGRATION:
   shell      Install/uninstall Explorer right-click context menu entries
@@ -111,6 +116,7 @@ pub fn run_cli(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         "netrule" => netrule::run(rest, state_dir),
         "memdefaults" => memdefaults::run(rest, state_dir),
         "shell" => shell::run(rest),
+        "doctor" => doctor::run(),
         _ => anyhow::bail!("unknown subcommand '{}'. Run 'winrsbox --help' for usage.", cmd),
     }
 }
