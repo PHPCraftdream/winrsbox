@@ -5,6 +5,8 @@ pub mod mockdir;
 pub mod defaults;
 pub mod r#why;
 pub mod export;
+pub mod regrule;
+pub mod regmock;
 
 use anyhow::Result;
 
@@ -17,6 +19,7 @@ pub const EXIT_CONFLICT: i32 = 3;
 /// Known subcommands — used for back-compat dispatch.
 pub const SUBCOMMANDS: &[&str] = &[
     "rule", "mock", "mockdir", "defaults", "why", "what-if", "export", "import",
+    "regrule", "regmock", "regdefaults", "regwhy",
 ];
 
 /// Check if args represent a CLI subcommand (vs legacy sandbox run).
@@ -74,6 +77,8 @@ pub fn run_cli(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         "what-if" => r#why::run_what_if(rest, state_dir),
         "export" => export::run_export(rest, state_dir),
         "import" => export::run_import(rest, state_dir),
+        "regrule" => regrule::run(rest, state_dir),
+        "regmock" => regmock::run(rest, state_dir),
         _ => anyhow::bail!("unknown subcommand '{}'. Run 'winrsbox --help' for usage.", cmd),
     }
 }
