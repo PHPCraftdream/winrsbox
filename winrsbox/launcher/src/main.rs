@@ -140,6 +140,10 @@ struct Cli {
     #[arg(long = "no-pre-scan")]
     no_pre_scan: bool,
 
+    /// Per-process memory limit in gigabytes (applied via Job Object).
+    #[arg(long = "memory-limit", value_name = "GB")]
+    memory_limit: Option<u64>,
+
     /// Override working directory (used by Explorer context menu integration).
     #[arg(long = "cwd", value_name = "PATH")]
     cwd: Option<String>,
@@ -336,6 +340,41 @@ async fn main() -> Result<()> {
 
     // Inject hook.dll into target before resuming.
     inject_dll(proc_info.hProcess, &dll_path)?;
+
+    // Assign to Job Object — kernel auto-kills all children when launcher exits.
+    // Job handle must outlive the target process.
+    let _job_handle = {
+        use windows::Win32::System::JobObjects::{
+            CreateJobObjectW, SetInformationJobObject, AssignProcessToJobObject,
+            JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT,
+        };
+        let limits = winrsbox::jobctl::JobLimits::default()
+            .with_memory(cli.memory_limit.map(|gb| gb * 1024 * 1024 * 1024));
+        // SAFETY: creating a new job with no name, no security attrs.
+        let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
+            .context("CreateJobObjectW")?;
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = Default::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT(
+            limits.limit_flags(),
+        );
+        if let Some(mem) = limits.memory_bytes {
+            info.ProcessMemoryLimit = mem as usize;
+        }
+        // SAFETY: info is a valid JOBOBJECT_EXTENDED_LIMIT_INFORMATION struct.
+        unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        }.context("SetInformationJobObject")?;
+        // SAFETY: both job and hProcess are valid HANDLEs.
+        unsafe { AssignProcessToJobObject(job, proc_info.hProcess) }
+            .context("AssignProcessToJobObject")?;
+        job // hold handle alive
+    };
 
     // Resume target main thread.
     // SAFETY: proc_info.hThread is valid for the lifetime of the child process;
