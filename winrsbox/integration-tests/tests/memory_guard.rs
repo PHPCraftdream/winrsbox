@@ -466,6 +466,41 @@ fn strict_blocks_shadow_copy() {
 
 #[test]
 #[serial]
+fn localhost_allowed_by_default() {
+    let r = run_payload("escape_localhost", "scan");
+    assert_eq!(r.status.code(), Some(0),
+        "localhost should be allowed by default\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn localhost_blocked_with_flag() {
+    let launcher = find_launcher();
+    let hook_dll = find_hook_dll();
+    let payload = find_binary("escape_localhost");
+    let env = TestEnv::setup("escape_localhost_blocked");
+    let output = std::process::Command::new(&launcher)
+        .arg("-d").args(["--guard", "scan"]).arg("--block-localhost")
+        .arg("--").arg(payload.to_str().unwrap())
+        .current_dir(&env.project_root)
+        .env("FS_SANDBOX_DLL", hook_dll.to_str().unwrap())
+        .output().expect("failed to run launcher");
+    let code = output.status.code();
+    assert_eq!(code, Some(5),
+        "localhost should be blocked with --block-localhost\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+#[serial]
+fn lolbas_regsvr32_blocked() {
+    let r = run_payload("escape_lolbas_regsvr32", "scan");
+    assert_ne!(r.status.code(), Some(0),
+        "regsvr32 LOLBAS should not succeed\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
 fn wfp_blocks_afd_direct() {
     // escape_afd_direct tries TCP connect to 10.0.0.1:80 via ws2_32.
     // WFP blocks RFC1918 at kernel level → connect fails or times out.

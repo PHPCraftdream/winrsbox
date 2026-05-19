@@ -76,6 +76,10 @@ pub fn is_localhost(host: &str) -> bool {
     host.starts_with("127.") || host == "::1" || host == "0:0:0:0:0:0:0:1"
 }
 
+fn block_localhost() -> bool {
+    std::env::var("FS_SANDBOX_BLOCK_LOCALHOST").is_ok()
+}
+
 fn is_connection_denied(host: &str, port: u16) -> bool {
     let req = ipc::Req::NetDecide { host: host.to_owned(), port };
     if let Some(resp) = crate::hooks::ipc_send_and_recv(req) {
@@ -104,10 +108,10 @@ unsafe extern "system" fn hook_connect(
     };
 
     if let Some((host, port)) = parse_sockaddr(name, namelen) {
-        if is_localhost(&host) {
+        if is_localhost(&host) && !block_localhost() {
             return call_original();
         }
-        if is_connection_denied(&host, port) {
+        if (is_localhost(&host) && block_localhost()) || is_connection_denied(&host, port) {
             // Set WSAEACCES and return SOCKET_ERROR
             if let Some(set_err) = WSA_SET_LAST_ERROR.get() {
                 set_err(WSAEACCES);

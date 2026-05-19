@@ -159,6 +159,14 @@ path = "src/bin/escape_pipe_scm.rs"
 name = "escape_shadow_copy"
 path = "src/bin/escape_shadow_copy.rs"
 
+[[bin]]
+name = "escape_localhost"
+path = "src/bin/escape_localhost.rs"
+
+[[bin]]
+name = "escape_lolbas_regsvr32"
+path = "src/bin/escape_lolbas_regsvr32.rs"
+
 [[test]]
 name = "mock_integration"
 path = "tests/mock_integration.rs"
