@@ -53,6 +53,41 @@ rules: [
         read: passthrough
         write: deny
     }
+    {
+        prefix: C:\\Users\\**\\.cargo
+        read: passthrough
+        write: passthrough
+    }
+    {
+        prefix: C:\\Users\\**\\.rustup
+        read: passthrough
+        write: passthrough
+    }
+    {
+        prefix: C:\\Users\\**\\.npm
+        read: passthrough
+        write: passthrough
+    }
+    {
+        prefix: C:\\Users\\**\\AppData\\Roaming\\npm
+        read: passthrough
+        write: passthrough
+    }
+    {
+        prefix: C:\\Users\\**\\AppData\\Local\\Temp
+        read: passthrough
+        write: passthrough
+    }
+    {
+        prefix: C:\\Users\\**\\AppData\\Local\\pip
+        read: passthrough
+        write: passthrough
+    }
+    {
+        prefix: C:\\Users\\**\\.gradle
+        read: passthrough
+        write: passthrough
+    }
 ]
 
 # mock_dirs: [
@@ -317,9 +352,7 @@ async fn main() -> Result<()> {
     let effective_guard = if cli.guard == GuardLevel::Full {
         let trust = winrsbox::trust::verify_signature(std::path::Path::new(&target_args[0]));
         if trust.is_trusted() {
-            if let winrsbox::trust::TrustLevel::Signed { ref publisher } = trust {
-                println!("[sandbox] trust: signed by \"{publisher}\" → scan mode (JIT-friendly)");
-            }
+            println!("[sandbox] trust: {trust} → scan mode (JIT-friendly)");
             // Override FS_SANDBOX_GUARD so hook.dll uses scan too
             std::env::set_var("FS_SANDBOX_GUARD", "scan");
             GuardLevel::Scan
