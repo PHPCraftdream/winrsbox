@@ -185,6 +185,10 @@ fn strict_kills_map_anon_rwx() {
 fn strict_kills_remote_thread() { assert_killed!("escape_remote_thread", "CreateRemoteThread"); }
 #[test]
 fn strict_kills_thread_hijack() { assert_killed!("escape_thread_hijack", "ContextHijack"); }
+#[test]
+fn strict_kills_hwbp_injection() { assert_killed!("escape_hwbp_injection", "ContextHijack"); }
+#[test]
+fn strict_kills_apc_injection() { assert_killed!("escape_apc_injection", "QueueApc"); }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // P9-A: Cross-process memory ops on external (non-owned) processes
@@ -266,6 +270,67 @@ fn pre_launch_promotes_bypass_direct_syscall() {
 }
 
 #[test]
+// ═══════════════════════════════════════════════════════════════════════════
+// Network: WFP kernel-level block
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn wfp_blocks_rfc1918() {
+    let r = run_payload("escape_net_rfc1918", "full");
+    // Connect should fail (WFP drops or ws2_32 hook denies). Either way, exit != 0.
+    assert!(!r.status.success() || r.status.code() == Some(2),
+        "RFC1918 connect should be blocked\nexit={:?}\nstderr: {}", r.status.code(), r.stderr);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Kernel: ProcessDynamicCodePolicy (full mode)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn kernel_blocks_dynamic_code_full() {
+    let r = run_payload("escape_dynamic_code", "full");
+    // Under full: kernel returns error, payload exits non-zero with error code.
+    // Under our user-mode: terminate with 0xC0000005.
+    assert!(!r.status.success(),
+        "dynamic code should be blocked under full guard\nexit={:?}\nstderr: {}", r.status.code(), r.stderr);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Job Objects
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn memory_limit_enforced() {
+    // Run with --memory-limit 1 (1 GB). Payload tries to alloc 12.8 GB.
+    let launcher = find_launcher();
+    let hook_dll = find_hook_dll();
+    let payload = find_binary("escape_memory_bomb");
+    let env = TestEnv::setup("memory_bomb");
+
+    // Clean fallback logs
+    let tmp = std::env::temp_dir();
+    if let Ok(entries) = std::fs::read_dir(&tmp) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("fs-sandbox-violation-") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    let output = std::process::Command::new(&launcher)
+        .arg("-d")
+        .arg("--memory-limit").arg("1")
+        .arg("--").arg(payload.to_str().unwrap())
+        .current_dir(&env.project_root)
+        .env("FS_SANDBOX_DLL", hook_dll.to_str().unwrap())
+        .output().expect("run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Payload should fail to allocate beyond 1 GB
+    assert!(!output.status.success(),
+        "memory bomb should be stopped\nexit={:?}\nstderr: {stderr}", output.status.code());
+}
+
 fn weak_mode_skips_pre_launch_scan() {
     let r = run_payload("escape_static_syscall", "none");
     // With --weak, scan is skipped, payload runs (and the syscall itself

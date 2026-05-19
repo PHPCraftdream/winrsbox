@@ -72,6 +72,26 @@ name = "escape_thread_hijack"
 path = "src/bin/escape_thread_hijack.rs"
 
 [[bin]]
+name = "escape_hwbp_injection"
+path = "src/bin/escape_hwbp_injection.rs"
+
+[[bin]]
+name = "escape_apc_injection"
+path = "src/bin/escape_apc_injection.rs"
+
+[[bin]]
+name = "escape_net_rfc1918"
+path = "src/bin/escape_net_rfc1918.rs"
+
+[[bin]]
+name = "escape_memory_bomb"
+path = "src/bin/escape_memory_bomb.rs"
+
+[[bin]]
+name = "escape_dynamic_code"
+path = "src/bin/escape_dynamic_code.rs"
+
+[[bin]]
 name = "escape_static_syscall"
 path = "src/bin/escape_static_syscall.rs"
 
@@ -102,6 +122,10 @@ path = "tests/mock_integration.rs"
 [[test]]
 name = "memory_guard"
 path = "tests/memory_guard.rs"
+
+[[test]]
+name = "real_world"
+path = "tests/real_world.rs"
 
 [dependencies]
 policy = { path = "../policy" }
