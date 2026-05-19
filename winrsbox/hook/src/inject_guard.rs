@@ -29,6 +29,19 @@ type FnNtCreateThreadEx = unsafe extern "system" fn(
     *mut c_void, *mut c_void, u32, usize, usize, usize, *mut c_void,
 ) -> NTSTATUS;
 
+// Legacy NtCreateThread signature (still used by some Win32 wrappers).
+// All scalar params widened to usize for detour Function trait compat.
+type FnNtCreateThread = unsafe extern "system" fn(
+    *mut HANDLE,            // ThreadHandle
+    usize,                  // DesiredAccess (ACCESS_MASK widened)
+    *mut OBJECT_ATTRIBUTES, // ObjectAttributes
+    HANDLE,                 // ProcessHandle
+    *mut c_void,            // ClientId
+    *mut c_void,            // ThreadContext (CONTEXT*)
+    *mut c_void,            // InitialTeb (USER_STACK*)
+    usize,                  // CreateSuspended (BOOLEAN widened)
+) -> NTSTATUS;
+
 type FnNtQueueApcThread = unsafe extern "system" fn(
     HANDLE, *mut c_void, *mut c_void, *mut c_void, *mut c_void,
 ) -> NTSTATUS;
@@ -37,7 +50,8 @@ type FnNtQueueApcThread = unsafe extern "system" fn(
 // Detour storage
 // ---------------------------------------------------------------------------
 
-static HOOK_CREATE_THREAD: OnceLock<GenericDetour<FnNtCreateThreadEx>> = OnceLock::new();
+static HOOK_CREATE_THREAD_EX: OnceLock<GenericDetour<FnNtCreateThreadEx>> = OnceLock::new();
+static HOOK_CREATE_THREAD: OnceLock<GenericDetour<FnNtCreateThread>> = OnceLock::new();
 static HOOK_QUEUE_APC: OnceLock<GenericDetour<FnNtQueueApcThread>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
@@ -236,7 +250,7 @@ unsafe extern "system" fn hook_nt_create_thread_ex(
     attribute_list: *mut c_void,
 ) -> NTSTATUS {
     let call_original = || {
-        HOOK_CREATE_THREAD.get().unwrap().call(
+        HOOK_CREATE_THREAD_EX.get().unwrap().call(
             thread_handle, desired_access, object_attributes,
             process_handle, start_routine, argument,
             create_flags, zero_bits, stack_size, maximum_stack_size,
@@ -255,6 +269,41 @@ unsafe extern "system" fn hook_nt_create_thread_ex(
                 ipc::InjectKind::CreateRemoteThread,
                 target_pid,
                 start_routine as u64,
+            );
+        }
+    }
+
+    call_original()
+}
+
+unsafe extern "system" fn hook_nt_create_thread(
+    thread_handle: *mut HANDLE,
+    desired_access: usize,
+    object_attributes: *mut OBJECT_ATTRIBUTES,
+    process_handle: HANDLE,
+    client_id: *mut c_void,
+    thread_context: *mut c_void,
+    initial_teb: *mut c_void,
+    create_suspended: usize,
+) -> NTSTATUS {
+    let call_original = || {
+        HOOK_CREATE_THREAD.get().unwrap().call(
+            thread_handle, desired_access, object_attributes, process_handle,
+            client_id, thread_context, initial_teb, create_suspended,
+        )
+    };
+
+    let Some(_guard) = anti_rec::enter() else {
+        return call_original();
+    };
+
+    if !is_self_process(process_handle) {
+        let target_pid = winapi::um::processthreadsapi::GetProcessId(process_handle);
+        if should_block(target_pid) {
+            report_and_terminate(
+                ipc::InjectKind::CreateRemoteThread,
+                target_pid,
+                thread_context as u64,
             );
         }
     }
@@ -318,7 +367,17 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
         }};
     }
 
-    install_guard!(HOOK_CREATE_THREAD, "NtCreateThreadEx\0",  hook_nt_create_thread_ex, FnNtCreateThreadEx);
+    install_guard!(HOOK_CREATE_THREAD_EX, "NtCreateThreadEx\0", hook_nt_create_thread_ex, FnNtCreateThreadEx);
+    // Legacy NtCreateThread is still used by some Win32 CreateRemoteThread paths
+    // on certain Windows builds. Best-effort install: don't fail if not found.
+    if let Some(addr) = crate::hooks::ntdll_export("NtCreateThread\0".as_bytes()) {
+        let target: FnNtCreateThread = std::mem::transmute(addr as usize);
+        let hook_ptr: FnNtCreateThread = hook_nt_create_thread;
+        if let Ok(detour) = GenericDetour::<FnNtCreateThread>::new(target, hook_ptr) {
+            let _ = HOOK_CREATE_THREAD.set(detour);
+            if let Some(h) = HOOK_CREATE_THREAD.get() { let _ = h.enable(); }
+        }
+    }
     install_guard!(HOOK_QUEUE_APC,     "NtQueueApcThread\0",  hook_nt_queue_apc_thread, FnNtQueueApcThread);
 
     // Hooks installed but NOT armed — will arm after first IPC Hello
@@ -328,6 +387,7 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
 /// # SAFETY
 /// Must be called from DLL_PROCESS_DETACH only.
 pub unsafe fn uninstall() {
+    if let Some(h) = HOOK_CREATE_THREAD_EX.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_CREATE_THREAD.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_QUEUE_APC.get() { let _ = h.disable(); }
 }
