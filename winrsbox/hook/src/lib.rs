@@ -23,6 +23,7 @@ pub mod net_hooks;
 pub mod process_tracker;
 pub mod scan_cache;
 pub mod reg_hooks;
+pub mod token_guard;
 
 #[cfg(not(test))]
 use winapi::shared::minwindef::{BOOL, DWORD, HINSTANCE, LPVOID, TRUE, FALSE};
