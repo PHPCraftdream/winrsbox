@@ -31,6 +31,7 @@ impl std::fmt::Display for AllocKind {
 pub enum InjectKind {
     CreateRemoteThread,
     QueueApc,
+    ContextHijack,
 }
 
 impl std::fmt::Display for InjectKind {
@@ -38,6 +39,7 @@ impl std::fmt::Display for InjectKind {
         match self {
             Self::CreateRemoteThread => f.write_str("CreateRemoteThread"),
             Self::QueueApc => f.write_str("QueueApc"),
+            Self::ContextHijack => f.write_str("ContextHijack"),
         }
     }
 }

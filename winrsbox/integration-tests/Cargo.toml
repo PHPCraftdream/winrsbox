@@ -52,6 +52,14 @@ name = "bypass_direct_syscall"
 path = "src/bin/bypass_direct_syscall.rs"
 
 [[bin]]
+name = "clean_sleep"
+path = "src/bin/clean_sleep.rs"
+
+[[bin]]
+name = "escape_thread_hijack"
+path = "src/bin/escape_thread_hijack.rs"
+
+[[bin]]
 name = "escape_static_syscall"
 path = "src/bin/escape_static_syscall.rs"
 
@@ -86,7 +94,7 @@ path = "tests/memory_guard.rs"
 [dependencies]
 policy = { path = "../policy" }
 serde_json = "1"
-winapi = { version = "0.3", features = ["memoryapi", "winnt", "processthreadsapi", "libloaderapi", "errhandlingapi"] }
+winapi = { version = "0.3", features = ["memoryapi", "winnt", "processthreadsapi", "libloaderapi", "errhandlingapi", "tlhelp32", "handleapi"] }
 ntapi = "0.4"
 
 [dev-dependencies]

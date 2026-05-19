@@ -175,6 +175,8 @@ fn strict_kills_map_anon_rwx() {
 #[test] fn strict_kills_ntdll_double_map() { assert_killed!("escape_ntdll_double_map", "MapView"); }
 #[test]
 fn strict_kills_remote_thread() { assert_killed!("escape_remote_thread", "CreateRemoteThread"); }
+#[test]
+fn strict_kills_thread_hijack() { assert_killed!("escape_thread_hijack", "ContextHijack"); }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Strict mode: clean payloads MUST NOT be terminated
