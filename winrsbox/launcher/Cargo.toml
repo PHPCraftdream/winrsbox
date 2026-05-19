@@ -57,3 +57,7 @@ harness = false
 [[bench]]
 name = "mitigations"
 harness = false
+
+[[bench]]
+name = "etw"
+harness = false
