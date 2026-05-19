@@ -7,6 +7,7 @@ pub mod r#why;
 pub mod export;
 pub mod regrule;
 pub mod regmock;
+pub mod regdefaults;
 
 use anyhow::Result;
 
@@ -79,6 +80,7 @@ pub fn run_cli(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         "import" => export::run_import(rest, state_dir),
         "regrule" => regrule::run(rest, state_dir),
         "regmock" => regmock::run(rest, state_dir),
+        "regdefaults" => regdefaults::run(rest, state_dir),
         _ => anyhow::bail!("unknown subcommand '{}'. Run 'winrsbox --help' for usage.", cmd),
     }
 }
