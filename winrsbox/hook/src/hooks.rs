@@ -349,6 +349,17 @@ unsafe fn extract_dos_path(attrs: *const OBJECT_ATTRIBUTES) -> Option<String> {
     policy::path::nt_to_dos_lower(name_slice)
 }
 
+unsafe fn extract_raw_nt_path(attrs: *const OBJECT_ATTRIBUTES) -> Option<String> {
+    if attrs.is_null() { return None; }
+    let obj = &*attrs;
+    if obj.ObjectName.is_null() { return None; }
+    let ustr = &*obj.ObjectName;
+    let char_count = (ustr.Length / 2) as usize;
+    if char_count == 0 { return None; }
+    let name_slice = std::slice::from_raw_parts(ustr.Buffer, char_count);
+    Some(String::from_utf16_lossy(name_slice))
+}
+
 // ---------------------------------------------------------------------------
 // CoW helper
 // ---------------------------------------------------------------------------
@@ -411,6 +422,18 @@ unsafe extern "system" fn hook_nt_create_file(
 
     // SAFETY: object_attributes valid per NT calling convention for the call duration.
     let Some(dos) = extract_dos_path(object_attributes as *const _) else {
+        // Not a DOS path — check if it's a device path that should be blocked.
+        if let Some(dev_path) = extract_raw_nt_path(object_attributes as *const _) {
+            if let Some(device) = policy::dev::nt_to_device_path(
+                &dev_path.encode_utf16().collect::<Vec<_>>(),
+            ) {
+                let kind = policy::dev::classify_device(&device);
+                if !policy::dev::is_safe_default(kind) {
+                    set_io_status(io_status_block, STATUS_ACCESS_DENIED);
+                    return STATUS_ACCESS_DENIED;
+                }
+            }
+        }
         return call_original!();
     };
 
@@ -524,6 +547,17 @@ unsafe extern "system" fn hook_nt_open_file(
 
     // SAFETY: object_attributes valid per NT calling convention.
     let Some(dos) = extract_dos_path(object_attributes as *const _) else {
+        if let Some(dev_path) = extract_raw_nt_path(object_attributes as *const _) {
+            if let Some(device) = policy::dev::nt_to_device_path(
+                &dev_path.encode_utf16().collect::<Vec<_>>(),
+            ) {
+                let kind = policy::dev::classify_device(&device);
+                if !policy::dev::is_safe_default(kind) {
+                    set_io_status(io_status_block, STATUS_ACCESS_DENIED);
+                    return STATUS_ACCESS_DENIED;
+                }
+            }
+        }
         return call_original!();
     };
 

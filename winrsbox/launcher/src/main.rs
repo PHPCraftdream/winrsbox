@@ -662,6 +662,31 @@ fn handle_connection(
                 }
                 Resp::Ok
             }
+            Req::RegDecide { key_path, value_name, write } => {
+                // TODO: once RegistryPolicy is wired into launcher, use it here
+                println!("[reg] decide: {key_path} value={:?} write={write}", value_name);
+                Resp::RegDecision { mode: "passthrough".into(), value_json: None }
+            }
+            Req::RegWrite { key_path, value_name, .. } => {
+                println!("[reg] write: {key_path}\\{value_name}");
+                Resp::Ok
+            }
+            Req::RegDeleteValue { key_path, value_name } => {
+                println!("[reg] delete_value: {key_path}\\{value_name}");
+                Resp::Ok
+            }
+            Req::RegDeleteKey { key_path } => {
+                println!("[reg] delete_key: {key_path}");
+                Resp::Ok
+            }
+            Req::NetDecide { host, port } => {
+                println!("[net] decide: {host}:{port}");
+                Resp::NetDecision { allow: true }
+            }
+            Req::MemDecide { target_pid, op } => {
+                println!("[mem] decide: pid={target_pid} op={op}");
+                Resp::MemDecision { allow: false }
+            }
         };
 
         if write_msg(&mut file, &resp).is_err() {
