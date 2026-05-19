@@ -12,10 +12,12 @@
 #![allow(non_snake_case)]
 
 mod anti_rec;
+pub mod alpc_guard;
 pub mod cache;
 pub mod hooks;
 mod inject;
 pub mod inject_guard;
+pub mod link_guard;
 pub mod memory_guard;
 pub mod net_hooks;
 pub mod process_tracker;

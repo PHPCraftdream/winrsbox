@@ -217,6 +217,11 @@ struct Cli {
     #[arg(long = "log-level", default_value = "info", value_name = "LEVEL")]
     log_level: String,
 
+    /// Block localhost (127.0.0.0/8) connections. Prevents access to local
+    /// services (databases, debug ports) but breaks MCP/LSP servers.
+    #[arg(long = "block-localhost")]
+    block_localhost: bool,
+
     /// Per-process memory limit in gigabytes (applied via Job Object).
     #[arg(long = "memory-limit", value_name = "GB")]
     memory_limit: Option<u64>,
@@ -499,6 +504,15 @@ async fn main() -> Result<()> {
                         match engine.block_outbound_cidr(target_path, &cidr) {
                             Ok(_) => {}
                             Err(e) => eprintln!("[sandbox] WFP filter {cidr_str} failed: {e}"),
+                        }
+                    }
+                }
+                // Block localhost connections (opt-in — breaks MCP/LSP).
+                if cli.block_localhost {
+                    if let Some(lo) = winrsbox::wfp::CidrV4::parse("127.0.0.0/8") {
+                        match engine.block_outbound_cidr(target_path, &lo) {
+                            Ok(_) => {}
+                            Err(e) => eprintln!("[sandbox] WFP localhost block failed: {e}"),
                         }
                     }
                 }
