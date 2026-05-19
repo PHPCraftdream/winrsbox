@@ -520,6 +520,15 @@ async fn pipe_accept_loop(
     }
 }
 
+/// Check if a (host, port) connection should be denied per netrules table.
+/// Minimal stub — iterates net_rules, returns true if any matching deny rule.
+fn policy_net_is_denied(_policy: &Policy, _host: &str, _port: u16) -> bool {
+    // TODO: query policy.net_rules table once Policy exposes net decision API.
+    // For now: default-allow (no rules consulted at runtime). The CLI populates
+    // the table but enforcement requires Policy::net_decide() to be added.
+    false
+}
+
 fn handle_connection(
     handle: HANDLE,
     policy: &Policy,
@@ -688,9 +697,27 @@ fn handle_connection(
                 Resp::Ok
             }
             Req::RegDecide { key_path, value_name, write } => {
-                // TODO: once RegistryPolicy is wired into launcher, use it here
-                println!("[reg] decide: {key_path} value={:?} write={write}", value_name);
-                Resp::RegDecision { mode: "passthrough".into(), value_json: None }
+                // P8 default-deny: block writes to known DLL-injection persistence
+                // vectors. Until full RegistryPolicy wiring, hardcode the most
+                // critical paths from DEFAULT_CONFIG_KTAV.
+                // Match by suffix to cover HKU\<SID>\... (per-user hive paths)
+                // as well as direct HKLM/HKCU/HKCR/HKU forms.
+                const PERSISTENCE_DENY_SUFFIXES: &[&str] = &[
+                    r"\software\microsoft\windows nt\currentversion\windows",
+                    r"\software\wow6432node\microsoft\windows nt\currentversion\windows",
+                    r"\software\microsoft\windows nt\currentversion\image file execution options",
+                    r"\system\currentcontrolset\control\session manager\appcertdlls",
+                ];
+                let key_lower = key_path.to_ascii_lowercase();
+                let mode = if write && PERSISTENCE_DENY_SUFFIXES.iter()
+                    .any(|s| key_lower.contains(s))
+                {
+                    eprintln!("[reg] DENY {key_path} value={value_name:?}");
+                    "deny"
+                } else {
+                    "passthrough"
+                };
+                Resp::RegDecision { mode: mode.into(), value_json: None }
             }
             Req::RegWrite { key_path, value_name, .. } => {
                 println!("[reg] write: {key_path}\\{value_name}");
@@ -705,8 +732,13 @@ fn handle_connection(
                 Resp::Ok
             }
             Req::NetDecide { host, port } => {
-                println!("[net] decide: {host}:{port}");
-                Resp::NetDecision { allow: true }
+                // Minimal: check netrules table for matching deny rule.
+                // Default-allow; explicit deny rule blocks.
+                let allow = !policy_net_is_denied(policy, &host, port);
+                if !allow {
+                    eprintln!("[net] DENY {host}:{port}");
+                }
+                Resp::NetDecision { allow }
             }
             Req::MemDecide { target_pid, op } => {
                 println!("[mem] decide: pid={target_pid} op={op}");

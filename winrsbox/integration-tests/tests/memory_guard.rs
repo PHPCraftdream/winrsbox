@@ -129,6 +129,11 @@ fn run_payload(payload_name: &str, guard_none: bool) -> RunResult {
     cmd.arg("--").arg(payload.to_str().unwrap());
     cmd.current_dir(&env.project_root);
     cmd.env("FS_SANDBOX_DLL", hook_dll.to_str().unwrap());
+    // Cross-process foreign-target tests: payload spawns child, we want the
+    // child to be treated as external (not as our owned injection target).
+    if payload_name.starts_with("escape_foreign_") {
+        cmd.env("FS_SANDBOX_NO_TRACK", "1");
+    }
 
     let output = cmd.output().expect("failed to run launcher");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -177,6 +182,30 @@ fn strict_kills_map_anon_rwx() {
 fn strict_kills_remote_thread() { assert_killed!("escape_remote_thread", "CreateRemoteThread"); }
 #[test]
 fn strict_kills_thread_hijack() { assert_killed!("escape_thread_hijack", "ContextHijack"); }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// P9-A: Cross-process memory ops on external (non-owned) processes
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test] fn strict_kills_foreign_alloc_rwx()     { assert_killed!("escape_foreign_alloc_rwx", "Allocate"); }
+#[test] fn strict_kills_foreign_write_syscall() { assert_killed!("escape_foreign_write_syscall", "Write"); }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// P9-B: Registry runtime hooks — persistence vector denial
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn strict_denies_reg_appinit_persistence() {
+    let r = run_payload("escape_reg_appinit", false);
+    // Payload exits with code 5 (ERROR_ACCESS_DENIED) when registry write
+    // is correctly denied by our hook+IPC.
+    let stderr_lower = r.stderr.to_ascii_lowercase();
+    assert!(
+        r.status.code() == Some(5) || stderr_lower.contains("status=5"),
+        "payload should report ERROR_ACCESS_DENIED on registry write to persistence path\nexit={:?}\nstderr: {}",
+        r.status.code(), r.stderr
+    );
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Strict mode: clean payloads MUST NOT be terminated

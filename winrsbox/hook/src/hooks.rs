@@ -199,6 +199,17 @@ fn ipc_spawned_child(parent_pid: u32, child_pid: u32, child_exe: String) {
     });
 }
 
+/// Send a request and return the Resp if the pipe is connected.
+/// Used by reg_hooks for RegDecide, net_hooks for NetDecide, etc.
+pub(crate) fn ipc_send_and_recv(req: ipc::Req) -> Option<ipc::Resp> {
+    ensure_ipc_and(|opt| {
+        if let Some(client) = opt.as_mut() {
+            return client.send(&req).ok();
+        }
+        None
+    }).flatten()
+}
+
 pub(crate) fn ipc_log_violation(req: ipc::Req) -> Option<()> {
     ensure_ipc_and(|opt| {
         if let Some(client) = opt.as_mut() {
@@ -928,8 +939,10 @@ unsafe extern "system" fn hook_nt_create_user_process(
         let parent_pid = unsafe { GetCurrentProcessId() };
         ipc_register_child(child_pid);
         // Send SpawnedChild with child exe path extracted from process parameters.
-        // The child exe path is available from the RTL_USER_PROCESS_PARAMETERS.
         let child_exe = extract_child_exe(process_parameters);
+        // Track this PID as our spawned child so memory_guard/reg_hooks can
+        // distinguish legitimate injection-target operations from external attacks.
+        crate::process_tracker::mark_spawned(child_pid, parent_pid, child_exe.clone());
         ipc_spawned_child(parent_pid, child_pid, child_exe);
     }
 
@@ -1043,6 +1056,12 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         let _install_guard = anti_rec::enter();
         crate::memory_guard::install(&guard)?;
         crate::inject_guard::install()?;
+        // Registry runtime enforcement: best-effort (some Windows builds
+        // may have unusual ntdll layouts that detour can't patch).
+        let _ = crate::reg_hooks::install();
+        // Network runtime enforcement: best-effort (ws2_32 may not be
+        // loaded in target — only matters for net-using software).
+        let _ = crate::net_hooks::install();
     }
 
     Ok(())
@@ -1054,6 +1073,8 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
 /// Must be called on DLL_PROCESS_DETACH only. Errors are ignored because
 /// the process is tearing down.
 pub unsafe fn uninstall_hooks() {
+    crate::net_hooks::uninstall();
+    crate::reg_hooks::uninstall();
     crate::inject_guard::uninstall();
     crate::memory_guard::uninstall();
     if let Some(h) = HOOK_NT_CREATE_FILE.get() { let _ = h.disable(); }

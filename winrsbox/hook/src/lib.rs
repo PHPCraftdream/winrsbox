@@ -17,6 +17,9 @@ pub mod hooks;
 mod inject;
 pub mod inject_guard;
 pub mod memory_guard;
+pub mod net_hooks;
+pub mod process_tracker;
+pub mod reg_hooks;
 
 #[cfg(not(test))]
 use winapi::shared::minwindef::{BOOL, DWORD, HINSTANCE, LPVOID, TRUE, FALSE};

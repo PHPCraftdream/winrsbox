@@ -39,6 +39,14 @@ type FnNtProtectVirtualMemory = unsafe extern "system" fn(
     *mut u32,       // OldProtect
 ) -> NTSTATUS;
 
+type FnNtWriteVirtualMemory = unsafe extern "system" fn(
+    HANDLE,         // ProcessHandle
+    *mut c_void,    // BaseAddress
+    *const c_void,  // Buffer
+    usize,          // NumberOfBytesToWrite
+    *mut usize,     // NumberOfBytesWritten
+) -> NTSTATUS;
+
 type FnNtMapViewOfSection = unsafe extern "system" fn(
     HANDLE,         // SectionHandle
     HANDLE,         // ProcessHandle
@@ -64,6 +72,7 @@ type FnNtUnmapViewOfSection = unsafe extern "system" fn(
 static HOOK_ALLOC: OnceLock<GenericDetour<FnNtAllocateVirtualMemory>> = OnceLock::new();
 static HOOK_PROTECT: OnceLock<GenericDetour<FnNtProtectVirtualMemory>> = OnceLock::new();
 static HOOK_MAP_VIEW: OnceLock<GenericDetour<FnNtMapViewOfSection>> = OnceLock::new();
+static HOOK_WRITE_MEM: OnceLock<GenericDetour<FnNtWriteVirtualMemory>> = OnceLock::new();
 static NT_UNMAP: OnceLock<FnNtUnmapViewOfSection> = OnceLock::new();
 
 // Guard mode: "scan" = content-aware (scan bytes for syscall), "full" = scan + DLL scan
@@ -289,7 +298,18 @@ fn capture_stack(skip: u32, count: u32) -> Vec<u64> {
 const NT_CURRENT_PROCESS: isize = -1;
 
 fn is_current_process(handle: HANDLE) -> bool {
-    handle as isize == NT_CURRENT_PROCESS
+    if handle as isize == NT_CURRENT_PROCESS {
+        return true;
+    }
+    if handle.is_null() {
+        return false;
+    }
+    // Real handle: check if it points to our own PID
+    // SAFETY: GetProcessId is safe on any HANDLE; returns 0 on invalid.
+    unsafe {
+        let pid = winapi::um::processthreadsapi::GetProcessId(handle);
+        pid != 0 && pid == GetCurrentProcessId()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -401,23 +421,25 @@ unsafe extern "system" fn hook_nt_allocate_virtual_memory(
         )
     };
 
-    if !is_current_process(process_handle) {
-        return call_original();
-    }
-
     let Some(_guard) = anti_rec::enter() else {
         return call_original();
     };
 
-    // Block RWX-from-start (PAGE_EXECUTE_READWRITE / PAGE_EXECUTE_WRITECOPY).
-    // These are simultaneously writable+executable — can't scan content since
-    // code can be written after alloc. Modern legit JIT uses W^X (alloc RW,
-    // write code, VirtualProtect to RX — we scan at that transition).
-    // --allow-rwx opts out for legacy packers.
-    if is_rwx(protect) && !allow_rwx() {
-        let size = if region_size.is_null() { 0 } else { *region_size as u64 };
-        let addr = if base_address.is_null() { 0 } else { *base_address as u64 };
-        report_and_terminate(ipc::AllocKind::Allocate, protect, size, addr);
+    if is_current_process(process_handle) {
+        if is_rwx(protect) && !allow_rwx() {
+            let size = if region_size.is_null() { 0 } else { *region_size as u64 };
+            let addr = if base_address.is_null() { 0 } else { *base_address as u64 };
+            report_and_terminate(ipc::AllocKind::Allocate, protect, size, addr);
+        }
+    } else {
+        let target_pid = winapi::um::processthreadsapi::GetProcessId(process_handle);
+        if target_pid != 0 && !crate::process_tracker::is_owned_child(target_pid) {
+            if is_executable(protect) {
+                let size = if region_size.is_null() { 0 } else { *region_size as u64 };
+                let addr = if base_address.is_null() { 0 } else { *base_address as u64 };
+                report_and_terminate(ipc::AllocKind::Allocate, protect, size, addr);
+            }
+        }
     }
 
     call_original()
@@ -437,18 +459,27 @@ unsafe extern "system" fn hook_nt_protect_virtual_memory(
         )
     };
 
-    if !is_current_process(process_handle) {
-        return call_original();
-    }
-
     let Some(_guard) = anti_rec::enter() else {
         return call_original();
     };
 
-    // Content-aware scan: when non-module memory transitions to executable,
-    // scan its content for direct syscall instructions. Module memory (.text
-    // of loaded DLLs) is skipped here — DLLs are scanned at NtMapViewOfSection
-    // time (P3b). This allows legit JIT/packers while catching syscall bypass.
+    if !is_current_process(process_handle) {
+        // Foreign process VirtualProtectEx
+        let target_pid = winapi::um::processthreadsapi::GetProcessId(process_handle);
+        if target_pid != 0 && !crate::process_tracker::is_owned_child(target_pid) {
+            // External process making memory executable → block
+            if is_executable(new_protect) && !base_address.is_null() {
+                let addr = *base_address;
+                let size = if region_size.is_null() { 0 } else { *region_size as u64 };
+                report_and_terminate(ipc::AllocKind::Protect, new_protect, size, addr as u64);
+            }
+        }
+        return call_original();
+    }
+
+    // Self-process content-aware scan: when non-module memory transitions to
+    // executable, scan its content for direct syscall instructions. Module
+    // memory (.text of loaded DLLs) is skipped — DLLs scanned at MapView time.
     if is_executable(new_protect) && !base_address.is_null() {
         let addr = *base_address;
         // Skip loaded module regions (loader operations, CRT, etc.)
@@ -574,6 +605,52 @@ unsafe extern "system" fn hook_nt_map_view_of_section(
     status
 }
 
+unsafe extern "system" fn hook_nt_write_virtual_memory(
+    process_handle: HANDLE,
+    base_address: *mut c_void,
+    buffer: *const c_void,
+    bytes_to_write: usize,
+    bytes_written: *mut usize,
+) -> NTSTATUS {
+    let call_original = || {
+        HOOK_WRITE_MEM.get().unwrap().call(
+            process_handle, base_address, buffer, bytes_to_write, bytes_written,
+        )
+    };
+
+    let Some(_guard) = anti_rec::enter() else {
+        return call_original();
+    };
+
+    // Self-process write is fine (memcpy-style)
+    if is_current_process(process_handle) {
+        return call_original();
+    }
+
+    // Foreign process: distinguish our injection target from external
+    let target_pid = winapi::um::processthreadsapi::GetProcessId(process_handle);
+    if target_pid == 0 || crate::process_tracker::is_owned_child(target_pid) {
+        return call_original();
+    }
+
+    // External process write: scan buffer for direct syscall instructions.
+    // Bound the scan to avoid pathological inputs.
+    if !buffer.is_null() && bytes_to_write > 0 && bytes_to_write <= 64 * 1024 * 1024 {
+        let slice = std::slice::from_raw_parts(buffer as *const u8, bytes_to_write);
+        let hits = policy::scan::find_direct_syscalls(slice, base_address as u64);
+        if !hits.is_empty() {
+            report_and_terminate(
+                ipc::AllocKind::Write,
+                0,
+                bytes_to_write as u64,
+                base_address as u64,
+            );
+        }
+    }
+
+    call_original()
+}
+
 // ---------------------------------------------------------------------------
 // Install / Uninstall
 // ---------------------------------------------------------------------------
@@ -606,6 +683,7 @@ pub unsafe fn install(guard_level: &str) -> Result<(), Box<dyn std::error::Error
     install_guard!(HOOK_ALLOC,   "NtAllocateVirtualMemory\0",  hook_nt_allocate_virtual_memory, FnNtAllocateVirtualMemory);
     install_guard!(HOOK_PROTECT, "NtProtectVirtualMemory\0",   hook_nt_protect_virtual_memory,  FnNtProtectVirtualMemory);
     install_guard!(HOOK_MAP_VIEW, "NtMapViewOfSection\0",      hook_nt_map_view_of_section,     FnNtMapViewOfSection);
+    install_guard!(HOOK_WRITE_MEM,"NtWriteVirtualMemory\0",    hook_nt_write_virtual_memory,    FnNtWriteVirtualMemory);
     // Resolve NtUnmapViewOfSection for cleanup before terminate
     if let Some(addr) = crate::hooks::ntdll_export("NtUnmapViewOfSection\0".as_bytes()) {
         // SAFETY: addr is a valid ntdll export with the FnNtUnmapViewOfSection signature.
@@ -620,6 +698,7 @@ pub unsafe fn install(guard_level: &str) -> Result<(), Box<dyn std::error::Error
 /// # SAFETY
 /// Must be called from DLL_PROCESS_DETACH only.
 pub unsafe fn uninstall() {
+    if let Some(h) = HOOK_WRITE_MEM.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_MAP_VIEW.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_ALLOC.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_PROTECT.get() { let _ = h.disable(); }
