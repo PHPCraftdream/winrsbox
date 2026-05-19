@@ -9,6 +9,7 @@ pub mod regrule;
 pub mod regmock;
 pub mod regdefaults;
 pub mod regwhy;
+pub mod devrule;
 pub mod shell;
 
 use anyhow::Result;
@@ -23,6 +24,7 @@ pub const EXIT_CONFLICT: i32 = 3;
 pub const SUBCOMMANDS: &[&str] = &[
     "rule", "mock", "mockdir", "defaults", "why", "what-if", "export", "import",
     "regrule", "regmock", "regdefaults", "regwhy",
+    "devrule",
     "shell",
 ];
 
@@ -48,6 +50,9 @@ SUBCOMMANDS:
 
 EXPLORER INTEGRATION:
   shell      Install/uninstall Explorer right-click context menu entries
+
+DEVICE SANDBOX:
+  devrule    Add, remove, list, or clear device access rules (deny-by-default)
 
 REGISTRY SANDBOX:
   regrule    Add, remove, list, or clear registry sandbox rules
@@ -94,6 +99,7 @@ pub fn run_cli(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         "regmock" => regmock::run(rest, state_dir),
         "regdefaults" => regdefaults::run(rest, state_dir),
         "regwhy" => regwhy::run(rest, state_dir),
+        "devrule" => devrule::run(rest, state_dir),
         "shell" => shell::run(rest),
         _ => anyhow::bail!("unknown subcommand '{}'. Run 'winrsbox --help' for usage.", cmd),
     }
