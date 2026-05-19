@@ -10,6 +10,7 @@ pub const OVERLAY_IDX: TableDefinition<&str, &str> = TableDefinition::new("overl
 pub const REG_RULES: TableDefinition<&str, &[u8]> = TableDefinition::new("reg_rules");
 pub const REG_MOCKS: TableDefinition<&str, &[u8]> = TableDefinition::new("reg_mocks");
 pub const DEV_RULES: TableDefinition<&str, &[u8]> = TableDefinition::new("dev_rules");
+pub const NET_RULES: TableDefinition<&str, &[u8]> = TableDefinition::new("net_rules");
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum RuleMode { Passthrough, Deny, Cow, Redirect }
@@ -1170,6 +1171,50 @@ pub fn dev_rule_clear(db: &redb::Database) -> Result<(), crate::PolicyError> {
     let txn = db.begin_write()?;
     {
         let mut t = txn.open_table(DEV_RULES)?;
+        let keys: Vec<String> = t.range::<&str>(..)?.filter_map(|r| r.ok())
+            .map(|(k, _)| k.value().to_owned()).collect();
+        for k in keys { t.remove(k.as_str())?; }
+    }
+    txn.commit()?;
+    Ok(())
+}
+
+// ─── Network CRUD ────────────────────────────────────────────────────────────
+
+pub fn net_rule_upsert(db: &redb::Database, rule: &crate::net::NetRule) -> Result<(), crate::PolicyError> {
+    let enc = bincode::serde::encode_to_vec(rule, bincode::config::standard())
+        .map_err(|e| crate::PolicyError::Ktav(format!("serialize: {e}")))?;
+    let txn = db.begin_write()?;
+    { let mut t = txn.open_table(NET_RULES)?; t.insert(rule.id.as_str(), enc.as_slice())?; }
+    txn.commit()?;
+    Ok(())
+}
+
+pub fn net_rule_remove(db: &redb::Database, id: &str) -> Result<bool, crate::PolicyError> {
+    let txn = db.begin_write()?;
+    let removed;
+    { let mut t = txn.open_table(NET_RULES)?; removed = t.remove(id)?.is_some(); }
+    txn.commit()?;
+    Ok(removed)
+}
+
+pub fn net_rule_list(db: &redb::Database) -> Result<Vec<crate::net::NetRule>, crate::PolicyError> {
+    let txn = db.begin_read()?;
+    let t = txn.open_table(NET_RULES)?;
+    let mut out = Vec::new();
+    for entry in t.range::<&str>(..)?.flatten() {
+        let (_, v) = entry;
+        if let Ok((rule, _)) = bincode::serde::decode_from_slice::<crate::net::NetRule, _>(v.value(), bincode::config::standard()) {
+            out.push(rule);
+        }
+    }
+    Ok(out)
+}
+
+pub fn net_rule_clear(db: &redb::Database) -> Result<(), crate::PolicyError> {
+    let txn = db.begin_write()?;
+    {
+        let mut t = txn.open_table(NET_RULES)?;
         let keys: Vec<String> = t.range::<&str>(..)?.filter_map(|r| r.ok())
             .map(|(k, _)| k.value().to_owned()).collect();
         for k in keys { t.remove(k.as_str())?; }

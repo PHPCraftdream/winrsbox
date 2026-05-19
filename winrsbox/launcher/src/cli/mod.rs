@@ -119,6 +119,7 @@ fn open_db(state_dir: &std::path::Path) -> Result<redb::Database> {
         txn.open_table(policy::db::REG_RULES)?;
         txn.open_table(policy::db::REG_MOCKS)?;
         txn.open_table(policy::db::DEV_RULES)?;
+        txn.open_table(policy::db::NET_RULES)?;
         txn.commit()?;
     }
     Ok(db)
