@@ -1082,16 +1082,19 @@ fn apply_mitigations(guard: &str) {
     use winapi::um::processthreadsapi::SetProcessMitigationPolicy;
     use winapi::um::winnt::PROCESS_MITIGATION_POLICY;
 
-    // ExtensionPointDisablePolicy (6): blocks AppInit_DLLs, SetWindowsHookEx, IFEO
-    // for all guard levels except none.
-    let ext_disable_flags: u32 = 1; // DisableExtensionPoints = bit 0
-    // SAFETY: ext_disable_flags is valid for PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY (4 bytes).
-    unsafe {
-        SetProcessMitigationPolicy(
-            6i32 as PROCESS_MITIGATION_POLICY, // ProcessExtensionPointDisablePolicy
-            &ext_disable_flags as *const u32 as *mut _,
-            std::mem::size_of::<u32>(),
-        );
+    // ExtensionPointDisablePolicy (6): blocks AppInit_DLLs, SetWindowsHookEx, IFEO.
+    // Applied only in full mode — some programs (cargo, compilers) may load DLLs
+    // that rely on extension points during startup.
+    if guard == "full" {
+        let ext_disable_flags: u32 = 1;
+        // SAFETY: ext_disable_flags is valid for PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY.
+        unsafe {
+            SetProcessMitigationPolicy(
+                6i32 as PROCESS_MITIGATION_POLICY,
+                &ext_disable_flags as *const u32 as *mut _,
+                std::mem::size_of::<u32>(),
+            );
+        }
     }
 
     if guard == "full" {

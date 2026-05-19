@@ -77,6 +77,11 @@ static NT_UNMAP: OnceLock<FnNtUnmapViewOfSection> = OnceLock::new();
 
 // Guard mode: "scan" = content-aware (scan bytes for syscall), "full" = scan + DLL scan
 static GUARD_MODE: OnceLock<String> = OnceLock::new();
+static SCAN_CACHE: OnceLock<crate::scan_cache::ScanCache> = OnceLock::new();
+
+fn scan_cache() -> &'static crate::scan_cache::ScanCache {
+    SCAN_CACHE.get_or_init(crate::scan_cache::ScanCache::new)
+}
 
 fn is_full_mode() -> bool {
     GUARD_MODE.get().map(|s| s == "full").unwrap_or(true)
@@ -426,7 +431,9 @@ unsafe extern "system" fn hook_nt_allocate_virtual_memory(
     };
 
     if is_current_process(process_handle) {
-        if is_rwx(protect) && !allow_rwx() {
+        // RWX-from-start: block only in full mode. In scan mode, allow for
+        // JIT runtimes (.NET CLR, V8). Content scan on VirtualProtect remains.
+        if is_rwx(protect) && !allow_rwx() && is_full_mode() {
             let size = if region_size.is_null() { 0 } else { *region_size as u64 };
             let addr = if base_address.is_null() { 0 } else { *base_address as u64 };
             report_and_terminate(ipc::AllocKind::Allocate, protect, size, addr);
@@ -487,8 +494,18 @@ unsafe extern "system" fn hook_nt_protect_virtual_memory(
             let size = if region_size.is_null() { 0 } else { *region_size };
             if size > 0 && size <= 64 * 1024 * 1024 {
                 let bytes = std::slice::from_raw_parts(addr as *const u8, size);
-                let hits = policy::scan::find_direct_syscalls(bytes, addr as u64);
-                if !hits.is_empty() {
+                // Check scan cache first — avoids re-scanning unchanged JIT pages
+                let cached = scan_cache().lookup(addr as usize, size, bytes);
+                let is_clean = match cached {
+                    Some(clean) => clean,
+                    None => {
+                        let hits = policy::scan::find_direct_syscalls(bytes, addr as u64);
+                        let clean = hits.is_empty();
+                        scan_cache().insert(addr as usize, size, bytes, clean);
+                        clean
+                    }
+                };
+                if !is_clean {
                     report_and_terminate(ipc::AllocKind::Protect, new_protect, size as u64, addr as u64);
                 }
             }

@@ -17,6 +17,8 @@ use std::sync::Mutex;
 pub enum TrustLevel {
     /// Signed by publisher whose cert chains to a MS-trusted root.
     Signed { publisher: String },
+    /// In a trusted install path (Windows, Program Files) — catalog-signed or admin-installed.
+    TrustedPath,
     /// Signed but cert chain doesn't reach a trusted root (self-signed, dev cert).
     SignedUntrustedRoot,
     /// No Authenticode signature.
@@ -25,9 +27,31 @@ pub enum TrustLevel {
     Error(String),
 }
 
+/// Trusted installation directories — binaries here were installed by admin
+/// or system and are considered trusted even without embedded Authenticode.
+/// Windows system binaries use catalog signing which our embedded-only check
+/// reports as Unsigned.
+const TRUSTED_PATHS: &[&str] = &[
+    r"c:\windows\",
+    r"c:\program files\",
+    r"c:\program files (x86)\",
+];
+
 impl TrustLevel {
     pub fn is_trusted(&self) -> bool {
-        matches!(self, TrustLevel::Signed { .. })
+        matches!(self, TrustLevel::Signed { .. } | TrustLevel::TrustedPath)
+    }
+}
+
+impl std::fmt::Display for TrustLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrustLevel::Signed { publisher } => write!(f, "signed by \"{publisher}\""),
+            TrustLevel::TrustedPath => write!(f, "trusted path (system/Program Files)"),
+            TrustLevel::SignedUntrustedRoot => write!(f, "signed (untrusted root)"),
+            TrustLevel::Unsigned => write!(f, "unsigned"),
+            TrustLevel::Error(e) => write!(f, "error: {e}"),
+        }
     }
 }
 
@@ -92,17 +116,35 @@ pub fn verify_signature(exe_path: &Path) -> TrustLevel {
             TrustLevel::Signed { publisher }
         }
         x if x == 0x800B0100_u32 as i32 => {
-            // TRUST_E_NOSIGNATURE — unsigned
-            TrustLevel::Unsigned
+            // TRUST_E_NOSIGNATURE — no embedded Authenticode.
+            // Fallback: check if binary is in a trusted install path.
+            // Windows system binaries use catalog signing (not embedded)
+            // and are safe to trust by location.
+            if is_in_trusted_path(exe_path) {
+                TrustLevel::TrustedPath
+            } else {
+                TrustLevel::Unsigned
+            }
         }
         x if x == 0x800B0109_u32 as i32 => {
             // CERT_E_UNTRUSTEDROOT
             TrustLevel::SignedUntrustedRoot
         }
         other => {
-            TrustLevel::Error(format!("WinVerifyTrust returned 0x{other:08x}"))
+            if is_in_trusted_path(exe_path) {
+                TrustLevel::TrustedPath
+            } else {
+                TrustLevel::Error(format!("WinVerifyTrust returned 0x{other:08x}"))
+            }
         }
     }
+}
+
+/// Check if the exe path is in a trusted installation directory.
+/// Covers Windows system binaries (catalog-signed) and admin-installed programs.
+pub fn is_in_trusted_path(exe_path: &Path) -> bool {
+    let path_str = exe_path.to_string_lossy().to_ascii_lowercase();
+    TRUSTED_PATHS.iter().any(|&tp| path_str.starts_with(tp))
 }
 
 /// Extract publisher CN from Authenticode signature via CryptQueryObject.
@@ -276,16 +318,22 @@ mod tests {
     }
 
     #[test]
-    fn verify_system_binary_catalog_signed() {
-        // Windows system binaries use catalog signing (not embedded Authenticode).
-        // WinVerifyTrust with WTD_CHOICE_FILE only checks embedded → returns Unsigned.
-        // This is expected — we primarily care about third-party embedded-signed binaries.
+    fn verify_system_binary_trusted_by_path() {
+        // Windows system binaries use catalog signing. Our embedded-only check
+        // returns Unsigned, but path-based trust kicks in → TrustedPath.
         let path = Path::new(r"C:\Windows\System32\notepad.exe");
         if !path.exists() { return; }
         let t = verify_signature(path);
-        // Catalog-signed → appears Unsigned to embedded-only check
-        assert!(matches!(t, TrustLevel::Unsigned | TrustLevel::Signed { .. }),
-            "notepad should be unsigned (catalog) or signed (if embedded check works): {t:?}");
+        assert!(t.is_trusted(), "notepad in Windows dir should be trusted: {t:?}");
+    }
+
+    #[test]
+    fn is_in_trusted_path_system32() {
+        assert!(is_in_trusted_path(Path::new(r"C:\Windows\System32\cmd.exe")));
+        assert!(is_in_trusted_path(Path::new(r"C:\Program Files\nodejs\node.exe")));
+        assert!(is_in_trusted_path(Path::new(r"c:\program files (x86)\steam\steam.exe")));
+        assert!(!is_in_trusted_path(Path::new(r"C:\Users\x\Desktop\evil.exe")));
+        assert!(!is_in_trusted_path(Path::new(r"C:\Temp\payload.exe")));
     }
 
     #[test]
