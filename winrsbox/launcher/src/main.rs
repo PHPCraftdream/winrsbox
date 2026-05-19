@@ -10,7 +10,7 @@ use clap::Parser;
 use ipc::{read_msg, write_msg, LogLevel, Req, Resp};
 use policy::Policy;
 use rustc_hash::FxHashSet;
-mod cli;
+use winrsbox::cli;
 use std::{
     ffi::OsStr,
     os::windows::ffi::OsStrExt,

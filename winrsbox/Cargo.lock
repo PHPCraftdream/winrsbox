@@ -1920,6 +1920,7 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
+ "criterion",
  "crossbeam-queue",
  "ipc",
  "ktav",
