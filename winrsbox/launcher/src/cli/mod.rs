@@ -9,6 +9,7 @@ pub mod regrule;
 pub mod regmock;
 pub mod regdefaults;
 pub mod regwhy;
+pub mod shell;
 
 use anyhow::Result;
 
@@ -22,6 +23,7 @@ pub const EXIT_CONFLICT: i32 = 3;
 pub const SUBCOMMANDS: &[&str] = &[
     "rule", "mock", "mockdir", "defaults", "why", "what-if", "export", "import",
     "regrule", "regmock", "regdefaults", "regwhy",
+    "shell",
 ];
 
 /// Check if args represent a CLI subcommand (vs legacy sandbox run).
@@ -43,6 +45,9 @@ SUBCOMMANDS:
   what-if    Test a hypothetical rule change without mutating state
   export     Dump current state as JSON to stdout (filesystem + registry)
   import     Load state from JSON stdin (merge or --replace) or --ktav file
+
+EXPLORER INTEGRATION:
+  shell      Install/uninstall Explorer right-click context menu entries
 
 REGISTRY SANDBOX:
   regrule    Add, remove, list, or clear registry sandbox rules
@@ -89,6 +94,7 @@ pub fn run_cli(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         "regmock" => regmock::run(rest, state_dir),
         "regdefaults" => regdefaults::run(rest, state_dir),
         "regwhy" => regwhy::run(rest, state_dir),
+        "shell" => shell::run(rest),
         _ => anyhow::bail!("unknown subcommand '{}'. Run 'winrsbox --help' for usage.", cmd),
     }
 }
