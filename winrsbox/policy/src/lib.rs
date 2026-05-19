@@ -224,6 +224,8 @@ impl Policy {
             txn.open_table(db::MOCKS)?;
             txn.open_table(db::MOCK_DIRS)?;
             txn.open_table(db::OVERLAY_IDX)?;
+            txn.open_table(db::REG_RULES)?;
+            txn.open_table(db::REG_MOCKS)?;
             txn.commit()?;
         }
         let project_root_lower = project_root.to_string_lossy().to_lowercase();
