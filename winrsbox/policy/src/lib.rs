@@ -1,5 +1,6 @@
 pub mod path;
 pub mod db;
+pub mod reg;
 pub mod scan;
 
 use std::path::{Path, PathBuf};
