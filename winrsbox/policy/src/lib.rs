@@ -2,6 +2,7 @@ pub mod path;
 pub mod db;
 pub mod reg;
 pub mod reg_overlay;
+pub mod dev;
 pub mod scan;
 
 use std::path::{Path, PathBuf};
@@ -226,6 +227,7 @@ impl Policy {
             txn.open_table(db::OVERLAY_IDX)?;
             txn.open_table(db::REG_RULES)?;
             txn.open_table(db::REG_MOCKS)?;
+            txn.open_table(db::DEV_RULES)?;
             txn.commit()?;
         }
         let project_root_lower = project_root.to_string_lossy().to_lowercase();
