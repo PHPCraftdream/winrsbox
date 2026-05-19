@@ -119,4 +119,17 @@ mod tests {
         assert!(matches!(row.mode_read, db::RuleMode::Deny));
         assert!(matches!(row.mode_write, db::RuleMode::Deny));
     }
+
+    #[test]
+    fn regdefaults_set_neither_errors() {
+        let (_dir, state) = tmp_state();
+        assert!(run_set(&[], &state).is_err());
+    }
+
+    #[test]
+    fn regdefaults_show_json() {
+        let (_dir, state) = tmp_state();
+        run_set(&["--read=passthrough".into(), "--write=cow".into()], &state).unwrap();
+        run_show(&["--json".into()], &state).unwrap();
+    }
 }
