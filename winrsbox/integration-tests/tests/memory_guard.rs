@@ -195,7 +195,16 @@ fn strict_kills_remote_thread() { assert_killed!("escape_remote_thread", "Create
 // Content-aware: clean JIT pattern MUST NOT be terminated
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[test] fn strict_allows_clean_jit()     { assert_alive!("clean_jit_pattern", false); }
+#[test] fn strict_allows_clean_jit()         { assert_alive!("clean_jit_pattern", false); }
+#[test] fn strict_allows_legit_unpacker()   { assert_alive!("legit_unpacker_sim", false); }
+#[test] fn strict_allows_legit_self_patch() { assert_alive!("legit_self_patching", false); }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Content-aware: malicious unpacker MUST be terminated
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test] fn strict_kills_unpacker_syscall()    { assert_killed!("escape_unpacker_syscall", "Protect"); }
+#[test] fn strict_kills_self_modify_syscall() { assert_killed!("escape_self_modify_syscall", "Protect"); }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // P2: Known bypass — direct syscall (executable documentation)

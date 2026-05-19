@@ -78,11 +78,41 @@ fn bench_protect_name(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_content_scan_4kb(c: &mut Criterion) {
+    let bytes = vec![0x90u8; 4096];
+    let mut group = c.benchmark_group("memory_guard");
+    group.bench_function("content_scan_4kb_clean", |b| {
+        b.iter(|| policy::scan::find_direct_syscalls(black_box(&bytes), 0x10000))
+    });
+    group.finish();
+}
+
+fn bench_content_scan_64kb(c: &mut Criterion) {
+    let bytes = vec![0x90u8; 65536];
+    let mut group = c.benchmark_group("memory_guard");
+    group.bench_function("content_scan_64kb_clean", |b| {
+        b.iter(|| policy::scan::find_direct_syscalls(black_box(&bytes), 0x10000))
+    });
+    group.finish();
+}
+
+fn bench_content_scan_1mb(c: &mut Criterion) {
+    let bytes = vec![0x90u8; 1024 * 1024];
+    let mut group = c.benchmark_group("memory_guard");
+    group.bench_function("content_scan_1mb_clean", |b| {
+        b.iter(|| policy::scan::find_direct_syscalls(black_box(&bytes), 0x10000))
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_is_executable,
     bench_is_address_in_module,
     bench_module_path_for_address,
     bench_protect_name,
+    bench_content_scan_4kb,
+    bench_content_scan_64kb,
+    bench_content_scan_1mb,
 );
 criterion_main!(benches);

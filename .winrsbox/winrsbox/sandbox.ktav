@@ -1,0 +1,21 @@
+# winrsbox policy — auto-generated on first run. Edit to customize.
+#
+# Reads pass through to the real filesystem; writes are Copy-on-Write
+# into <state_dir>/workdir/. Add `rules` entries to deny or mock paths.
+
+defaults: {
+    read: passthrough
+    write: cow
+}
+
+rules: [
+    {
+        prefix: C:\Windows
+        read: passthrough
+        write: deny
+    }
+]
+
+# mock_dirs: [
+#     { prefix: C:\Users\Computer\.config\fakeapp }
+# ]
