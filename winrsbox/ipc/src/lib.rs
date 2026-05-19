@@ -76,6 +76,12 @@ pub enum Req {
         caller_module: Option<String>,
         stack_top: Vec<u64>,
     },
+    RegDecide { key_path: String, value_name: Option<String>, write: bool },
+    RegWrite { key_path: String, value_name: String, value_json: Vec<u8> },
+    RegDeleteValue { key_path: String, value_name: String },
+    RegDeleteKey { key_path: String },
+    NetDecide { host: String, port: u16 },
+    MemDecide { target_pid: u32, op: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -83,6 +89,9 @@ pub enum Resp {
     Decision(Decision),
     Ok,
     Err(String),
+    RegDecision { mode: String, value_json: Option<Vec<u8>> },
+    NetDecision { allow: bool },
+    MemDecision { allow: bool },
 }
 
 #[derive(Error, Debug)]
@@ -345,5 +354,72 @@ mod tests {
             IpcError::Io(_) => {}
             other => panic!("expected Io, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn req_reg_decide_roundtrip() {
+        let msg = Req::RegDecide { key_path: r"hklm\software\foo".into(), value_name: Some("bar".into()), write: false };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Req = read_msg(&mut buf).unwrap();
+        match dec {
+            Req::RegDecide { key_path, value_name, write } => {
+                assert_eq!(key_path, r"hklm\software\foo");
+                assert_eq!(value_name, Some("bar".into()));
+                assert!(!write);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn req_reg_write_roundtrip() {
+        let msg = Req::RegWrite { key_path: "k".into(), value_name: "v".into(), value_json: vec![1,2,3] };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Req = read_msg(&mut buf).unwrap();
+        match dec { Req::RegWrite { value_json, .. } => assert_eq!(value_json, vec![1,2,3]), _ => panic!() }
+    }
+
+    #[test]
+    fn req_net_decide_roundtrip() {
+        let msg = Req::NetDecide { host: "api.github.com".into(), port: 443 };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Req = read_msg(&mut buf).unwrap();
+        match dec { Req::NetDecide { host, port } => { assert_eq!(host, "api.github.com"); assert_eq!(port, 443); }, _ => panic!() }
+    }
+
+    #[test]
+    fn req_mem_decide_roundtrip() {
+        let msg = Req::MemDecide { target_pid: 1234, op: "CreateRemoteThread".into() };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Req = read_msg(&mut buf).unwrap();
+        match dec { Req::MemDecide { target_pid, op } => { assert_eq!(target_pid, 1234); assert_eq!(op, "CreateRemoteThread"); }, _ => panic!() }
+    }
+
+    #[test]
+    fn resp_reg_decision_roundtrip() {
+        let msg = Resp::RegDecision { mode: "cow".into(), value_json: Some(vec![42]) };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Resp = read_msg(&mut buf).unwrap();
+        match dec { Resp::RegDecision { mode, value_json } => { assert_eq!(mode, "cow"); assert_eq!(value_json, Some(vec![42])); }, _ => panic!() }
+    }
+
+    #[test]
+    fn resp_net_decision_roundtrip() {
+        let msg = Resp::NetDecision { allow: true };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Resp = read_msg(&mut buf).unwrap();
+        match dec { Resp::NetDecision { allow } => assert!(allow), _ => panic!() }
     }
 }
