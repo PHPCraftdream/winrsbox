@@ -42,7 +42,9 @@ pub fn classify_device(path: &str) -> DeviceKind {
     if lower.starts_with(r"device\tcp") || lower.starts_with(r"\device\tcp") { return DeviceKind::Socket; }
     if lower.starts_with(r"device\udp") || lower.starts_with(r"\device\udp") { return DeviceKind::Socket; }
     if lower.contains("condrv") || lower.contains("console") { return DeviceKind::Console; }
-    if lower.contains(r"device\null") { return DeviceKind::Null; }
+    if lower.contains(r"device\null") || lower == "nul" || lower.ends_with(r"\nul") {
+        return DeviceKind::Null;
+    }
     DeviceKind::Unknown
 }
 
@@ -70,6 +72,24 @@ mod tests {
     fn nt_to_device_dot_prefix() {
         let raw: Vec<u16> = r"\\.\PhysicalDrive0".encode_utf16().collect();
         assert_eq!(nt_to_device_path(&raw), Some(r"device\physicaldrive0".into()));
+    }
+
+    #[test]
+    fn classify_nul_device_short_form() {
+        // Rust's Stdio::null() opens \??\NUL which parses to "nul"
+        assert_eq!(classify_device("nul"), DeviceKind::Null);
+        assert!(is_safe_default(classify_device("nul")));
+    }
+
+    #[test]
+    fn classify_nul_with_path_prefix() {
+        assert_eq!(classify_device(r"some\path\nul"), DeviceKind::Null);
+    }
+
+    #[test]
+    fn classify_device_null_long_form() {
+        assert_eq!(classify_device(r"\device\null"), DeviceKind::Null);
+        assert_eq!(classify_device(r"device\null"), DeviceKind::Null);
     }
 
     #[test]

@@ -174,7 +174,6 @@ fn strict_kills_map_anon_rwx() {
 }
 #[test] fn strict_kills_ntdll_double_map() { assert_killed!("escape_ntdll_double_map", "MapView"); }
 #[test]
-#[ignore = "inject_guard installed but child spawn + OpenProcess interaction needs debugging"]
 fn strict_kills_remote_thread() { assert_killed!("escape_remote_thread", "CreateRemoteThread"); }
 
 // ═══════════════════════════════════════════════════════════════════════════

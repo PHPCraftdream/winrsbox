@@ -238,19 +238,21 @@ unsafe fn extract_child_exe(params: *mut c_void) -> String {
     if params.is_null() {
         return String::new();
     }
-    // RTL_USER_PROCESS_PARAMETERS layout (partial):
-    //   offset 0x00: MaximumLength, Length (ULONG)
-    //   offset 0x08: Flags (ULONG)
-    //   offset 0x0C: ConsoleHandle (HANDLE)
-    //   ...
-    //   offset 0x20: ImagePathName (UNICODE_STRING)
-    //   offset 0x30: CommandLine (UNICODE_STRING)
+    // RTL_USER_PROCESS_PARAMETERS layout on x64 Windows 10/11:
+    //   0x00: MaximumLength (ULONG), Length (ULONG)
+    //   0x08: Flags (ULONG), DebugFlags (ULONG)
+    //   0x10: ConsoleHandle (HANDLE), ConsoleFlags (ULONG) + pad
+    //   0x20: StandardInput (HANDLE)
+    //   0x28: StandardOutput (HANDLE)
+    //   0x30: StandardError (HANDLE)
+    //   0x38: CurrentDirectory (CURDIR — 0x18 bytes)
+    //   0x50: DllPath (UNICODE_STRING — 0x10 bytes)
+    //   0x60: ImagePathName (UNICODE_STRING — 0x10 bytes)
+    //   0x70: CommandLine (UNICODE_STRING)
     //
-    // We read the ImagePathName at offset 0x20 (pointer-dependent but stable on x64 Windows).
-    // This is the NT path to the child executable.
+    // Reading ImagePathName at offset 0x60 (NT path to child executable).
     let params_ptr = params as *const u8;
-    // Offset of ImagePathName in RTL_USER_PROCESS_PARAMETERS on x64
-    let image_path_offset = 0x20usize;
+    let image_path_offset = 0x60usize;
     let ustr_ptr = params_ptr.add(image_path_offset) as *const UNICODE_STRING;
     if ustr_ptr.is_null() {
         return String::new();
