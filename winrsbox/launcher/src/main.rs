@@ -388,6 +388,13 @@ async fn main() -> Result<()> {
     // ── Launch target process ─────────────────────────────────────────────
     let dll_path = find_hook_dll()?;
 
+    // Sanitize sensitive env vars BEFORE child inherits them.
+    // Removes API keys, tokens, secrets, credentials from the environment.
+    let removed = winrsbox::env_guard::sanitize();
+    if removed > 0 {
+        println!("[sandbox] env: sanitized {removed} sensitive variables");
+    }
+
     // Set env vars for child before CreateProcessW — child inherits them.
     std::env::set_var("FS_SANDBOX_PIPE", &pipe_name);
     std::env::set_var("FS_SANDBOX_DLL", &dll_path);
