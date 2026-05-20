@@ -45,6 +45,9 @@ impl CidrV4 {
 /// RFC1918 private address ranges — block to prevent lateral movement.
 pub const RFC1918: &[&str] = &["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
 
+/// SMB/NetBIOS ports — block to prevent DFS UNC exfiltration.
+pub const SMB_PORTS: &[u16] = &[445, 139];
+
 /// WFP engine handle + registered filter IDs for cleanup.
 pub struct WfpEngine {
     handle: windows::Win32::Foundation::HANDLE,
@@ -188,6 +191,52 @@ impl WfpEngine {
         };
         if status.is_err() {
             anyhow::bail!("FwpmFilterAdd0 port {port} failed: {:?}", status);
+        }
+        self.filter_ids.push(filter_id);
+        Ok(filter_id)
+    }
+
+    /// Block all outbound TCP connections to a specific port (IPv6).
+    pub fn block_outbound_port_v6(&mut self, port: u16) -> Result<u64> {
+        use windows::Wdk::NetworkManagement::WindowsFilteringPlatform::FwpmFilterAdd0;
+        use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
+
+        let mut conditions = [FWPM_FILTER_CONDITION0 {
+            fieldKey: FWPM_CONDITION_IP_REMOTE_PORT,
+            matchType: FWP_MATCH_EQUAL,
+            conditionValue: FWP_CONDITION_VALUE0 {
+                r#type: FWP_UINT16,
+                Anonymous: FWP_CONDITION_VALUE0_0 { uint16: port },
+            },
+        }];
+
+        let name_wide: Vec<u16> = format!("winrsbox-block-v6-port-{port}\0")
+            .encode_utf16().collect();
+        let display = FWPM_DISPLAY_DATA0 {
+            name: windows::core::PWSTR(name_wide.as_ptr() as *mut _),
+            description: windows::core::PWSTR::null(),
+        };
+
+        let filter = FWPM_FILTER0 {
+            displayData: display,
+            layerKey: FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+            subLayerKey: FWPM_SUBLAYER_UNIVERSAL,
+            action: FWPM_ACTION0 { r#type: FWP_ACTION_BLOCK, ..Default::default() },
+            filterCondition: conditions.as_mut_ptr(),
+            numFilterConditions: 1,
+            weight: FWP_VALUE0 {
+                r#type: FWP_UINT8,
+                Anonymous: FWP_VALUE0_0 { uint8: 10 },
+            },
+            ..Default::default()
+        };
+
+        let mut filter_id: u64 = 0;
+        let status = unsafe {
+            FwpmFilterAdd0(self.handle, &filter, None, Some(&mut filter_id))
+        };
+        if status.is_err() {
+            anyhow::bail!("FwpmFilterAdd0 v6 port {port} failed: {:?}", status);
         }
         self.filter_ids.push(filter_id);
         Ok(filter_id)

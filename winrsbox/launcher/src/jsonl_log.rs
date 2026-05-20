@@ -176,6 +176,8 @@ pub enum Event {
     Wfp { ts: u64, filters: usize },
     #[serde(rename = "exit")]
     Exit { ts: u64, code: u32, decides: u64, violations: u64 },
+    #[serde(rename = "etw")]
+    EtwEvent { ts: u64, pid: u32, kind: String },
 }
 
 impl Event {
@@ -185,7 +187,7 @@ impl Event {
             Event::Deny { .. } | Event::DenyDevice { .. } => LogLevel::Warn,
             Event::Hello { .. } | Event::Child { .. } | Event::Wfp { .. } | Event::Exit { .. }
             | Event::RegDecide { .. } | Event::NetDecide { .. } => LogLevel::Info,
-            Event::Decide { .. } => LogLevel::Trace,
+            Event::Decide { .. } | Event::EtwEvent { .. } => LogLevel::Trace,
         }
     }
 
@@ -215,5 +217,8 @@ impl Event {
     }
     pub fn exit(code: u32, decides: u64, violations: u64) -> Self {
         Self::Exit { ts: ts(), code, decides, violations }
+    }
+    pub fn etw_event(pid: u32, kind: &str) -> Self {
+        Self::EtwEvent { ts: ts(), pid, kind: kind.to_string() }
     }
 }

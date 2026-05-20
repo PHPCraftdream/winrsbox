@@ -519,13 +519,11 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                // Block SMB/NetBIOS egress — prevents DFS UNC exfiltration
-                // to remote servers (\\evil.com\share\stolen.dat).
-                for port in [445u16, 139] {
-                    match engine.block_outbound_port(port) {
-                        Ok(_) => {}
-                        Err(e) => eprintln!("[sandbox] WFP port {port} block failed: {e}"),
-                    }
+                // Block SMB/NetBIOS egress (IPv4 + IPv6) — prevents DFS UNC
+                // exfiltration to remote servers.
+                for port in winrsbox::wfp::SMB_PORTS {
+                    let _ = engine.block_outbound_port(*port);
+                    let _ = engine.block_outbound_port_v6(*port);
                 }
                 let fc = engine.filter_count();
                 println!("[sandbox] WFP: {fc} outbound filters registered");
@@ -541,14 +539,13 @@ async fn main() -> Result<()> {
         None
     };
 
-    // ETW Kernel-Process listener (best-effort — needs admin on some builds).
+    // ETW Kernel-Process listener — monitoring layer (logs events, no enforcement).
     let _etw = if cli.guard != GuardLevel::None {
-        let scoreboard = Arc::new(std::sync::Mutex::new(winrsbox::etw::EtwScoreboard::new()));
         let proc_info_ref = global_proc_info();
         let pid_checker: Arc<dyn Fn(u32) -> bool + Send + Sync> = Arc::new(move |pid: u32| {
             proc_info_ref.pin().get(&pid).is_some()
         });
-        match winrsbox::etw_listener::start(scoreboard, pid_checker) {
+        match winrsbox::etw_listener::start(pid_checker) {
             Ok(h) => {
                 println!("[sandbox] ETW: Kernel-Process listener active");
                 Some(h)
@@ -562,6 +559,16 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Insert root target into PROC_INFO BEFORE resume — ensures ETW listener
+    // sees this PID when kernel fires ImageLoad/ThreadStart during process startup.
+    let arg0_lower = target_args.first()
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    global_proc_info().pin().insert(
+        proc_info.dwProcessId,
+        ProcInfo { depth: 0, exe_lower: Arc::from(arg0_lower.as_str()) },
+    );
+
     // Resume target main thread.
     // SAFETY: proc_info.hThread is valid for the lifetime of the child process;
     //         it was returned by CreateProcessW and has not yet been closed.
@@ -570,15 +577,6 @@ async fn main() -> Result<()> {
     unsafe { CloseHandle(proc_info.hThread).ok() };
 
     println!("[sandbox] target started (pid {})", proc_info.dwProcessId);
-
-    // Insert root target into PROC_INFO
-    let arg0_lower = target_args.first()
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_default();
-    global_proc_info().pin().insert(
-        proc_info.dwProcessId,
-        ProcInfo { depth: 0, exe_lower: Arc::from(arg0_lower.as_str()) },
-    );
 
     // ── Wait for target process ───────────────────────────────────────────
     // Offload the blocking wait to spawn_blocking so the tokio executor
@@ -634,8 +632,9 @@ async fn main() -> Result<()> {
 
     let s = &stats;
     let viol = s.violations.load(Ordering::Relaxed);
+    let (etw_total, etw_sandbox) = winrsbox::etw_listener::stats();
     println!(
-        "\n[sandbox] exit={exit_code}  decide={} redirect={} deny={} mock={} cow={} violations={viol}",
+        "\n[sandbox] exit={exit_code}  decide={} redirect={} deny={} mock={} cow={} violations={viol} etw={etw_sandbox}/{etw_total}",
         s.decide.load(Ordering::Relaxed),
         s.redirect.load(Ordering::Relaxed),
         s.deny.load(Ordering::Relaxed),
