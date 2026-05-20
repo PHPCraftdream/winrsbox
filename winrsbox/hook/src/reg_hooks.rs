@@ -207,11 +207,18 @@ unsafe extern "system" fn hook_nt_set_value_key(
 
     if let Some(friendly) = resolve_handle_friendly(key_handle) {
         let v_name = ustr_to_string(value_name as *const _);
-        let mode = check_write_mode(&friendly, v_name); if mode.eq_ignore_ascii_case("deny") {
+        let mode = check_write_mode(&friendly, v_name.clone());
+        if mode.eq_ignore_ascii_case("deny") {
             return STATUS_ACCESS_DENIED;
         }
         if mode.eq_ignore_ascii_case("silent_ok") {
-            return 0; // STATUS_SUCCESS — sandbox absorbs the write
+            if !data.is_null() && data_size > 0 {
+                let bytes = std::slice::from_raw_parts(data as *const u8, data_size as usize);
+                if let Ok(mut ov) = crate::reg_overlay::overlay().lock() {
+                    ov.set_value(&friendly, &v_name.unwrap_or_default(), value_type, bytes);
+                }
+            }
+            return 0; // STATUS_SUCCESS — written to overlay, not real registry
         }
     }
     call_original()
@@ -231,11 +238,15 @@ unsafe extern "system" fn hook_nt_delete_value_key(
 
     if let Some(friendly) = resolve_handle_friendly(key_handle) {
         let v_name = ustr_to_string(value_name as *const _);
-        let mode = check_write_mode(&friendly, v_name); if mode.eq_ignore_ascii_case("deny") {
+        let mode = check_write_mode(&friendly, v_name.clone());
+        if mode.eq_ignore_ascii_case("deny") {
             return STATUS_ACCESS_DENIED;
         }
         if mode.eq_ignore_ascii_case("silent_ok") {
-            return 0; // STATUS_SUCCESS — sandbox absorbs the write
+            if let Ok(mut ov) = crate::reg_overlay::overlay().lock() {
+                ov.delete_value(&friendly, &v_name.unwrap_or_default());
+            }
+            return 0; // STATUS_SUCCESS — tombstone in overlay
         }
     }
     call_original()
@@ -251,8 +262,15 @@ unsafe extern "system" fn hook_nt_delete_key(key_handle: HANDLE) -> NTSTATUS {
     };
 
     if let Some(friendly) = resolve_handle_friendly(key_handle) {
-        let mode = check_write_mode(&friendly, None); if mode.eq_ignore_ascii_case("deny") {
+        let mode = check_write_mode(&friendly, None);
+        if mode.eq_ignore_ascii_case("deny") {
             return STATUS_ACCESS_DENIED;
+        }
+        if mode.eq_ignore_ascii_case("silent_ok") {
+            if let Ok(mut ov) = crate::reg_overlay::overlay().lock() {
+                ov.delete_key(&friendly);
+            }
+            return 0;
         }
         if mode.eq_ignore_ascii_case("silent_ok") {
             return 0; // STATUS_SUCCESS — sandbox absorbs the write
