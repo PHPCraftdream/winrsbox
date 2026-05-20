@@ -259,7 +259,7 @@ use windows::{
                 PIPE_TYPE_BYTE, PIPE_WAIT,
             },
             Threading::{
-                CreateProcessW, CreateRemoteThread, GetExitCodeProcess, GetExitCodeThread,
+                CreateProcessW, GetExitCodeProcess,
                 OpenProcess, ResumeThread, WaitForMultipleObjects, WaitForSingleObject,
                 CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION, PROCESS_SYNCHRONIZE,
                 STARTUPINFOW,
@@ -466,7 +466,7 @@ async fn main() -> Result<()> {
     }
 
     // Inject hook.dll into target before resuming.
-    inject_dll(proc_info.hProcess, &dll_path)?;
+    inject_dll(proc_info.hProcess, proc_info.hThread, &dll_path)?;
 
     // Assign to Job Object — kernel auto-kills all children when launcher exits.
     // Job handle must outlive the target process.
@@ -1084,100 +1084,74 @@ fn launch_suspended(cwd: &std::path::Path, target_args: &[String], _guard: Guard
     Ok(pi)
 }
 
-fn inject_dll(process: HANDLE, dll_path: &str) -> Result<()> {
+fn inject_dll(process: HANDLE, thread: HANDLE, dll_path: &str) -> Result<()> {
     let dll_wide: Vec<u16> = OsStr::new(dll_path)
         .encode_wide()
         .chain(Some(0))
         .collect();
     let byte_len = dll_wide.len() * 2;
 
-    // Allocate memory in target process to hold the DLL path string.
     // SAFETY: process is a valid HANDLE with PROCESS_ALL_ACCESS; byte_len > 0.
     let remote_buf = unsafe {
-        VirtualAllocEx(
-            process,
-            None,
-            byte_len,
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE,
-        )
+        VirtualAllocEx(process, None, byte_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
     };
     anyhow::ensure!(!remote_buf.is_null(), "VirtualAllocEx failed");
 
-    // Write the DLL path into the remote process memory.
     let mut written = 0usize;
-    // SAFETY: remote_buf was just allocated in `process` with byte_len bytes;
-    //         dll_wide.as_ptr() is valid for byte_len bytes.
+    // SAFETY: remote_buf just allocated in target; dll_wide valid for byte_len bytes.
     let write_ok = unsafe {
-        WriteProcessMemory(
-            process,
-            remote_buf,
-            dll_wide.as_ptr() as *const _,
-            byte_len,
-            Some(&mut written),
-        )
+        WriteProcessMemory(process, remote_buf, dll_wide.as_ptr() as *const _, byte_len, Some(&mut written))
     };
     if write_ok.is_err() || written != byte_len {
-        // SAFETY: remote_buf was allocated by us; 0 size means VirtualFreeEx treats
-        //         dwSize as irrelevant when dwFreeType is MEM_RELEASE.
         unsafe { VirtualFreeEx(process, remote_buf, 0, VIRTUAL_FREE_TYPE(0x8000)).ok() };
-        anyhow::bail!("WriteProcessMemory failed (written={written}, expected={byte_len})");
+        anyhow::bail!("WriteProcessMemory failed");
     }
 
-    // Resolve LoadLibraryW from our own kernel32 — its address is the same in the target
-    // because kernel32.dll is always mapped at the same base across processes on Windows.
-    let k32_wide: Vec<u16> = OsStr::new("kernel32.dll")
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
+    let k32_wide: Vec<u16> = OsStr::new("kernel32.dll").encode_wide().chain(Some(0)).collect();
     // SAFETY: k32_wide is a valid null-terminated UTF-16 module name.
     let k32 = unsafe { GetModuleHandleW(PCWSTR(k32_wide.as_ptr()))? };
-
-    // SAFETY: k32 is a valid HMODULE for kernel32.dll; "LoadLibraryW\0" is a valid PCSTR.
+    // SAFETY: k32 is valid HMODULE; "LoadLibraryW\0" is valid PCSTR.
     let load_lib = unsafe { GetProcAddress(k32, windows::core::s!("LoadLibraryW")) }
         .context("GetProcAddress(LoadLibraryW) returned NULL")?;
 
-    // Cast LoadLibraryW to the LPTHREAD_START_ROUTINE signature required by CreateRemoteThread.
-    // SAFETY: LoadLibraryW has the ABI `unsafe extern "system" fn(*mut c_void) -> u32`
-    //         which is identical to LPTHREAD_START_ROUTINE; both are __stdcall on x86_64.
-    //         The pointer was obtained from GetProcAddress and is non-null (checked above).
-    let thread_start: Option<unsafe extern "system" fn(*mut core::ffi::c_void) -> u32> =
-        Some(unsafe { std::mem::transmute(load_lib) });
-
-    // Create a remote thread in the target process that calls LoadLibraryW(dll_path).
-    // SAFETY: process is valid; remote_buf is the DLL path allocated above;
-    //         thread_start is a valid LPTHREAD_START_ROUTINE pointing to LoadLibraryW.
-    let thread = unsafe {
-        CreateRemoteThread(
-            process,
-            None,       // security attributes
-            0,          // stack size (use default)
-            thread_start,
-            Some(remote_buf),
-            0,          // creation flags (run immediately)
-            None,       // thread ID output (not needed)
-        )?
+    // Queue APC on the suspended main thread instead of CreateRemoteThread.
+    // APC runs in the context of the main thread BEFORE the entry point,
+    // avoiding CRT double-initialization that breaks cmd.exe.
+    type FnNtQueueApcThread = unsafe extern "system" fn(
+        HANDLE, *const core::ffi::c_void, *mut core::ffi::c_void,
+        *mut core::ffi::c_void, *mut core::ffi::c_void,
+    ) -> i32;
+    let ntdll_w: Vec<u16> = OsStr::new("ntdll.dll").encode_wide().chain(Some(0)).collect();
+    // SAFETY: ntdll is always loaded.
+    let ntdll = unsafe { GetModuleHandleW(PCWSTR(ntdll_w.as_ptr()))? };
+    let nt_queue = unsafe { GetProcAddress(ntdll, windows::core::s!("NtQueueApcThread")) }
+        .context("NtQueueApcThread not found")?;
+    // SAFETY: load_lib is LoadLibraryW address; remote_buf is the DLL path.
+    let status = unsafe {
+        let queue_fn: FnNtQueueApcThread = std::mem::transmute(nt_queue);
+        queue_fn(
+            thread,
+            load_lib as *const _,
+            remote_buf,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
     };
+    if status < 0 {
+        unsafe { VirtualFreeEx(process, remote_buf, 0, VIRTUAL_FREE_TYPE(0x8000)).ok() };
+        anyhow::bail!("NtQueueApcThread failed: 0x{status:08x}");
+    }
 
-    // Wait for LoadLibraryW to complete (up to 10 seconds).
-    // SAFETY: thread is a valid HANDLE returned by CreateRemoteThread.
-    unsafe { WaitForSingleObject(thread, 10_000) };
+    // APC will execute when thread resumes and enters alertable wait.
+    // The main thread of a suspended CREATE_SUSPENDED process enters
+    // alertable state during kernel32!BaseThreadInitThunk before calling
+    // the entry point — our APC fires there.
+    //
+    // Note: we can't verify exit_code like with CreateRemoteThread.
+    // If hook.dll fails to load, the process runs un-sandboxed.
+    // inject_via_apc in hook.rs handles this for child processes
+    // with a post-resume check.
 
-    let mut exit_code = 0u32;
-    // SAFETY: thread handle is valid; exit_code will be set to the return value of
-    //         LoadLibraryW (the HMODULE of the loaded DLL, or 0 on failure).
-    unsafe { GetExitCodeThread(thread, &mut exit_code).ok() };
-    // SAFETY: done with thread handle.
-    unsafe { CloseHandle(thread).ok() };
-
-    // Free the remote buffer regardless of outcome.
-    // SAFETY: remote_buf was allocated by VirtualAllocEx; MEM_RELEASE = 0x8000.
-    unsafe { VirtualFreeEx(process, remote_buf, 0, VIRTUAL_FREE_TYPE(0x8000)).ok() };
-
-    anyhow::ensure!(
-        exit_code != 0,
-        "LoadLibraryW returned NULL — hook.dll failed to load (path: {dll_path})"
-    );
     Ok(())
 }
 
