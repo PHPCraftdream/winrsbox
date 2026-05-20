@@ -14,7 +14,9 @@ fn main() {
     // This is a real LOLBAS technique (T1218.010).
     // In sandbox: NtCreateUserProcess hook catches child spawn → injects hook.dll.
     // alpc_guard blocks COM activation → regsvr32 can't activate scrobj.dll.
-    let output = std::process::Command::new("regsvr32.exe")
+    // Use full path to avoid PATH resolution issues inside sandbox
+    let regsvr = r"C:\Windows\System32\regsvr32.exe";
+    let output = std::process::Command::new(regsvr)
         .args(["/s", "/n", "/i:http://127.0.0.1:1/test.sct", "scrobj.dll"])
         .output();
 
