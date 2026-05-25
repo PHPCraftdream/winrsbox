@@ -296,8 +296,14 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     install!(HOOK_FIND_WINDOW_A,    "FindWindowA",      hook_find_window_a,      FnFindWindowA);
     install!(HOOK_FIND_WINDOW_EX_W, "FindWindowExW",    hook_find_window_ex_w,   FnFindWindowExW);
     install!(HOOK_FIND_WINDOW_EX_A, "FindWindowExA",    hook_find_window_ex_a,   FnFindWindowExA);
-    install!(HOOK_OPEN_CLIPBOARD,   "OpenClipboard",    hook_open_clipboard,     FnOpenClipboard);
-    install!(HOOK_GET_CLIPBOARD,    "GetClipboardData", hook_get_clipboard_data, FnGetClipboardData);
+
+    let strict_clipboard = std::env::var("FS_SANDBOX_STRICT_CLIPBOARD")
+        .as_deref() == Ok("1");
+    if strict_clipboard {
+        install!(HOOK_OPEN_CLIPBOARD,   "OpenClipboard",    hook_open_clipboard,     FnOpenClipboard);
+        install!(HOOK_GET_CLIPBOARD,    "GetClipboardData", hook_get_clipboard_data, FnGetClipboardData);
+    }
+
     install!(HOOK_POST_MESSAGE_W,   "PostMessageW",     hook_post_message_w,     FnPostMessageW);
     install!(HOOK_POST_MESSAGE_A,   "PostMessageA",     hook_post_message_a,     FnPostMessageA);
     install!(HOOK_SEND_MESSAGE_W,   "SendMessageW",     hook_send_message_w,     FnSendMessageW);

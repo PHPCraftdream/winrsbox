@@ -63,8 +63,8 @@ impl Default for UiRestrictions {
     fn default() -> Self {
         Self {
             no_foreign_handles: true,
-            no_read_clipboard: true,
-            no_write_clipboard: true,
+            no_read_clipboard: false,
+            no_write_clipboard: false,
             no_system_params: true,
             no_display_settings: true,
             no_global_atoms: true,
@@ -75,6 +75,14 @@ impl Default for UiRestrictions {
 }
 
 impl UiRestrictions {
+    /// Enable strict clipboard blocking (read + write). Used when
+    /// --strict-clipboard CLI flag is set.
+    pub fn with_strict_clipboard(mut self) -> Self {
+        self.no_read_clipboard = true;
+        self.no_write_clipboard = true;
+        self
+    }
+
     pub fn limit_flags(&self) -> u32 {
         let mut f = 0u32;
         if self.no_foreign_handles    { f |= 0x01; }
@@ -149,9 +157,34 @@ mod tests {
     // -- UiRestrictions tests --
 
     #[test]
-    fn ui_default_all_flags() {
-        let ui = UiRestrictions::default();
+    fn ui_default_all_flags_when_strict() {
+        let ui = UiRestrictions::default().with_strict_clipboard();
         assert_eq!(ui.limit_flags(), 0xFF);
+    }
+
+    #[test]
+    fn default_allows_clipboard() {
+        let ui = UiRestrictions::default();
+        assert!(!ui.no_read_clipboard);
+        assert!(!ui.no_write_clipboard);
+        assert_eq!(ui.limit_flags() & (0x02 | 0x04), 0);
+    }
+
+    #[test]
+    fn with_strict_clipboard_sets_both() {
+        let ui = UiRestrictions::default().with_strict_clipboard();
+        assert!(ui.no_read_clipboard);
+        assert!(ui.no_write_clipboard);
+        assert_ne!(ui.limit_flags() & 0x02, 0);
+        assert_ne!(ui.limit_flags() & 0x04, 0);
+    }
+
+    #[test]
+    fn ui_default_non_clipboard_flags() {
+        let ui = UiRestrictions::default();
+        // Everything except clipboard should be set
+        let expected = 0x01 | 0x08 | 0x10 | 0x20 | 0x40 | 0x80; // all except 0x02, 0x04
+        assert_eq!(ui.limit_flags(), expected);
     }
 
     #[test]
