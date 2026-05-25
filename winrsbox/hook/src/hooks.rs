@@ -291,6 +291,10 @@ unsafe fn extract_child_exe(params: *mut c_void) -> String {
 /// # SAFETY
 /// IO_STATUS_BLOCK.Status/Pointer union begins at offset 0 on all Windows
 /// x64 ABIs. Writing an i32 (NTSTATUS) to offset 0 is always correct.
+// TODO: writes only 4 bytes into the 8-byte union slot on x64; upper
+// 4 bytes retain previous garbage. Safe for callers reading Status
+// (NTSTATUS = i32), unsafe for callers interpreting union as Pointer.
+// Should zero the full ULONG_PTR before writing Status.
 unsafe fn set_io_status(block: *mut IO_STATUS_BLOCK, status: NTSTATUS) {
     if !block.is_null() {
         std::ptr::write(block as *mut i32, status);
@@ -378,6 +382,29 @@ unsafe fn extract_raw_nt_path(attrs: *const OBJECT_ATTRIBUTES) -> Option<String>
     Some(String::from_utf16_lossy(name_slice))
 }
 
+/// Returns Some(STATUS_ACCESS_DENIED) if the raw NT path in `attrs` is a
+/// hard-blocked device (shadowcopy, physicaldrive, raw harddisk, dangerous
+/// pipe). None otherwise → caller should call the original Nt* function.
+///
+/// SAFETY: `attrs` must be valid per NT calling convention.
+unsafe fn check_device_block(attrs: *const OBJECT_ATTRIBUTES) -> Option<NTSTATUS> {
+    let dev_path = extract_raw_nt_path(attrs)?;
+    let utf16: Vec<u16> = dev_path.encode_utf16().collect();
+    let device = policy::dev::nt_to_device_path(&utf16)?;
+    let kind = policy::dev::classify_device(&device);
+    if matches!(kind, policy::dev::DeviceKind::Unknown) {
+        if is_trace() {
+            ipc_log(
+                ipc::LogLevel::Trace,
+                format!("DENY device: {dev_path} kind={kind:?}"),
+            );
+        }
+        Some(STATUS_ACCESS_DENIED)
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CoW helper
 // ---------------------------------------------------------------------------
@@ -441,19 +468,9 @@ unsafe extern "system" fn hook_nt_create_file(
     // SAFETY: object_attributes valid per NT calling convention for the call duration.
     let Some(dos) = extract_dos_path(object_attributes as *const _) else {
         // Not a DOS path — check if it's a device path that should be blocked.
-        if let Some(dev_path) = extract_raw_nt_path(object_attributes as *const _) {
-            if let Some(device) = policy::dev::nt_to_device_path(
-                &dev_path.encode_utf16().collect::<Vec<_>>(),
-            ) {
-                let kind = policy::dev::classify_device(&device);
-                if !policy::dev::is_safe_with_access(kind, desired_access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA) != 0) {
-                    if is_trace() {
-                        ipc_log(ipc::LogLevel::Trace, format!("DENY device NtCreateFile: {dev_path} kind={kind:?}"));
-                    }
-                    set_io_status(io_status_block, STATUS_ACCESS_DENIED);
-                    return STATUS_ACCESS_DENIED;
-                }
-            }
+        if let Some(status) = check_device_block(object_attributes as *const _) {
+            set_io_status(io_status_block, status);
+            return status;
         }
         return call_original!();
     };
@@ -571,16 +588,9 @@ unsafe extern "system" fn hook_nt_open_file(
 
     // SAFETY: object_attributes valid per NT calling convention.
     let Some(dos) = extract_dos_path(object_attributes as *const _) else {
-        if let Some(dev_path) = extract_raw_nt_path(object_attributes as *const _) {
-            if let Some(device) = policy::dev::nt_to_device_path(
-                &dev_path.encode_utf16().collect::<Vec<_>>(),
-            ) {
-                let kind = policy::dev::classify_device(&device);
-                if !policy::dev::is_safe_with_access(kind, desired_access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA) != 0) {
-                    set_io_status(io_status_block, STATUS_ACCESS_DENIED);
-                    return STATUS_ACCESS_DENIED;
-                }
-            }
+        if let Some(status) = check_device_block(object_attributes as *const _) {
+            set_io_status(io_status_block, status);
+            return status;
         }
         return call_original!();
     };

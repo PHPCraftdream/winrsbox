@@ -466,6 +466,18 @@ fn strict_blocks_shadow_copy() {
 
 #[test]
 #[serial]
+fn strict_blocks_raw_disk() {
+    // Hard-block: classify_device returns Unknown for any path containing
+    // "physicaldrive". Note: even without our block, opening PhysicalDrive0
+    // from a non-admin process is denied by kernel ACL — this test confirms
+    // the path is rejected but does not distinguish our block from the ACL.
+    let r = run_payload("escape_raw_disk", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "raw disk should be blocked\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
 fn localhost_allowed_by_default() {
     let r = run_payload("escape_localhost", "scan");
     assert_eq!(r.status.code(), Some(0),
