@@ -160,6 +160,10 @@ name = "escape_shadow_copy"
 path = "src/bin/escape_shadow_copy.rs"
 
 [[bin]]
+name = "escape_raw_disk"
+path = "src/bin/escape_raw_disk.rs"
+
+[[bin]]
 name = "escape_localhost"
 path = "src/bin/escape_localhost.rs"
 

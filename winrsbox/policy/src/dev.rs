@@ -39,9 +39,17 @@ pub fn nt_to_device_path(raw: &[u16]) -> Option<String> {
 
 pub fn classify_device(path: &str) -> DeviceKind {
     let lower = path.to_lowercase();
-    // Block volume shadow copies — give access to historical file versions
+    // === Hard blocks: actual escape vectors ===
+    // Volume shadow copies — give access to historical file versions
     // bypassing current-state deny rules. \Device\HarddiskVolumeShadowCopyN\
     if lower.contains("shadowcopy") { return DeviceKind::Unknown; }
+    // Raw physical drive — bypass file system entirely.
+    if lower.contains("physicaldrive") { return DeviceKind::Unknown; }
+    // Raw partition / volume bitmap access.
+    if lower.contains(r"device\harddisk") && !lower.contains("harddiskvolume") {
+        return DeviceKind::Unknown;
+    }
+
     if lower.starts_with(r"device\harddiskvolume") { return DeviceKind::HarddiskVolume; }
     if lower.starts_with(r"\device\harddiskvolume") { return DeviceKind::HarddiskVolume; }
     // Named pipes: full form `\Device\NamedPipe\…` and DOS-form short `pipe\…`
@@ -67,19 +75,16 @@ pub fn classify_device(path: &str) -> DeviceKind {
     if lower.contains(r"device\null") || lower == "nul" || lower.ends_with(r"\nul") {
         return DeviceKind::Null;
     }
-    // Known read-only system query devices used by Win32 / .NET BCL.
-    const SYSTEM_QUERY_DEVICES: &[&str] = &[
-        "mountpointmanager",  // \Device\MountPointManager — volume mount queries
-        "ipt",                // \Device\IPT — Intel Processor Trace
-        "kernelobjects",      // \KernelObjects — synchronization primitive lookup
-        "dfs",                // \Device\Dfs — DFS path resolution
-    ];
-    for name in SYSTEM_QUERY_DEVICES {
-        if lower.contains(name) {
-            return DeviceKind::SystemQuery;
-        }
-    }
-    DeviceKind::Unknown
+    // Default: SystemQuery (read OK, write denied).
+    // Modern GUI/UWP/Node processes open many internal device handles during
+    // startup (KsecDD, Cng, CMNotify, DeviceApi, Lanmanredirector, UWP services).
+    // Denying all unknown devices by default broke notepad and node — the
+    // actual escape vectors are covered by other layers: CoW for files, WFP
+    // for network, ALPC guard for COM/RPC, dangerous-pipe list, raw-disk
+    // blocks above. SystemQuery permits read access (needed for crypto
+    // sessions, mount queries, device info) and denies writes through
+    // unrecognized device handles.
+    DeviceKind::SystemQuery
 }
 
 /// Pipes that give access to dangerous system services.
@@ -94,21 +99,6 @@ fn is_dangerous_pipe(lower_path: &str) -> bool {
     DANGEROUS_PIPES.iter().any(|&p| lower_path.contains(p))
 }
 
-pub fn is_safe_default(kind: DeviceKind) -> bool {
-    matches!(kind, DeviceKind::HarddiskVolume | DeviceKind::NamedPipe | DeviceKind::Console | DeviceKind::Null | DeviceKind::Socket)
-}
-
-/// Stricter check for SystemQuery devices: allow read, deny write.
-/// MountPointManager IOCTL_MOUNTMGR_CREATE_POINT needs write access +
-/// SeRestorePrivilege; NSI NsiSetParameter needs write access.
-/// Limiting to read-only access removes these vectors even without
-/// relying on privilege checks.
-pub fn is_safe_with_access(kind: DeviceKind, write: bool) -> bool {
-    match kind {
-        DeviceKind::SystemQuery => !write,
-        _ => is_safe_default(kind),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -136,7 +126,6 @@ mod tests {
     fn classify_nul_device_short_form() {
         // Rust's Stdio::null() opens \??\NUL which parses to "nul"
         assert_eq!(classify_device("nul"), DeviceKind::Null);
-        assert!(is_safe_default(classify_device("nul")));
     }
 
     #[test]
@@ -203,9 +192,19 @@ mod tests {
     }
 
     #[test]
-    fn classify_unknown() {
-        assert_eq!(classify_device(r"\device\cldflt"), DeviceKind::Unknown);
+    fn classify_unknown_devices_default_to_system_query() {
+        // CldFlt is the Cloud Files filter driver — legitimately opened by Explorer
+        // and modern apps; treated as SystemQuery (read-only safe) by default.
+        assert_eq!(classify_device(r"\device\cldflt"), DeviceKind::SystemQuery);
+    }
+
+    #[test]
+    fn classify_raw_disk_blocked() {
+        // Raw physical drive bypasses file system — explicitly blocked.
         assert_eq!(classify_device(r"device\physicaldrive0"), DeviceKind::Unknown);
+        assert_eq!(classify_device(r"\device\physicaldrive1"), DeviceKind::Unknown);
+        // Raw HarddiskN (without "volume") bypasses the volume layer.
+        assert_eq!(classify_device(r"\device\harddisk0\partition1"), DeviceKind::Unknown);
     }
 
     #[test]
@@ -222,7 +221,6 @@ mod tests {
     fn classify_shadow_copy_blocked() {
         assert_eq!(classify_device(r"\device\harddiskvolumeshadowcopy3"), DeviceKind::Unknown);
         assert_eq!(classify_device(r"device\harddiskvolumeshadowcopy1\windows\system32"), DeviceKind::Unknown);
-        assert!(!is_safe_default(DeviceKind::Unknown));
     }
 
     #[test]
@@ -242,26 +240,7 @@ mod tests {
     fn classify_system_query_devices() {
         assert_eq!(classify_device(r"\device\mountpointmanager"), DeviceKind::SystemQuery);
         assert_eq!(classify_device(r"device\ipt"), DeviceKind::SystemQuery);
-        assert!(is_safe_with_access(DeviceKind::SystemQuery, false));
-        assert!(!is_safe_with_access(DeviceKind::SystemQuery, true));
     }
 
-    #[test]
-    fn safe_default_allows_expected() {
-        assert!(is_safe_default(DeviceKind::HarddiskVolume));
-        assert!(is_safe_default(DeviceKind::NamedPipe));
-        assert!(is_safe_default(DeviceKind::Console));
-        assert!(is_safe_default(DeviceKind::Null));
-        assert!(is_safe_default(DeviceKind::Socket));
-        assert!(!is_safe_default(DeviceKind::SystemQuery));
-        assert!(!is_safe_default(DeviceKind::Unknown));
-    }
 
-    #[test]
-    fn system_query_read_only() {
-        assert!(is_safe_with_access(DeviceKind::SystemQuery, false));
-        assert!(!is_safe_with_access(DeviceKind::SystemQuery, true));
-        assert!(is_safe_with_access(DeviceKind::Socket, false));
-        assert!(is_safe_with_access(DeviceKind::Socket, true));
-    }
 }
