@@ -203,7 +203,7 @@ struct Cli {
     no_pre_scan: bool,
 
     /// Disable specific hook categories for debugging (comma-separated).
-    /// Categories: memory, inject, reg, net, mitigations, fs.
+    /// Categories: memory, inject, reg, net, link, alpc, token, mitigations, fs, ui.
     /// Example: --disable-hooks inject,mitigations
     #[arg(long = "disable-hooks", value_name = "CATEGORIES")]
     disable_hooks: Option<String>,
@@ -497,9 +497,36 @@ async fn main() -> Result<()> {
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
         }.context("SetInformationJobObject")?;
+
         // SAFETY: both job and hProcess are valid HANDLEs.
         unsafe { AssignProcessToJobObject(job, proc_info.hProcess) }
             .context("AssignProcessToJobObject")?;
+
+        // Apply UI restrictions to block clipboard, foreign-HWND messaging,
+        // ExitWindowsEx, etc. Best-effort: not all flags are enforced on every
+        // Windows build (e.g. UILIMIT_HANDLES has limited effect on Win10
+        // 19045 against medium-integrity foreign windows). The user32 hooks
+        // in hook::ui_guard provide a second layer.
+        {
+            use windows::Win32::System::JobObjects::{
+                JobObjectBasicUIRestrictions, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+                JOB_OBJECT_UILIMIT,
+            };
+            let ui = winrsbox::jobctl::UiRestrictions::default();
+            let ui_info = JOBOBJECT_BASIC_UI_RESTRICTIONS {
+                UIRestrictionsClass: JOB_OBJECT_UILIMIT(ui.limit_flags()),
+            };
+            // SAFETY: ui_info is a valid JOBOBJECT_BASIC_UI_RESTRICTIONS struct.
+            unsafe {
+                SetInformationJobObject(
+                    job,
+                    JobObjectBasicUIRestrictions,
+                    &ui_info as *const _ as *const _,
+                    std::mem::size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
+                )
+            }.context("SetInformationJobObject(UI restrictions)")?;
+        }
+
         job // hold handle alive
     };
 

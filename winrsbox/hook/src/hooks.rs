@@ -223,7 +223,7 @@ pub(crate) fn ipc_log_violation(req: ipc::Req) -> Option<()> {
     })
 }
 
-fn ipc_log(level: ipc::LogLevel, msg: String) {
+pub(crate) fn ipc_log(level: ipc::LogLevel, msg: String) {
     let pid = unsafe { GetCurrentProcessId() };
     let _ = ensure_ipc_and(|opt| {
         if let Some(client) = opt.as_mut() {
@@ -1105,6 +1105,9 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         if !skip("token") {
             let _ = crate::token_guard::install();
         }
+        if !skip("ui") {
+            let _ = crate::ui_guard::install();
+        }
 
         if !skip("mitigations") {
             apply_mitigations(&guard);
@@ -1169,6 +1172,7 @@ fn apply_mitigations(guard: &str) {
 /// Must be called on DLL_PROCESS_DETACH only. Errors are ignored because
 /// the process is tearing down.
 pub unsafe fn uninstall_hooks() {
+    crate::ui_guard::uninstall();
     crate::token_guard::uninstall();
     crate::alpc_guard::uninstall();
     crate::link_guard::uninstall();
