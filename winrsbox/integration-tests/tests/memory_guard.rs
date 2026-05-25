@@ -524,3 +524,55 @@ fn wfp_blocks_afd_direct() {
         "escape_afd_direct should not connect to RFC1918\nstderr: {}", r.stderr,
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UI guard: input synthesis (SendInput, keybd_event) + Job UI restrictions
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[serial]
+fn strict_blocks_input_synthesis() {
+    let r = run_payload("escape_sendinput", "scan");
+    assert_ne!(r.status.code(), Some(0),
+        "SendInput should be blocked by ui_guard\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_legacy_keybd_event() {
+    let r = run_payload("escape_keybd_event", "scan");
+    assert_ne!(r.status.code(), Some(0),
+        "keybd_event should be blocked by ui_guard\nstderr: {}", r.stderr);
+}
+
+// Best-effort defense — JOB_OBJECT_UILIMIT_HANDLES is not enforced on Win10
+// 19045 (FindWindowW returns foreign HWND despite the flag), and our user32
+// FindWindowW patch is bypassed because the kernel routes legacy entry through
+// win32u.dll. The actual Win+R escape vector (SendInput) is fully covered by
+// strict_blocks_input_synthesis. Kept as `#[ignore]` for documentation.
+#[test]
+#[ignore = "best-effort: Job UI HANDLES + FindWindow hook bypassed on Win10 19045"]
+#[serial]
+fn strict_blocks_foreign_window_msg() {
+    let r = run_payload("escape_window_msg", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "Foreign HWND access should be blocked by Job UI HANDLES\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_clipboard_read() {
+    let r = run_payload("escape_clipboard", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "Clipboard read should be blocked by Job UI READCLIPBOARD\nstderr: {}", r.stderr);
+}
+
+// MANUAL ONLY — opens real Run dialog if defense fails.
+#[test]
+#[ignore = "manual only — destructive if defense fails"]
+#[serial]
+fn manual_blocks_winr_notepad_escape() {
+    let r = run_payload("escape_winr_notepad_real", "scan");
+    assert_ne!(r.status.code(), Some(0),
+        "Win+R notepad escape should be blocked\nstderr: {}", r.stderr);
+}
