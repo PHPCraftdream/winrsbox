@@ -561,10 +561,31 @@ fn strict_blocks_foreign_window_msg() {
 
 #[test]
 #[serial]
-fn strict_blocks_clipboard_read() {
+fn strict_clipboard_flag_blocks_read() {
+    let launcher = find_launcher();
+    let hook_dll = find_hook_dll();
+    let payload = find_binary("escape_clipboard");
+    let env = TestEnv::setup("clipboard_strict");
+    let output = std::process::Command::new(&launcher)
+        .arg("-d").args(["--guard", "scan"]).arg("--strict-clipboard")
+        .arg("--").arg(payload.to_str().unwrap())
+        .current_dir(&env.project_root)
+        .env("FS_SANDBOX_DLL", hook_dll.to_str().unwrap())
+        .output().expect("failed to run launcher");
+    assert_eq!(output.status.code(), Some(5),
+        "Clipboard read should be blocked with --strict-clipboard\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+#[serial]
+fn default_allows_clipboard_open() {
     let r = run_payload("escape_clipboard", "scan");
-    assert_eq!(r.status.code(), Some(5),
-        "Clipboard read should be blocked by Job UI READCLIPBOARD\nstderr: {}", r.stderr);
+    // 5 = our hook denied OpenClipboard (would be a regression).
+    // 0 = clipboard had data (real escape if not in strict mode).
+    // 6 = OpenClipboard succeeded, clipboard was empty (expected baseline).
+    assert_ne!(r.status.code(), Some(5),
+        "clipboard should NOT be blocked in default mode\nstderr: {}", r.stderr);
 }
 
 // MANUAL ONLY — opens real Run dialog if defense fails.

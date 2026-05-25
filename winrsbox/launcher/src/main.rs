@@ -222,6 +222,14 @@ struct Cli {
     #[arg(long = "block-localhost")]
     block_localhost: bool,
 
+    /// Block clipboard access from sandboxed processes (default: allow).
+    /// Without this flag, sandboxed apps can read/write clipboard normally,
+    /// enabling Ctrl+C/Ctrl+V at the sandbox boundary. Set this flag when
+    /// running untrusted code that could exfiltrate or pollute clipboard
+    /// contents.
+    #[arg(long = "strict-clipboard")]
+    strict_clipboard: bool,
+
     /// Per-process memory limit in gigabytes (applied via Job Object).
     #[arg(long = "memory-limit", value_name = "GB")]
     memory_limit: Option<u64>,
@@ -421,6 +429,9 @@ async fn main() -> Result<()> {
     if cli.block_localhost {
         std::env::set_var("FS_SANDBOX_BLOCK_LOCALHOST", "1");
     }
+    if cli.strict_clipboard {
+        std::env::set_var("FS_SANDBOX_STRICT_CLIPBOARD", "1");
+    }
 
     // Trust-based guard level override: signed binaries get scan (JIT-friendly)
     // instead of full (kernel blocks JIT). Unsigned stays at user's chosen level.
@@ -512,7 +523,8 @@ async fn main() -> Result<()> {
                 JobObjectBasicUIRestrictions, JOBOBJECT_BASIC_UI_RESTRICTIONS,
                 JOB_OBJECT_UILIMIT,
             };
-            let ui = winrsbox::jobctl::UiRestrictions::default();
+            let mut ui = winrsbox::jobctl::UiRestrictions::default();
+            if cli.strict_clipboard { ui = ui.with_strict_clipboard(); }
             let ui_info = JOBOBJECT_BASIC_UI_RESTRICTIONS {
                 UIRestrictionsClass: JOB_OBJECT_UILIMIT(ui.limit_flags()),
             };
