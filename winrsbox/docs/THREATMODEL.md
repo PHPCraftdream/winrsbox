@@ -95,10 +95,46 @@ this is an open gap.
 
 **Status**: P2 audit in progress.
 
+## Direct syscall defense analysis
+
+Direct syscalls (Hell's Gate / Halo's Gate / Tartarus' Gate) bypass user-mode
+ntdll hooks by reading the SSN at runtime and issuing `syscall` directly.
+winrsbox defends against this with three layers:
+
+| Layer | Mechanism | What it catches | Code |
+|---|---|---|---|
+| Pre-launch .text scan | `iced-x86` disassembly of target exe's `.text` section before resume | Compile-time embedded `syscall`/`sysenter`/`int 2eh` instructions | `launcher/src/main.rs:pre_launch_scan` |
+| Content-aware RX scan | Disassembly of non-module memory on RW→RX transition | Runtime-generated shellcode containing syscall instructions | `hook/src/memory_guard.rs:hook_nt_protect_virtual_memory` |
+| Process Mitigation Policies | `PROHIBIT_DYNAMIC_CODE_ALWAYS_ON` + `BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON` | Prevents creation of new executable memory (kernel-enforced) | `launcher/src/mitigations.rs` |
+
+**Test coverage**: `pre_launch_promotes_bypass_direct_syscall` (was `#[ignore]`, now
+passes — pre-launch scan catches the `bypass_direct_syscall` payload before execution).
+`pre_launch_refuses_static_syscall` verifies static syscall binaries are refused.
+
+**Remaining gap**: A Hell's Gate variant that resolves the SSN at runtime and writes
+the `syscall` instruction into dynamically-allocated memory. DynamicCodePolicy
+blocks new executable memory creation (kernel-enforced), so this requires either:
+- Bypassing DynamicCodePolicy (kernel exploit — out of scope)
+- Using pre-existing executable memory from a loaded DLL (blocked by BLOCK_NON_MS)
+- Operating in `--guard scan` mode (no DynamicCodePolicy — accepted risk for JIT)
+
+**Decision**: Option A — accept as known gap. Rationale:
+- AI-agent threat model: AI rarely writes direct-syscall shellcode
+- Three defense layers raise the bar significantly
+- ETW Threat Intelligence (Option B) requires admin/elevated launcher (non-default)
+- Full ETW TI subscription is deferred until elevated launcher infrastructure exists
+
+**Future work**: If elevated launcher becomes default, subscribe to
+`Microsoft-Windows-Threat-Intelligence` ETW provider for real-time direct-syscall
+monitoring and kill. ETW scoring already supports `DirectSyscallDetected` (score 15,
+highest priority — see `launcher/src/etw.rs`).
+
 ## Known gaps
 
 | Gap | Severity | Status |
 |---|---|---|
+| Runtime SSN-resolved direct syscall in scan mode | Low | Accepted (Option A): DynamicCodePolicy off for JIT compat; content-aware RX scan still active |
+| ETW TI not subscribed (requires admin) | Low | Deferred: scoring infrastructure ready, needs elevated launcher |
 | WFP registers 0 filters on some configs | ~~High~~ | **Fixed**: wrong condition key + missing sublayer/display |
 | Direct AFD IOCTL bypasses ws2_32 hook | Medium | **Mitigated**: WFP now active (3 RFC1918 filters), kernel-level enforcement |
 | DFS UNC exfiltration | ~~Medium~~ | **Fixed**: WFP blocks TCP ports 445 (SMB) and 139 (NetBIOS) |
@@ -147,10 +183,12 @@ All verified with exit=0, violations=0 in scan mode:
 | git status, git log | mingw64 git |
 | curl (HTTPS) | TLS via schannel |
 
-## 14 escape payloads (all blocked)
+## 16 escape payloads (all blocked)
 
 escape_alloc_rwx, escape_jit_protect, escape_heap_to_exec, escape_stack_exec,
 escape_map_anon_rwx, escape_ntdll_double_map, escape_remote_thread,
 escape_thread_hijack, escape_hwbp_injection, escape_apc_injection,
 escape_foreign_alloc_rwx, escape_foreign_write_syscall,
-escape_unpacker_syscall, escape_self_modify_syscall.
+escape_unpacker_syscall, escape_self_modify_syscall,
+escape_static_syscall (pre-launch refused),
+bypass_direct_syscall (pre-launch refused).
