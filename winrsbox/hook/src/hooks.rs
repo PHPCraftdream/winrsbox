@@ -1265,13 +1265,17 @@ unsafe extern "system" fn hook_nt_fs_control_file(
 /// Returns (offset of FileNameLength field, offset of FileName field) for a
 /// given FileInformationClass. Returns None for unhandled classes (passthrough).
 const fn dir_info_name_offsets(class: u32) -> Option<(usize, usize)> {
+    // (FileNameLength offset, FileName offset) — verified against MS docs.
+    // FileAttributes is at 0x38 in dir-info classes; FileNameLength is at
+    // 0x3C right after it. The previous 0x38 for classes 1/2/38 pointed at
+    // FileAttributes and silently disabled the filter (wrong-bytes check).
     match class {
-        1  => Some((0x38, 0x40)), // FileDirectoryInformation
-        2  => Some((0x38, 0x44)), // FileFullDirectoryInformation
+        1  => Some((0x3C, 0x40)), // FileDirectoryInformation
+        2  => Some((0x3C, 0x44)), // FileFullDirectoryInformation
         3  => Some((0x3C, 0x5E)), // FileBothDirectoryInformation
         12 => Some((0x08, 0x0C)), // FileNamesInformation
         37 => Some((0x3C, 0x68)), // FileIdBothDirectoryInformation
-        38 => Some((0x38, 0x50)), // FileIdFullDirectoryInformation
+        38 => Some((0x3C, 0x50)), // FileIdFullDirectoryInformation
         _ => None,
     }
 }
