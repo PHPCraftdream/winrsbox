@@ -10,6 +10,9 @@
 //         PROC_THREAD_ATTRIBUTE_PARENT_PROCESS.
 // Hook 3: NtAssignProcessToJobObject — unconditionally denies Job reassignment
 //         from within the sandbox, preventing nested-Job escape on Win10+.
+// Hook 4: NtSetInformationProcess — blocks dangerous ProcessInformationClass
+//         mutations on foreign (non-owned) processes. Self-process is always
+//         allowed for legitimate JIT/runtime usage.
 
 use std::sync::OnceLock;
 
@@ -17,6 +20,7 @@ use detour2::GenericDetour;
 use ntapi::winapi::shared::ntdef::{HANDLE, NTSTATUS, OBJECT_ATTRIBUTES};
 use winapi::ctypes::c_void;
 use winapi::um::processthreadsapi::GetCurrentProcessId;
+use winapi::shared::ntdef::ULONG;
 
 use crate::anti_rec;
 use crate::hooks::{ipc_log, is_trace};
@@ -42,6 +46,13 @@ type FnNtOpenProcess = unsafe extern "system" fn(
 type FnNtAssignProcessToJobObject = unsafe extern "system" fn(
     *mut c_void,  // JobHandle
     *mut c_void,  // ProcessHandle
+) -> NTSTATUS;
+
+type FnNtSetInformationProcess = unsafe extern "system" fn(
+    HANDLE,          // ProcessHandle
+    ULONG,           // ProcessInformationClass
+    *mut c_void,     // ProcessInformation
+    ULONG,           // ProcessInformationLength
 ) -> NTSTATUS;
 
 // PS_ATTRIBUTE for parent-spoof detection in NtCreateUserProcess attribute list.
@@ -75,6 +86,7 @@ fn pid_owned(pid: u32) -> bool {
 
 static HOOK_NT_OPEN_PROCESS: OnceLock<GenericDetour<FnNtOpenProcess>> = OnceLock::new();
 static HOOK_NT_ASSIGN_JOB: OnceLock<GenericDetour<FnNtAssignProcessToJobObject>> = OnceLock::new();
+static HOOK_NT_SET_INFO_PROCESS: OnceLock<GenericDetour<FnNtSetInformationProcess>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // NtOpenProcess hook
@@ -159,6 +171,120 @@ unsafe extern "system" fn hook_nt_assign_process_to_job_object(
                 job as usize, process as usize));
     }
     STATUS_ACCESS_DENIED
+}
+
+// ---------------------------------------------------------------------------
+// NtSetInformationProcess hook — block dangerous foreign-process mutations
+// ---------------------------------------------------------------------------
+//
+// Classes treated as dangerous on FOREIGN PIDs (self-process is always allowed
+// for legitimate JIT/runtime usage):
+//   1  ProcessQuotaLimits        — change quotas of another process
+//   3  ProcessBasePriority       — set base priority foreign
+//   8  ProcessIoPortHandlers     — set IO completion port handlers
+//   9  ProcessAccessToken        — assign primary token to foreign process (escape!)
+//   20 ProcessPriorityBoost      — boost priority foreign
+//   21 ProcessAffinityMask       — change CPU affinity foreign
+//   25 ProcessForegroundInformation — set foreground on foreign
+//   32 ProcessHandleTracing      — enable handle tracing foreign
+
+const PROCESS_QUOTA_LIMITS: ULONG = 1;
+const PROCESS_BASE_PRIORITY: ULONG = 3;
+const PROCESS_IO_PORT_HANDLERS: ULONG = 8;
+const PROCESS_ACCESS_TOKEN: ULONG = 9;
+const PROCESS_PRIORITY_BOOST: ULONG = 20;
+const PROCESS_AFFINITY_MASK: ULONG = 21;
+const PROCESS_FOREGROUND_INFORMATION: ULONG = 25;
+const PROCESS_HANDLE_TRACING: ULONG = 32;
+
+const DANGEROUS_PROC_CLASSES: &[ULONG] = &[
+    PROCESS_QUOTA_LIMITS,
+    PROCESS_BASE_PRIORITY,
+    PROCESS_IO_PORT_HANDLERS,
+    PROCESS_ACCESS_TOKEN,
+    PROCESS_PRIORITY_BOOST,
+    PROCESS_AFFINITY_MASK,
+    PROCESS_FOREGROUND_INFORMATION,
+    PROCESS_HANDLE_TRACING,
+];
+
+unsafe extern "system" fn hook_nt_set_information_process(
+    process_handle: HANDLE,
+    class: ULONG,
+    info: *mut c_void,
+    len: ULONG,
+) -> NTSTATUS {
+    let call_original = || {
+        HOOK_NT_SET_INFO_PROCESS.get().unwrap().call(process_handle, class, info, len)
+    };
+
+    let Some(_guard) = anti_rec::enter() else {
+        return call_original();
+    };
+
+    if !DANGEROUS_PROC_CLASSES.contains(&class) {
+        return call_original();
+    }
+
+    // Resolve handle → PID. If self or owned child → allow.
+    let target_pid = resolve_process_pid(process_handle);
+    if target_pid == 0 || pid_owned(target_pid) {
+        return call_original();
+    }
+
+    if is_trace() {
+        ipc_log(ipc::LogLevel::Trace,
+            format!("proc_setinfo_blocked pid={target_pid} class={class}"));
+    }
+    STATUS_ACCESS_DENIED
+}
+
+// ---------------------------------------------------------------------------
+// Resolve process handle → PID via NtQueryInformationProcess
+// ---------------------------------------------------------------------------
+
+fn resolve_process_pid(handle: HANDLE) -> u32 {
+    #[repr(C)]
+    struct PROCESS_BASIC_INFORMATION {
+        reserved1: *mut c_void,
+        peb_base_address: *mut c_void,
+        reserved2: [*mut c_void; 2],
+        unique_process_id: usize,
+        reserved3: *mut c_void,
+    }
+
+    type FnNtQueryInformationProcess = unsafe extern "system" fn(
+        HANDLE,
+        ULONG,       // ProcessInformationClass (0 = ProcessBasicInformation)
+        *mut c_void, // ProcessInformation
+        ULONG,       // ProcessInformationLength
+        *mut ULONG,  // ReturnLength
+    ) -> NTSTATUS;
+
+    static QIP: OnceLock<Option<FnNtQueryInformationProcess>> = OnceLock::new();
+    let qip = QIP.get_or_init(|| {
+        unsafe {
+            let addr = crate::hooks::ntdll_export("NtQueryInformationProcess\0".as_bytes())?;
+            Some(std::mem::transmute(addr as usize))
+        }
+    });
+
+    if let Some(qip_fn) = qip {
+        let mut pbi = std::mem::MaybeUninit::<PROCESS_BASIC_INFORMATION>::uninit();
+        let status = unsafe {
+            qip_fn(
+                handle,
+                0, // ProcessBasicInformation
+                pbi.as_mut_ptr() as *mut c_void,
+                std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as ULONG,
+                std::ptr::null_mut(),
+            )
+        };
+        if status >= 0 {
+            return unsafe { (*pbi.as_ptr()).unique_process_id as u32 };
+        }
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +396,19 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
         .enable()
         .map_err(|e| format!("detour enable NtAssignProcessToJobObject: {:?}", e))?;
 
+    // Hook 4: NtSetInformationProcess — block dangerous foreign-process mutations
+    let addr3 = crate::hooks::ntdll_export("NtSetInformationProcess\0".as_bytes())
+        .ok_or("ntdll export not found: NtSetInformationProcess")?;
+    let target3: FnNtSetInformationProcess = std::mem::transmute(addr3 as usize);
+    let hook_ptr3: FnNtSetInformationProcess = hook_nt_set_information_process;
+    let detour3 = GenericDetour::<FnNtSetInformationProcess>::new(target3, hook_ptr3)
+        .map_err(|e| format!("detour init NtSetInformationProcess: {:?}", e))?;
+    HOOK_NT_SET_INFO_PROCESS.set(detour3).ok();
+    HOOK_NT_SET_INFO_PROCESS.get()
+        .expect("set above")
+        .enable()
+        .map_err(|e| format!("detour enable NtSetInformationProcess: {:?}", e))?;
+
     if is_trace() {
         ipc_log(ipc::LogLevel::Trace, "proc_guard_installed".into());
     }
@@ -277,6 +416,9 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub unsafe fn uninstall() {
+    if let Some(h) = HOOK_NT_SET_INFO_PROCESS.get() {
+        let _ = h.disable();
+    }
     if let Some(h) = HOOK_NT_ASSIGN_JOB.get() {
         let _ = h.disable();
     }

@@ -307,6 +307,10 @@ path = "src/bin/escape_hardlink_to_host.rs"
 name = "escape_reparse_create"
 path = "src/bin/escape_reparse_create.rs"
 
+[[bin]]
+name = "escape_setinfo_process"
+path = "src/bin/escape_setinfo_process.rs"
+
 [[test]]
 name = "mock_integration"
 path = "tests/mock_integration.rs"

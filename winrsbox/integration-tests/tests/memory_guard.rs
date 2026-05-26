@@ -916,6 +916,15 @@ fn strict_hides_winrsbox_enum() {
 
 #[test]
 #[serial]
+fn strict_blocks_setinfo_process() {
+    let r = run_payload("escape_setinfo_process", "scan");
+    if r.status.code() == Some(7) { return; }
+    assert_eq!(r.status.code(), Some(5),
+        "SetProcessAffinityMask on foreign process should be blocked\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
 fn strict_blocks_reparse_create() {
     let r = run_payload("escape_reparse_create", "scan");
     if r.status.code() == Some(7) {
