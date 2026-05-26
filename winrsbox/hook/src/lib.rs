@@ -20,6 +20,7 @@ pub mod inject_guard;
 pub mod link_guard;
 pub mod memory_guard;
 pub mod net_hooks;
+pub mod proc_guard;
 pub mod process_tracker;
 pub mod scan_cache;
 pub mod reg_hooks;

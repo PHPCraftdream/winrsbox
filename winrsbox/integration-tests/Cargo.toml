@@ -184,16 +184,24 @@ name = "escape_keybd_event"
 path = "src/bin/escape_keybd_event.rs"
 
 [[bin]]
-name = "escape_window_msg"
-path = "src/bin/escape_window_msg.rs"
-
-[[bin]]
 name = "escape_clipboard"
 path = "src/bin/escape_clipboard.rs"
 
 [[bin]]
-name = "escape_winr_notepad_real"
-path = "src/bin/escape_winr_notepad_real.rs"
+name = "escape_inject_remote"
+path = "src/bin/escape_inject_remote.rs"
+
+[[bin]]
+name = "escape_spawn_wsl"
+path = "src/bin/escape_spawn_wsl.rs"
+
+[[bin]]
+name = "escape_spawn_wmic"
+path = "src/bin/escape_spawn_wmic.rs"
+
+[[bin]]
+name = "escape_parent_spoof"
+path = "src/bin/escape_parent_spoof.rs"
 
 [[test]]
 name = "mock_integration"
@@ -210,7 +218,7 @@ path = "tests/real_world.rs"
 [dependencies]
 policy = { path = "../policy" }
 serde_json = "1"
-winapi = { version = "0.3", features = ["memoryapi", "winnt", "processthreadsapi", "libloaderapi", "errhandlingapi", "tlhelp32", "handleapi", "winreg", "minwindef", "fileapi", "ioapiset", "processenv", "winuser"] }
+winapi = { version = "0.3", features = ["memoryapi", "winnt", "processthreadsapi", "libloaderapi", "errhandlingapi", "tlhelp32", "handleapi", "winreg", "minwindef", "fileapi", "ioapiset", "processenv", "winuser", "synchapi", "winbase"] }
 ntapi = "0.4"
 
 [dev-dependencies]
