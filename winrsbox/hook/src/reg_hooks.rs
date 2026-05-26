@@ -272,9 +272,6 @@ unsafe extern "system" fn hook_nt_delete_key(key_handle: HANDLE) -> NTSTATUS {
             }
             return 0;
         }
-        if mode.eq_ignore_ascii_case("silent_ok") {
-            return 0; // STATUS_SUCCESS — sandbox absorbs the write
-        }
     }
     call_original()
 }
