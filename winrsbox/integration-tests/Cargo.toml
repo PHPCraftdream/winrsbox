@@ -68,6 +68,18 @@ name = "escape_reg_appinit"
 path = "src/bin/escape_reg_appinit.rs"
 
 [[bin]]
+name = "escape_reg_ifeo"
+path = "src/bin/escape_reg_ifeo.rs"
+
+[[bin]]
+name = "escape_reg_silentexit"
+path = "src/bin/escape_reg_silentexit.rs"
+
+[[bin]]
+name = "escape_reg_service"
+path = "src/bin/escape_reg_service.rs"
+
+[[bin]]
 name = "escape_thread_hijack"
 path = "src/bin/escape_thread_hijack.rs"
 
