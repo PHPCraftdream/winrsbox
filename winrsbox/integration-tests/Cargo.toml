@@ -291,6 +291,14 @@ path = "src/bin/escape_scm_open.rs"
 name = "escape_service_changeconfig"
 path = "src/bin/escape_service_changeconfig.rs"
 
+[[bin]]
+name = "escape_rename_outside_sandbox"
+path = "src/bin/escape_rename_outside_sandbox.rs"
+
+[[bin]]
+name = "escape_hardlink_to_host"
+path = "src/bin/escape_hardlink_to_host.rs"
+
 [[test]]
 name = "mock_integration"
 path = "tests/mock_integration.rs"
