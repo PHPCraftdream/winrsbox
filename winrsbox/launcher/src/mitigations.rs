@@ -56,7 +56,8 @@ pub fn compute(profile: Profile) -> (u64, u64) {
                    | v1::BOTTOM_UP_ASLR_ALWAYS_ON
                    | v1::HIGH_ENTROPY_ASLR_ALWAYS_ON
                    | v1::STRICT_HANDLE_CHECKS_ALWAYS_ON
-                   | v1::IMAGE_LOAD_PREFER_SYSTEM32_ALWAYS_ON;
+                   | v1::IMAGE_LOAD_PREFER_SYSTEM32_ALWAYS_ON
+                   | v1::IMAGE_LOAD_NO_REMOTE_ALWAYS_ON;
             (m1, 0)
         }
         Profile::Full => {
@@ -68,7 +69,8 @@ pub fn compute(profile: Profile) -> (u64, u64) {
                    | v1::BOTTOM_UP_ASLR_ALWAYS_ON
                    | v1::HIGH_ENTROPY_ASLR_ALWAYS_ON
                    | v1::STRICT_HANDLE_CHECKS_ALWAYS_ON
-                   | v1::IMAGE_LOAD_PREFER_SYSTEM32_ALWAYS_ON;
+                   | v1::IMAGE_LOAD_PREFER_SYSTEM32_ALWAYS_ON
+                   | v1::IMAGE_LOAD_NO_REMOTE_ALWAYS_ON;
             let m2 = v2::RESTRICT_INDIRECT_BRANCH_PREDICTION
                    | v2::SPECULATIVE_STORE_BYPASS_DISABLE;
             (m1, m2)

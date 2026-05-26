@@ -255,6 +255,10 @@ path = "src/bin/escape_token_duplicate.rs"
 name = "escape_token_impersonate"
 path = "src/bin/escape_token_impersonate.rs"
 
+[[bin]]
+name = "escape_dll_sideload"
+path = "src/bin/escape_dll_sideload.rs"
+
 [[test]]
 name = "mock_integration"
 path = "tests/mock_integration.rs"
