@@ -18,7 +18,6 @@ pub mod cache;
 pub mod hooks;
 mod inject;
 pub mod inject_guard;
-pub mod link_guard;
 pub mod memory_guard;
 pub mod net_hooks;
 pub mod proc_guard;
