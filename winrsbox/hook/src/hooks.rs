@@ -363,6 +363,7 @@ pub const WRITE_DAC: u32 = 0x0004_0000;
 pub const WRITE_OWNER: u32 = 0x0008_0000;
 
 pub const FILE_CREATE: u32 = 0x0000_0002;
+pub const FILE_OPEN_IF: u32 = 0x0000_0003;
 pub const FILE_OVERWRITE: u32 = 0x0000_0004;
 pub const FILE_OVERWRITE_IF: u32 = 0x0000_0005;
 pub const FILE_SUPERSEDE: u32 = 0x0000_0000;
@@ -371,7 +372,7 @@ pub fn is_write_access(desired: ACCESS_MASK, disposition: u32) -> bool {
     let write_bits =
         GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER;
     desired & write_bits != 0
-        || matches!(disposition, FILE_CREATE | FILE_OVERWRITE | FILE_OVERWRITE_IF | FILE_SUPERSEDE)
+        || matches!(disposition, FILE_CREATE | FILE_OPEN_IF | FILE_OVERWRITE | FILE_OVERWRITE_IF | FILE_SUPERSEDE)
 }
 
 // ---------------------------------------------------------------------------
@@ -1150,8 +1151,9 @@ unsafe extern "system" fn hook_nt_set_information_file(
                 return call_original();
             }
 
-            let root = *(info.add(off_root) as *const HANDLE);
-            let name_len = *(info.add(off_namelen) as *const u32) as usize;
+            let info_bytes = info as *mut u8;
+            let root = *(info_bytes.add(off_root) as *const HANDLE);
+            let name_len = *(info_bytes.add(off_namelen) as *const u32) as usize;
             if name_len == 0 || name_len > 0x8000 {
                 return call_original();
             }
@@ -1159,7 +1161,7 @@ unsafe extern "system" fn hook_nt_set_information_file(
             if off_name + name_len > len as usize {
                 return call_original();
             }
-            let name_ptr = info.add(off_name) as *const u16;
+            let name_ptr = info_bytes.add(off_name) as *const u16;
             let chars = name_len / 2;
             let name_slice = std::slice::from_raw_parts(name_ptr, chars);
             let dest_name = String::from_utf16_lossy(name_slice);
@@ -1630,31 +1632,44 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
             crate::inject_guard::install()?;
         }
         if !skip("reg") {
-            let _ = crate::reg_hooks::install();
+            if let Err(e) = crate::reg_hooks::install() {
+                ipc_log(ipc::LogLevel::Warn, format!("reg_hooks install failed: {:?}", e));
+            }
         }
         if !skip("net") {
-            let _ = crate::net_hooks::install();
-        }
-        if !skip("link") {
-            let _ = crate::link_guard::install();
+            if let Err(e) = crate::net_hooks::install() {
+                ipc_log(ipc::LogLevel::Warn, format!("net_hooks install failed: {:?}", e));
+            }
         }
         if !skip("alpc") {
-            let _ = crate::alpc_guard::install();
+            if let Err(e) = crate::alpc_guard::install() {
+                ipc_log(ipc::LogLevel::Warn, format!("alpc_guard install failed: {:?}", e));
+            }
         }
         if !skip("token") {
-            let _ = crate::token_guard::install();
+            if let Err(e) = crate::token_guard::install() {
+                ipc_log(ipc::LogLevel::Warn, format!("token_guard install failed: {:?}", e));
+            }
         }
         if !skip("ui") {
-            let _ = crate::ui_guard::install();
+            if let Err(e) = crate::ui_guard::install() {
+                ipc_log(ipc::LogLevel::Warn, format!("ui_guard install failed: {:?}", e));
+            }
         }
         if !skip("proc") {
-            let _ = crate::proc_guard::install();
+            if let Err(e) = crate::proc_guard::install() {
+                ipc_log(ipc::LogLevel::Warn, format!("proc_guard install failed: {:?}", e));
+            }
         }
         if !skip("com") {
-            let _ = crate::com_guard::install();
+            if let Err(e) = crate::com_guard::install() {
+                ipc_log(ipc::LogLevel::Warn, format!("com_guard install failed: {:?}", e));
+            }
         }
         if !skip("service") {
-            let _ = crate::service_guard::install();
+            if let Err(e) = crate::service_guard::install() {
+                ipc_log(ipc::LogLevel::Warn, format!("service_guard install failed: {:?}", e));
+            }
         }
 
         if !skip("mitigations") {
@@ -1746,7 +1761,6 @@ pub unsafe fn uninstall_hooks() {
     crate::ui_guard::uninstall();
     crate::token_guard::uninstall();
     crate::alpc_guard::uninstall();
-    crate::link_guard::uninstall();
     crate::net_hooks::uninstall();
     crate::reg_hooks::uninstall();
     crate::inject_guard::uninstall();

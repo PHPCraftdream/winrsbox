@@ -333,7 +333,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn req_injection_violation_roundtrip() {
         let msg = Req::InjectionViolation {
             pid: 100,
@@ -359,6 +358,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn read_msg_oversized_returns_decode() {
         let mut buf = Cursor::new(Vec::new());
         let len = (MAX_MSG_LEN as u32) + 1;

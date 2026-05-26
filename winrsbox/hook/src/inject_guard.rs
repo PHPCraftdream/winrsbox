@@ -129,7 +129,7 @@ pub fn is_system_caller() -> bool {
 
 const NT_CURRENT_PROCESS: isize = -1;
 
-pub fn is_self_process(handle: HANDLE) -> bool {
+pub unsafe fn is_self_process(handle: HANDLE) -> bool {
     if handle as isize == NT_CURRENT_PROCESS {
         return true;
     }
@@ -141,7 +141,7 @@ pub fn is_self_process(handle: HANDLE) -> bool {
     target_pid != 0 && target_pid == unsafe { GetCurrentProcessId() }
 }
 
-pub fn thread_owner_pid(thread_handle: HANDLE) -> u32 {
+pub unsafe fn thread_owner_pid(thread_handle: HANDLE) -> u32 {
     if thread_handle.is_null() {
         return 0;
     }
@@ -477,22 +477,22 @@ mod tests {
 
     #[test]
     fn is_self_process_pseudo_handle() {
-        assert!(is_self_process(-1isize as HANDLE));
+        assert!(unsafe { is_self_process(-1isize as HANDLE) });
     }
 
     #[test]
     fn is_self_process_null_is_false() {
-        assert!(!is_self_process(std::ptr::null_mut()));
+        assert!(unsafe { !is_self_process(std::ptr::null_mut()) });
     }
 
     #[test]
     fn thread_owner_pid_null_is_zero() {
-        assert_eq!(thread_owner_pid(std::ptr::null_mut()), 0);
+        assert_eq!(unsafe { thread_owner_pid(std::ptr::null_mut()) }, 0);
     }
 
     #[test]
     fn thread_owner_pid_current_thread() {
-        let owner = thread_owner_pid(-2isize as HANDLE);
+        let owner = unsafe { thread_owner_pid(-2isize as HANDLE) };
         let self_pid = unsafe { GetCurrentProcessId() };
         assert_eq!(owner, self_pid);
     }
