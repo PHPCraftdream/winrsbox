@@ -31,8 +31,16 @@ impl JobLimits {
     }
 
     /// Compute the LimitFlags DWORD from our settings. Pure function.
+    ///
+    /// SECURITY: BREAKAWAY_OK (0x0800) and SILENT_BREAKAWAY_OK (0x1000) are
+    /// intentionally NEVER set. If either were enabled, a sandboxed child could
+    /// escape the Job Object via CreateProcess(CREATE_BREAKAWAY_FROM_JOB) or
+    /// silent auto-breakaway — bypassing all kernel-enforced restrictions
+    /// (kill-on-close, memory limits, UI restrictions).
     pub fn limit_flags(&self) -> u32 {
         let mut flags = 0u32;
+        // JOB_OBJECT_LIMIT_BREAKAWAY_OK       (0x0800) — MUST remain unset
+        // JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK (0x1000) — MUST remain unset
         if self.kill_on_close {
             flags |= 0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         }
@@ -197,6 +205,28 @@ mod tests {
         assert_eq!(UiRestrictions { no_global_atoms: true, ..empty_ui() }.limit_flags(), 0x20);
         assert_eq!(UiRestrictions { no_desktop: true, ..empty_ui() }.limit_flags(), 0x40);
         assert_eq!(UiRestrictions { no_exit_windows: true, ..empty_ui() }.limit_flags(), 0x80);
+    }
+
+    #[test]
+    fn job_disallows_breakaway() {
+        // SECURITY: if either breakaway flag leaks in, the sandbox is escaped.
+        let lim = JobLimits::default();
+        let f = lim.limit_flags();
+        assert_eq!(f & 0x0800, 0, "JOB_OBJECT_LIMIT_BREAKAWAY_OK must be unset");
+        assert_eq!(f & 0x1000, 0, "JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK must be unset");
+    }
+
+    #[test]
+    fn job_disallows_breakaway_even_with_all_limits() {
+        let lim = JobLimits {
+            kill_on_close: true,
+            memory_bytes: Some(4 * 1024 * 1024 * 1024),
+            die_on_unhandled: true,
+        };
+        let f = lim.limit_flags();
+        assert_eq!(f & 0x0800, 0, "JOB_OBJECT_LIMIT_BREAKAWAY_OK must be unset");
+        assert_eq!(f & 0x1000, 0, "JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK must be unset");
+        assert_ne!(f & 0x2000, 0, "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE must be set");
     }
 
     #[test]
