@@ -1,6 +1,7 @@
 // Inject guard — blocks cross-process injection from sandboxed processes.
 //
-// Hooks NtCreateThreadEx and NtQueueApcThread. Three-layer filtering:
+// Hooks NtCreateThreadEx, NtQueueApcThread, and NtQueueApcThreadEx.
+// Three-layer filtering:
 //   1. Caller-aware: system DLLs (ntdll/kernelbase/kernel32) → allow
 //   2. Deferred install: hooks activate after ARMED flag is set (post-init)
 //   3. System PID whitelist: target PID < SYSTEM_PID_THRESHOLD → allow
@@ -46,6 +47,19 @@ type FnNtQueueApcThread = unsafe extern "system" fn(
     HANDLE, *mut c_void, *mut c_void, *mut c_void, *mut c_void,
 ) -> NTSTATUS;
 
+// NtQueueApcThreadEx — Windows 10+ variant with UserApcReserveHandle.
+// Signature from ntapi 0.4 ntpsapi.rs:
+//   NtQueueApcThreadEx(ThreadHandle, UserApcReserveHandle, ApcRoutine,
+//                     ApcArgument1, ApcArgument2, ApcArgument3) -> NTSTATUS
+type FnNtQueueApcThreadEx = unsafe extern "system" fn(
+    HANDLE, // ThreadHandle
+    HANDLE, // UserApcReserveHandle
+    *mut c_void, // ApcRoutine
+    *mut c_void, // ApcArgument1
+    *mut c_void, // ApcArgument2
+    *mut c_void, // ApcArgument3
+) -> NTSTATUS;
+
 type FnNtSetContextThread = unsafe extern "system" fn(
     HANDLE,         // ThreadHandle
     *const c_void,  // Context (CONTEXT*)
@@ -58,6 +72,7 @@ type FnNtSetContextThread = unsafe extern "system" fn(
 static HOOK_CREATE_THREAD_EX: OnceLock<GenericDetour<FnNtCreateThreadEx>> = OnceLock::new();
 static HOOK_CREATE_THREAD: OnceLock<GenericDetour<FnNtCreateThread>> = OnceLock::new();
 static HOOK_QUEUE_APC: OnceLock<GenericDetour<FnNtQueueApcThread>> = OnceLock::new();
+static HOOK_QUEUE_APC_EX: OnceLock<GenericDetour<FnNtQueueApcThreadEx>> = OnceLock::new();
 static HOOK_SET_CONTEXT: OnceLock<GenericDetour<FnNtSetContextThread>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
@@ -420,6 +435,40 @@ unsafe extern "system" fn hook_nt_queue_apc_thread(
     call_original()
 }
 
+unsafe extern "system" fn hook_nt_queue_apc_thread_ex(
+    thread_handle: HANDLE,
+    user_apc_reserve_handle: HANDLE,
+    apc_routine: *mut c_void,
+    apc_arg1: *mut c_void,
+    apc_arg2: *mut c_void,
+    apc_arg3: *mut c_void,
+) -> NTSTATUS {
+    let call_original = || {
+        HOOK_QUEUE_APC_EX.get().unwrap().call(
+            thread_handle, user_apc_reserve_handle,
+            apc_routine, apc_arg1, apc_arg2, apc_arg3,
+        )
+    };
+
+    let Some(_guard) = anti_rec::enter() else {
+        return call_original();
+    };
+
+    let owner_pid = thread_owner_pid(thread_handle);
+    let self_pid = GetCurrentProcessId();
+    if owner_pid != 0 && owner_pid != self_pid {
+        if should_block(owner_pid) {
+            report_and_terminate(
+                ipc::InjectKind::QueueApc,
+                owner_pid,
+                apc_routine as u64,
+            );
+        }
+    }
+
+    call_original()
+}
+
 // ---------------------------------------------------------------------------
 // Install / Uninstall
 // ---------------------------------------------------------------------------
@@ -456,6 +505,16 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     install_guard!(HOOK_QUEUE_APC,     "NtQueueApcThread\0",  hook_nt_queue_apc_thread, FnNtQueueApcThread);
+    // NtQueueApcThreadEx — Windows 10+ variant (early-bird APC). Best-effort
+    // install: not present on older Windows, so don't fail if export missing.
+    if let Some(addr) = crate::hooks::ntdll_export("NtQueueApcThreadEx\0".as_bytes()) {
+        let target: FnNtQueueApcThreadEx = std::mem::transmute(addr as usize);
+        let hook_ptr: FnNtQueueApcThreadEx = hook_nt_queue_apc_thread_ex;
+        if let Ok(detour) = GenericDetour::<FnNtQueueApcThreadEx>::new(target, hook_ptr) {
+            let _ = HOOK_QUEUE_APC_EX.set(detour);
+            if let Some(h) = HOOK_QUEUE_APC_EX.get() { let _ = h.enable(); }
+        }
+    }
     install_guard!(HOOK_SET_CONTEXT,   "NtSetContextThread\0", hook_nt_set_context_thread, FnNtSetContextThread);
 
     // Hooks installed but NOT armed — will arm after first IPC Hello
@@ -468,6 +527,7 @@ pub unsafe fn uninstall() {
     if let Some(h) = HOOK_SET_CONTEXT.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_CREATE_THREAD_EX.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_CREATE_THREAD.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_QUEUE_APC_EX.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_QUEUE_APC.get() { let _ = h.disable(); }
 }
 

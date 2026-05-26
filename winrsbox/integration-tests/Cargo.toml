@@ -92,6 +92,10 @@ name = "escape_apc_injection"
 path = "src/bin/escape_apc_injection.rs"
 
 [[bin]]
+name = "escape_apc_ex"
+path = "src/bin/escape_apc_ex.rs"
+
+[[bin]]
 name = "escape_net_rfc1918"
 path = "src/bin/escape_net_rfc1918.rs"
 
