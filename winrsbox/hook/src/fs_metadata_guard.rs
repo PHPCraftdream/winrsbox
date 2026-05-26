@@ -70,6 +70,7 @@ const FILE_DISPOSITION_EX_INFO_CLASS: u32 = 64;
 const FSCTL_SET_REPARSE_POINT: u32    = 0x900A4;
 const FSCTL_SET_REPARSE_POINT_EX: u32 = 0x900E4;
 const FSCTL_DELETE_REPARSE_POINT: u32 = 0x900AC;
+const FSCTL_PIPE_IMPERSONATE: u32     = 0x11003C;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -235,11 +236,12 @@ unsafe extern "system" fn hook_nt_fs_control_file(
     match fs_control_code {
         FSCTL_SET_REPARSE_POINT
         | FSCTL_SET_REPARSE_POINT_EX
-        | FSCTL_DELETE_REPARSE_POINT => {
+        | FSCTL_DELETE_REPARSE_POINT
+        | FSCTL_PIPE_IMPERSONATE => {
             if hooks::is_trace() {
                 let src = query_handle_dos_path(handle).unwrap_or_default();
                 hooks::ipc_log(ipc::LogLevel::Trace,
-                    format!("fs_fsctl_block_reparse code=0x{:x} src={}", fs_control_code, src));
+                    format!("fs_fsctl_block code=0x{:x} src={}", fs_control_code, src));
             }
             if !iosb.is_null() {
                 hooks::set_io_status(iosb, STATUS_ACCESS_DENIED);
