@@ -96,6 +96,19 @@ type FnNtSetInformationFile = unsafe extern "system" fn(
     u32,                     // FileInformationClass
 ) -> NTSTATUS;
 
+type FnNtFsControlFile = unsafe extern "system" fn(
+    HANDLE,                  // FileHandle
+    HANDLE,                  // Event
+    *mut c_void,             // ApcRoutine
+    *mut c_void,             // ApcContext
+    *mut IO_STATUS_BLOCK,    // IoStatusBlock
+    u32,                     // FsControlCode
+    *mut c_void,             // InputBuffer
+    u32,                     // InputBufferLength
+    *mut c_void,             // OutputBuffer
+    u32,                     // OutputBufferLength
+) -> NTSTATUS;
+
 // ---------------------------------------------------------------------------
 // Detour storage
 // ---------------------------------------------------------------------------
@@ -111,6 +124,7 @@ static HOOK_NT_CREATE_USER_PROCESS: OnceLock<GenericDetour<FnNtCreateUserProcess
 static HOOK_NT_QUERY_DIRECTORY_FILE: OnceLock<GenericDetour<FnNtQueryDirectoryFile>> =
     OnceLock::new();
 static HOOK_NT_SET_INFO_FILE: OnceLock<GenericDetour<FnNtSetInformationFile>> = OnceLock::new();
+static HOOK_NT_FS_CONTROL_FILE: OnceLock<GenericDetour<FnNtFsControlFile>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // IPC / cache globals
@@ -1199,6 +1213,52 @@ unsafe extern "system" fn hook_nt_set_information_file(
 }
 
 // ---------------------------------------------------------------------------
+// NtFsControlFile — block reparse-point creation/deletion
+// ---------------------------------------------------------------------------
+
+const FSCTL_SET_REPARSE_POINT: u32    = 0x900A4;
+const FSCTL_SET_REPARSE_POINT_EX: u32 = 0x900E4;
+const FSCTL_DELETE_REPARSE_POINT: u32 = 0x900AC;
+
+unsafe extern "system" fn hook_nt_fs_control_file(
+    handle: HANDLE,
+    event: HANDLE,
+    apc_routine: *mut c_void,
+    apc_context: *mut c_void,
+    iosb: *mut IO_STATUS_BLOCK,
+    fs_control_code: u32,
+    input: *mut c_void, input_len: u32,
+    output: *mut c_void, output_len: u32,
+) -> NTSTATUS {
+    let call_original = || {
+        HOOK_NT_FS_CONTROL_FILE.get().unwrap().call(
+            handle, event, apc_routine, apc_context, iosb,
+            fs_control_code, input, input_len, output, output_len,
+        )
+    };
+    let Some(_g) = anti_rec::enter() else { return call_original(); };
+
+    match fs_control_code {
+        FSCTL_SET_REPARSE_POINT
+        | FSCTL_SET_REPARSE_POINT_EX
+        | FSCTL_DELETE_REPARSE_POINT => {
+            if is_trace() {
+                let src = query_handle_dos_path(handle).unwrap_or_default();
+                ipc_log(ipc::LogLevel::Trace,
+                    format!("fs_fsctl_block_reparse code=0x{:x} src={}", fs_control_code, src));
+            }
+            if !iosb.is_null() {
+                set_io_status(iosb, STATUS_ACCESS_DENIED);
+            }
+            return STATUS_ACCESS_DENIED;
+        }
+        _ => {}
+    }
+
+    call_original()
+}
+
+// ---------------------------------------------------------------------------
 // NtQueryDirectoryFile — filter .winrsbox from directory listings
 // ---------------------------------------------------------------------------
 
@@ -1550,6 +1610,7 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         install!(HOOK_NT_CREATE_USER_PROCESS,      "NtCreateUserProcess\0",       hook_nt_create_user_process,      FnNtCreateUserProcess);
         install!(HOOK_NT_QUERY_DIRECTORY_FILE,      "NtQueryDirectoryFile\0",      hook_nt_query_directory_file,     FnNtQueryDirectoryFile);
         install!(HOOK_NT_SET_INFO_FILE,              "NtSetInformationFile\0",      hook_nt_set_information_file,     FnNtSetInformationFile);
+        install!(HOOK_NT_FS_CONTROL_FILE,            "NtFsControlFile\0",           hook_nt_fs_control_file,          FnNtFsControlFile);
     }
 
     if guard != "none" {
@@ -1693,6 +1754,7 @@ pub unsafe fn uninstall_hooks() {
     if let Some(h) = HOOK_NT_CREATE_USER_PROCESS.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_NT_QUERY_DIRECTORY_FILE.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_NT_SET_INFO_FILE.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_NT_FS_CONTROL_FILE.get() { let _ = h.disable(); }
 }
 
 #[cfg(test)]

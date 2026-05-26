@@ -893,3 +893,19 @@ fn strict_hides_winrsbox_enum() {
     }
     assert_eq!(code, Some(5), ".winrsbox should not appear in directory enumeration\nstderr: {}", r.stderr);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NtFsControlFile — reparse-point creation escape vector
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[serial]
+fn strict_blocks_reparse_create() {
+    let r = run_payload("escape_reparse_create", "scan");
+    if r.status.code() == Some(7) {
+        eprintln!("setup failed (mkdir), skipping");
+        return;
+    }
+    assert_eq!(r.status.code(), Some(5),
+        "FSCTL_SET_REPARSE_POINT should be denied\nstderr: {}", r.stderr);
+}
