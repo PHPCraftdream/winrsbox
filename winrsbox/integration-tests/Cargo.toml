@@ -275,6 +275,14 @@ path = "src/bin/escape_dll_sideload.rs"
 name = "escape_com_classobject"
 path = "src/bin/escape_com_classobject.rs"
 
+[[bin]]
+name = "escape_winrsbox_read"
+path = "src/bin/escape_winrsbox_read.rs"
+
+[[bin]]
+name = "escape_winrsbox_enum"
+path = "src/bin/escape_winrsbox_enum.rs"
+
 [[test]]
 name = "mock_integration"
 path = "tests/mock_integration.rs"
