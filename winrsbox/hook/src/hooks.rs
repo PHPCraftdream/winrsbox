@@ -74,40 +74,8 @@ type FnNtCreateUserProcess = unsafe extern "system" fn(
     *mut c_void,            // AttributeList
 ) -> NTSTATUS;
 
-type FnNtQueryDirectoryFile = unsafe extern "system" fn(
-    HANDLE,                  // FileHandle
-    HANDLE,                  // Event
-    *mut c_void,             // ApcRoutine
-    *mut c_void,             // ApcContext
-    *mut IO_STATUS_BLOCK,    // IoStatusBlock
-    *mut c_void,             // FileInformation
-    u32,                     // Length
-    u32,                     // FileInformationClass
-    u8,                      // ReturnSingleEntry (BOOLEAN)
-    *mut UNICODE_STRING,     // FileName (filter pattern, optional)
-    u8,                      // RestartScan
-) -> NTSTATUS;
-
-type FnNtSetInformationFile = unsafe extern "system" fn(
-    HANDLE,                  // FileHandle
-    *mut IO_STATUS_BLOCK,    // IoStatusBlock
-    *mut c_void,             // FileInformation
-    u32,                     // Length
-    u32,                     // FileInformationClass
-) -> NTSTATUS;
-
-type FnNtFsControlFile = unsafe extern "system" fn(
-    HANDLE,                  // FileHandle
-    HANDLE,                  // Event
-    *mut c_void,             // ApcRoutine
-    *mut c_void,             // ApcContext
-    *mut IO_STATUS_BLOCK,    // IoStatusBlock
-    u32,                     // FsControlCode
-    *mut c_void,             // InputBuffer
-    u32,                     // InputBufferLength
-    *mut c_void,             // OutputBuffer
-    u32,                     // OutputBufferLength
-) -> NTSTATUS;
+// FnNtQueryDirectoryFile, FnNtSetInformationFile, FnNtFsControlFile
+// moved to dir_filter.rs and fs_metadata_guard.rs respectively.
 
 // ---------------------------------------------------------------------------
 // Detour storage
@@ -121,10 +89,8 @@ static HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE: OnceLock<GenericDetour<FnNtQueryFullA
     OnceLock::new();
 static HOOK_NT_CREATE_USER_PROCESS: OnceLock<GenericDetour<FnNtCreateUserProcess>> =
     OnceLock::new();
-static HOOK_NT_QUERY_DIRECTORY_FILE: OnceLock<GenericDetour<FnNtQueryDirectoryFile>> =
-    OnceLock::new();
-static HOOK_NT_SET_INFO_FILE: OnceLock<GenericDetour<FnNtSetInformationFile>> = OnceLock::new();
-static HOOK_NT_FS_CONTROL_FILE: OnceLock<GenericDetour<FnNtFsControlFile>> = OnceLock::new();
+// HOOK_NT_QUERY_DIRECTORY_FILE moved to dir_filter.rs
+// HOOK_NT_SET_INFO_FILE, HOOK_NT_FS_CONTROL_FILE moved to fs_metadata_guard.rs
 
 // ---------------------------------------------------------------------------
 // IPC / cache globals
@@ -145,7 +111,7 @@ thread_local! {
 
 static PIPE_NAME: OnceLock<String> = OnceLock::new();
 static DLL_PATH: OnceLock<String> = OnceLock::new();
-static SANDBOX_CWD: OnceLock<String> = OnceLock::new();
+pub(crate) static SANDBOX_CWD: OnceLock<String> = OnceLock::new();
 static TRACE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn is_trace() -> bool {
@@ -333,7 +299,7 @@ unsafe fn extract_child_exe(params: *mut c_void) -> String {
 /// on x64). We zero the full 8-byte slot first, then write the 4-byte
 /// NTSTATUS, so callers reading the Pointer member see a clean value.
 /// The Information field (next 8 bytes) is intentionally NOT touched.
-unsafe fn set_io_status(block: *mut IO_STATUS_BLOCK, status: NTSTATUS) {
+pub(crate) unsafe fn set_io_status(block: *mut IO_STATUS_BLOCK, status: NTSTATUS) {
     if !block.is_null() {
         // Zero the full 8-byte union slot, then write the 4-byte status.
         let slot = block as *mut usize;
@@ -1070,356 +1036,9 @@ unsafe extern "system" fn hook_nt_query_full_attributes_file(
     }
 }
 
-// ---------------------------------------------------------------------------
-// NtSetInformationFile — block rename/hardlink/disposition escaping sandbox
-// ---------------------------------------------------------------------------
+// NtSetInformationFile + NtFsControlFile hooks moved to fs_metadata_guard.rs
 
-/// Resolve the DOS path of an open file handle via GetFinalPathNameByHandleW.
-/// Returns lowercase DOS path without `\\?\` prefix, or None on failure.
-unsafe fn query_handle_dos_path(handle: HANDLE) -> Option<String> {
-    use winapi::um::fileapi::GetFinalPathNameByHandleW;
-    const VOLUME_NAME_DOS: u32 = 0;
-    let mut buf: Vec<u16> = vec![0; 4096];
-    let len = GetFinalPathNameByHandleW(
-        handle, buf.as_mut_ptr(), buf.len() as u32, VOLUME_NAME_DOS,
-    );
-    if len == 0 || len as usize >= buf.len() {
-        return None;
-    }
-    let s = String::from_utf16_lossy(&buf[..len as usize]);
-    let lower = s.to_ascii_lowercase();
-    let stripped = lower.strip_prefix(r"\\?\").unwrap_or(&lower).to_string();
-    Some(stripped)
-}
-
-/// Given a RootDirectory handle and a filename from FILE_RENAME/LINK_INFORMATION,
-/// resolve to an absolute lowercase DOS path. Returns None on failure.
-unsafe fn resolve_dest_path(root: HANDLE, name: &str) -> Option<String> {
-    if root.is_null() {
-        // name is absolute (NT path like \??\C:\... or DOS like C:\...)
-        let name_u16: Vec<u16> = name.encode_utf16().collect();
-        policy::path::nt_to_dos_lower(&name_u16)
-    } else {
-        // Relative: resolve root handle path, then append name
-        let base = query_handle_dos_path(root)?;
-        let full = if name.starts_with('\\') {
-            format!("{}{}", base, name)
-        } else {
-            format!("{}\\{}", base, name)
-        };
-        Some(full.to_ascii_lowercase())
-    }
-}
-
-const FILE_RENAME_INFO_CLASS: u32 = 10;
-const FILE_RENAME_EX_INFO_CLASS: u32 = 65;
-const FILE_LINK_INFO_CLASS: u32 = 11;
-const FILE_LINK_EX_INFO_CLASS: u32 = 72;
-const FILE_DISPOSITION_INFO_CLASS: u32 = 13;
-const FILE_DISPOSITION_EX_INFO_CLASS: u32 = 64;
-
-unsafe extern "system" fn hook_nt_set_information_file(
-    handle: HANDLE,
-    iosb: *mut IO_STATUS_BLOCK,
-    info: *mut c_void,
-    len: u32,
-    class: u32,
-) -> NTSTATUS {
-    let call_original = || {
-        HOOK_NT_SET_INFO_FILE.get().unwrap().call(handle, iosb, info, len, class)
-    };
-    let Some(_guard) = anti_rec::enter() else {
-        return call_original();
-    };
-
-    match class {
-        FILE_RENAME_INFO_CLASS | FILE_RENAME_EX_INFO_CLASS
-        | FILE_LINK_INFO_CLASS | FILE_LINK_EX_INFO_CLASS => {
-            // Layout for non-Ex (RENAME/LINK):
-            //   0x00: ReplaceIfExists (BOOLEAN)
-            //   0x08: RootDirectory (HANDLE)
-            //   0x10: FileNameLength (ULONG)
-            //   0x14: FileName[] (WCHAR)
-            // Layout for Ex (RENAME_EX/LINK_EX):
-            //   0x00: Flags (ULONG)
-            //   0x08: RootDirectory (HANDLE)
-            //   0x10: FileNameLength (ULONG)
-            //   0x14: FileName[] (WCHAR)
-            // Both variants share RootDirectory at 0x08, FileNameLength at 0x10, FileName at 0x14.
-            let off_root = 0x08usize;
-            let off_namelen = 0x10usize;
-            let off_name = 0x14usize;
-            if (len as usize) < off_name {
-                return call_original();
-            }
-
-            let info_bytes = info as *mut u8;
-            let root = *(info_bytes.add(off_root) as *const HANDLE);
-            let name_len = *(info_bytes.add(off_namelen) as *const u32) as usize;
-            if name_len == 0 || name_len > 0x8000 {
-                return call_original();
-            }
-            // Bounds check: FileName buffer must fit within declared Length
-            if off_name + name_len > len as usize {
-                return call_original();
-            }
-            let name_ptr = info_bytes.add(off_name) as *const u16;
-            let chars = name_len / 2;
-            let name_slice = std::slice::from_raw_parts(name_ptr, chars);
-            let dest_name = String::from_utf16_lossy(name_slice);
-
-            if let Some(dest) = resolve_dest_path(root, &dest_name) {
-                // Check if destination is outside sandbox root
-                if let Some(sandbox_root) = SANDBOX_CWD.get() {
-                    if !dest.starts_with(&sandbox_root.to_lowercase()) {
-                        if is_trace() {
-                            ipc_log(ipc::LogLevel::Trace,
-                                format!("fs_setinfo_block_outside class={} dest={}", class, dest));
-                        }
-                        if !iosb.is_null() {
-                            set_io_status(iosb, STATUS_ACCESS_DENIED);
-                        }
-                        return STATUS_ACCESS_DENIED;
-                    }
-                }
-            }
-        }
-        FILE_DISPOSITION_INFO_CLASS | FILE_DISPOSITION_EX_INFO_CLASS => {
-            let wants_delete = if class == FILE_DISPOSITION_EX_INFO_CLASS {
-                if (len as usize) < 4 { return call_original(); }
-                let flags = *(info as *const u32);
-                (flags & 1) != 0 // FILE_DISPOSITION_DELETE
-            } else {
-                if (len as usize) < 1 { return call_original(); }
-                *(info as *const u8) != 0 // DeleteFile = TRUE
-            };
-            if wants_delete {
-                if let Some(path) = query_handle_dos_path(handle) {
-                    if let Some(sandbox_root) = SANDBOX_CWD.get() {
-                        if !path.starts_with(&sandbox_root.to_lowercase()) {
-                            if is_trace() {
-                                ipc_log(ipc::LogLevel::Trace,
-                                    format!("fs_setinfo_delete_block path={}", path));
-                            }
-                            if !iosb.is_null() {
-                                set_io_status(iosb, STATUS_ACCESS_DENIED);
-                            }
-                            return STATUS_ACCESS_DENIED;
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-
-    call_original()
-}
-
-// ---------------------------------------------------------------------------
-// NtFsControlFile — block reparse-point creation/deletion
-// ---------------------------------------------------------------------------
-
-const FSCTL_SET_REPARSE_POINT: u32    = 0x900A4;
-const FSCTL_SET_REPARSE_POINT_EX: u32 = 0x900E4;
-const FSCTL_DELETE_REPARSE_POINT: u32 = 0x900AC;
-
-unsafe extern "system" fn hook_nt_fs_control_file(
-    handle: HANDLE,
-    event: HANDLE,
-    apc_routine: *mut c_void,
-    apc_context: *mut c_void,
-    iosb: *mut IO_STATUS_BLOCK,
-    fs_control_code: u32,
-    input: *mut c_void, input_len: u32,
-    output: *mut c_void, output_len: u32,
-) -> NTSTATUS {
-    let call_original = || {
-        HOOK_NT_FS_CONTROL_FILE.get().unwrap().call(
-            handle, event, apc_routine, apc_context, iosb,
-            fs_control_code, input, input_len, output, output_len,
-        )
-    };
-    let Some(_g) = anti_rec::enter() else { return call_original(); };
-
-    match fs_control_code {
-        FSCTL_SET_REPARSE_POINT
-        | FSCTL_SET_REPARSE_POINT_EX
-        | FSCTL_DELETE_REPARSE_POINT => {
-            if is_trace() {
-                let src = query_handle_dos_path(handle).unwrap_or_default();
-                ipc_log(ipc::LogLevel::Trace,
-                    format!("fs_fsctl_block_reparse code=0x{:x} src={}", fs_control_code, src));
-            }
-            if !iosb.is_null() {
-                set_io_status(iosb, STATUS_ACCESS_DENIED);
-            }
-            return STATUS_ACCESS_DENIED;
-        }
-        _ => {}
-    }
-
-    call_original()
-}
-
-// ---------------------------------------------------------------------------
-// NtQueryDirectoryFile — filter .winrsbox from directory listings
-// ---------------------------------------------------------------------------
-
-/// Returns (offset of FileNameLength field, offset of FileName field) for a
-/// given FileInformationClass. Returns None for unhandled classes (passthrough).
-const fn dir_info_name_offsets(class: u32) -> Option<(usize, usize)> {
-    // (FileNameLength offset, FileName offset) — verified against MS docs.
-    // FileAttributes is at 0x38 in dir-info classes; FileNameLength is at
-    // 0x3C right after it. The previous 0x38 for classes 1/2/38 pointed at
-    // FileAttributes and silently disabled the filter (wrong-bytes check).
-    match class {
-        1  => Some((0x3C, 0x40)), // FileDirectoryInformation
-        2  => Some((0x3C, 0x44)), // FileFullDirectoryInformation
-        3  => Some((0x3C, 0x5E)), // FileBothDirectoryInformation
-        12 => Some((0x08, 0x0C)), // FileNamesInformation
-        37 => Some((0x3C, 0x68)), // FileIdBothDirectoryInformation
-        38 => Some((0x3C, 0x50)), // FileIdFullDirectoryInformation
-        _ => None,
-    }
-}
-
-/// Walk the linked-list buffer returned by NtQueryDirectoryFile and remove any
-/// entry whose FileName is `.winrsbox` (case-insensitive). For unhandled
-/// FileInformationClass values, returns `false` (caller should passthrough).
-///
-/// Returns `true` if filtering was applied (buffer may have been modified).
-/// If the only entry was `.winrsbox`, returns `true` and sets `*only_hidden = true`.
-unsafe fn filter_dot_winrsbox(
-    buf: *mut u8,
-    total_size: usize,
-    class: u32,
-    only_hidden: &mut bool,
-) -> bool {
-    let Some((name_len_off, name_off)) = dir_info_name_offsets(class) else {
-        return false;
-    };
-
-    let mut prev: *mut u8 = std::ptr::null_mut();
-    let mut cur = buf;
-    let end = buf.add(total_size);
-    let mut filtered_any = false;
-    *only_hidden = false;
-
-    while cur < end {
-        let next_off = *(cur as *const u32) as usize;
-        let name_len = *(cur.add(name_len_off) as *const u32) as usize;
-        if name_len >= 2 && name_len <= 22 {
-            let name_ptr = cur.add(name_off) as *const u16;
-            let chars = name_len / 2;
-            let name_slice = std::slice::from_raw_parts(name_ptr, chars);
-            let is_winrsbox = chars == 9
-                && (name_slice[0] == '.' as u16)
-                && (name_slice[1] == 'W' as u16 || name_slice[1] == 'w' as u16)
-                && (name_slice[2] == 'I' as u16 || name_slice[2] == 'i' as u16)
-                && (name_slice[3] == 'N' as u16 || name_slice[3] == 'n' as u16)
-                && (name_slice[4] == 'R' as u16 || name_slice[4] == 'r' as u16)
-                && (name_slice[5] == 'S' as u16 || name_slice[5] == 's' as u16)
-                && (name_slice[6] == 'B' as u16 || name_slice[6] == 'b' as u16)
-                && (name_slice[7] == 'O' as u16 || name_slice[7] == 'o' as u16)
-                && (name_slice[8] == 'X' as u16 || name_slice[8] == 'x' as u16);
-
-            if is_winrsbox {
-                filtered_any = true;
-                if !prev.is_null() {
-                    // Middle/last entry: patch previous to skip this one
-                    let prev_next = *(prev as *const u32) as usize;
-                    let new_next = if next_off == 0 {
-                        0u32
-                    } else {
-                        (prev_next + next_off) as u32
-                    };
-                    *(prev as *mut u32) = new_next;
-                } else if next_off == 0 {
-                    *only_hidden = true;
-                    return true;
-                } else {
-                    // First of multiple entries — shift the rest of the buffer left
-                    let shift = next_off;
-                    let remain = (end as usize) - (cur as usize) - shift;
-                    std::ptr::copy(cur.add(shift), cur, remain);
-                    continue;
-                }
-                if next_off == 0 { break; }
-                cur = cur.add(next_off);
-                continue;
-            }
-        }
-        prev = cur;
-        if next_off == 0 { break; }
-        cur = cur.add(next_off);
-    }
-
-    filtered_any
-}
-
-unsafe extern "system" fn hook_nt_query_directory_file(
-    file_handle: HANDLE,
-    event: HANDLE,
-    apc_routine: *mut c_void,
-    apc_context: *mut c_void,
-    io_status_block: *mut IO_STATUS_BLOCK,
-    file_information: *mut c_void,
-    length: u32,
-    file_information_class: u32,
-    return_single_entry: u8,
-    file_name: *mut UNICODE_STRING,
-    restart_scan: u8,
-) -> NTSTATUS {
-    let Some(_guard) = anti_rec::enter() else {
-        return HOOK_NT_QUERY_DIRECTORY_FILE.get().unwrap().call(
-            file_handle, event, apc_routine, apc_context, io_status_block,
-            file_information, length, file_information_class,
-            return_single_entry, file_name, restart_scan,
-        );
-    };
-
-    let status = HOOK_NT_QUERY_DIRECTORY_FILE.get().unwrap().call(
-        file_handle, event, apc_routine, apc_context, io_status_block,
-        file_information, length, file_information_class,
-        return_single_entry, file_name, restart_scan,
-    );
-
-    if status != 0 {
-        return status;
-    }
-
-    // IoStatusBlock.Information (offset 8 on x64) contains bytes written
-    if io_status_block.is_null() || file_information.is_null() {
-        return status;
-    }
-    let info_size = *((io_status_block as *const u8).add(8) as *const usize);
-    if info_size == 0 {
-        return status;
-    }
-
-    let mut only_hidden = false;
-    if filter_dot_winrsbox(
-        file_information as *mut u8,
-        info_size,
-        file_information_class,
-        &mut only_hidden,
-    ) {
-        if only_hidden {
-            // The only entry was .winrsbox — return NO_MORE_FILES
-            const STATUS_NO_MORE_FILES: NTSTATUS = 0x0000_0104_u32 as NTSTATUS;
-            if is_trace() {
-                ipc_log(ipc::LogLevel::Trace, "fs_hide_winrsbox_enum: only entry hidden".into());
-            }
-            return STATUS_NO_MORE_FILES;
-        }
-        if is_trace() {
-            ipc_log(ipc::LogLevel::Trace, "fs_hide_winrsbox_enum: entry filtered from listing".into());
-        }
-    }
-
-    status
-}
+// NtQueryDirectoryFile hook moved to dir_filter.rs
 
 const THREAD_CREATE_FLAGS_CREATE_SUSPENDED: u32 = 0x0000_0001;
 
@@ -1616,9 +1235,8 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         install!(HOOK_NT_QUERY_ATTRIBUTES_FILE,    "NtQueryAttributesFile\0",     hook_nt_query_attributes_file,    FnNtQueryAttributesFile);
         install!(HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE, "NtQueryFullAttributesFile\0", hook_nt_query_full_attributes_file, FnNtQueryFullAttributesFile);
         install!(HOOK_NT_CREATE_USER_PROCESS,      "NtCreateUserProcess\0",       hook_nt_create_user_process,      FnNtCreateUserProcess);
-        install!(HOOK_NT_QUERY_DIRECTORY_FILE,      "NtQueryDirectoryFile\0",      hook_nt_query_directory_file,     FnNtQueryDirectoryFile);
-        install!(HOOK_NT_SET_INFO_FILE,              "NtSetInformationFile\0",      hook_nt_set_information_file,     FnNtSetInformationFile);
-        install!(HOOK_NT_FS_CONTROL_FILE,            "NtFsControlFile\0",           hook_nt_fs_control_file,          FnNtFsControlFile);
+        crate::dir_filter::install()?;
+        crate::fs_metadata_guard::install()?;
     }
 
     if guard != "none" {
@@ -1772,9 +1390,8 @@ pub unsafe fn uninstall_hooks() {
     if let Some(h) = HOOK_NT_QUERY_ATTRIBUTES_FILE.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_NT_CREATE_USER_PROCESS.get() { let _ = h.disable(); }
-    if let Some(h) = HOOK_NT_QUERY_DIRECTORY_FILE.get() { let _ = h.disable(); }
-    if let Some(h) = HOOK_NT_SET_INFO_FILE.get() { let _ = h.disable(); }
-    if let Some(h) = HOOK_NT_FS_CONTROL_FILE.get() { let _ = h.disable(); }
+    crate::fs_metadata_guard::uninstall();
+    crate::dir_filter::uninstall();
 }
 
 #[cfg(test)]

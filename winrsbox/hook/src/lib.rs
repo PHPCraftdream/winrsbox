@@ -15,6 +15,8 @@ mod anti_rec;
 pub mod alpc_guard;
 pub mod com_guard;
 pub mod cache;
+pub mod dir_filter;
+pub mod fs_metadata_guard;
 pub mod hooks;
 mod inject;
 pub mod inject_guard;
