@@ -26,6 +26,7 @@ pub mod process_tracker;
 pub mod scan_cache;
 pub mod reg_hooks;
 pub mod reg_overlay;
+pub mod service_guard;
 pub mod token_guard;
 pub mod ui_guard;
 

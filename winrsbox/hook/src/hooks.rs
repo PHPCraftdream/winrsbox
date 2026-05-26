@@ -1433,6 +1433,9 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         if !skip("com") {
             let _ = crate::com_guard::install();
         }
+        if !skip("service") {
+            let _ = crate::service_guard::install();
+        }
 
         if !skip("mitigations") {
             apply_mitigations(&guard);
@@ -1517,6 +1520,7 @@ fn apply_mitigations(guard: &str) {
 /// Must be called on DLL_PROCESS_DETACH only. Errors are ignored because
 /// the process is tearing down.
 pub unsafe fn uninstall_hooks() {
+    crate::service_guard::uninstall();
     crate::com_guard::uninstall();
     crate::proc_guard::uninstall();
     crate::ui_guard::uninstall();

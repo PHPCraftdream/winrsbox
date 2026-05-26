@@ -821,6 +821,30 @@ fn strict_blocks_dll_sideload() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Service guard: SCM / service handle escape vectors
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[serial]
+fn strict_blocks_scm_open() {
+    let r = run_payload("escape_scm_open", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "OpenSCManagerW with ALL_ACCESS should be blocked\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_service_changeconfig() {
+    let r = run_payload("escape_service_changeconfig", "scan");
+    if r.status.code() == Some(7) {
+        eprintln!("SCM connect failed (rare permission issue), skipping");
+        return;
+    }
+    assert_eq!(r.status.code(), Some(5),
+        "OpenServiceW with CHANGE_CONFIG should be blocked\nstderr: {}", r.stderr);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // .winrsbox state isolation — sandbox state hidden from sandboxed processes
 // ═══════════════════════════════════════════════════════════════════════════
 
