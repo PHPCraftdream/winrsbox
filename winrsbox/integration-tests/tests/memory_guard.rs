@@ -674,3 +674,42 @@ fn strict_blocks_com_taskscheduler() {
     assert_eq!(r.status.code(), Some(5),
         "Schedule.Service CoCreateInstance should be blocked\nstderr: {}", r.stderr);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FS path canonicalization
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[serial]
+fn strict_blocks_globalroot() {
+    let r = run_payload("escape_globalroot", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "GLOBALROOT namespace should be denied\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_ads() {
+    let r = run_payload("escape_ads", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "ADS write should be denied\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_short_name() {
+    let r = run_payload("escape_short_name", "scan");
+    // Acceptable: exit 5 (deny) or exit 6 (CoW absorbed). Exit 0 = real escape.
+    let code = r.status.code();
+    assert!(code == Some(5) || code == Some(6),
+        "8.3 short name write under Program Files should be denied or CoW-absorbed, got {:?}\nstderr: {}",
+        code, r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_file_by_id() {
+    let r = run_payload("escape_file_by_id", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "FILE_OPEN_BY_FILE_ID should be denied\nstderr: {}", r.stderr);
+}

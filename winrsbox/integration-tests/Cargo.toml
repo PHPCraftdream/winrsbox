@@ -219,6 +219,22 @@ path = "src/bin/escape_com_wmi.rs"
 name = "escape_com_taskscheduler"
 path = "src/bin/escape_com_taskscheduler.rs"
 
+[[bin]]
+name = "escape_globalroot"
+path = "src/bin/escape_globalroot.rs"
+
+[[bin]]
+name = "escape_ads"
+path = "src/bin/escape_ads.rs"
+
+[[bin]]
+name = "escape_short_name"
+path = "src/bin/escape_short_name.rs"
+
+[[bin]]
+name = "escape_file_by_id"
+path = "src/bin/escape_file_by_id.rs"
+
 [[test]]
 name = "mock_integration"
 path = "tests/mock_integration.rs"
