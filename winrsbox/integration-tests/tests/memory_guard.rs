@@ -702,6 +702,14 @@ fn strict_blocks_com_taskscheduler() {
         "Schedule.Service CoCreateInstance should be blocked\nstderr: {}", r.stderr);
 }
 
+#[test]
+#[serial]
+fn strict_blocks_com_classobject() {
+    let r = run_payload("escape_com_classobject", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "Shell.Application CoGetClassObject should be blocked\nstderr: {}", r.stderr);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // FS path canonicalization
 // ═══════════════════════════════════════════════════════════════════════════

@@ -1,10 +1,12 @@
-// COM guard — blocks out-of-proc COM activation (CoCreateInstance / CoCreateInstanceEx)
-// for dangerous CLSIDs that allow sandbox escape via process spawn or system modification.
+// COM guard — blocks out-of-proc COM activation (CoCreateInstance / CoCreateInstanceEx /
+// CoGetClassObject) for dangerous CLSIDs that allow sandbox escape via process spawn or
+// system modification.
 //
 // Denylisted CLSIDs: Shell.Application, WScript.Shell, FileSystemObject, WMI, Task Scheduler,
 // BITS, Office automation. All are well-known escape vectors for AI agents.
 //
-// Hook targets: combase.dll!CoCreateInstance, combase.dll!CoCreateInstanceEx.
+// Hook targets: combase.dll!CoCreateInstance, combase.dll!CoCreateInstanceEx,
+//               combase.dll!CoGetClassObject.
 
 use std::sync::OnceLock;
 
@@ -107,6 +109,21 @@ type FnCoCreateInstanceEx = unsafe extern "C" fn(
     *mut c_void, // pResults
 ) -> i32;
 
+// HRESULT CoGetClassObject(
+//   REFCLSID     rclsid,
+//   DWORD        dwClsContext,
+//   COSERVERINFO *pvReserved,
+//   REFIID       riid,
+//   LPVOID       *ppv
+// );
+type FnCoGetClassObject = unsafe extern "C" fn(
+    *const GUID,       // rclsid
+    u32,               // dwClsContext
+    *mut c_void,       // pvReserved (COSERVERINFO*)
+    *const GUID,       // riid
+    *mut *mut c_void,  // ppv
+) -> i32;
+
 const E_ACCESSDENIED: i32 = 0x8007_0005_u32 as i32;
 
 // ---------------------------------------------------------------------------
@@ -115,6 +132,7 @@ const E_ACCESSDENIED: i32 = 0x8007_0005_u32 as i32;
 
 static HOOK_CO_CREATE_INSTANCE: OnceLock<GenericDetour<FnCoCreateInstance>> = OnceLock::new();
 static HOOK_CO_CREATE_INSTANCE_EX: OnceLock<GenericDetour<FnCoCreateInstanceEx>> = OnceLock::new();
+static HOOK_CO_GET_CLASS_OBJECT: OnceLock<GenericDetour<FnCoGetClassObject>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Hook implementations
@@ -180,6 +198,37 @@ unsafe extern "C" fn hook_co_create_instance_ex(
     call_original()
 }
 
+unsafe extern "C" fn hook_co_get_class_object(
+    rclsid: *const GUID,
+    dw_cls_context: u32,
+    pv_reserved: *mut c_void,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> i32 {
+    let call_original = || {
+        HOOK_CO_GET_CLASS_OBJECT.get().unwrap().call(
+            rclsid, dw_cls_context, pv_reserved, riid, ppv,
+        )
+    };
+
+    let Some(_guard) = anti_rec::enter() else {
+        return call_original();
+    };
+
+    if let Some(name) = check_denylist(rclsid) {
+        if is_trace() {
+            ipc_log(ipc::LogLevel::Trace,
+                format!("com_classobject_blocked clsid={} ctx=0x{:x}", name, dw_cls_context));
+        }
+        if !ppv.is_null() {
+            *ppv = std::ptr::null_mut();
+        }
+        return E_ACCESSDENIED;
+    }
+
+    call_original()
+}
+
 // ---------------------------------------------------------------------------
 // combase.dll export resolver
 // ---------------------------------------------------------------------------
@@ -225,6 +274,20 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
             "com_guard: combase.dll export CoCreateInstanceEx not found — skipping".into());
     }
 
+    // CoGetClassObject
+    if let Some(addr3) = combase_export(b"CoGetClassObject\0") {
+        let target3: FnCoGetClassObject = std::mem::transmute(addr3);
+        let hook_ptr3: FnCoGetClassObject = hook_co_get_class_object;
+        let detour3 = GenericDetour::<FnCoGetClassObject>::new(target3, hook_ptr3)
+            .map_err(|e| format!("detour init CoGetClassObject: {:?}", e))?;
+        HOOK_CO_GET_CLASS_OBJECT.set(detour3).ok();
+        HOOK_CO_GET_CLASS_OBJECT.get().expect("set above").enable()
+            .map_err(|e| format!("detour enable CoGetClassObject: {:?}", e))?;
+    } else {
+        ipc_log(ipc::LogLevel::Warn,
+            "com_guard: combase.dll export CoGetClassObject not found — skipping".into());
+    }
+
     if is_trace() {
         ipc_log(ipc::LogLevel::Trace, "com_guard_installed".into());
     }
@@ -234,4 +297,5 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
 pub unsafe fn uninstall() {
     if let Some(h) = HOOK_CO_CREATE_INSTANCE.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_CO_CREATE_INSTANCE_EX.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_CO_GET_CLASS_OBJECT.get() { let _ = h.disable(); }
 }
