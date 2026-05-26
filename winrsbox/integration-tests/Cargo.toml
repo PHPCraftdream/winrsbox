@@ -203,6 +203,22 @@ path = "src/bin/escape_spawn_wmic.rs"
 name = "escape_parent_spoof"
 path = "src/bin/escape_parent_spoof.rs"
 
+[[bin]]
+name = "escape_com_shell"
+path = "src/bin/escape_com_shell.rs"
+
+[[bin]]
+name = "escape_com_wscript"
+path = "src/bin/escape_com_wscript.rs"
+
+[[bin]]
+name = "escape_com_wmi"
+path = "src/bin/escape_com_wmi.rs"
+
+[[bin]]
+name = "escape_com_taskscheduler"
+path = "src/bin/escape_com_taskscheduler.rs"
+
 [[test]]
 name = "mock_integration"
 path = "tests/mock_integration.rs"
