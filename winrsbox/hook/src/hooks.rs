@@ -382,6 +382,79 @@ unsafe fn extract_raw_nt_path(attrs: *const OBJECT_ATTRIBUTES) -> Option<String>
     Some(String::from_utf16_lossy(name_slice))
 }
 
+/// Returns Some(STATUS_ACCESS_DENIED) if the raw NT path or create options
+/// indicate a path-traversal / escape vector. None → caller should continue.
+///
+/// Checks:
+///   1. FILE_OPEN_BY_FILE_ID — opens by FileID, path ignored by kernel
+///   2. GLOBALROOT alternate namespace — bypasses DOS-form classifier
+///   3. ADS (Alternate Data Streams) — colon after drive letter (non-standard)
+///   4. 8.3 short names (e.g. `PROGRA~1`) — bypass classifier + CoW pipeline
+///
+/// SAFETY: `attrs` must be valid per NT calling convention.
+unsafe fn check_path_traversal(attrs: *const OBJECT_ATTRIBUTES, create_options: u32) -> Option<NTSTATUS> {
+    // 1. FILE_OPEN_BY_FILE_ID — path ignored, opens by FileID instead
+    const FILE_OPEN_BY_FILE_ID: u32 = 0x00002000;
+    if create_options & FILE_OPEN_BY_FILE_ID != 0 {
+        if is_trace() { ipc_log(ipc::LogLevel::Trace, "fs_block_open_by_file_id".into()); }
+        return Some(STATUS_ACCESS_DENIED);
+    }
+
+    // 2. GLOBALROOT namespace — \??\GLOBALROOT\Device\...
+    let raw_nt = extract_raw_nt_path(attrs)?;
+    let lower = raw_nt.to_ascii_lowercase();
+    if lower.contains(r"\??\globalroot") || lower.contains(r"\globalroot\") {
+        if is_trace() { ipc_log(ipc::LogLevel::Trace, format!("fs_block_globalroot: {}", raw_nt)); }
+        return Some(STATUS_ACCESS_DENIED);
+    }
+
+    // 3. ADS — colon after drive-letter colon (\??\C:\path\file.txt:hidden)
+    //    Strip \??\ prefix, check for a second colon after the drive-letter colon.
+    if let Some(after_prefix) = strip_nt_dos_prefix(&lower) {
+        let bytes = after_prefix.as_bytes();
+        if bytes.len() >= 3 && bytes[1] == b':' {
+            // Skip drive-letter colon at index 1, look for another colon after it
+            if let Some(extra_colon) = after_prefix[2..].find(':') {
+                let stream = &after_prefix[2 + extra_colon + 1..];
+                // Allow standard system streams
+                let allowed = ["$data", "$index_allocation", "zone.identifier"];
+                if !allowed.iter().any(|a| stream == *a || stream.starts_with(&format!("{}:", a))) {
+                    if is_trace() {
+                        ipc_log(ipc::LogLevel::Trace,
+                            format!("fs_block_ads: stream={} path={}", stream, raw_nt));
+                    }
+                    return Some(STATUS_ACCESS_DENIED);
+                }
+            }
+        }
+    }
+
+    // 4. 8.3 short-name (e.g. PROGRA~1) — kernel resolves these to full paths
+    //    transparently, bypassing both the classifier (matches on literal path)
+    //    and the CoW redirect (overlay path built from 8.3 doesn't redirect
+    //    correctly). Legit Windows code uses full long names; 8.3 in a request
+    //    is a strong escape signal.
+    if needs_short_name_resolve(&lower) {
+        if is_trace() { ipc_log(ipc::LogLevel::Trace, format!("fs_block_short_name: {}", raw_nt)); }
+        return Some(STATUS_ACCESS_DENIED);
+    }
+
+    None
+}
+
+/// Strip the `\??\` (or `\\?\`) prefix from an NT DOS-form path string.
+/// Returns the remainder (e.g. `c:\path`) or None if the path doesn't start
+/// with a known prefix.
+fn strip_nt_dos_prefix(lower: &str) -> Option<&str> {
+    if let Some(rest) = lower.strip_prefix(r"\??\") {
+        return Some(rest);
+    }
+    if let Some(rest) = lower.strip_prefix(r"\\?\") {
+        return Some(rest);
+    }
+    None
+}
+
 /// Returns Some(STATUS_ACCESS_DENIED) if the raw NT path in `attrs` is a
 /// hard-blocked device (shadowcopy, physicaldrive, raw harddisk, dangerous
 /// pipe). None otherwise → caller should call the original Nt* function.
@@ -403,6 +476,26 @@ unsafe fn check_device_block(attrs: *const OBJECT_ATTRIBUTES) -> Option<NTSTATUS
     } else {
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// Post-open reparse verification + 8.3 short-name resolution
+// ---------------------------------------------------------------------------
+
+// NOTE: post-open junction/symlink verification removed — false positives on
+// legitimate DLL/path-canonicalization differences. Junctions can still be
+// closed by hooking NtCreateFile with FILE_FLAG_OPEN_REPARSE_POINT and
+// blocking the create-side (separate task).
+
+/// Check if a path contains an 8.3 short-name pattern (tilde followed by digit).
+fn needs_short_name_resolve(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    for i in 0..bytes.len().saturating_sub(1) {
+        if bytes[i] == b'~' && bytes[i + 1].is_ascii_digit() {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -466,6 +559,13 @@ unsafe extern "system" fn hook_nt_create_file(
     };
 
     // SAFETY: object_attributes valid per NT calling convention for the call duration.
+
+    // Early-deny: path-traversal vectors (GLOBALROOT, FILE_OPEN_BY_FILE_ID, ADS)
+    if let Some(status) = check_path_traversal(object_attributes as *const _, create_options) {
+        set_io_status(io_status_block, status);
+        return status;
+    }
+
     let Some(dos) = extract_dos_path(object_attributes as *const _) else {
         // Not a DOS path — check if it's a device path that should be blocked.
         if let Some(status) = check_device_block(object_attributes as *const _) {
@@ -476,10 +576,13 @@ unsafe extern "system" fn hook_nt_create_file(
     };
 
     let write = is_write_access(desired_access, create_disposition);
+    // Note: 8.3 short-name paths are blocked early in check_path_traversal.
     let decision = decide(&dos, write);
 
     match decision.mode {
-        Mode::Passthrough => call_original!(),
+        Mode::Passthrough => {
+            call_original!()
+        }
         Mode::Deny => {
             if is_trace() {
                 ipc_log(ipc::LogLevel::Trace, format!("DENY NtCreateFile: {dos} write={write}"));
@@ -587,6 +690,13 @@ unsafe extern "system" fn hook_nt_open_file(
     };
 
     // SAFETY: object_attributes valid per NT calling convention.
+
+    // Early-deny: path-traversal vectors (GLOBALROOT, FILE_OPEN_BY_FILE_ID, ADS)
+    if let Some(status) = check_path_traversal(object_attributes as *const _, open_options) {
+        set_io_status(io_status_block, status);
+        return status;
+    }
+
     let Some(dos) = extract_dos_path(object_attributes as *const _) else {
         if let Some(status) = check_device_block(object_attributes as *const _) {
             set_io_status(io_status_block, status);
@@ -598,6 +708,7 @@ unsafe extern "system" fn hook_nt_open_file(
     let write_bits =
         GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER;
     let write = desired_access & write_bits != 0;
+    // Note: 8.3 short-name paths are blocked early in check_path_traversal.
     let decision = decide(&dos, write);
 
     match decision.mode {
