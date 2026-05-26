@@ -1020,7 +1020,9 @@ fn handle_connection(
                     r"\software\microsoft\windows nt\currentversion\windows",
                     r"\software\wow6432node\microsoft\windows nt\currentversion\windows",
                     r"\software\microsoft\windows nt\currentversion\image file execution options",
+                    r"\software\microsoft\windows nt\currentversion\silentprocessexit",
                     r"\system\currentcontrolset\control\session manager\appcertdlls",
+                    r"\system\currentcontrolset\services\",
                 ];
                 let key_lower = key_path.to_ascii_lowercase();
                 let is_persistence = PERSISTENCE_DENY_SUFFIXES.iter().any(|s| key_lower.contains(s));

@@ -249,6 +249,45 @@ fn strict_denies_reg_appinit_persistence() {
     );
 }
 
+#[test]
+#[serial]
+fn strict_denies_reg_ifeo_debugger() {
+    let r = run_payload("escape_reg_ifeo", "full");
+    // IFEO Debugger write should be denied — either our hook returns deny on
+    // NtCreateKey/NtSetValueKey, or OS ACL denies non-admin HKLM write.
+    // Acceptable: exit 5 (access denied) or exit 2 (HKLM key creation failed).
+    let code = r.status.code();
+    assert!(
+        code == Some(5) || code == Some(2),
+        "IFEO Debugger write should be denied, got {:?}\nstderr: {}",
+        code, r.stderr
+    );
+}
+
+#[test]
+#[serial]
+fn strict_denies_reg_silentprocessexit() {
+    let r = run_payload("escape_reg_silentexit", "full");
+    let code = r.status.code();
+    assert!(
+        code == Some(5) || code == Some(2),
+        "SilentProcessExit MonitorProcess write should be denied, got {:?}\nstderr: {}",
+        code, r.stderr
+    );
+}
+
+#[test]
+#[serial]
+fn strict_denies_reg_service_imagepath() {
+    let r = run_payload("escape_reg_service", "full");
+    let code = r.status.code();
+    assert!(
+        code == Some(5) || code == Some(2),
+        "Services ImagePath write should be denied, got {:?}\nstderr: {}",
+        code, r.stderr
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Strict mode: clean payloads MUST NOT be terminated
 // ═══════════════════════════════════════════════════════════════════════════
