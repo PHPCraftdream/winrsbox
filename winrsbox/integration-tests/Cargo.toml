@@ -243,6 +243,18 @@ path = "src/bin/escape_job_reassign.rs"
 name = "escape_job_breakaway"
 path = "src/bin/escape_job_breakaway.rs"
 
+[[bin]]
+name = "escape_token_open"
+path = "src/bin/escape_token_open.rs"
+
+[[bin]]
+name = "escape_token_duplicate"
+path = "src/bin/escape_token_duplicate.rs"
+
+[[bin]]
+name = "escape_token_impersonate"
+path = "src/bin/escape_token_impersonate.rs"
+
 [[test]]
 name = "mock_integration"
 path = "tests/mock_integration.rs"

@@ -428,6 +428,33 @@ fn strict_blocks_token_privilege_enable() {
 
 #[test]
 #[serial]
+fn strict_blocks_token_open_foreign() {
+    // NtOpenProcessTokenEx on explorer.exe with TOKEN_DUPLICATE
+    let r = run_payload("escape_token_open", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "escape_token_open should exit 5 (blocked)\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_token_duplicate_primary() {
+    // NtDuplicateToken with TokenPrimary type
+    let r = run_payload("escape_token_duplicate", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "escape_token_duplicate should exit 5 (blocked)\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_token_impersonation() {
+    // NtSetInformationThread(ThreadImpersonationToken) with non-null token
+    let r = run_payload("escape_token_impersonate", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "escape_token_impersonate should exit 5 (blocked)\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
 fn strict_denies_fs_system_write() {
     // Clean any prior canary in real C:\Windows
     let canary = std::path::Path::new(r"C:\Windows\winrsbox-escape-canary.txt");
