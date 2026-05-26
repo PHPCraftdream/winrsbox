@@ -199,6 +199,22 @@ fn strict_kills_hwbp_injection() { assert_killed!("escape_hwbp_injection", "Cont
 #[serial]
 fn strict_kills_apc_injection() { assert_killed!("escape_apc_injection", "QueueApc"); }
 
+#[test]
+#[serial]
+fn strict_kills_apc_ex_injection() {
+    // NtQueueApcThreadEx — Windows 10+ early-bird APC variant
+    let r = run_payload("escape_apc_ex", "full");
+    // Exit code 7 = NtQueueApcThreadEx export not found (older Windows) → skip
+    if r.status.code() == Some(7) {
+        eprintln!("NtQueueApcThreadEx not available, skipping");
+        return;
+    }
+    assert!(!r.status.success(), "escape_apc_ex should have been killed\nstderr: {}", r.stderr);
+    let v = r.read_violations();
+    assert!(v.contains("QueueApc"),
+        "escape_apc_ex: violations should contain QueueApc\nlog: {}\nstderr: {}", v, r.stderr);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // P9-A: Cross-process memory ops on external (non-owned) processes
 // ═══════════════════════════════════════════════════════════════════════════
