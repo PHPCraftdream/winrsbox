@@ -68,19 +68,23 @@ fn starts_with_u16_ascii(slice: &[u16], prefix: &[u8]) -> bool {
 }
 
 /// Convert UTF-16 slice to String, optionally ASCII-lowercasing in one pass.
-/// Non-ASCII codepoints are passed through to `char::from_u32` unchanged;
-/// if they can't be decoded they become the replacement character (matching
-/// the behaviour of `String::from_utf16_lossy`).
+/// Uses `char::decode_utf16` to correctly handle surrogate pairs (non-BMP
+/// codepoints such as emoji, CJK extension B, etc.). Lone surrogates become
+/// the replacement character U+FFFD, matching `String::from_utf16_lossy`.
 fn u16_slice_to_ascii_lower(raw: &[u16], lowercase: bool) -> String {
     let mut out = String::with_capacity(raw.len());
-    for &u in raw {
-        let c = if lowercase && u >= 0x41 && u <= 0x5A {
-            // ASCII A-Z → a-z
-            char::from_u32((u + 0x20) as u32).unwrap()
-        } else {
-            char::from_u32(u as u32).unwrap_or('\u{FFFD}')
-        };
-        out.push(c);
+    for r in std::char::decode_utf16(raw.iter().copied()) {
+        match r {
+            Ok(c) if lowercase && c.is_ascii_uppercase() => {
+                out.push((c as u8 + 0x20) as char);
+            }
+            Ok(c) => {
+                out.push(c);
+            }
+            Err(_) => {
+                out.push('\u{FFFD}');
+            }
+        }
     }
     out
 }
@@ -649,6 +653,21 @@ mod conv_tests {
             mirror_into_overlay(r"c:\users\alice\foo.txt", root),
             std::path::PathBuf::from(r"\sb\c\users\alice\foo.txt"),
         );
+    }
+
+    #[test]
+    fn ascii_lower_handles_surrogate_pairs() {
+        // U+1F600 (😀) = surrogate pair 0xD83D 0xDE00 in UTF-16
+        let input: [u16; 6] = [b'A' as u16, b'b' as u16, 0xD83D, 0xDE00, b'C' as u16, b'd' as u16];
+        let out = u16_slice_to_ascii_lower(&input, true);
+        assert!(out.starts_with("ab"), "expected lowercase ab prefix: {:?}", out);
+        assert!(out.ends_with("cd"), "expected lowercase cd suffix: {:?}", out);
+        assert!(out.contains('\u{1F600}'), "emoji preserved: {:?}", out);
+        assert_eq!(out, "ab\u{1F600}cd");
+
+        // Without lowercase flag — A and C stay uppercase
+        let out_no_lower = u16_slice_to_ascii_lower(&input, false);
+        assert_eq!(out_no_lower, "Ab\u{1F600}Cd");
     }
 
     // proptest demo: any DOS path that survives nt_to_dos round-trips through
