@@ -638,3 +638,39 @@ fn strict_blocks_parent_spoof() {
     assert_eq!(r.status.code(), Some(5),
         "parent-PID spoofing should be blocked\nstderr: {}", r.stderr);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COM guard: out-of-proc COM activation escape
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[serial]
+fn strict_blocks_com_shell() {
+    let r = run_payload("escape_com_shell", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "Shell.Application CoCreateInstance should be blocked\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_com_wscript() {
+    let r = run_payload("escape_com_wscript", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "WScript.Shell CoCreateInstance should be blocked\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_com_wmi() {
+    let r = run_payload("escape_com_wmi", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "WbemLocator CoCreateInstance should be blocked\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_com_taskscheduler() {
+    let r = run_payload("escape_com_taskscheduler", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "Schedule.Service CoCreateInstance should be blocked\nstderr: {}", r.stderr);
+}
