@@ -845,8 +845,26 @@ fn strict_blocks_service_changeconfig() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// .winrsbox state isolation — sandbox state hidden from sandboxed processes
+// NtSetInformationFile — rename/hardlink/disposition escape vectors
 // ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[serial]
+fn strict_blocks_rename_outside_sandbox() {
+    let r = run_payload("escape_rename_outside_sandbox", "scan");
+    let code = r.status.code();
+    assert!(code == Some(5) || code == Some(6),
+        "rename outside sandbox should be blocked, got {:?}\nstderr: {}", code, r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_hardlink_to_host() {
+    let r = run_payload("escape_hardlink_to_host", "scan");
+    if r.status.code() == Some(7) { return; }
+    assert_eq!(r.status.code(), Some(5),
+        "hardlink to host file should be blocked\nstderr: {}", r.stderr);
+}
 
 #[test]
 #[serial]
