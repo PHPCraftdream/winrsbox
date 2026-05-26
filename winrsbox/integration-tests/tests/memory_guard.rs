@@ -934,3 +934,16 @@ fn strict_blocks_reparse_create() {
     assert_eq!(r.status.code(), Some(5),
         "FSCTL_SET_REPARSE_POINT should be denied\nstderr: {}", r.stderr);
 }
+
+#[test]
+#[serial]
+fn strict_blocks_pipe_impersonate() {
+    let r = run_payload("escape_pipe_impersonate", "scan");
+    let code = r.status.code();
+    if code == Some(7) || code == Some(8) {
+        eprintln!("setup failure (CreateNamedPipe/Connect), skipping");
+        return;
+    }
+    assert_eq!(code, Some(5),
+        "ImpersonateNamedPipeClient should be blocked\nstderr: {}", r.stderr);
+}
