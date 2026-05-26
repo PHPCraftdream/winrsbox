@@ -930,6 +930,30 @@ unsafe extern "system" fn hook_nt_create_user_process(
         );
     };
 
+    // --- proc_guard: denylisted executables ---
+    if let Some(img) = crate::proc_guard::extract_image_path(process_parameters) {
+        if crate::proc_guard::is_denylisted(&img) {
+            if is_trace() {
+                ipc_log(ipc::LogLevel::Trace,
+                    format!("proc_spawn_blocked: {img}"));
+            }
+            return STATUS_ACCESS_DENIED;
+        }
+    }
+
+    // --- proc_guard: parent-PID spoofing ---
+    if !attribute_list.is_null() {
+        if crate::proc_guard::attribute_list_contains_parent_process(attribute_list) {
+            let img = crate::proc_guard::extract_image_path(process_parameters)
+                .unwrap_or_else(|| "(unknown)".into());
+            if is_trace() {
+                ipc_log(ipc::LogLevel::Trace,
+                    format!("proc_parent_spoof_blocked: {img}"));
+            }
+            return STATUS_ACCESS_DENIED;
+        }
+    }
+
     // Force the child to start suspended so we can inject before it runs.
     let forced_flags = thread_flags | THREAD_CREATE_FLAGS_CREATE_SUSPENDED;
     let originally_suspended = (thread_flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED) != 0;
@@ -1108,6 +1132,9 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         if !skip("ui") {
             let _ = crate::ui_guard::install();
         }
+        if !skip("proc") {
+            let _ = crate::proc_guard::install();
+        }
 
         if !skip("mitigations") {
             apply_mitigations(&guard);
@@ -1172,6 +1199,7 @@ fn apply_mitigations(guard: &str) {
 /// Must be called on DLL_PROCESS_DETACH only. Errors are ignored because
 /// the process is tearing down.
 pub unsafe fn uninstall_hooks() {
+    crate::proc_guard::uninstall();
     crate::ui_guard::uninstall();
     crate::token_guard::uninstall();
     crate::alpc_guard::uninstall();

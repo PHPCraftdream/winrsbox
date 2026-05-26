@@ -203,8 +203,33 @@ fn strict_kills_apc_injection() { assert_killed!("escape_apc_injection", "QueueA
 // P9-A: Cross-process memory ops on external (non-owned) processes
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[test] #[serial] fn strict_kills_foreign_alloc_rwx()     { assert_killed!("escape_foreign_alloc_rwx", "Allocate"); }
-#[test] #[serial] fn strict_kills_foreign_write_syscall() { assert_killed!("escape_foreign_write_syscall", "Write"); }
+// Note: with proc_guard active, NtOpenProcess on a non-owned PID with dangerous
+// access (VM_OPERATION/VM_WRITE) is denied *before* memory_guard sees any RWX
+// allocation — handle returns NULL, payload exits with non-zero. If proc_guard
+// is bypassed (e.g. direct syscall to NtOpenProcess), memory_guard still kicks
+// in on the RWX call. Either outcome means the attack was stopped.
+#[test]
+#[serial]
+fn strict_kills_foreign_alloc_rwx() {
+    let r = run_payload("escape_foreign_alloc_rwx", "full");
+    assert!(!r.status.success(),
+        "escape_foreign_alloc_rwx should be blocked (proc_guard) or killed (memory_guard)\nstderr: {}", r.stderr);
+    // If we got a violation, it should be Allocate. If empty, proc_guard denied at OpenProcess.
+    let v = r.read_violations();
+    assert!(v.is_empty() || v.contains("Allocate"),
+        "unexpected violation kind: {}\nstderr: {}", v, r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_kills_foreign_write_syscall() {
+    let r = run_payload("escape_foreign_write_syscall", "full");
+    assert!(!r.status.success(),
+        "escape_foreign_write_syscall should be blocked (proc_guard) or killed (memory_guard)\nstderr: {}", r.stderr);
+    let v = r.read_violations();
+    assert!(v.is_empty() || v.contains("Write"),
+        "unexpected violation kind: {}\nstderr: {}", v, r.stderr);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // P9-B: Registry runtime hooks — persistence vector denial
@@ -545,20 +570,6 @@ fn strict_blocks_legacy_keybd_event() {
         "keybd_event should be blocked by ui_guard\nstderr: {}", r.stderr);
 }
 
-// Best-effort defense — JOB_OBJECT_UILIMIT_HANDLES is not enforced on Win10
-// 19045 (FindWindowW returns foreign HWND despite the flag), and our user32
-// FindWindowW patch is bypassed because the kernel routes legacy entry through
-// win32u.dll. The actual Win+R escape vector (SendInput) is fully covered by
-// strict_blocks_input_synthesis. Kept as `#[ignore]` for documentation.
-#[test]
-#[ignore = "best-effort: Job UI HANDLES + FindWindow hook bypassed on Win10 19045"]
-#[serial]
-fn strict_blocks_foreign_window_msg() {
-    let r = run_payload("escape_window_msg", "scan");
-    assert_eq!(r.status.code(), Some(5),
-        "Foreign HWND access should be blocked by Job UI HANDLES\nstderr: {}", r.stderr);
-}
-
 #[test]
 #[serial]
 fn strict_clipboard_flag_blocks_read() {
@@ -588,12 +599,42 @@ fn default_allows_clipboard_open() {
         "clipboard should NOT be blocked in default mode\nstderr: {}", r.stderr);
 }
 
-// MANUAL ONLY — opens real Run dialog if defense fails.
+// ═══════════════════════════════════════════════════════════════════════════
+// Process guard: cross-process injection, dangerous spawns, parent spoof
+// ═══════════════════════════════════════════════════════════════════════════
+
 #[test]
-#[ignore = "manual only — destructive if defense fails"]
 #[serial]
-fn manual_blocks_winr_notepad_escape() {
-    let r = run_payload("escape_winr_notepad_real", "scan");
-    assert_ne!(r.status.code(), Some(0),
-        "Win+R notepad escape should be blocked\nstderr: {}", r.stderr);
+fn strict_blocks_inject_remote() {
+    let r = run_payload("escape_inject_remote", "scan");
+    // 7 = explorer absent (CI/sparse env). Treat as skip.
+    if r.status.code() == Some(7) { eprintln!("explorer.exe not running, skipping"); return; }
+    assert_eq!(r.status.code(), Some(5),
+        "OpenProcess(VM_WRITE|CREATE_THREAD) on explorer should be blocked\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_spawn_wsl() {
+    let r = run_payload("escape_spawn_wsl", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "wsl.exe spawn should be blocked\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_spawn_wmic() {
+    let r = run_payload("escape_spawn_wmic", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "wmic.exe spawn should be blocked\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_parent_spoof() {
+    let r = run_payload("escape_parent_spoof", "scan");
+    if r.status.code() == Some(7) { return; }
+    if r.status.code() == Some(8) { panic!("test setup failed (InitializeProcThreadAttributeList): {}", r.stderr); }
+    assert_eq!(r.status.code(), Some(5),
+        "parent-PID spoofing should be blocked\nstderr: {}", r.stderr);
 }
