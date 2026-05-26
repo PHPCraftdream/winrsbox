@@ -1305,6 +1305,26 @@ fn apply_mitigations(guard: &str) {
             );
         }
     }
+
+    // ImageLoadPolicy (10): PreferSystem32Images + NoRemoteImages.
+    // Applied in both scan and full mode — DLL sideloading via CWD/PATH hijack
+    // is a critical sandbox-escape vector that affects all profiles.
+    // Safe to apply after hook installation: hook.dll is already loaded,
+    // and PreferSystem32Images only affects *subsequent* LoadLibrary calls.
+    {
+        // PROCESS_MITIGATION_IMAGE_LOAD_POLICY bit layout:
+        //   bit 0 = NoRemoteImages    (block UNC \\server\share\evil.dll)
+        //   bit 2 = PreferSystem32Images (System32 searched before CWD/PATH)
+        let image_load_flags: u32 = (1 << 0) | (1 << 2); // NoRemote | PreferSystem32
+        // SAFETY: image_load_flags is valid for PROCESS_MITIGATION_IMAGE_LOAD_POLICY (4 bytes).
+        unsafe {
+            SetProcessMitigationPolicy(
+                10i32 as PROCESS_MITIGATION_POLICY, // ProcessImageLoadPolicy
+                &image_load_flags as *const u32 as *mut _,
+                std::mem::size_of::<u32>(),
+            );
+        }
+    }
 }
 
 /// Disable all detours. Called from DllMain(DLL_PROCESS_DETACH).

@@ -760,3 +760,15 @@ fn strict_blocks_job_breakaway() {
     assert_eq!(r.status.code(), Some(5),
         "CreateProcess(BREAKAWAY) should fail\nstderr: {}", r.stderr);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DLL sideloading defense — PreferSystem32Images + NoRemoteImages
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[serial]
+fn strict_blocks_dll_sideload() {
+    let r = run_payload("escape_dll_sideload", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "PreferSystem32Images + NoRemoteImages mitigations should be applied\nstderr: {}", r.stderr);
+}
