@@ -299,6 +299,10 @@ path = "src/bin/escape_rename_outside_sandbox.rs"
 name = "escape_hardlink_to_host"
 path = "src/bin/escape_hardlink_to_host.rs"
 
+[[bin]]
+name = "escape_reparse_create"
+path = "src/bin/escape_reparse_create.rs"
+
 [[test]]
 name = "mock_integration"
 path = "tests/mock_integration.rs"
