@@ -329,14 +329,16 @@ unsafe fn extract_child_exe(params: *mut c_void) -> String {
 ///
 /// # SAFETY
 /// IO_STATUS_BLOCK.Status/Pointer union begins at offset 0 on all Windows
-/// x64 ABIs. Writing an i32 (NTSTATUS) to offset 0 is always correct.
-// TODO: writes only 4 bytes into the 8-byte union slot on x64; upper
-// 4 bytes retain previous garbage. Safe for callers reading Status
-// (NTSTATUS = i32), unsafe for callers interpreting union as Pointer.
-// Should zero the full ULONG_PTR before writing Status.
+/// x64 ABIs. The union is `{ Status: i32 | Pointer: *mut c_void }` (8 bytes
+/// on x64). We zero the full 8-byte slot first, then write the 4-byte
+/// NTSTATUS, so callers reading the Pointer member see a clean value.
+/// The Information field (next 8 bytes) is intentionally NOT touched.
 unsafe fn set_io_status(block: *mut IO_STATUS_BLOCK, status: NTSTATUS) {
     if !block.is_null() {
-        std::ptr::write(block as *mut i32, status);
+        // Zero the full 8-byte union slot, then write the 4-byte status.
+        let slot = block as *mut usize;
+        *slot = 0;
+        *(block as *mut NTSTATUS) = status;
     }
 }
 
