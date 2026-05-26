@@ -105,7 +105,11 @@ fn is_dangerous_pipe(lower_path: &str) -> bool {
         "browser",      // Browser service — network recon
         "epmapper",     // RPC endpoint mapper — service enumeration
     ];
-    DANGEROUS_PIPES.iter().any(|&p| lower_path.contains(p))
+    let segment = match lower_path.rfind(|c: char| c == '\\' || c == '/') {
+        Some(idx) => &lower_path[idx + 1..],
+        None => lower_path,
+    };
+    DANGEROUS_PIPES.iter().any(|&p| segment == p)
 }
 
 
@@ -263,5 +267,16 @@ mod tests {
         assert_eq!(classify_device(r"device\ipt"), DeviceKind::SystemQuery);
     }
 
-
+    #[test]
+    fn dangerous_pipe_exact_segment_match() {
+        // Exact pipe name must match
+        assert!(is_dangerous_pipe(r"\device\namedpipe\lsass"));
+        assert!(is_dangerous_pipe(r"pipe\samr"));
+        // Substring-only must NOT match (false positives before this fix)
+        assert!(!is_dangerous_pipe(r"\device\namedpipe\myapp-eventlog"));
+        assert!(!is_dangerous_pipe(r"\device\namedpipe\eventlog_extra"));
+        assert!(!is_dangerous_pipe(r"\device\namedpipe\myappbrowser"));
+        assert!(!is_dangerous_pipe(r"\device\namedpipe\samr_app_data"));
+        assert!(!is_dangerous_pipe(r"pipe\some-browser-helper"));
+    }
 }
