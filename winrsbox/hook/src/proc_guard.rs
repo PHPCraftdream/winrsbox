@@ -1,5 +1,5 @@
 // Process guard — blocks cross-process code injection, dangerous process spawns,
-// and parent-PID spoofing.
+// parent-PID spoofing, and Job Object breakaway.
 //
 // Hook 1: NtOpenProcess — denies PROCESS_TERMINATE | CREATE_THREAD | VM_OPERATION |
 //         VM_WRITE | DUP_HANDLE | CREATE_PROCESS | SET_QUOTA | SET_INFORMATION |
@@ -8,6 +8,8 @@
 // Hook 2: Integrated into hooks.rs hook_nt_create_user_process — blocks denylisted
 //         executables (wsl, wmic, LOLBins) and parent-PID spoofing via
 //         PROC_THREAD_ATTRIBUTE_PARENT_PROCESS.
+// Hook 3: NtAssignProcessToJobObject — unconditionally denies Job reassignment
+//         from within the sandbox, preventing nested-Job escape on Win10+.
 
 use std::sync::OnceLock;
 
@@ -35,6 +37,11 @@ type FnNtOpenProcess = unsafe extern "system" fn(
     u32,                  // DesiredAccess
     *const OBJECT_ATTRIBUTES,
     *const CLIENT_ID,
+) -> NTSTATUS;
+
+type FnNtAssignProcessToJobObject = unsafe extern "system" fn(
+    *mut c_void,  // JobHandle
+    *mut c_void,  // ProcessHandle
 ) -> NTSTATUS;
 
 // PS_ATTRIBUTE for parent-spoof detection in NtCreateUserProcess attribute list.
@@ -67,6 +74,7 @@ fn pid_owned(pid: u32) -> bool {
 // ---------------------------------------------------------------------------
 
 static HOOK_NT_OPEN_PROCESS: OnceLock<GenericDetour<FnNtOpenProcess>> = OnceLock::new();
+static HOOK_NT_ASSIGN_JOB: OnceLock<GenericDetour<FnNtAssignProcessToJobObject>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // NtOpenProcess hook
@@ -121,6 +129,36 @@ unsafe extern "system" fn hook_nt_open_process(
     }
 
     call_original()
+}
+
+// ---------------------------------------------------------------------------
+// NtAssignProcessToJobObject hook — blocks Job reassignment escape
+// ---------------------------------------------------------------------------
+
+unsafe extern "system" fn hook_nt_assign_process_to_job_object(
+    job: *mut c_void,
+    process: *mut c_void,
+) -> NTSTATUS {
+    let call_original = || {
+        HOOK_NT_ASSIGN_JOB.get().unwrap().call(job, process)
+    };
+
+    let Some(_guard) = anti_rec::enter() else {
+        return call_original();
+    };
+
+    // Any hooked process is already inside our sandbox Job. An explicit
+    // NtAssignProcessToJobObject call from within the sandbox is an escape
+    // attempt — the attacker creates an empty Job (no limits) and reassigns
+    // themselves into it. On Win10+ nested Jobs allow this, so the process
+    // would be in both Jobs but could use the empty one to dodge restrictions.
+    // Deny unconditionally.
+    if is_trace() {
+        ipc_log(ipc::LogLevel::Trace,
+            format!("job_assign_blocked job=0x{:x} proc=0x{:x}",
+                job as usize, process as usize));
+    }
+    STATUS_ACCESS_DENIED
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +258,18 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
         .enable()
         .map_err(|e| format!("detour enable NtOpenProcess: {:?}", e))?;
 
+    let addr2 = crate::hooks::ntdll_export("NtAssignProcessToJobObject\0".as_bytes())
+        .ok_or("ntdll export not found: NtAssignProcessToJobObject")?;
+    let target2: FnNtAssignProcessToJobObject = std::mem::transmute(addr2 as usize);
+    let hook_ptr2: FnNtAssignProcessToJobObject = hook_nt_assign_process_to_job_object;
+    let detour2 = GenericDetour::<FnNtAssignProcessToJobObject>::new(target2, hook_ptr2)
+        .map_err(|e| format!("detour init NtAssignProcessToJobObject: {:?}", e))?;
+    HOOK_NT_ASSIGN_JOB.set(detour2).ok();
+    HOOK_NT_ASSIGN_JOB.get()
+        .expect("set above")
+        .enable()
+        .map_err(|e| format!("detour enable NtAssignProcessToJobObject: {:?}", e))?;
+
     if is_trace() {
         ipc_log(ipc::LogLevel::Trace, "proc_guard_installed".into());
     }
@@ -227,6 +277,9 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub unsafe fn uninstall() {
+    if let Some(h) = HOOK_NT_ASSIGN_JOB.get() {
+        let _ = h.disable();
+    }
     if let Some(h) = HOOK_NT_OPEN_PROCESS.get() {
         let _ = h.disable();
     }

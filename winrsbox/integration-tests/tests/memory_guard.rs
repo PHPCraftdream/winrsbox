@@ -713,3 +713,23 @@ fn strict_blocks_file_by_id() {
     assert_eq!(r.status.code(), Some(5),
         "FILE_OPEN_BY_FILE_ID should be denied\nstderr: {}", r.stderr);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Job guard: breakaway + reassignment escape vectors
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[serial]
+fn strict_blocks_job_reassign() {
+    let r = run_payload("escape_job_reassign", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "Job reassign should be denied\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_job_breakaway() {
+    let r = run_payload("escape_job_breakaway", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "CreateProcess(BREAKAWAY) should fail\nstderr: {}", r.stderr);
+}
