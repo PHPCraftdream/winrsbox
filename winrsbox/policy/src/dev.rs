@@ -95,6 +95,15 @@ fn is_dangerous_pipe(lower_path: &str) -> bool {
         "psexesvc",     // PsExec remote execution
         "srvsvc",       // Server service → share management
         "winreg",       // Remote registry access
+        "lsass",        // LSASS — credential dump / privilege escalation
+        "spoolss",      // Print spooler — PrintNightmare class exploits
+        "samr",         // SAMR — local account enumeration
+        "netlogon",     // Netlogon — domain auth / Zerologon class
+        "wkssvc",       // Workstation service → session enumeration
+        "lsarpc",       // LSA RPC — policy/privelege queries
+        "eventlog",     // Event log — log manipulation / info leak
+        "browser",      // Browser service — network recon
+        "epmapper",     // RPC endpoint mapper — service enumeration
     ];
     DANGEROUS_PIPES.iter().any(|&p| lower_path.contains(p))
 }
@@ -212,9 +221,21 @@ mod tests {
         assert_eq!(classify_device(r"\device\namedpipe\svcctl"), DeviceKind::Unknown);
         assert_eq!(classify_device(r"pipe\atsvc"), DeviceKind::Unknown);
         assert_eq!(classify_device(r"\device\namedpipe\psexesvc"), DeviceKind::Unknown);
+        assert_eq!(classify_device(r"\device\namedpipe\winreg"), DeviceKind::Unknown);
+        assert_eq!(classify_device(r"\device\namedpipe\srvsvc"), DeviceKind::Unknown);
+        // Previously allowed — now blocked (audit gap fix)
+        assert_eq!(classify_device(r"\device\namedpipe\lsass"), DeviceKind::Unknown);
+        assert_eq!(classify_device(r"\device\namedpipe\spoolss"), DeviceKind::Unknown);
+        assert_eq!(classify_device(r"\device\namedpipe\samr"), DeviceKind::Unknown);
+        assert_eq!(classify_device(r"\device\namedpipe\netlogon"), DeviceKind::Unknown);
+        assert_eq!(classify_device(r"\device\namedpipe\wkssvc"), DeviceKind::Unknown);
+        assert_eq!(classify_device(r"\device\namedpipe\lsarpc"), DeviceKind::Unknown);
+        assert_eq!(classify_device(r"\device\namedpipe\eventlog"), DeviceKind::Unknown);
+        assert_eq!(classify_device(r"\device\namedpipe\browser"), DeviceKind::Unknown);
+        assert_eq!(classify_device(r"\device\namedpipe\epmapper"), DeviceKind::Unknown);
         // Safe pipes still allowed
-        assert_eq!(classify_device(r"\device\namedpipe\lsarpc"), DeviceKind::NamedPipe);
         assert_eq!(classify_device(r"pipe\fs-sandbox-1234"), DeviceKind::NamedPipe);
+        assert_eq!(classify_device(r"\device\namedpipe\myapp-ipc"), DeviceKind::NamedPipe);
     }
 
     #[test]
