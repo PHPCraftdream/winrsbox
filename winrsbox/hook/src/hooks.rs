@@ -1334,6 +1334,24 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Signal launcher that hook.dll initialized successfully via kernel Event.
+    // If this env var is absent, we're in a context that doesn't need signaling
+    // (e.g. unit tests running hook code directly).
+    if let Ok(event_name) = std::env::var("FS_SANDBOX_INIT_EVENT") {
+        let wide: Vec<u16> = event_name.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            let h = winapi::um::synchapi::OpenEventW(
+                0x0002, // EVENT_MODIFY_STATE — needed for SetEvent
+                0,      // bInheritHandle = FALSE
+                wide.as_ptr(),
+            );
+            if !h.is_null() {
+                winapi::um::synchapi::SetEvent(h);
+                winapi::um::handleapi::CloseHandle(h);
+            }
+        }
+    }
+
     Ok(())
 }
 
