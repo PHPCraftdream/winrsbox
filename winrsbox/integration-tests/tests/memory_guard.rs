@@ -947,3 +947,16 @@ fn strict_blocks_pipe_impersonate() {
     assert_eq!(code, Some(5),
         "ImpersonateNamedPipeClient should be blocked\nstderr: {}", r.stderr);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NtUnmapViewOfSection — foreign-process unmap (Process Hollowing closure)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[serial]
+fn strict_blocks_unmap_foreign() {
+    let r = run_payload("escape_unmap_foreign", "scan");
+    if r.status.code() == Some(7) || r.status.code() == Some(8) { return; }
+    assert_eq!(r.status.code(), Some(5),
+        "NtUnmapViewOfSection on foreign process should be blocked\nstderr: {}", r.stderr);
+}
