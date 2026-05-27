@@ -1,6 +1,7 @@
 // Memory guard — preventive termination on suspicious executable memory operations.
 //
-// Hooks NtAllocateVirtualMemory, NtProtectVirtualMemory, and NtMapViewOfSection.
+// Hooks NtAllocateVirtualMemory, NtProtectVirtualMemory, NtMapViewOfSection,
+// NtUnmapViewOfSection.
 // Terminates the process if user-initiated code attempts to create executable
 // memory outside of normal DLL loading.
 //
@@ -17,6 +18,7 @@ use winapi::ctypes::c_void;
 use winapi::um::processthreadsapi::GetCurrentProcessId;
 
 use crate::anti_rec;
+use crate::hooks::{ipc_log, is_trace};
 
 // ---------------------------------------------------------------------------
 // Nt* function type aliases
@@ -82,7 +84,10 @@ static ALLOC_TLS_INDEX: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 static HOOK_PROTECT: OnceLock<GenericDetour<FnNtProtectVirtualMemory>> = OnceLock::new();
 static HOOK_MAP_VIEW: OnceLock<GenericDetour<FnNtMapViewOfSection>> = OnceLock::new();
 static HOOK_WRITE_MEM: OnceLock<GenericDetour<FnNtWriteVirtualMemory>> = OnceLock::new();
-static NT_UNMAP: OnceLock<FnNtUnmapViewOfSection> = OnceLock::new();
+static HOOK_NT_UNMAP_VIEW: OnceLock<GenericDetour<FnNtUnmapViewOfSection>> = OnceLock::new();
+// Resolved original NtUnmapViewOfSection — used for cleanup unmaps (double-map guard)
+// where we need to call the raw function without triggering our own hook.
+static NT_UNMAP_ORIG: OnceLock<FnNtUnmapViewOfSection> = OnceLock::new();
 
 // Guard mode: "scan" = content-aware (scan bytes for syscall), "full" = scan + DLL scan
 static GUARD_MODE: OnceLock<String> = OnceLock::new();
@@ -257,6 +262,47 @@ fn get_mapped_file_basename(addr: *const c_void) -> Option<String> {
         let basename = path.rsplit_once('\\').map(|(_, b)| b).unwrap_or(&path);
         Some(basename.to_ascii_lowercase())
     }
+}
+
+const STATUS_ACCESS_DENIED: NTSTATUS = 0xC000_0022_u32 as NTSTATUS;
+
+// ---------------------------------------------------------------------------
+// Hook: NtUnmapViewOfSection — deny foreign-process unmap (Process Hollowing)
+// ---------------------------------------------------------------------------
+
+unsafe extern "system" fn hook_nt_unmap_view_of_section(
+    process_handle: HANDLE,
+    base_address: *mut c_void,
+) -> NTSTATUS {
+    let call_original = || {
+        HOOK_NT_UNMAP_VIEW.get().unwrap().call(process_handle, base_address)
+    };
+
+    let Some(_guard) = anti_rec::enter() else {
+        return call_original();
+    };
+
+    // Self-process: allow (legit DLL unload, JIT cleanup, etc.)
+    if process_handle as isize == NT_CURRENT_PROCESS {
+        return call_original();
+    }
+
+    // Resolve PID for real handles
+    let target_pid = unsafe { winapi::um::processthreadsapi::GetProcessId(process_handle) };
+    let self_pid = unsafe { GetCurrentProcessId() };
+    if target_pid == 0 || target_pid == self_pid {
+        return call_original();
+    }
+
+    // Foreign process: deny unconditionally.
+    // Even our own owned children should not have their image unmapped —
+    // that's the core of Process Hollowing.
+    if is_trace() {
+        ipc_log(ipc::LogLevel::Trace,
+            format!("mem_unmap_foreign_blocked pid={target_pid} base=0x{:x}",
+                base_address as usize));
+    }
+    STATUS_ACCESS_DENIED
 }
 
 // ---------------------------------------------------------------------------
@@ -580,8 +626,7 @@ unsafe extern "system" fn hook_nt_map_view_of_section(
     if is_image_mapping(mapped_base) {
         if let Some(basename) = get_mapped_file_basename(mapped_base) {
             if is_critical_dll(&basename) {
-                let unmap = NT_UNMAP.get();
-                if let Some(unmap_fn) = unmap {
+                if let Some(unmap_fn) = unmap_section_original_pub() {
                     // SAFETY: mapped_base was just mapped successfully; we unmap
                     // it before terminating to clean up.
                     unmap_fn(-1isize as HANDLE, mapped_base);
@@ -602,7 +647,7 @@ unsafe extern "system" fn hook_nt_map_view_of_section(
                         let text_slice = std::slice::from_raw_parts(text_addr, scan_size);
                         let hits = policy::scan::find_direct_syscalls(text_slice, text_addr as u64);
                         if !hits.is_empty() {
-                            let unmap = NT_UNMAP.get();
+                            let unmap = unmap_section_original_pub();
                             if let Some(unmap_fn) = unmap {
                                 unmap_fn(-1isize as HANDLE, mapped_base);
                             }
@@ -627,7 +672,7 @@ unsafe extern "system" fn hook_nt_map_view_of_section(
             effective |= mbi.Protect;
         }
         if is_executable(effective) {
-            let unmap = NT_UNMAP.get();
+            let unmap = unmap_section_original_pub();
             if let Some(unmap_fn) = unmap {
                 unmap_fn(-1isize as HANDLE, mapped_base);
             }
@@ -874,10 +919,15 @@ pub unsafe fn install(guard_level: &str) -> Result<(), Box<dyn std::error::Error
     if !skip("mem-write") {
         install_guard!(HOOK_WRITE_MEM,"NtWriteVirtualMemory\0",    hook_nt_write_virtual_memory,    FnNtWriteVirtualMemory);
     }
-    // Resolve NtUnmapViewOfSection for cleanup before terminate
+    if !skip("mem-unmap") {
+        install_guard!(HOOK_NT_UNMAP_VIEW, "NtUnmapViewOfSection\0", hook_nt_unmap_view_of_section, FnNtUnmapViewOfSection);
+    }
+    // Always resolve the raw NtUnmapViewOfSection for cleanup unmaps used by
+    // the MapView double-map guard (calls with NtCurrentProcess, which our
+    // hook allows through, but using the raw address avoids any re-entrancy
+    // concerns during terminate-path cleanup).
     if let Some(addr) = crate::hooks::ntdll_export("NtUnmapViewOfSection\0".as_bytes()) {
-        // SAFETY: addr is a valid ntdll export with the FnNtUnmapViewOfSection signature.
-        let _ = NT_UNMAP.set(std::mem::transmute::<usize, FnNtUnmapViewOfSection>(addr as usize));
+        let _ = NT_UNMAP_ORIG.set(std::mem::transmute::<usize, FnNtUnmapViewOfSection>(addr as usize));
     }
 
     Ok(())
@@ -888,6 +938,7 @@ pub unsafe fn install(guard_level: &str) -> Result<(), Box<dyn std::error::Error
 /// # SAFETY
 /// Must be called from DLL_PROCESS_DETACH only.
 pub unsafe fn uninstall() {
+    if let Some(h) = HOOK_NT_UNMAP_VIEW.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_WRITE_MEM.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_MAP_VIEW.get() { let _ = h.disable(); }
     uninstall_manual_alloc_hook();
@@ -897,6 +948,10 @@ pub unsafe fn uninstall() {
 // ---------------------------------------------------------------------------
 // pub(crate) accessors for inject_guard
 // ---------------------------------------------------------------------------
+
+pub(crate) fn unmap_section_original_pub() -> Option<FnNtUnmapViewOfSection> {
+    NT_UNMAP_ORIG.get().copied()
+}
 
 pub(crate) fn capture_stack_pub(skip: u32, count: u32) -> Vec<u64> {
     capture_stack(skip, count)
