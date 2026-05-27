@@ -994,3 +994,12 @@ fn strict_blocks_set_system_info() {
     assert_eq!(r.status.code(), Some(5),
         "NtSetSystemInformation should be blocked\nstderr: {}", r.stderr);
 }
+
+#[test]
+#[serial]
+fn strict_blocks_create_debug_object() {
+    let r = run_payload("escape_debug_object", "scan");
+    if r.status.code() == Some(8) { return; }
+    assert_eq!(r.status.code(), Some(5),
+        "NtCreateDebugObject should be blocked\nstderr: {}", r.stderr);
+}

@@ -331,6 +331,10 @@ path = "src/bin/escape_shutdown.rs"
 name = "escape_set_system_info"
 path = "src/bin/escape_set_system_info.rs"
 
+[[bin]]
+name = "escape_debug_object"
+path = "src/bin/escape_debug_object.rs"
+
 [[test]]
 name = "mock_integration"
 path = "tests/mock_integration.rs"
