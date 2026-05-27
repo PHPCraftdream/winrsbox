@@ -1,10 +1,12 @@
 // Tries NtUnmapViewOfSection on a foreign (non-self) process.
+// Uses PROCESS_VM_READ only (not VM_OPERATION) to bypass proc_guard's
+// OpenProcess deny, so the payload reaches our memory_guard cross-proc hook.
 // Without hook: unmap reaches kernel (may fail with STATUS_NOT_MAPPED_VIEW).
 // With hook: NtUnmapViewOfSection denied → STATUS_ACCESS_DENIED → exit 5.
 
 use winapi::shared::minwindef::FALSE;
 use winapi::um::processthreadsapi::OpenProcess;
-use winapi::um::winnt::{PROCESS_VM_OPERATION, PROCESS_VM_READ};
+use winapi::um::winnt::PROCESS_VM_READ;
 use winapi::um::tlhelp32::*;
 use winapi::um::handleapi::{INVALID_HANDLE_VALUE, CloseHandle};
 
@@ -37,9 +39,11 @@ fn main() {
     eprintln!("[escape_unmap_foreign] target pid={pid}");
 
     unsafe {
-        let h = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ, FALSE, pid);
+        // PROCESS_VM_READ only — bypasses proc_guard (not in DANGEROUS_ACCESS mask)
+        // so our memory_guard NtUnmapViewOfSection hook is actually exercised.
+        let h = OpenProcess(PROCESS_VM_READ, FALSE, pid);
         if h.is_null() {
-            eprintln!("[escape_unmap_foreign] blocked at OpenProcess (proc_guard) — defense in depth");
+            eprintln!("[escape_unmap_foreign] blocked at OpenProcess — unexpected (VM_READ should pass proc_guard)");
             std::process::exit(5);
         }
 
