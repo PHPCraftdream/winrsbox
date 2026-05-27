@@ -627,8 +627,17 @@ unsafe extern "system" fn hook_nt_create_file(
         return call_original!();
     };
 
+    // P2-4 fix: check 8.3 short-name on the JOINED path (covers RootDirectory-relative opens)
+    if needs_short_name_resolve(&dos) {
+        if is_trace() {
+            ipc_log(ipc::LogLevel::Trace, format!("fs_block_short_name_joined: {}", dos));
+        }
+        set_io_status(io_status_block, STATUS_ACCESS_DENIED);
+        return STATUS_ACCESS_DENIED;
+    }
+
     let write = is_write_access(desired_access, create_disposition);
-    // Note: 8.3 short-name paths are blocked early in check_path_traversal.
+    // Note: 8.3 short-name paths are blocked in check_path_traversal (raw path) and above (joined path).
     let decision = decide(&dos, write);
 
     match decision.mode {
@@ -757,10 +766,19 @@ unsafe extern "system" fn hook_nt_open_file(
         return call_original!();
     };
 
+    // P2-4 fix: check 8.3 short-name on the JOINED path (covers RootDirectory-relative opens)
+    if needs_short_name_resolve(&dos) {
+        if is_trace() {
+            ipc_log(ipc::LogLevel::Trace, format!("fs_block_short_name_joined: {}", dos));
+        }
+        set_io_status(io_status_block, STATUS_ACCESS_DENIED);
+        return STATUS_ACCESS_DENIED;
+    }
+
     let write_bits =
         GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER;
     let write = desired_access & write_bits != 0;
-    // Note: 8.3 short-name paths are blocked early in check_path_traversal.
+    // Note: 8.3 short-name paths are blocked in check_path_traversal (raw path) and above (joined path).
     let decision = decide(&dos, write);
 
     match decision.mode {
