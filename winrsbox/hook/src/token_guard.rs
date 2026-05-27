@@ -5,6 +5,8 @@
 //   NtOpenProcessTokenEx        — block opening foreign process tokens (B)
 //   NtDuplicateToken            — block duplicating foreign tokens (B)
 //   NtSetInformationThread(ThreadImpersonationToken) — block impersonation (B)
+//   NtImpersonateThread         — block impersonating foreign thread tokens (P2-2)
+//   NtOpenThreadTokenEx         — block opening foreign thread tokens (P2-2)
 //
 // In practice: non-admin sandbox processes don't have these privileges.
 // This guard is defense-in-depth for the edge case where a sandbox runs
@@ -341,6 +343,132 @@ unsafe extern "system" fn hook_nt_set_information_thread(
 }
 
 // ---------------------------------------------------------------------------
+// Hook 5: NtImpersonateThread — block impersonating foreign threads
+// ---------------------------------------------------------------------------
+// NtImpersonateThread copies the impersonation token from ServerThreadHandle
+// onto ClientThreadHandle. If the server thread belongs to a higher-priv
+// process, the sandbox inherits that privilege level → escalation.
+//
+// Policy: allow self-impersonation (server thread owned by self PID or
+// NtCurrentThread pseudo-handle). Deny if server thread belongs to a foreign PID.
+
+type FnNtImpersonateThread = unsafe extern "system" fn(
+    HANDLE,         // ServerThreadHandle
+    HANDLE,         // ClientThreadHandle
+    *mut c_void,    // SecurityQualityOfService
+) -> NTSTATUS;
+
+static HOOK_IMPERSONATE_THREAD: OnceLock<GenericDetour<FnNtImpersonateThread>> = OnceLock::new();
+
+const NT_CURRENT_THREAD: isize = -2;
+
+unsafe extern "system" fn hook_nt_impersonate_thread(
+    server_thread: HANDLE,
+    client_thread: HANDLE,
+    sqos: *mut c_void,
+) -> NTSTATUS {
+    let call_original = || {
+        HOOK_IMPERSONATE_THREAD.get().unwrap().call(
+            server_thread, client_thread, sqos,
+        )
+    };
+
+    let Some(_guard) = anti_rec::enter() else {
+        return call_original();
+    };
+
+    // NtCurrentThread pseudo-handle → self-impersonation → allow
+    if server_thread as isize == NT_CURRENT_THREAD {
+        return call_original();
+    }
+
+    let self_pid = GetCurrentProcessId();
+    let owner_pid = crate::inject_guard::thread_owner_pid(server_thread);
+
+    if owner_pid != 0 && owner_pid != self_pid && !process_tracker::is_owned_child(owner_pid) {
+        if is_trace() {
+            ipc_log(ipc::LogLevel::Trace,
+                format!("token_impersonate_thread_blocked server_owner_pid={owner_pid}"));
+        }
+        return STATUS_ACCESS_DENIED;
+    }
+
+    call_original()
+}
+
+// ---------------------------------------------------------------------------
+// Hook 6: NtOpenThreadTokenEx — block opening foreign thread tokens
+// ---------------------------------------------------------------------------
+// NtOpenThreadTokenEx opens a thread's impersonation token. With dangerous
+// access rights on a foreign thread's token, the sandbox can later call
+// NtSetInformationThread to impersonate.
+//
+// Policy: allow self-thread token operations (NtCurrentThread or owner == self PID).
+// For foreign threads, block dangerous access bits; allow TOKEN_QUERY (read-only).
+
+type FnNtOpenThreadTokenEx = unsafe extern "system" fn(
+    HANDLE,         // ThreadHandle
+    u32,            // DesiredAccess
+    u8,             // OpenAsSelf (BOOLEAN)
+    u32,            // HandleAttributes
+    *mut HANDLE,    // TokenHandle (out)
+) -> NTSTATUS;
+
+static HOOK_OPEN_THREAD_TOKEN: OnceLock<GenericDetour<FnNtOpenThreadTokenEx>> = OnceLock::new();
+
+// Dangerous token access bits (same set as TOKEN_DANGEROUS_ACCESS above)
+const THREAD_TOKEN_DANGEROUS: u32 =
+    0x0001 |  // TOKEN_ASSIGN_PRIMARY
+    0x0002 |  // TOKEN_DUPLICATE
+    0x0004 |  // TOKEN_IMPERSONATE
+    0x0020 |  // TOKEN_ADJUST_PRIVILEGES
+    0x0040 |  // TOKEN_ADJUST_GROUPS
+    0x0080;   // TOKEN_ADJUST_DEFAULT
+
+unsafe extern "system" fn hook_nt_open_thread_token_ex(
+    thread_handle: HANDLE,
+    desired_access: u32,
+    open_as_self: u8,
+    handle_attributes: u32,
+    token_handle: *mut HANDLE,
+) -> NTSTATUS {
+    let call_original = || {
+        HOOK_OPEN_THREAD_TOKEN.get().unwrap().call(
+            thread_handle, desired_access, open_as_self, handle_attributes, token_handle,
+        )
+    };
+
+    let Some(_guard) = anti_rec::enter() else {
+        return call_original();
+    };
+
+    // NtCurrentThread pseudo-handle (-6 for thread token, -2 for current thread)
+    // Both represent self-thread → allow
+    if thread_handle as isize == NT_CURRENT_THREAD || thread_handle as isize == -6 {
+        return call_original();
+    }
+
+    let self_pid = GetCurrentProcessId();
+    let owner_pid = crate::inject_guard::thread_owner_pid(thread_handle);
+
+    if owner_pid != 0 && owner_pid != self_pid && !process_tracker::is_owned_child(owner_pid) {
+        let dangerous = desired_access & THREAD_TOKEN_DANGEROUS;
+        if dangerous != 0 {
+            if is_trace() {
+                ipc_log(ipc::LogLevel::Trace,
+                    format!("token_open_thread_blocked owner_pid={owner_pid} access=0x{desired_access:08x} dangerous=0x{dangerous:08x}"));
+            }
+            if !token_handle.is_null() {
+                *token_handle = std::ptr::null_mut();
+            }
+            return STATUS_ACCESS_DENIED;
+        }
+    }
+
+    call_original()
+}
+
+// ---------------------------------------------------------------------------
 // Install / Uninstall
 // ---------------------------------------------------------------------------
 
@@ -393,6 +521,30 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("detour enable NtSetInformationThread: {e:?}"))?;
     }
 
+    {
+        let addr = crate::hooks::ntdll_export("NtImpersonateThread\0".as_bytes())
+            .ok_or("NtImpersonateThread not found")?;
+        let target: FnNtImpersonateThread = std::mem::transmute(addr as usize);
+        let hook_ptr: FnNtImpersonateThread = hook_nt_impersonate_thread;
+        let detour = GenericDetour::<FnNtImpersonateThread>::new(target, hook_ptr)
+            .map_err(|e| format!("detour init NtImpersonateThread: {e:?}"))?;
+        let _ = HOOK_IMPERSONATE_THREAD.set(detour);
+        HOOK_IMPERSONATE_THREAD.get().expect("set above").enable()
+            .map_err(|e| format!("detour enable NtImpersonateThread: {e:?}"))?;
+    }
+
+    {
+        let addr = crate::hooks::ntdll_export("NtOpenThreadTokenEx\0".as_bytes())
+            .ok_or("NtOpenThreadTokenEx not found")?;
+        let target: FnNtOpenThreadTokenEx = std::mem::transmute(addr as usize);
+        let hook_ptr: FnNtOpenThreadTokenEx = hook_nt_open_thread_token_ex;
+        let detour = GenericDetour::<FnNtOpenThreadTokenEx>::new(target, hook_ptr)
+            .map_err(|e| format!("detour init NtOpenThreadTokenEx: {e:?}"))?;
+        let _ = HOOK_OPEN_THREAD_TOKEN.set(detour);
+        HOOK_OPEN_THREAD_TOKEN.get().expect("set above").enable()
+            .map_err(|e| format!("detour enable NtOpenThreadTokenEx: {e:?}"))?;
+    }
+
     if is_trace() {
         ipc_log(ipc::LogLevel::Trace, "token_guard_installed".into());
     }
@@ -400,6 +552,8 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub unsafe fn uninstall() {
+    if let Some(h) = HOOK_OPEN_THREAD_TOKEN.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_IMPERSONATE_THREAD.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_SET_INFO_THREAD.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_DUPLICATE_TOKEN.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_OPEN_PROC_TOKEN.get() { let _ = h.disable(); }

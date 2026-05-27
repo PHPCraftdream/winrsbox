@@ -339,6 +339,14 @@ path = "src/bin/escape_set_system_info.rs"
 name = "escape_debug_object"
 path = "src/bin/escape_debug_object.rs"
 
+[[bin]]
+name = "escape_impersonate_thread"
+path = "src/bin/escape_impersonate_thread.rs"
+
+[[bin]]
+name = "escape_open_thread_token"
+path = "src/bin/escape_open_thread_token.rs"
+
 [[test]]
 name = "mock_integration"
 path = "tests/mock_integration.rs"

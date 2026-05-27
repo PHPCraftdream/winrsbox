@@ -510,6 +510,24 @@ fn strict_blocks_token_impersonation() {
 
 #[test]
 #[serial]
+fn strict_blocks_impersonate_thread() {
+    // NtImpersonateThread on foreign (explorer) thread
+    let r = run_payload("escape_impersonate_thread", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "escape_impersonate_thread should exit 5 (blocked)\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_open_thread_token() {
+    // NtOpenThreadTokenEx on foreign thread with TOKEN_IMPERSONATE
+    let r = run_payload("escape_open_thread_token", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "escape_open_thread_token should exit 5 (blocked)\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
 fn strict_denies_fs_system_write() {
     // Clean any prior canary in real C:\Windows
     let canary = std::path::Path::new(r"C:\Windows\winrsbox-escape-canary.txt");
