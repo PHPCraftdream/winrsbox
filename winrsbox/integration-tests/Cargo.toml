@@ -323,6 +323,14 @@ path = "src/bin/escape_unmap_foreign.rs"
 name = "escape_map_foreign"
 path = "src/bin/escape_map_foreign.rs"
 
+[[bin]]
+name = "escape_shutdown"
+path = "src/bin/escape_shutdown.rs"
+
+[[bin]]
+name = "escape_set_system_info"
+path = "src/bin/escape_set_system_info.rs"
+
 [[test]]
 name = "mock_integration"
 path = "tests/mock_integration.rs"

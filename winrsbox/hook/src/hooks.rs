@@ -1291,6 +1291,11 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
                 ipc_log(ipc::LogLevel::Warn, format!("service_guard install failed: {:?}", e));
             }
         }
+        if !skip("system") {
+            if let Err(e) = crate::system_guard::install() {
+                ipc_log(ipc::LogLevel::Warn, format!("system_guard install failed: {:?}", e));
+            }
+        }
 
         if !skip("mitigations") {
             apply_mitigations(&guard);
@@ -1375,6 +1380,7 @@ fn apply_mitigations(guard: &str) {
 /// Must be called on DLL_PROCESS_DETACH only. Errors are ignored because
 /// the process is tearing down.
 pub unsafe fn uninstall_hooks() {
+    crate::system_guard::uninstall();
     crate::service_guard::uninstall();
     crate::com_guard::uninstall();
     crate::proc_guard::uninstall();
