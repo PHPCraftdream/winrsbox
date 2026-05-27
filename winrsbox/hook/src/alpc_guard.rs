@@ -66,7 +66,13 @@ const DANGEROUS_PORT_SUBSTRINGS: &[&str] = &[
 
 fn is_dangerous_port(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    DANGEROUS_PORT_SUBSTRINGS.iter().any(|&s| lower.contains(s))
+    // Get last path segment (after final \ or /) so that "ole" in
+    // "Console" or "GoogleChrome..." does not false-positive.
+    let segment = match lower.rfind(|c| c == '\\' || c == '/') {
+        Some(idx) => &lower[idx + 1..],
+        None => &lower,
+    };
+    DANGEROUS_PORT_SUBSTRINGS.iter().any(|&p| segment.starts_with(p))
 }
 
 unsafe extern "system" fn hook_nt_alpc_connect_port(
@@ -155,5 +161,11 @@ mod tests {
         assert!(!is_dangerous_port("lsass"));
         assert!(!is_dangerous_port("epmapper"));
         assert!(!is_dangerous_port("DnsResolver"));
+
+        // False-positive regression: "ole" substring inside a segment
+        // must NOT match when the segment does not start with "ole".
+        assert!(!is_dangerous_port(r"\RPC Control\Console"));
+        assert!(!is_dangerous_port(r"\RPC Control\ConsoleNotificationPort"));
+        assert!(!is_dangerous_port(r"\BaseNamedObjects\GoogleChromeServiceSocket"));
     }
 }
