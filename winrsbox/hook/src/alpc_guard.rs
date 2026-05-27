@@ -62,6 +62,7 @@ const DANGEROUS_PORT_SUBSTRINGS: &[&str] = &[
     // instead of CoCreateInstance(WbemLocator) which com_guard catches)
     "wmi",          // \RPC Control\WMI* — WMI core service
     "wbem",         // \RPC Control\WBEM* — WMI scripting service
+    "spool",        // \RPC Control\spoolss — Print Spooler RPC (PrintNightmare class)
     // NOTE: "epmapper" intentionally NOT blocked — COM activation needs it
     // for endpoint resolution; com_guard catches dangerous CLSIDs before
     // epmapper is contacted. Blocking epmapper breaks legit COM (verified
@@ -160,6 +161,9 @@ mod tests {
         assert!(is_dangerous_port(r"\RPC Control\winreg"));
         assert!(is_dangerous_port(r"\RPC Control\seclogon"));
         assert!(is_dangerous_port("WMsgKMessagePort"));
+
+        // Print Spooler RPC (PrintNightmare class)
+        assert!(is_dangerous_port(r"\RPC Control\spoolss"));
 
         // WMI direct ALPC bypass patterns
         assert!(is_dangerous_port(r"\RPC Control\WMI_RPC_12345"));
