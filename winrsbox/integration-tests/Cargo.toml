@@ -340,6 +340,10 @@ name = "escape_debug_object"
 path = "src/bin/escape_debug_object.rs"
 
 [[bin]]
+name = "escape_raise_hard_error"
+path = "src/bin/escape_raise_hard_error.rs"
+
+[[bin]]
 name = "escape_impersonate_thread"
 path = "src/bin/escape_impersonate_thread.rs"
 
