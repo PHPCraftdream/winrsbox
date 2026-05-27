@@ -13,6 +13,8 @@
 // Hook 4: NtSetInformationProcess — blocks dangerous ProcessInformationClass
 //         mutations on foreign (non-owned) processes. Self-process is always
 //         allowed for legitimate JIT/runtime usage.
+// Hook 5: NtTerminateProcess — untracks child PIDs from process_tracker on
+//         exit, preventing unbounded growth and PID-reuse poisoning (P1-2).
 
 use std::sync::OnceLock;
 
@@ -55,6 +57,11 @@ type FnNtSetInformationProcess = unsafe extern "system" fn(
     ULONG,           // ProcessInformationLength
 ) -> NTSTATUS;
 
+type FnNtTerminateProcess = unsafe extern "system" fn(
+    HANDLE,    // ProcessHandle
+    NTSTATUS,  // ExitStatus
+) -> NTSTATUS;
+
 // PS_ATTRIBUTE for parent-spoof detection in NtCreateUserProcess attribute list.
 #[repr(C)]
 struct PS_ATTRIBUTE {
@@ -87,6 +94,7 @@ fn pid_owned(pid: u32) -> bool {
 static HOOK_NT_OPEN_PROCESS: OnceLock<GenericDetour<FnNtOpenProcess>> = OnceLock::new();
 static HOOK_NT_ASSIGN_JOB: OnceLock<GenericDetour<FnNtAssignProcessToJobObject>> = OnceLock::new();
 static HOOK_NT_SET_INFO_PROCESS: OnceLock<GenericDetour<FnNtSetInformationProcess>> = OnceLock::new();
+static HOOK_NT_TERMINATE_PROCESS: OnceLock<GenericDetour<FnNtTerminateProcess>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // NtOpenProcess hook
@@ -237,6 +245,44 @@ unsafe extern "system" fn hook_nt_set_information_process(
             format!("proc_setinfo_blocked pid={target_pid} class={class}"));
     }
     STATUS_ACCESS_DENIED
+}
+
+// ---------------------------------------------------------------------------
+// NtTerminateProcess hook — untrack child PIDs on exit (P1-2 fix)
+// ---------------------------------------------------------------------------
+//
+// This is a tracker-cleanup hook, NOT a security hook. Always passes through
+// to the original. Prevents unbounded growth of process_tracker and PID-reuse
+// poisoning (recycled PID treated as owned child → escape vector).
+
+unsafe extern "system" fn hook_nt_terminate_process(
+    process_handle: HANDLE,
+    exit_status: NTSTATUS,
+) -> NTSTATUS {
+    let call_original = || {
+        HOOK_NT_TERMINATE_PROCESS.get().unwrap().call(process_handle, exit_status)
+    };
+
+    let Some(_guard) = anti_rec::enter() else {
+        return call_original();
+    };
+
+    // Resolve handle → PID. GetProcessId returns 0 on failure or pseudo-handle
+    // for current process (NtCurrentProcess = -1).
+    let target_pid = winapi::um::processthreadsapi::GetProcessId(process_handle);
+    let self_pid = GetCurrentProcessId();
+
+    // Untrack if it's one of our owned children. Skip self (never tracked)
+    // and skip 0 (resolution failure / NtCurrentProcess pseudo-handle).
+    if target_pid != 0 && target_pid != self_pid {
+        if is_trace() {
+            ipc_log(ipc::LogLevel::Trace,
+                format!("proc_terminate_untrack pid={target_pid}"));
+        }
+        process_tracker::untrack(target_pid);
+    }
+
+    call_original()
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +455,19 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
         .enable()
         .map_err(|e| format!("detour enable NtSetInformationProcess: {:?}", e))?;
 
+    // Hook 5: NtTerminateProcess — untrack child PIDs on exit (P1-2 fix)
+    let addr4 = crate::hooks::ntdll_export("NtTerminateProcess\0".as_bytes())
+        .ok_or("ntdll export not found: NtTerminateProcess")?;
+    let target4: FnNtTerminateProcess = std::mem::transmute(addr4 as usize);
+    let hook_ptr4: FnNtTerminateProcess = hook_nt_terminate_process;
+    let detour4 = GenericDetour::<FnNtTerminateProcess>::new(target4, hook_ptr4)
+        .map_err(|e| format!("detour init NtTerminateProcess: {:?}", e))?;
+    HOOK_NT_TERMINATE_PROCESS.set(detour4).ok();
+    HOOK_NT_TERMINATE_PROCESS.get()
+        .expect("set above")
+        .enable()
+        .map_err(|e| format!("detour enable NtTerminateProcess: {:?}", e))?;
+
     if is_trace() {
         ipc_log(ipc::LogLevel::Trace, "proc_guard_installed".into());
     }
@@ -416,6 +475,9 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub unsafe fn uninstall() {
+    if let Some(h) = HOOK_NT_TERMINATE_PROCESS.get() {
+        let _ = h.disable();
+    }
     if let Some(h) = HOOK_NT_SET_INFO_PROCESS.get() {
         let _ = h.disable();
     }
