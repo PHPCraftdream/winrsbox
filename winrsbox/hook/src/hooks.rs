@@ -114,6 +114,10 @@ static DLL_PATH: OnceLock<String> = OnceLock::new();
 pub(crate) static SANDBOX_CWD: OnceLock<String> = OnceLock::new();
 static TRACE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Consecutive IPC failures counter for fail-closed self-termination (P1-3 audit fix).
+static IPC_CONSECUTIVE_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const IPC_FAIL_THRESHOLD: u32 = 10;
+
 pub(crate) fn is_trace() -> bool {
     TRACE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -164,18 +168,46 @@ fn ensure_ipc_and<R>(f: impl FnOnce(&mut Option<ipc::SyncClient>) -> R) -> Optio
 }
 
 fn ipc_decide(dos_lower: &str, write: bool) -> Decision {
-    ensure_ipc_and(|opt| {
+    let result = ensure_ipc_and(|opt| {
         if let Some(client) = opt.as_mut() {
             let req = ipc::Req::Decide {
                 dos_path: dos_lower.to_owned(),
                 write,
             };
             if let Ok(ipc::Resp::Decision(d)) = client.send(&req) {
-                return d;
+                return Some(d);
             }
         }
-        Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None }
-    }).unwrap_or(Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None })
+        None
+    });
+
+    match result {
+        Some(Some(d)) => {
+            IPC_CONSECUTIVE_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
+            d
+        }
+        _ => {
+            // IPC failure — increment counter, possibly self-terminate (fail-closed).
+            let n = IPC_CONSECUTIVE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n >= IPC_FAIL_THRESHOLD {
+                eprintln!(
+                    "[hook] CRITICAL: {} consecutive IPC failures — \
+                     sandbox launcher dead/hung, self-terminating",
+                    n,
+                );
+                unsafe {
+                    winapi::um::processthreadsapi::TerminateProcess(
+                        winapi::um::processthreadsapi::GetCurrentProcess(),
+                        0xC0000005,
+                    );
+                }
+                // Unreachable after TerminateProcess, but satisfies type checker.
+                std::process::exit(1);
+            }
+            // Below threshold — return Passthrough (grace period for transient pipe hiccups).
+            Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None }
+        }
+    }
 }
 
 fn ipc_record_overlay(orig: &str, overlay: &str) {
