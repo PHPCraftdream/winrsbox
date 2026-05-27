@@ -338,12 +338,23 @@ fn resolve_process_pid(handle: HANDLE) -> u32 {
 // ---------------------------------------------------------------------------
 
 const SPAWN_DENYLIST: &[&str] = &[
+    // WSL / Linux subsystem
     "wsl.exe", "wslhost.exe", "bash.exe",
+    // WMI cmdline
     "wmic.exe",
+    // Classic LOLBins — script/DLL execution from signed binaries
     "mshta.exe", "regsvr32.exe", "rundll32.exe",
     "bitsadmin.exe", "certutil.exe",
     "installutil.exe", "msbuild.exe",
     "regasm.exe", "regsvcs.exe",
+    // Delayed-execution / callback persistence LOLBins
+    "at.exe",            // deprecated task scheduler — still functional on some configs
+    "applaunch.exe",     // .NET LOLBin — launches arbitrary managed DLL
+    "mavinject.exe",     // App-V tool — injects DLL into running process
+    "forfiles.exe",      // command runner via filter expression
+    "pcalua.exe",        // Program Compatibility Assistant — runs anything
+    "scriptrunner.exe",  // generic script execution LOLBin
+    "cmstp.exe",         // Connection Manager — executes INF directives
 ];
 
 /// Check if an image path matches the spawn denylist. Returns true if blocked.

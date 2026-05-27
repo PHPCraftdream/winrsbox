@@ -63,6 +63,8 @@ const DANGEROUS_PORT_SUBSTRINGS: &[&str] = &[
     "wmi",          // \RPC Control\WMI* — WMI core service
     "wbem",         // \RPC Control\WBEM* — WMI scripting service
     "spool",        // \RPC Control\spoolss — Print Spooler RPC (PrintNightmare class)
+    "schedule",     // \RPC Control\schedule — Task Scheduler direct LRPC
+                    // (bypass for Schedule.Service COM which com_guard blocks)
     // NOTE: "epmapper" intentionally NOT blocked — COM activation needs it
     // for endpoint resolution; com_guard catches dangerous CLSIDs before
     // epmapper is contacted. Blocking epmapper breaks legit COM (verified
@@ -168,6 +170,9 @@ mod tests {
         // WMI direct ALPC bypass patterns
         assert!(is_dangerous_port(r"\RPC Control\WMI_RPC_12345"));
         assert!(is_dangerous_port(r"\RPC Control\WbemLevel1Login"));
+
+        // Task Scheduler direct LRPC
+        assert!(is_dangerous_port(r"\RPC Control\schedule"));
 
         // Negative — must NOT be blocked
         assert!(!is_dangerous_port("lsass"));
