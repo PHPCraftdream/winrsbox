@@ -112,6 +112,32 @@ thread_local! {
 static PIPE_NAME: OnceLock<String> = OnceLock::new();
 static DLL_PATH: OnceLock<String> = OnceLock::new();
 pub(crate) static SANDBOX_CWD: OnceLock<String> = OnceLock::new();
+
+// ---------------------------------------------------------------------------
+// Install-error buffer (P2-5)
+//
+// At install_hooks() time the IPC pipe may not yet be connected (Hello hasn't
+// been sent), so ipc_log() would silently drop messages.  We buffer them here
+// and flush on the first successful Hello.
+// ---------------------------------------------------------------------------
+static INSTALL_ERRORS: OnceLock<std::sync::Mutex<Vec<String>>> = OnceLock::new();
+
+fn buffer_install_error(msg: String) {
+    let buf = INSTALL_ERRORS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    if let Ok(mut v) = buf.lock() {
+        v.push(msg);
+    }
+}
+
+pub(crate) fn flush_install_errors() {
+    if let Some(buf) = INSTALL_ERRORS.get() {
+        if let Ok(mut v) = buf.lock() {
+            for msg in v.drain(..) {
+                ipc_log(ipc::LogLevel::Warn, msg);
+            }
+        }
+    }
+}
 static TRACE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Consecutive IPC failures counter for fail-closed self-termination (P1-3 audit fix).
@@ -162,6 +188,7 @@ fn ensure_ipc_and<R>(f: impl FnOnce(&mut Option<ipc::SyncClient>) -> R) -> Optio
     });
     if sent {
         HELLO_SENT.set(true);
+        flush_install_errors();
         crate::inject_guard::arm();
     }
     result
@@ -1314,47 +1341,47 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         }
         if !skip("reg") {
             if let Err(e) = crate::reg_hooks::install() {
-                ipc_log(ipc::LogLevel::Warn, format!("reg_hooks install failed: {:?}", e));
+                buffer_install_error(format!("reg_hooks install failed: {:?}", e));
             }
         }
         if !skip("net") {
             if let Err(e) = crate::net_hooks::install() {
-                ipc_log(ipc::LogLevel::Warn, format!("net_hooks install failed: {:?}", e));
+                buffer_install_error(format!("net_hooks install failed: {:?}", e));
             }
         }
         if !skip("alpc") {
             if let Err(e) = crate::alpc_guard::install() {
-                ipc_log(ipc::LogLevel::Warn, format!("alpc_guard install failed: {:?}", e));
+                buffer_install_error(format!("alpc_guard install failed: {:?}", e));
             }
         }
         if !skip("token") {
             if let Err(e) = crate::token_guard::install() {
-                ipc_log(ipc::LogLevel::Warn, format!("token_guard install failed: {:?}", e));
+                buffer_install_error(format!("token_guard install failed: {:?}", e));
             }
         }
         if !skip("ui") {
             if let Err(e) = crate::ui_guard::install() {
-                ipc_log(ipc::LogLevel::Warn, format!("ui_guard install failed: {:?}", e));
+                buffer_install_error(format!("ui_guard install failed: {:?}", e));
             }
         }
         if !skip("proc") {
             if let Err(e) = crate::proc_guard::install() {
-                ipc_log(ipc::LogLevel::Warn, format!("proc_guard install failed: {:?}", e));
+                buffer_install_error(format!("proc_guard install failed: {:?}", e));
             }
         }
         if !skip("com") {
             if let Err(e) = crate::com_guard::install() {
-                ipc_log(ipc::LogLevel::Warn, format!("com_guard install failed: {:?}", e));
+                buffer_install_error(format!("com_guard install failed: {:?}", e));
             }
         }
         if !skip("service") {
             if let Err(e) = crate::service_guard::install() {
-                ipc_log(ipc::LogLevel::Warn, format!("service_guard install failed: {:?}", e));
+                buffer_install_error(format!("service_guard install failed: {:?}", e));
             }
         }
         if !skip("system") {
             if let Err(e) = crate::system_guard::install() {
-                ipc_log(ipc::LogLevel::Warn, format!("system_guard install failed: {:?}", e));
+                buffer_install_error(format!("system_guard install failed: {:?}", e));
             }
         }
 
