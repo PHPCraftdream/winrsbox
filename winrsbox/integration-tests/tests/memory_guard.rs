@@ -973,3 +973,24 @@ fn strict_blocks_map_foreign() {
     assert_eq!(r.status.code(), Some(5),
         "NtMapViewOfSection into foreign process should be blocked\nstderr: {}", r.stderr);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// System guard: NtShutdownSystem + NtSetSystemInformation
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[serial]
+fn strict_blocks_shutdown() {
+    let r = run_payload("escape_shutdown", "scan");
+    assert_eq!(r.status.code(), Some(5),
+        "ExitWindowsEx/NtShutdownSystem should be blocked\nstderr: {}", r.stderr);
+}
+
+#[test]
+#[serial]
+fn strict_blocks_set_system_info() {
+    let r = run_payload("escape_set_system_info", "scan");
+    if r.status.code() == Some(8) { return; }
+    assert_eq!(r.status.code(), Some(5),
+        "NtSetSystemInformation should be blocked\nstderr: {}", r.stderr);
+}
