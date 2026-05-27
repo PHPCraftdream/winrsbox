@@ -267,7 +267,7 @@ use windows::{
                 PIPE_TYPE_BYTE, PIPE_WAIT,
             },
             Threading::{
-                CreateProcessW, GetExitCodeProcess,
+                CreateEventW, CreateProcessW, GetExitCodeProcess,
                 OpenProcess, ResumeThread, WaitForMultipleObjects, WaitForSingleObject,
                 CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION, PROCESS_SYNCHRONIZE,
                 STARTUPINFOW,
@@ -432,6 +432,14 @@ async fn main() -> Result<()> {
     if cli.strict_clipboard {
         std::env::set_var("FS_SANDBOX_STRICT_CLIPBOARD", "1");
     }
+
+    // Create kernel Event for hook.dll init signaling.
+    let init_event_name = format!("Local\\fs-sandbox-init-{}", std::process::id());
+    let event_name_wide: Vec<u16> = init_event_name.encode_utf16().chain(Some(0)).collect();
+    let init_event = unsafe {
+        CreateEventW(None, false, false, PCWSTR(event_name_wide.as_ptr()))
+    }?;
+    std::env::set_var("FS_SANDBOX_INIT_EVENT", &init_event_name);
 
     // Trust-based guard level override: signed binaries get scan (JIT-friendly)
     // instead of full (kernel blocks JIT). Unsigned stays at user's chosen level.
@@ -621,6 +629,30 @@ async fn main() -> Result<()> {
     unsafe { ResumeThread(proc_info.hThread) };
     // SAFETY: same — close the thread handle after use; the thread continues running.
     unsafe { CloseHandle(proc_info.hThread).ok() };
+
+    // Wait for hook.dll to signal successful initialization via kernel Event.
+    // spawn_blocking moves the blocking wait to tokio's thread pool — the async
+    // runtime stays free to run pipe_accept_loop and other tasks.
+    let event_handle_raw = init_event.0 as usize; // HANDLE → usize for Send
+    let wait_result = tokio::task::spawn_blocking(move || unsafe {
+        WaitForSingleObject(HANDLE(event_handle_raw as *mut _), 5000)
+    }).await?;
+
+    if wait_result.0 == 0 { // WAIT_OBJECT_0
+        println!("[sandbox] hook.dll init confirmed (pid {})", proc_info.dwProcessId);
+    } else {
+        eprintln!(
+            "[sandbox] CRITICAL: hook.dll did not signal init within 5s, killing child pid={}",
+            proc_info.dwProcessId
+        );
+        unsafe {
+            windows::Win32::System::Threading::TerminateProcess(proc_info.hProcess, 0xC000_0005).ok();
+            CloseHandle(proc_info.hProcess).ok();
+        }
+        unsafe { CloseHandle(init_event).ok() };
+        anyhow::bail!("hook.dll injection failed — child terminated (pid={})", proc_info.dwProcessId);
+    }
+    unsafe { CloseHandle(init_event).ok() };
 
     println!("[sandbox] target started (pid {})", proc_info.dwProcessId);
 
