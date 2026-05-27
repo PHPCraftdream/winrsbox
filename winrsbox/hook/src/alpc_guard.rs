@@ -58,6 +58,10 @@ const DANGEROUS_PORT_SUBSTRINGS: &[&str] = &[
     "winreg",       // \RPC Control\winreg — remote registry
     "seclogon",     // \RPC Control\seclogon — secondary logon / RunAs (priv escalation)
     "wmsgk",        // WMsgKMessagePort — window message dispatch
+    // WMI direct ALPC bypass (sandbox uses direct LRPC to WMI service
+    // instead of CoCreateInstance(WbemLocator) which com_guard catches)
+    "wmi",          // \RPC Control\WMI* — WMI core service
+    "wbem",         // \RPC Control\WBEM* — WMI scripting service
     // NOTE: "epmapper" intentionally NOT blocked — COM activation needs it
     // for endpoint resolution; com_guard catches dangerous CLSIDs before
     // epmapper is contacted. Blocking epmapper breaks legit COM (verified
@@ -156,6 +160,10 @@ mod tests {
         assert!(is_dangerous_port(r"\RPC Control\winreg"));
         assert!(is_dangerous_port(r"\RPC Control\seclogon"));
         assert!(is_dangerous_port("WMsgKMessagePort"));
+
+        // WMI direct ALPC bypass patterns
+        assert!(is_dangerous_port(r"\RPC Control\WMI_RPC_12345"));
+        assert!(is_dangerous_port(r"\RPC Control\WbemLevel1Login"));
 
         // Negative — must NOT be blocked
         assert!(!is_dangerous_port("lsass"));
