@@ -721,6 +721,15 @@ fn strict_blocks_parent_spoof() {
         "parent-PID spoofing should be blocked\nstderr: {}", r.stderr);
 }
 
+#[test]
+#[serial]
+fn strict_blocks_handle_list_inheritance() {
+    let r = run_payload("escape_handle_list_inheritance", "scan");
+    if r.status.code() == Some(8) { return; }
+    assert_eq!(r.status.code(), Some(5),
+        "PROC_THREAD_ATTRIBUTE_HANDLE_LIST should be blocked\nstderr: {}", r.stderr);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // COM guard: out-of-proc COM activation escape
 // ═══════════════════════════════════════════════════════════════════════════

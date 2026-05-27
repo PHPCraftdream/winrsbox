@@ -1121,6 +1121,17 @@ unsafe extern "system" fn hook_nt_create_user_process(
         }
     }
 
+    // --- proc_guard: explicit handle-list inheritance ---
+    if !attribute_list.is_null() {
+        if crate::proc_guard::attribute_list_contains_handle_list(attribute_list) {
+            if is_trace() {
+                ipc_log(ipc::LogLevel::Trace,
+                    "proc_handle_list_blocked".into());
+            }
+            return STATUS_ACCESS_DENIED;
+        }
+    }
+
     // Force the child to start suspended so we can inject before it runs.
     let forced_flags = thread_flags | THREAD_CREATE_FLAGS_CREATE_SUSPENDED;
     let originally_suspended = (thread_flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED) != 0;

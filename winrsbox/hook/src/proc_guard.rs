@@ -390,6 +390,38 @@ pub fn attribute_list_contains_parent_process(attr_list: *const c_void) -> bool 
 }
 
 // ---------------------------------------------------------------------------
+// Handle-list inheritance detection via PS_ATTRIBUTE_LIST
+// ---------------------------------------------------------------------------
+
+/// Check if the attribute list contains PROC_THREAD_ATTRIBUTE_HANDLE_LIST.
+///
+/// PsAttributeHandleList has attribute number 2 in the NT attribute table.
+/// The encoded value uses 0x00020002 (number=2 | PS_ATTRIBUTE_INPUT).
+/// We match on the lower 16 bits == 2 (PsAttributeHandleList number).
+pub fn attribute_list_contains_handle_list(attr_list: *const c_void) -> bool {
+    if attr_list.is_null() {
+        return false;
+    }
+    let list = attr_list as *const PS_ATTRIBUTE_LIST;
+    let total = unsafe { (*list).TotalLength };
+    if total < std::mem::size_of::<usize>() {
+        return false;
+    }
+    let attr_count = (total - std::mem::size_of::<usize>()) / std::mem::size_of::<PS_ATTRIBUTE>();
+    if attr_count == 0 {
+        return false;
+    }
+    let attrs = unsafe { (*list).Attributes.as_ptr() };
+    for i in 0..attr_count {
+        let attr = unsafe { &*attrs.add(i) };
+        if (attr.Attribute & 0xFFFF) == 2 {
+            return true;
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Extract image path from RTL_USER_PROCESS_PARAMETERS
 // ---------------------------------------------------------------------------
 
