@@ -960,3 +960,16 @@ fn strict_blocks_unmap_foreign() {
     assert_eq!(r.status.code(), Some(5),
         "NtUnmapViewOfSection on foreign process should be blocked\nstderr: {}", r.stderr);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NtMapViewOfSection — foreign-process map (Process Hollowing step 3)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[serial]
+fn strict_blocks_map_foreign() {
+    let r = run_payload("escape_map_foreign", "scan");
+    if r.status.code() == Some(7) || r.status.code() == Some(8) { return; }
+    assert_eq!(r.status.code(), Some(5),
+        "NtMapViewOfSection into foreign process should be blocked\nstderr: {}", r.stderr);
+}

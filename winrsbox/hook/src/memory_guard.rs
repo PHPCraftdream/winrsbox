@@ -598,7 +598,23 @@ unsafe extern "system" fn hook_nt_map_view_of_section(
         )
     };
 
+    // Cross-process mapping deny:
+    // If target is a foreign process (not self, not NtCurrentProcess), deny
+    // independently of section content. Attacker mapping section into foreign
+    // proc address space → when that proc reads/executes → runs attacker code.
+    // Self-process mapping continues to existing content-aware path.
     if !is_current_process(process_handle) {
+        let target_pid = unsafe { winapi::um::processthreadsapi::GetProcessId(process_handle) };
+        let self_pid = unsafe { GetCurrentProcessId() };
+        if target_pid != 0 && target_pid != self_pid {
+            if is_trace() {
+                ipc_log(ipc::LogLevel::Trace,
+                    format!("mem_map_foreign_blocked pid={target_pid} win32protect=0x{:x}",
+                        win32_protect));
+            }
+            return STATUS_ACCESS_DENIED;
+        }
+        // Handle belongs to self (pseudo-handle resolved to same PID)
         return call_original();
     }
 
