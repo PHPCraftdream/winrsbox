@@ -1,12 +1,15 @@
-// System guard — blocks NtShutdownSystem and NtSetSystemInformation.
+// System guard — blocks NtShutdownSystem, NtSetSystemInformation,
+// NtCreateDebugObject, and NtRaiseHardError.
 //
 // Escape vector:
 //   AI-agent calls NtShutdownSystem(ShutdownReboot) or
 //   NtSetSystemInformation(SystemLoadGdt, ...) to modify kernel state.
+//   NtRaiseHardError(OptionShutdownSystem=6) can trigger BSOD/forced logoff.
 //   Even though SeShutdownPrivilege / SeTcbPrivilege are blocked via
 //   token_guard, defense-in-depth: unconditional STATUS_ACCESS_DENIED.
 //
-// Hook targets: ntdll.dll!NtShutdownSystem, ntdll.dll!NtSetSystemInformation.
+// Hook targets: ntdll.dll!NtShutdownSystem, ntdll.dll!NtSetSystemInformation,
+//               ntdll.dll!NtCreateDebugObject, ntdll.dll!NtRaiseHardError.
 
 use std::sync::OnceLock;
 
@@ -27,10 +30,19 @@ type FnNtCreateDebugObject = unsafe extern "system" fn(
     *const OBJECT_ATTRIBUTES,  // ObjectAttributes
     u32,                       // Flags
 ) -> NTSTATUS;
+type FnNtRaiseHardError = unsafe extern "system" fn(
+    NTSTATUS,       // ErrorStatus
+    u32,            // NumberOfParameters
+    u32,            // UnicodeStringParameterMask
+    *mut usize,     // Parameters (PULONG_PTR)
+    u32,            // ValidResponseOptions (OptionShutdownSystem=6 is dangerous)
+    *mut u32,       // Response (out)
+) -> NTSTATUS;
 
 static HOOK_SHUTDOWN: OnceLock<GenericDetour<FnNtShutdownSystem>> = OnceLock::new();
 static HOOK_SET_SYS_INFO: OnceLock<GenericDetour<FnNtSetSystemInformation>> = OnceLock::new();
 static HOOK_CREATE_DEBUG_OBJ: OnceLock<GenericDetour<FnNtCreateDebugObject>> = OnceLock::new();
+static HOOK_RAISE_HARD_ERROR: OnceLock<GenericDetour<FnNtRaiseHardError>> = OnceLock::new();
 
 unsafe extern "system" fn hook_nt_shutdown_system(action: u32) -> NTSTATUS {
     let call_original = || {
@@ -78,6 +90,26 @@ unsafe extern "system" fn hook_nt_create_debug_object(
     STATUS_ACCESS_DENIED
 }
 
+unsafe extern "system" fn hook_nt_raise_hard_error(
+    error_status: NTSTATUS,
+    num_params: u32,
+    unicode_mask: u32,
+    params: *mut usize,
+    response_option: u32,
+    response: *mut u32,
+) -> NTSTATUS {
+    let call_original = || {
+        HOOK_RAISE_HARD_ERROR.get().unwrap().call(
+            error_status, num_params, unicode_mask, params, response_option, response)
+    };
+    let Some(_g) = anti_rec::enter() else { return call_original(); };
+    if is_trace() {
+        ipc_log(ipc::LogLevel::Trace,
+            format!("sys_raise_hard_error_blocked status=0x{:x} option={}", error_status as u32, response_option));
+    }
+    STATUS_ACCESS_DENIED
+}
+
 pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     // NtShutdownSystem
     if let Some(addr) = ntdll_export("NtShutdownSystem\0".as_bytes()) {
@@ -121,6 +153,20 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
             "system_guard: ntdll export NtCreateDebugObject not found".into());
     }
 
+    // NtRaiseHardError
+    if let Some(addr) = ntdll_export("NtRaiseHardError\0".as_bytes()) {
+        let target: FnNtRaiseHardError = std::mem::transmute(addr as usize);
+        let hook_ptr: FnNtRaiseHardError = hook_nt_raise_hard_error;
+        let detour = GenericDetour::<FnNtRaiseHardError>::new(target, hook_ptr)
+            .map_err(|e| format!("detour init NtRaiseHardError: {:?}", e))?;
+        HOOK_RAISE_HARD_ERROR.set(detour).ok();
+        HOOK_RAISE_HARD_ERROR.get().expect("set above").enable()
+            .map_err(|e| format!("detour enable NtRaiseHardError: {:?}", e))?;
+    } else {
+        ipc_log(ipc::LogLevel::Warn,
+            "system_guard: ntdll export NtRaiseHardError not found".into());
+    }
+
     if is_trace() {
         ipc_log(ipc::LogLevel::Trace, "system_guard_installed".into());
     }
@@ -128,6 +174,7 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub unsafe fn uninstall() {
+    if let Some(h) = HOOK_RAISE_HARD_ERROR.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_CREATE_DEBUG_OBJ.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_SET_SYS_INFO.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_SHUTDOWN.get() { let _ = h.disable(); }

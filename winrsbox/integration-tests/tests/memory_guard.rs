@@ -1036,3 +1036,12 @@ fn strict_blocks_create_debug_object() {
     assert_eq!(r.status.code(), Some(5),
         "NtCreateDebugObject should be blocked\nstderr: {}", r.stderr);
 }
+
+#[test]
+#[serial]
+fn strict_blocks_raise_hard_error() {
+    let r = run_payload("escape_raise_hard_error", "scan");
+    if r.status.code() == Some(8) { return; }
+    assert_eq!(r.status.code(), Some(5),
+        "NtRaiseHardError should be blocked\nstderr: {}", r.stderr);
+}
