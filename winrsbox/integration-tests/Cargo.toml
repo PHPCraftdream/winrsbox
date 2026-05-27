@@ -319,6 +319,10 @@ path = "src/bin/escape_pipe_impersonate.rs"
 name = "escape_unmap_foreign"
 path = "src/bin/escape_unmap_foreign.rs"
 
+[[bin]]
+name = "escape_map_foreign"
+path = "src/bin/escape_map_foreign.rs"
+
 [[test]]
 name = "mock_integration"
 path = "tests/mock_integration.rs"
