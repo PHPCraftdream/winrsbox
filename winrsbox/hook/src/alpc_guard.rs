@@ -48,9 +48,20 @@ static HOOK_ALPC_CONNECT: OnceLock<GenericDetour<FnNtAlpcConnectPort>> = OnceLoc
 // Port name substrings that indicate dangerous RPC endpoints.
 // These enable COM activation → WMI → process creation outside sandbox.
 const DANGEROUS_PORT_SUBSTRINGS: &[&str] = &[
+    // COM/OLE activation (existing)
     "ole",          // COM/OLE activation service
     "actkernel",    // COM activation kernel port
     "comlaunch",    // COM launch service
+    // Security services (NEW)
+    "lsarpc",       // \RPC Control\LSARPC — LSA policy queries
+    "samr",         // \RPC Control\samr — SAM database (account enum)
+    "winreg",       // \RPC Control\winreg — remote registry
+    "seclogon",     // \RPC Control\seclogon — secondary logon / RunAs (priv escalation)
+    "wmsgk",        // WMsgKMessagePort — window message dispatch
+    // NOTE: "epmapper" intentionally NOT blocked — COM activation needs it
+    // for endpoint resolution; com_guard catches dangerous CLSIDs before
+    // epmapper is contacted. Blocking epmapper breaks legit COM (verified
+    // in earlier audit revert).
 ];
 
 fn is_dangerous_port(name: &str) -> bool {
@@ -128,9 +139,19 @@ mod tests {
 
     #[test]
     fn dangerous_port_detection() {
+        // Existing — COM/OLE patterns
         assert!(is_dangerous_port(r"\RPC Control\OLE12345"));
         assert!(is_dangerous_port("actkernel_port"));
         assert!(is_dangerous_port("ComLaunch"));
+
+        // NEW — security service patterns
+        assert!(is_dangerous_port(r"\RPC Control\lsarpc"));
+        assert!(is_dangerous_port(r"\RPC Control\samr"));
+        assert!(is_dangerous_port(r"\RPC Control\winreg"));
+        assert!(is_dangerous_port(r"\RPC Control\seclogon"));
+        assert!(is_dangerous_port("WMsgKMessagePort"));
+
+        // Negative — must NOT be blocked
         assert!(!is_dangerous_port("lsass"));
         assert!(!is_dangerous_port("epmapper"));
         assert!(!is_dangerous_port("DnsResolver"));
