@@ -220,6 +220,10 @@ name = "escape_parent_spoof"
 path = "src/bin/escape_parent_spoof.rs"
 
 [[bin]]
+name = "escape_handle_list_inheritance"
+path = "src/bin/escape_handle_list_inheritance.rs"
+
+[[bin]]
 name = "escape_com_shell"
 path = "src/bin/escape_com_shell.rs"
 
