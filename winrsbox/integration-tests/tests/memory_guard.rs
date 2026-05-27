@@ -950,6 +950,9 @@ fn strict_blocks_pipe_impersonate() {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // NtUnmapViewOfSection — foreign-process unmap (Process Hollowing closure)
+//
+// Payload uses PROCESS_VM_READ only to bypass proc_guard's OpenProcess deny,
+// ensuring the test exercises the memory_guard NtUnmapViewOfSection hook.
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -963,6 +966,9 @@ fn strict_blocks_unmap_foreign() {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // NtMapViewOfSection — foreign-process map (Process Hollowing step 3)
+//
+// Payload uses PROCESS_VM_READ only to bypass proc_guard's OpenProcess deny,
+// ensuring the test exercises the memory_guard NtMapViewOfSection hook.
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
