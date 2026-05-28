@@ -172,4 +172,93 @@ mod tests {
         let bytes = to_bytes(0, 0);
         assert!(bytes.iter().all(|&b| b == 0));
     }
+
+    // ─── Create-time mitigation bitmap composition ──────────────────────────
+    //
+    // These tests pin the EXACT bitmask handed to
+    // PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY by sandbox::launch_suspended.
+    //
+    // The launcher strips BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON from the
+    // create-time bitmap (and re-applies it at runtime from inside hook.dll's
+    // apply_mitigations, AFTER our unsigned hook.dll has loaded). Every other
+    // bit MUST survive into the kernel's create-time policy because those
+    // policies are create-time-only — there is no SetProcessMitigationPolicy
+    // for STRICT_HANDLE_CHECKS, FORCE_RELOCATE_IMAGES, or HIGH_ENTROPY_ASLR.
+
+    /// Full mode minus the runtime-applied BLOCK_NON_MICROSOFT bit. Locks in
+    /// every create-time-only policy we expect the kernel to enforce on the
+    /// suspended child before hook.dll loads.
+    #[test]
+    fn full_create_time_bitmap_retains_all_required_v1_bits() {
+        let (full_m1, _) = compute(Profile::Full);
+        let create_v1 = full_m1 & !v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
+
+        // BLOCK_NON_MICROSOFT_BINARIES must be CLEARED at create time —
+        // otherwise hook.dll (unsigned) is rejected by the kernel image loader.
+        assert_eq!(create_v1 & v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON, 0,
+            "create-time bitmap must NOT include BLOCK_NON_MICROSOFT_BINARIES");
+
+        // ALL other Full-mode v1 bits must survive — none of these are
+        // re-settable at runtime via SetProcessMitigationPolicy, so the kernel
+        // ONLY learns about them through this create-time bitmap.
+        assert_ne!(create_v1 & v1::PROHIBIT_DYNAMIC_CODE_ALWAYS_ON, 0,
+            "PROHIBIT_DYNAMIC_CODE_ALWAYS_ON missing from create-time bitmap");
+        assert_ne!(create_v1 & v1::FORCE_RELOCATE_IMAGES_ALWAYS_ON, 0,
+            "FORCE_RELOCATE_IMAGES_ALWAYS_ON missing from create-time bitmap");
+        assert_ne!(create_v1 & v1::HEAP_TERMINATE_ALWAYS_ON, 0,
+            "HEAP_TERMINATE_ALWAYS_ON missing from create-time bitmap");
+        assert_ne!(create_v1 & v1::BOTTOM_UP_ASLR_ALWAYS_ON, 0,
+            "BOTTOM_UP_ASLR_ALWAYS_ON missing from create-time bitmap");
+        assert_ne!(create_v1 & v1::HIGH_ENTROPY_ASLR_ALWAYS_ON, 0,
+            "HIGH_ENTROPY_ASLR_ALWAYS_ON missing from create-time bitmap");
+        assert_ne!(create_v1 & v1::STRICT_HANDLE_CHECKS_ALWAYS_ON, 0,
+            "STRICT_HANDLE_CHECKS_ALWAYS_ON missing from create-time bitmap");
+        assert_ne!(create_v1 & v1::IMAGE_LOAD_PREFER_SYSTEM32_ALWAYS_ON, 0,
+            "IMAGE_LOAD_PREFER_SYSTEM32_ALWAYS_ON missing from create-time bitmap");
+        assert_ne!(create_v1 & v1::IMAGE_LOAD_NO_REMOTE_ALWAYS_ON, 0,
+            "IMAGE_LOAD_NO_REMOTE_ALWAYS_ON missing from create-time bitmap");
+        assert_ne!(create_v1 & v1::EXTENSION_POINT_DISABLE_ALWAYS_ON, 0,
+            "EXTENSION_POINT_DISABLE_ALWAYS_ON missing from create-time bitmap");
+    }
+
+    /// Scan mode bitmap composition: hardening bits ON, JIT-killing bits OFF.
+    /// Scan is the JIT-friendly profile — agent runtimes (node, .NET, JVM)
+    /// must keep working. Block-non-MS and PROHIBIT_DYNAMIC_CODE both kill
+    /// JIT, so neither is set in either the policy or the create-time bitmap.
+    #[test]
+    fn scan_bitmap_excludes_jit_killers_includes_hardening() {
+        let (scan_m1, scan_m2) = compute(Profile::Scan);
+        // Scan never sets v2 today; lock that in so a future tweak doesn't
+        // accidentally enable CET on JIT-heavy targets.
+        assert_eq!(scan_m2, 0, "Scan profile must not set any v2 bits");
+
+        // JIT-killing bits — must be ABSENT.
+        assert_eq!(scan_m1 & v1::PROHIBIT_DYNAMIC_CODE_ALWAYS_ON, 0,
+            "Scan must not set PROHIBIT_DYNAMIC_CODE (breaks JIT runtimes)");
+        assert_eq!(scan_m1 & v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON, 0,
+            "Scan must not set BLOCK_NON_MICROSOFT_BINARIES (breaks 3p DLLs)");
+
+        // Hardening bits — must be PRESENT.
+        assert_ne!(scan_m1 & v1::FORCE_RELOCATE_IMAGES_ALWAYS_ON, 0);
+        assert_ne!(scan_m1 & v1::HEAP_TERMINATE_ALWAYS_ON, 0);
+        assert_ne!(scan_m1 & v1::BOTTOM_UP_ASLR_ALWAYS_ON, 0);
+        assert_ne!(scan_m1 & v1::HIGH_ENTROPY_ASLR_ALWAYS_ON, 0);
+        assert_ne!(scan_m1 & v1::STRICT_HANDLE_CHECKS_ALWAYS_ON, 0);
+        assert_ne!(scan_m1 & v1::IMAGE_LOAD_PREFER_SYSTEM32_ALWAYS_ON, 0);
+        assert_ne!(scan_m1 & v1::IMAGE_LOAD_NO_REMOTE_ALWAYS_ON, 0);
+        assert_ne!(scan_m1 & v1::EXTENSION_POINT_DISABLE_ALWAYS_ON, 0);
+    }
+
+    /// The Full create-time bitmap differs from the raw Full bitmap by
+    /// EXACTLY one bit (BLOCK_NON_MICROSOFT). Catches any future drift where
+    /// a maintainer adds another "runtime-only" exception without thinking it
+    /// through.
+    #[test]
+    fn create_time_strip_is_exactly_block_non_ms() {
+        let (full_m1, _) = compute(Profile::Full);
+        let create_v1 = full_m1 & !v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
+        let diff = full_m1 ^ create_v1;
+        assert_eq!(diff, v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON,
+            "create-time strip must remove exactly BLOCK_NON_MICROSOFT and nothing else");
+    }
 }

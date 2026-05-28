@@ -9,13 +9,19 @@ use windows::{
         System::{
             Console::GetConsoleWindow,
             Threading::{
-                CreateProcessW, TerminateProcess, CREATE_SUSPENDED,
-                PROCESS_INFORMATION, STARTUPINFOW,
+                CreateProcessW, DeleteProcThreadAttributeList,
+                InitializeProcThreadAttributeList, TerminateProcess,
+                UpdateProcThreadAttribute, CREATE_SUSPENDED,
+                EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+                PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROCESS_INFORMATION,
+                STARTUPINFOEXW, STARTUPINFOW,
             },
         },
         UI::WindowsAndMessaging::{ShowWindow, SW_HIDE},
     },
 };
+
+use winrsbox::mitigations::{self, v1 as miti_v1};
 
 // Raw FFI declaration for IsWow64Process2 — avoids pulling in the
 // Win32_System_SystemInformation feature for one symbol. Signature per
@@ -175,36 +181,148 @@ pub(crate) fn maybe_hide_console(debug: bool) {
 }
 
 /// Launch `target_args[0]` suspended under `cwd`, returning the PROCESS_INFORMATION.
-pub(crate) fn launch_suspended(cwd: &Path, target_args: &[String], _guard: crate::GuardLevel) -> Result<PROCESS_INFORMATION> {
-    // NOTE: mitigations are applied from WITHIN hook.dll (after hooks installed)
-    // via SetProcessMitigationPolicy — not from the launcher via
-    // PROC_THREAD_ATTRIBUTE, because BLOCK_NON_MICROSOFT_BINARIES would
-    // prevent loading our hook.dll in the first place.
-
+///
+/// Applies create-time kernel mitigations via PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY.
+/// The runtime-only `BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON` flag is dropped here
+/// (hook.dll is unsigned — kernel would reject its load if the bit were set at
+/// create time). That flag is re-applied AFTER hook.dll loads, from inside
+/// hook::apply_mitigations via SetProcessMitigationPolicy. All other v1/v2 bits
+/// only take effect at process create, so they MUST be passed via this path.
+pub(crate) fn launch_suspended(cwd: &Path, target_args: &[String], guard: crate::GuardLevel) -> Result<PROCESS_INFORMATION> {
     let cmdline = build_cmdline(target_args);
     let mut cmdline_wide: Vec<u16> = cmdline.encode_utf16().chain(Some(0)).collect();
     let cwd_wide: Vec<u16> = cwd.as_os_str().encode_wide().chain(Some(0)).collect();
 
-    let si = STARTUPINFOW {
-        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-        ..Default::default()
+    // ─── Compute mitigation bitmask for this guard level ───────────────────
+    let profile = match guard {
+        crate::GuardLevel::None => mitigations::Profile::None,
+        crate::GuardLevel::Scan => mitigations::Profile::Scan,
+        crate::GuardLevel::Full => mitigations::Profile::Full,
     };
+    let (v1, v2) = mitigations::compute(profile);
+    // Strip BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON — kernel enforces this at
+    // image-load time. With it set BEFORE hook.dll loads, kernel32!LoadLibrary
+    // would refuse our unsigned hook.dll and brick the sandbox. hook::apply_
+    // mitigations re-applies the runtime SignaturePolicy flag once hook.dll
+    // has finished installing detours.
+    let create_v1 = v1 & !miti_v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
+    let has_mitigations = (create_v1 != 0) || (v2 != 0);
+    // Stack-allocated 16-byte buffer; must outlive CreateProcessW (the kernel
+    // reads from the pointer stored in the attribute list, not a copy).
+    let bytes = mitigations::to_bytes(create_v1, v2);
+
     let mut pi = PROCESS_INFORMATION::default();
 
+    // ─── Build the attribute list (only if we have any mitigation bits) ────
+    //
+    // SAFETY for the whole block: the buffers used by UpdateProcThreadAttribute
+    // (here: `bytes` for PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY) MUST outlive
+    // the CreateProcessW call AND the DeleteProcThreadAttributeList call. We
+    // keep `bytes` (stack) and `attr_buf` (heap Vec) on this stack frame past
+    // both. `attr_list` is a raw pointer into `attr_buf`'s backing storage.
+    let mut attr_buf: Vec<u8> = Vec::new();
+    let mut attr_list = LPPROC_THREAD_ATTRIBUTE_LIST::default();
+    let mut creation_flags = CREATE_SUSPENDED;
+
+    if has_mitigations {
+        // First call: query required buffer size. Expected to fail with
+        // ERROR_INSUFFICIENT_BUFFER and write attr_list_size. Ignore the Result.
+        let mut attr_list_size: usize = 0;
+        // SAFETY: passing None for lpattributelist is the documented way to query size.
+        let _ = unsafe {
+            InitializeProcThreadAttributeList(None, 1, None, &mut attr_list_size)
+        };
+        anyhow::ensure!(
+            attr_list_size > 0,
+            "InitializeProcThreadAttributeList returned size=0 (driver inconsistency)",
+        );
+        attr_buf = vec![0u8; attr_list_size];
+        attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_buf.as_mut_ptr() as *mut _);
+
+        // SAFETY: attr_buf is at least attr_list_size bytes; pointer is valid.
+        unsafe {
+            InitializeProcThreadAttributeList(Some(attr_list), 1, None, &mut attr_list_size)
+        }
+        .context("InitializeProcThreadAttributeList failed")?;
+
+        // SAFETY: bytes is a stack 16-byte array; pointer valid for the
+        // duration of the CreateProcessW call (and the subsequent
+        // DeleteProcThreadAttributeList — the kernel keeps the buffer pointer
+        // in the attribute list, not a copy).
+        let update_result = unsafe {
+            UpdateProcThreadAttribute(
+                attr_list,
+                0,
+                PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY as usize,
+                Some(bytes.as_ptr() as *const std::ffi::c_void),
+                bytes.len(),
+                None,
+                None,
+            )
+        };
+        if let Err(e) = update_result {
+            // SAFETY: attr_list was successfully Initialize'd above.
+            unsafe { DeleteProcThreadAttributeList(attr_list); }
+            return Err(anyhow::Error::from(e))
+                .context("UpdateProcThreadAttribute(MITIGATION_POLICY) failed");
+        }
+        creation_flags |= EXTENDED_STARTUPINFO_PRESENT;
+    }
+
+    // STARTUPINFOEXW is repr(C) with STARTUPINFOW as the first field, so
+    // CreateProcessW (which expects *const STARTUPINFOW) can read the W part
+    // from a pointer to the EXW; `cb` must equal sizeof(STARTUPINFOEXW) so
+    // the kernel knows to look past the W tail at lpAttributeList. When we
+    // have no mitigations, we still use STARTUPINFOEXW for code simplicity
+    // but set `cb = sizeof(STARTUPINFOW)` and omit EXTENDED_STARTUPINFO_PRESENT
+    // so the kernel ignores the unused tail.
+    let si_ex = STARTUPINFOEXW {
+        StartupInfo: STARTUPINFOW {
+            cb: if has_mitigations {
+                std::mem::size_of::<STARTUPINFOEXW>() as u32
+            } else {
+                std::mem::size_of::<STARTUPINFOW>() as u32
+            },
+            ..Default::default()
+        },
+        lpAttributeList: attr_list,
+    };
+    // *const STARTUPINFOW — same address regardless of has_mitigations: the
+    // STARTUPINFOW header sits at offset 0 of STARTUPINFOEXW (repr(C)).
+    let si_ptr: *const STARTUPINFOW = &si_ex.StartupInfo;
+
     // SAFETY: cmdline_wide and cwd_wide are valid null-terminated UTF-16 strings.
-    unsafe {
+    //         attr_list (if used) is initialized and was populated above.
+    //         si_ex stays alive for the duration of this call.
+    let create_result = unsafe {
         CreateProcessW(
             PCWSTR::null(),
             Some(windows::core::PWSTR(cmdline_wide.as_mut_ptr())),
             None, None, false,
-            CREATE_SUSPENDED,
+            creation_flags,
             None,
             PCWSTR(cwd_wide.as_ptr()),
-            &si,
+            si_ptr,
             &mut pi,
         )
+    };
+
+    // Free the attribute list — kernel has copied what it needs from it by
+    // the time CreateProcessW returns (success OR failure). Per MSDN,
+    // DeleteProcThreadAttributeList does NOT free the buffer pointers we
+    // attached (bytes); we manage their lifetime ourselves via Rust's stack.
+    if has_mitigations {
+        // SAFETY: attr_list was Initialize'd; safe to Delete exactly once.
+        unsafe { DeleteProcThreadAttributeList(attr_list); }
     }
-    .context("CreateProcessW failed")?;
+    // Touch si_ex AFTER CreateProcessW to ensure the compiler doesn't move
+    // the drop earlier. (Defensive — repr(C) on-stack lifetime already covers
+    // the syscall, but the read is free and documents intent.)
+    let _ = si_ex.StartupInfo.cb;
+    // Touch attr_buf to assert it stayed alive past the syscall.
+    let _ = attr_buf.len();
+
+    create_result.context("CreateProcessW failed")?;
 
     // ─── Refuse 32-bit (WoW64) children ─────────────────────────────────────
     //
