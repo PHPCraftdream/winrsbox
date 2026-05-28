@@ -104,6 +104,11 @@ pub fn is_write_access(desired: ACCESS_MASK, disposition: u32) -> bool {
 pub(crate) const STATUS_ACCESS_DENIED: NTSTATUS = 0xC000_0022_u32 as NTSTATUS;
 pub(crate) const STATUS_OBJECT_NAME_NOT_FOUND: NTSTATUS = 0xC000_0034_u32 as NTSTATUS;
 pub(crate) const STATUS_PRIVILEGE_NOT_HELD: NTSTATUS = 0xC000_0061_u32 as NTSTATUS;
+/// Returned by the KTM (transacted-registry) hook handlers — these syscalls
+/// give callers a CLR/RegOpenKeyTransacted-style escape vector around the
+/// regular registry write hooks. We refuse the transaction outright rather
+/// than try to overlay it.
+pub(crate) const STATUS_NOT_SUPPORTED: NTSTATUS = 0xC000_00BB_u32 as NTSTATUS;
 
 // ---------------------------------------------------------------------------
 // decide() — consults cache then IPC
@@ -1154,5 +1159,10 @@ mod status_constant_tests {
     #[test]
     fn status_privilege_not_held_is_canonical() {
         assert_eq!(STATUS_PRIVILEGE_NOT_HELD, 0xC000_0061_u32 as i32);
+    }
+
+    #[test]
+    fn status_not_supported_is_canonical() {
+        assert_eq!(STATUS_NOT_SUPPORTED, 0xC000_00BB_u32 as i32);
     }
 }

@@ -138,6 +138,19 @@ const REGDB_E_CLASSNOTREG: i32 = 0x8004_0154_u32 as i32;
 // WinRT activation denylist (case-insensitive prefix match on runtime class name)
 // ---------------------------------------------------------------------------
 
+// NOTE on `windows.devices` umbrella entry:
+//
+// We deliberately deny the entire `Windows.Devices.*` namespace as a single
+// policy choice rather than enumerating each leaf (`Bluetooth`, `Usb`, `Hid`,
+// `SmartCards`, `PointOfService`, `Geolocation`, `Sensors`, `Radios`, ...).
+// The sandbox has no legitimate need for any device-control or device-data API:
+//   * Any subspace is a plausible exfil vector (Geolocation, Radios, Sensors).
+//   * Any subspace is a plausible peripheral-spoofing vector (Hid, Usb, Bluetooth).
+//   * New Windows.Devices.* leaves added by future Windows releases are
+//     automatically covered without requiring a denylist update.
+// If a sandboxed workload legitimately needs (e.g.) Geolocation, the correct
+// path is a launcher-side capability grant rather than poking holes in this
+// umbrella block.
 const WINRT_DENY_PREFIXES: &[&str] = &[
     "windows.system.launcher",                  // LaunchUriAsync, LaunchFileAsync
     "windows.system.remotelauncher",
@@ -151,6 +164,19 @@ const WINRT_DENY_PREFIXES: &[&str] = &[
     "windows.networking.sockets",               // socket via WinRT (defense-in-depth)
     "windows.ui.notifications",                 // toast persistence
     "windows.system.scheduler",                 // TaskScheduler equivalent
+    "windows.system.power",                     // PowerManager.RequestShutdown/Restart
+    "windows.system.threading",                 // ThreadPoolTimer delayed callbacks
+    "windows.system.userprofile",
+    "windows.system.profile",                   // hardware-id exfil
+    "windows.devices",                          // umbrella: Bluetooth/USB/HID/etc — see note above
+    "windows.foundation.diagnostics",           // user-mode ETW
+    "windows.ui.notifications.management",      // toast exfil
+    "windows.applicationmodel.core",
+    "windows.applicationmodel.activation",
+    "windows.applicationmodel.contacts",
+    "windows.applicationmodel.appointments",
+    "windows.security.credentials",             // PasswordVault credential extraction
+    "windows.security.exchangeactivesyncprovisioning",
 ];
 
 /// Returns true if `name` matches any denied WinRT activation class prefix
@@ -605,5 +631,72 @@ mod tests {
         // distinct identifier must NOT match.
         assert!(!is_winrt_class_denied("Windows.System.LauncherEx"));
         assert!(!is_winrt_class_denied("Windows.System.SchedulerService"));
+    }
+
+    /// Smoke-check every entry in `WINRT_DENY_PREFIXES` so a typo or stray
+    /// uppercase character in the table is caught at test time. Iterates the
+    /// full list and asserts both the exact prefix and a `.<sub>` form match.
+    #[test]
+    fn coverage_of_every_listed_winrt_prefix() {
+        for p in WINRT_DENY_PREFIXES {
+            // Exact-prefix form must match.
+            assert!(
+                is_winrt_class_denied(p),
+                "expected to be denied (exact): {p}"
+            );
+            // Sub-namespace form (`prefix.Child`) must also match.
+            let sub = format!("{p}.Child");
+            assert!(
+                is_winrt_class_denied(&sub),
+                "expected to be denied (sub): {sub}"
+            );
+            // Uppercased form must match (case-insensitive guarantee).
+            let upper: String = p.to_ascii_uppercase();
+            assert!(
+                is_winrt_class_denied(&upper),
+                "expected to be denied (uppercased): {upper}"
+            );
+            // Every entry must itself be stored in lowercase or the
+            // case-insensitive comparison will silently miss it.
+            assert_eq!(
+                *p,
+                p.to_ascii_lowercase(),
+                "WINRT_DENY_PREFIXES entry not lowercased: {p}"
+            );
+        }
+    }
+
+    /// Pins the size of the WinRT denylist so silent regressions (an entry
+    /// accidentally deleted during a merge) are caught at test time.
+    /// Update this number deliberately when adding/removing entries.
+    #[test]
+    fn winrt_deny_list_count_pinned() {
+        assert_eq!(WINRT_DENY_PREFIXES.len(), 25);
+    }
+
+    /// Spot-checks for the newly added entries — each one should match a
+    /// realistic class name that exists in the Windows.* namespace.
+    #[test]
+    fn newly_added_winrt_prefixes_match_realistic_classes() {
+        assert!(is_winrt_class_denied("Windows.System.Power.PowerManager"));
+        assert!(is_winrt_class_denied("Windows.System.Threading.ThreadPoolTimer"));
+        assert!(is_winrt_class_denied("Windows.System.UserProfile.GlobalizationPreferences"));
+        assert!(is_winrt_class_denied("Windows.System.Profile.AnalyticsInfo"));
+        // Devices umbrella covers every leaf.
+        assert!(is_winrt_class_denied("Windows.Devices.Bluetooth.BluetoothDevice"));
+        assert!(is_winrt_class_denied("Windows.Devices.Usb.UsbDevice"));
+        assert!(is_winrt_class_denied("Windows.Devices.HumanInterfaceDevice.HidDevice"));
+        assert!(is_winrt_class_denied("Windows.Devices.Geolocation.Geolocator"));
+        assert!(is_winrt_class_denied("Windows.Devices.Radios.Radio"));
+        assert!(is_winrt_class_denied("Windows.Foundation.Diagnostics.LoggingChannel"));
+        assert!(is_winrt_class_denied("Windows.UI.Notifications.Management.UserNotificationListener"));
+        assert!(is_winrt_class_denied("Windows.ApplicationModel.Core.CoreApplication"));
+        assert!(is_winrt_class_denied("Windows.ApplicationModel.Activation.LaunchActivatedEventArgs"));
+        assert!(is_winrt_class_denied("Windows.ApplicationModel.Contacts.Contact"));
+        assert!(is_winrt_class_denied("Windows.ApplicationModel.Appointments.Appointment"));
+        assert!(is_winrt_class_denied("Windows.Security.Credentials.PasswordVault"));
+        assert!(is_winrt_class_denied(
+            "Windows.Security.ExchangeActiveSyncProvisioning.EasClientDeviceInformation"
+        ));
     }
 }
