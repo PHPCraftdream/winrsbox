@@ -18,7 +18,7 @@ use winapi::ctypes::c_void;
 use winapi::um::processthreadsapi::GetCurrentProcessId;
 
 use crate::anti_rec;
-use crate::hooks::{ipc_log, is_trace};
+use crate::hooks::{ipc_log, is_trace, STATUS_ACCESS_DENIED};
 
 // ---------------------------------------------------------------------------
 // Nt* function type aliases
@@ -263,8 +263,6 @@ fn get_mapped_file_basename(addr: *const c_void) -> Option<String> {
         Some(basename.to_ascii_lowercase())
     }
 }
-
-const STATUS_ACCESS_DENIED: NTSTATUS = 0xC000_0022_u32 as NTSTATUS;
 
 // ---------------------------------------------------------------------------
 // Hook: NtUnmapViewOfSection — deny foreign-process unmap (Process Hollowing)

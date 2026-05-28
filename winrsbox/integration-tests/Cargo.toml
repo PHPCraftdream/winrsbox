@@ -351,6 +351,14 @@ path = "src/bin/escape_impersonate_thread.rs"
 name = "escape_open_thread_token"
 path = "src/bin/escape_open_thread_token.rs"
 
+[[bin]]
+name = "clean_write_one_file"
+path = "src/bin/clean_write_one_file.rs"
+
+[[bin]]
+name = "spawn_two_children"
+path = "src/bin/spawn_two_children.rs"
+
 [[test]]
 name = "mock_integration"
 path = "tests/mock_integration.rs"
@@ -362,6 +370,10 @@ path = "tests/memory_guard.rs"
 [[test]]
 name = "real_world"
 path = "tests/real_world.rs"
+
+[[test]]
+name = "concurrent_children"
+path = "tests/concurrent_children.rs"
 
 [dependencies]
 policy = { path = "../policy" }

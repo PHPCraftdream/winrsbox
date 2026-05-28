@@ -2195,7 +2195,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "windows 0.61.3",
- "windows-targets",
  "winreg",
  "xxhash-rust",
 ]

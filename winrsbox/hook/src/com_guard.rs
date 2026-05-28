@@ -1,12 +1,15 @@
 // COM guard — blocks out-of-proc COM activation (CoCreateInstance / CoCreateInstanceEx /
 // CoGetClassObject) for dangerous CLSIDs that allow sandbox escape via process spawn or
-// system modification.
+// system modification. Also blocks WinRT (Windows Runtime) activation via
+// RoGetActivationFactory / RoActivateInstance for dangerous runtime class prefixes
+// (Windows.System.Launcher, Windows.Management.Deployment, ...).
 //
 // Denylisted CLSIDs: Shell.Application, WScript.Shell, FileSystemObject, WMI, Task Scheduler,
 // BITS, Office automation. All are well-known escape vectors for AI agents.
 //
 // Hook targets: combase.dll!CoCreateInstance, combase.dll!CoCreateInstanceEx,
-//               combase.dll!CoGetClassObject.
+//               combase.dll!CoGetClassObject, combase.dll!RoGetActivationFactory,
+//               combase.dll!RoActivateInstance.
 
 use std::sync::OnceLock;
 
@@ -64,6 +67,7 @@ fn clsid_eq(a: &GUID, b: &GUID) -> bool {
 
 fn check_denylist(clsid: *const GUID) -> Option<&'static str> {
     if clsid.is_null() { return None; }
+    // SAFETY: deref of non-null GUID pointer — caller must ensure it points to a valid GUID.
     let clsid = unsafe { &*clsid };
     for entry in CLSID_DENYLIST {
         if clsid_eq(clsid, &entry.clsid) {
@@ -84,7 +88,7 @@ fn check_denylist(clsid: *const GUID) -> Option<&'static str> {
 //   REFIID    riid,
 //   LPVOID    *ppv
 // );
-type FnCoCreateInstance = unsafe extern "C" fn(
+type FnCoCreateInstance = unsafe extern "system" fn(
     *const GUID,       // rclsid
     *mut c_void,       // pUnkOuter
     u32,               // dwClsContext
@@ -100,7 +104,7 @@ type FnCoCreateInstance = unsafe extern "C" fn(
 //   DWORD            dwCount,
 //   MULTI_QI         *pResults
 // );
-type FnCoCreateInstanceEx = unsafe extern "C" fn(
+type FnCoCreateInstanceEx = unsafe extern "system" fn(
     *const GUID, // Clsid
     *mut c_void, // punkOuter
     u32,         // dwClsCtx
@@ -116,7 +120,7 @@ type FnCoCreateInstanceEx = unsafe extern "C" fn(
 //   REFIID       riid,
 //   LPVOID       *ppv
 // );
-type FnCoGetClassObject = unsafe extern "C" fn(
+type FnCoGetClassObject = unsafe extern "system" fn(
     *const GUID,       // rclsid
     u32,               // dwClsContext
     *mut c_void,       // pvReserved (COSERVERINFO*)
@@ -126,6 +130,102 @@ type FnCoGetClassObject = unsafe extern "C" fn(
 
 const E_ACCESSDENIED: i32 = 0x8007_0005_u32 as i32;
 
+// REGDB_E_CLASSNOTREG — class not registered. Benign-looking COM error returned
+// to denied WinRT activations so the caller takes a clean failure path.
+const REGDB_E_CLASSNOTREG: i32 = 0x8004_0154_u32 as i32;
+
+// ---------------------------------------------------------------------------
+// WinRT activation denylist (case-insensitive prefix match on runtime class name)
+// ---------------------------------------------------------------------------
+
+const WINRT_DENY_PREFIXES: &[&str] = &[
+    "windows.system.launcher",                  // LaunchUriAsync, LaunchFileAsync
+    "windows.system.remotelauncher",
+    "windows.system.diagnostics",               // ProcessDiagnosticInfo
+    "windows.applicationmodel.appservice",
+    "windows.applicationmodel.background",      // BackgroundTaskRegistration
+    "windows.management.deployment",            // PackageManager
+    "windows.storage.pickers",                  // FileOpenPicker
+    "windows.system.remotedesktop",
+    "windows.system.remotesystems",
+    "windows.networking.sockets",               // socket via WinRT (defense-in-depth)
+    "windows.ui.notifications",                 // toast persistence
+    "windows.system.scheduler",                 // TaskScheduler equivalent
+];
+
+/// Returns true if `name` matches any denied WinRT activation class prefix
+/// (case-insensitive). Extracted as a free function so it's unit-testable
+/// without touching any FFI or detour state.
+fn is_winrt_class_denied(name: &str) -> bool {
+    // We do per-byte ASCII lowercase comparison to avoid allocating a lowercased
+    // copy of every incoming class name. All denylist entries and all valid WinRT
+    // runtime class names are ASCII per Windows.Foundation rules.
+    let bytes = name.as_bytes();
+    for prefix in WINRT_DENY_PREFIXES {
+        let p = prefix.as_bytes();
+        if bytes.len() < p.len() { continue; }
+        let mut ok = true;
+        for i in 0..p.len() {
+            if bytes[i].to_ascii_lowercase() != p[i] {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            // For a "prefix" match, accept either end-of-string or a separator
+            // (`.`) immediately after the prefix to avoid the prefix accidentally
+            // matching a longer unrelated identifier.
+            if bytes.len() == p.len() {
+                return true;
+            }
+            let next = bytes[p.len()];
+            if next == b'.' {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// WinRT function types
+// ---------------------------------------------------------------------------
+
+// HSTRING is an opaque handle to a counted, immutable UTF-16 string.
+// In the Windows headers it's typedef'd as `HSTRING__*`; for FFI we treat it
+// as an opaque pointer.
+type HSTRING = *mut c_void;
+
+// HRESULT RoGetActivationFactory(
+//   HSTRING activatableClassId,
+//   REFIID  iid,
+//   void**  factory
+// );
+type FnRoGetActivationFactory = unsafe extern "system" fn(
+    HSTRING,           // activatableClassId
+    *const GUID,       // iid
+    *mut *mut c_void,  // factory
+) -> i32;
+
+// HRESULT RoActivateInstance(
+//   HSTRING       activatableClassId,
+//   IInspectable **instance
+// );
+type FnRoActivateInstance = unsafe extern "system" fn(
+    HSTRING,           // activatableClassId
+    *mut *mut c_void,  // instance (IInspectable**)
+) -> i32;
+
+// PCWSTR WindowsGetStringRawBuffer(HSTRING string, UINT32 *length);
+// Returns a pointer to the underlying UTF-16 buffer. The buffer is valid for
+// the lifetime of the HSTRING and is NOT null-terminated guarantees-wise —
+// caller must use the returned length. For a null HSTRING (= empty string),
+// returns a pointer to a zero-length buffer and writes 0 to *length.
+type FnWindowsGetStringRawBuffer = unsafe extern "system" fn(
+    HSTRING,    // string
+    *mut u32,   // length (out, in UTF-16 code units)
+) -> *const u16;
+
 // ---------------------------------------------------------------------------
 // Detour storage
 // ---------------------------------------------------------------------------
@@ -133,12 +233,19 @@ const E_ACCESSDENIED: i32 = 0x8007_0005_u32 as i32;
 static HOOK_CO_CREATE_INSTANCE: OnceLock<GenericDetour<FnCoCreateInstance>> = OnceLock::new();
 static HOOK_CO_CREATE_INSTANCE_EX: OnceLock<GenericDetour<FnCoCreateInstanceEx>> = OnceLock::new();
 static HOOK_CO_GET_CLASS_OBJECT: OnceLock<GenericDetour<FnCoGetClassObject>> = OnceLock::new();
+static HOOK_RO_GET_ACTIVATION_FACTORY: OnceLock<GenericDetour<FnRoGetActivationFactory>> = OnceLock::new();
+static HOOK_RO_ACTIVATE_INSTANCE: OnceLock<GenericDetour<FnRoActivateInstance>> = OnceLock::new();
+
+/// Cached pointer to combase!WindowsGetStringRawBuffer. Resolved at install
+/// time. Used inside both WinRT hook trampolines to decode the HSTRING.
+static WINDOWS_GET_STRING_RAW_BUFFER: OnceLock<FnWindowsGetStringRawBuffer> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Hook implementations
 // ---------------------------------------------------------------------------
 
-unsafe extern "C" fn hook_co_create_instance(
+// SAFETY: Called by detour2 dispatcher with combase!CoCreateInstance ABI.
+unsafe extern "system" fn hook_co_create_instance(
     rclsid: *const GUID,
     p_unk_outer: *mut c_void,
     dw_cls_context: u32,
@@ -146,6 +253,7 @@ unsafe extern "C" fn hook_co_create_instance(
     ppv: *mut *mut c_void,
 ) -> i32 {
     let call_original = || {
+        // SAFETY: detour2 trampoline matches FnCoCreateInstance ABI.
         HOOK_CO_CREATE_INSTANCE.get().unwrap().call(
             rclsid, p_unk_outer, dw_cls_context, riid, ppv,
         )
@@ -169,7 +277,8 @@ unsafe extern "C" fn hook_co_create_instance(
     call_original()
 }
 
-unsafe extern "C" fn hook_co_create_instance_ex(
+// SAFETY: Called by detour2 dispatcher with combase!CoCreateInstanceEx ABI.
+unsafe extern "system" fn hook_co_create_instance_ex(
     clsid: *const GUID,
     punk_outer: *mut c_void,
     dw_cls_ctx: u32,
@@ -178,6 +287,7 @@ unsafe extern "C" fn hook_co_create_instance_ex(
     p_results: *mut c_void,
 ) -> i32 {
     let call_original = || {
+        // SAFETY: detour2 trampoline matches FnCoCreateInstanceEx ABI.
         HOOK_CO_CREATE_INSTANCE_EX.get().unwrap().call(
             clsid, punk_outer, dw_cls_ctx, p_server_info, dw_count, p_results,
         )
@@ -198,7 +308,8 @@ unsafe extern "C" fn hook_co_create_instance_ex(
     call_original()
 }
 
-unsafe extern "C" fn hook_co_get_class_object(
+// SAFETY: Called by detour2 dispatcher with combase!CoGetClassObject ABI.
+unsafe extern "system" fn hook_co_get_class_object(
     rclsid: *const GUID,
     dw_cls_context: u32,
     pv_reserved: *mut c_void,
@@ -206,6 +317,7 @@ unsafe extern "C" fn hook_co_get_class_object(
     ppv: *mut *mut c_void,
 ) -> i32 {
     let call_original = || {
+        // SAFETY: detour2 trampoline matches FnCoGetClassObject ABI.
         HOOK_CO_GET_CLASS_OBJECT.get().unwrap().call(
             rclsid, dw_cls_context, pv_reserved, riid, ppv,
         )
@@ -230,13 +342,117 @@ unsafe extern "C" fn hook_co_get_class_object(
 }
 
 // ---------------------------------------------------------------------------
+// WinRT hook implementations
+// ---------------------------------------------------------------------------
+
+/// Decode an HSTRING to an owned `String` for matching against the denylist.
+///
+/// Returns `None` when:
+///   - the HSTRING is null (treated as empty / not-matched),
+///   - WindowsGetStringRawBuffer was not resolved (very old build), or
+///   - the resolver returned a null/zero-length buffer.
+///
+/// # SAFETY
+/// Caller must hold an anti_rec guard. `hs` is interpreted as a combase
+/// HSTRING handle; if the caller passed a non-null value that is not a valid
+/// HSTRING, behavior is whatever combase does in that case (typically a clean
+/// error inside WindowsGetStringRawBuffer).
+unsafe fn decode_hstring(hs: HSTRING) -> Option<String> {
+    if hs.is_null() {
+        return None;
+    }
+    let resolver = WINDOWS_GET_STRING_RAW_BUFFER.get().copied()?;
+    let mut len: u32 = 0;
+    let buf = resolver(hs, &mut len as *mut u32);
+    if buf.is_null() || len == 0 {
+        return None;
+    }
+    // SAFETY: combase guarantees `buf` points to `len` valid UTF-16 code units
+    // for the lifetime of `hs`. We are still inside the hooked call, so the
+    // caller's HSTRING reference keeps the buffer alive.
+    let slice = std::slice::from_raw_parts(buf, len as usize);
+    Some(String::from_utf16_lossy(slice))
+}
+
+// SAFETY: Called by detour2 dispatcher with combase!RoGetActivationFactory ABI.
+unsafe extern "system" fn hook_ro_get_activation_factory(
+    activatable_class_id: HSTRING,
+    iid: *const GUID,
+    factory: *mut *mut c_void,
+) -> i32 {
+    let call_original = || {
+        // SAFETY: detour2 trampoline matches FnRoGetActivationFactory ABI.
+        HOOK_RO_GET_ACTIVATION_FACTORY.get().unwrap().call(
+            activatable_class_id, iid, factory,
+        )
+    };
+
+    let Some(_guard) = anti_rec::enter() else {
+        return call_original();
+    };
+
+    if let Some(class_name) = decode_hstring(activatable_class_id) {
+        if is_winrt_class_denied(&class_name) {
+            crate::hooks::ipc_log_violation(ipc::Req::Log {
+                pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                level: ipc::LogLevel::Warn,
+                msg: format!("winrt_activation_blocked: {class_name}"),
+            });
+            if !factory.is_null() {
+                *factory = std::ptr::null_mut();
+            }
+            return REGDB_E_CLASSNOTREG;
+        }
+    }
+
+    call_original()
+}
+
+// SAFETY: Called by detour2 dispatcher with combase!RoActivateInstance ABI.
+unsafe extern "system" fn hook_ro_activate_instance(
+    activatable_class_id: HSTRING,
+    instance: *mut *mut c_void,
+) -> i32 {
+    let call_original = || {
+        // SAFETY: detour2 trampoline matches FnRoActivateInstance ABI.
+        HOOK_RO_ACTIVATE_INSTANCE.get().unwrap().call(
+            activatable_class_id, instance,
+        )
+    };
+
+    let Some(_guard) = anti_rec::enter() else {
+        return call_original();
+    };
+
+    if let Some(class_name) = decode_hstring(activatable_class_id) {
+        if is_winrt_class_denied(&class_name) {
+            crate::hooks::ipc_log_violation(ipc::Req::Log {
+                pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                level: ipc::LogLevel::Warn,
+                msg: format!("winrt_activation_blocked: {class_name}"),
+            });
+            if !instance.is_null() {
+                *instance = std::ptr::null_mut();
+            }
+            return REGDB_E_CLASSNOTREG;
+        }
+    }
+
+    call_original()
+}
+
+// ---------------------------------------------------------------------------
 // combase.dll export resolver
 // ---------------------------------------------------------------------------
 
+/// # SAFETY
+/// Must be called during install (DllMain context). `name` must be a null-terminated ASCII byte string.
 unsafe fn combase_export(name: &[u8]) -> Option<*const c_void> {
     let module_w: Vec<u16> = "combase.dll\0".encode_utf16().collect();
+    // SAFETY: FFI call to LoadLibraryW with null-terminated wide string.
     let h = winapi::um::libloaderapi::LoadLibraryW(module_w.as_ptr());
     if h.is_null() { return None; }
+    // SAFETY: FFI call to GetProcAddress with valid HMODULE and null-terminated ASCII name.
     let addr = winapi::um::libloaderapi::GetProcAddress(h, name.as_ptr() as *const i8);
     if addr.is_null() { None } else { Some(addr as *const c_void) }
 }
@@ -245,9 +461,12 @@ unsafe fn combase_export(name: &[u8]) -> Option<*const c_void> {
 // Install / Uninstall
 // ---------------------------------------------------------------------------
 
+/// # SAFETY
+/// Must be called from install_hooks() in DllMain context with anti_rec entered.
 pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     // CoCreateInstance
     if let Some(addr1) = combase_export(b"CoCreateInstance\0") {
+        // SAFETY: transmute of combase.dll export address; ABI matches FnCoCreateInstance.
         let target1: FnCoCreateInstance = std::mem::transmute(addr1);
         let hook_ptr1: FnCoCreateInstance = hook_co_create_instance;
         let detour1 = GenericDetour::<FnCoCreateInstance>::new(target1, hook_ptr1)
@@ -262,6 +481,7 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
 
     // CoCreateInstanceEx
     if let Some(addr2) = combase_export(b"CoCreateInstanceEx\0") {
+        // SAFETY: transmute of combase.dll export address; ABI matches FnCoCreateInstanceEx.
         let target2: FnCoCreateInstanceEx = std::mem::transmute(addr2);
         let hook_ptr2: FnCoCreateInstanceEx = hook_co_create_instance_ex;
         let detour2 = GenericDetour::<FnCoCreateInstanceEx>::new(target2, hook_ptr2)
@@ -276,6 +496,7 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
 
     // CoGetClassObject
     if let Some(addr3) = combase_export(b"CoGetClassObject\0") {
+        // SAFETY: transmute of combase.dll export address; ABI matches FnCoGetClassObject.
         let target3: FnCoGetClassObject = std::mem::transmute(addr3);
         let hook_ptr3: FnCoGetClassObject = hook_co_get_class_object;
         let detour3 = GenericDetour::<FnCoGetClassObject>::new(target3, hook_ptr3)
@@ -288,14 +509,101 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
             "com_guard: combase.dll export CoGetClassObject not found — skipping".into());
     }
 
+    // WindowsGetStringRawBuffer — required to decode HSTRING inside WinRT hooks.
+    // If absent (very old Win build pre-RT), we skip installing the WinRT hooks
+    // entirely rather than installing them in a half-functional state.
+    let raw_buffer_resolved = if let Some(addr_rb) = combase_export(b"WindowsGetStringRawBuffer\0") {
+        // SAFETY: transmute of combase.dll export address; ABI matches FnWindowsGetStringRawBuffer.
+        let f: FnWindowsGetStringRawBuffer = std::mem::transmute(addr_rb);
+        let _ = WINDOWS_GET_STRING_RAW_BUFFER.set(f);
+        true
+    } else {
+        ipc_log(ipc::LogLevel::Warn,
+            "com_guard: combase.dll export WindowsGetStringRawBuffer not found — skipping WinRT hooks".into());
+        false
+    };
+
+    // RoGetActivationFactory
+    if raw_buffer_resolved {
+        if let Some(addr4) = combase_export(b"RoGetActivationFactory\0") {
+            // SAFETY: transmute of combase.dll export address; ABI matches FnRoGetActivationFactory.
+            let target4: FnRoGetActivationFactory = std::mem::transmute(addr4);
+            let hook_ptr4: FnRoGetActivationFactory = hook_ro_get_activation_factory;
+            let detour4 = GenericDetour::<FnRoGetActivationFactory>::new(target4, hook_ptr4)
+                .map_err(|e| format!("detour init RoGetActivationFactory: {:?}", e))?;
+            HOOK_RO_GET_ACTIVATION_FACTORY.set(detour4).ok();
+            HOOK_RO_GET_ACTIVATION_FACTORY.get().expect("set above").enable()
+                .map_err(|e| format!("detour enable RoGetActivationFactory: {:?}", e))?;
+        } else {
+            ipc_log(ipc::LogLevel::Warn,
+                "com_guard: combase.dll export RoGetActivationFactory not found — skipping".into());
+        }
+
+        // RoActivateInstance
+        if let Some(addr5) = combase_export(b"RoActivateInstance\0") {
+            // SAFETY: transmute of combase.dll export address; ABI matches FnRoActivateInstance.
+            let target5: FnRoActivateInstance = std::mem::transmute(addr5);
+            let hook_ptr5: FnRoActivateInstance = hook_ro_activate_instance;
+            let detour5 = GenericDetour::<FnRoActivateInstance>::new(target5, hook_ptr5)
+                .map_err(|e| format!("detour init RoActivateInstance: {:?}", e))?;
+            HOOK_RO_ACTIVATE_INSTANCE.set(detour5).ok();
+            HOOK_RO_ACTIVATE_INSTANCE.get().expect("set above").enable()
+                .map_err(|e| format!("detour enable RoActivateInstance: {:?}", e))?;
+        } else {
+            ipc_log(ipc::LogLevel::Warn,
+                "com_guard: combase.dll export RoActivateInstance not found — skipping".into());
+        }
+    }
+
     if is_trace() {
         ipc_log(ipc::LogLevel::Trace, "com_guard_installed".into());
     }
     Ok(())
 }
 
+/// # SAFETY
+/// Must be called from DLL_PROCESS_DETACH only.
 pub unsafe fn uninstall() {
     if let Some(h) = HOOK_CO_CREATE_INSTANCE.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_CO_CREATE_INSTANCE_EX.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_CO_GET_CLASS_OBJECT.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_RO_GET_ACTIVATION_FACTORY.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_RO_ACTIVATE_INSTANCE.get() { let _ = h.disable(); }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn winrt_deny_matches_prefix_case_insensitive() {
+        // Exact match.
+        assert!(is_winrt_class_denied("Windows.System.Launcher"));
+        // Sub-class under denied prefix.
+        assert!(is_winrt_class_denied("Windows.System.Launcher.LaunchUriParameters"));
+        // Case-insensitive — uppercased prefix segment.
+        assert!(is_winrt_class_denied("WINDOWS.System.Launcher"));
+        // Fully uppercase.
+        assert!(is_winrt_class_denied("WINDOWS.SYSTEM.LAUNCHER.LAUNCHURIPARAMETERS"));
+
+        // Other denylist entries.
+        assert!(is_winrt_class_denied("Windows.Management.Deployment.PackageManager"));
+        assert!(is_winrt_class_denied("Windows.Storage.Pickers.FileOpenPicker"));
+        assert!(is_winrt_class_denied("Windows.System.Diagnostics.ProcessDiagnosticInfo"));
+        assert!(is_winrt_class_denied("Windows.ApplicationModel.AppService.AppServiceConnection"));
+
+        // NOT denied — different sub-namespace under Windows.
+        assert!(!is_winrt_class_denied("Windows.UI.Xaml.Controls.Button"));
+        assert!(!is_winrt_class_denied("Windows.Foundation.Uri"));
+        assert!(!is_winrt_class_denied("Windows.Data.Json.JsonObject"));
+
+        // Empty string must not match.
+        assert!(!is_winrt_class_denied(""));
+
+        // Regression: prefix must be bounded on a `.` separator — a class whose
+        // first segment shares a prefix-string with a denied entry but is a
+        // distinct identifier must NOT match.
+        assert!(!is_winrt_class_denied("Windows.System.LauncherEx"));
+        assert!(!is_winrt_class_denied("Windows.System.SchedulerService"));
+    }
 }

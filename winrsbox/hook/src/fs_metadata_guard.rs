@@ -13,6 +13,7 @@ use winapi::ctypes::c_void;
 
 use crate::anti_rec;
 use crate::hooks;
+use crate::hooks::STATUS_ACCESS_DENIED;
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -39,18 +40,35 @@ type FnNtFsControlFile = unsafe extern "system" fn(
     u32,                     // OutputBufferLength
 ) -> NTSTATUS;
 
+/// `NtSetEaFile` — writes NTFS Extended Attributes to an already-open handle.
+///
+/// Signature (per ntdll!NtSetEaFile, Windows 10/11 x64):
+/// ```c
+/// NTSTATUS NtSetEaFile(
+///     HANDLE FileHandle,
+///     PIO_STATUS_BLOCK IoStatusBlock,
+///     PVOID Buffer,
+///     ULONG Length
+/// );
+/// ```
+///
+/// EAs are off-band, do not appear in directory listings, persist across
+/// reboots, and have been documented as covert payload storage by
+/// BlackLotus-class loaders. No expected sandboxed workload writes EAs.
+type FnNtSetEaFile = unsafe extern "system" fn(
+    HANDLE,                  // FileHandle
+    *mut IO_STATUS_BLOCK,    // IoStatusBlock
+    *mut c_void,             // Buffer
+    u32,                     // Length
+) -> NTSTATUS;
+
 // ---------------------------------------------------------------------------
 // Detour storage
 // ---------------------------------------------------------------------------
 
 static HOOK_NT_SET_INFO_FILE: OnceLock<GenericDetour<FnNtSetInformationFile>> = OnceLock::new();
 static HOOK_NT_FS_CONTROL_FILE: OnceLock<GenericDetour<FnNtFsControlFile>> = OnceLock::new();
-
-// ---------------------------------------------------------------------------
-// STATUS codes
-// ---------------------------------------------------------------------------
-
-const STATUS_ACCESS_DENIED: NTSTATUS = 0xC000_0022_u32 as NTSTATUS;
+static HOOK_NT_SET_EA_FILE: OnceLock<GenericDetour<FnNtSetEaFile>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // FileInformationClass constants
@@ -254,6 +272,40 @@ unsafe extern "system" fn hook_nt_fs_control_file(
     call_original()
 }
 
+/// Unconditionally deny `NtSetEaFile`. Symmetric to the EA-buffer block in
+/// `hook_nt_create_file`: closes the post-open vector where a child writes
+/// EAs to a handle the sandbox already opened. NtQueryEaFile is read-only
+/// and intentionally left alone — info-leak is out of scope for this fix.
+///
+/// # Safety
+/// Called by the kernel via the installed detour with NT-ABI-conformant
+/// arguments. We do not dereference Buffer; we only write to IoStatusBlock
+/// if non-null. iosb is the only pointer touched and the standard NT
+/// convention guarantees it points at writable memory or is null.
+unsafe extern "system" fn hook_nt_set_ea_file(
+    _handle: HANDLE,
+    iosb: *mut IO_STATUS_BLOCK,
+    _buffer: *mut c_void,
+    length: u32,
+) -> NTSTATUS {
+    // No need to call original — unconditional deny.
+    // Skip anti_rec: this hook is a leaf (no NT re-entry), and even if our
+    // own code somehow set EAs we'd want to know about it.
+    if hooks::is_trace() {
+        hooks::ipc_log(ipc::LogLevel::Trace,
+            format!("nt_set_ea_file_blocked length={}", length));
+    }
+    crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+        pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+        level: ipc::LogLevel::Warn,
+        msg: format!("nt_set_ea_file_blocked length={}", length),
+    });
+    if !iosb.is_null() {
+        hooks::set_io_status(iosb, STATUS_ACCESS_DENIED);
+    }
+    STATUS_ACCESS_DENIED
+}
+
 // ---------------------------------------------------------------------------
 // Install / uninstall
 // ---------------------------------------------------------------------------
@@ -278,10 +330,100 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     install!(HOOK_NT_SET_INFO_FILE,   "NtSetInformationFile\0", hook_nt_set_information_file, FnNtSetInformationFile);
     install!(HOOK_NT_FS_CONTROL_FILE, "NtFsControlFile\0",      hook_nt_fs_control_file,      FnNtFsControlFile);
 
+    // NtSetEaFile — closes the post-open NTFS EA-write vector (audit H-S3).
+    // Best-effort: if this fails the rest of fs_metadata_guard is still
+    // useful, and the create-time EA block in fs_hooks.rs still catches
+    // EA-setting via NtCreateFile. Surface the failure via buffer_install_error.
+    match hooks::ntdll_export(b"NtSetEaFile\0") {
+        Some(addr) => {
+            let target: FnNtSetEaFile = std::mem::transmute(addr as usize);
+            let hook_ptr: FnNtSetEaFile = hook_nt_set_ea_file;
+            match GenericDetour::<FnNtSetEaFile>::new(target, hook_ptr) {
+                Ok(detour) => {
+                    let _ = HOOK_NT_SET_EA_FILE.set(detour);
+                    if let Some(d) = HOOK_NT_SET_EA_FILE.get() {
+                        if let Err(e) = d.enable() {
+                            crate::hooks::buffer_install_error(
+                                format!("NtSetEaFile enable failed: {:?}", e));
+                        }
+                    }
+                }
+                Err(e) => crate::hooks::buffer_install_error(
+                    format!("NtSetEaFile detour init failed: {:?}", e)),
+            }
+        }
+        None => crate::hooks::buffer_install_error(
+            "NtSetEaFile export not found in ntdll".into()),
+    }
+
     Ok(())
 }
 
 pub unsafe fn uninstall() {
+    if let Some(h) = HOOK_NT_SET_EA_FILE.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_NT_FS_CONTROL_FILE.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_NT_SET_INFO_FILE.get() { let _ = h.disable(); }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `hook_nt_set_ea_file` MUST return STATUS_ACCESS_DENIED for any input,
+    /// including null pointers and zero length. This is the contract that
+    /// makes the unconditional deny safe: we never dereference Buffer and
+    /// we tolerate a null IoStatusBlock.
+    #[test]
+    fn nt_set_ea_file_unconditional_deny() {
+        let status = unsafe {
+            hook_nt_set_ea_file(
+                std::ptr::null_mut(), // FileHandle
+                std::ptr::null_mut(), // IoStatusBlock (null tolerated)
+                std::ptr::null_mut(), // Buffer
+                0,                    // Length
+            )
+        };
+        assert_eq!(status, STATUS_ACCESS_DENIED);
+
+        // Also with a non-zero length — must still deny without inspecting Buffer.
+        let status = unsafe {
+            hook_nt_set_ea_file(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                4096,
+            )
+        };
+        assert_eq!(status, STATUS_ACCESS_DENIED);
+    }
+
+    /// When IoStatusBlock IS provided, the hook must populate it with the
+    /// deny status before returning. Callers reading the IOSB Status field
+    /// must observe the same value as the return.
+    #[test]
+    fn nt_set_ea_file_writes_io_status_block() {
+        // IO_STATUS_BLOCK contains a winapi UNION! field with no Default impl.
+        // mem::zeroed is the standard idiom for this ABI-compatible POD.
+        // SAFETY: IO_STATUS_BLOCK is (union | usize)-sized POD; all-zero is
+        // a valid "no status, no information" bit pattern.
+        let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        let status = unsafe {
+            hook_nt_set_ea_file(
+                std::ptr::null_mut(),
+                &mut iosb as *mut _,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(status, STATUS_ACCESS_DENIED);
+        // Status field is at offset 0 (Status/Pointer union). set_io_status
+        // zeros the union slot then writes the 4-byte NTSTATUS.
+        // SAFETY: reading the Status arm of the union after we wrote it
+        // through set_io_status (same offset) is sound.
+        let raw_status = unsafe { *(&iosb as *const _ as *const NTSTATUS) };
+        assert_eq!(raw_status, STATUS_ACCESS_DENIED);
+    }
 }

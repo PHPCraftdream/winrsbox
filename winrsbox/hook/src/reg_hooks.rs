@@ -19,6 +19,7 @@ use ntapi::winapi::shared::ntdef::{HANDLE, NTSTATUS, OBJECT_ATTRIBUTES, UNICODE_
 use winapi::ctypes::c_void;
 
 use crate::anti_rec;
+use crate::hooks::STATUS_ACCESS_DENIED;
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -70,7 +71,6 @@ static HOOK_DELETE_KEY: OnceLock<GenericDetour<FnNtDeleteKey>> = OnceLock::new()
 // Resolved at install time, used for path lookup in handlers.
 static NT_QUERY_KEY: OnceLock<FnNtQueryKey> = OnceLock::new();
 
-const STATUS_ACCESS_DENIED: NTSTATUS = 0xC000_0022_u32 as NTSTATUS;
 const KEY_NAME_INFORMATION: u32 = 3;
 
 // ---------------------------------------------------------------------------
@@ -78,10 +78,14 @@ const KEY_NAME_INFORMATION: u32 = 3;
 // ---------------------------------------------------------------------------
 
 /// Read the NT path of an open key handle via NtQueryKey(KeyNameInformation).
+///
+/// # SAFETY
+/// `key` must be a valid open registry HANDLE. `NT_QUERY_KEY` must be initialised (install-time).
 unsafe fn query_key_full_path(key: HANDLE) -> Option<Vec<u16>> {
     let nt_query = *NT_QUERY_KEY.get()?;
     let mut buf = vec![0u8; 4096];
     let mut ret_len: u32 = 0;
+    // SAFETY: FFI call into ntdll!NtQueryKey; buf is a valid 4096-byte stack allocation.
     let status = nt_query(
         key, KEY_NAME_INFORMATION,
         buf.as_mut_ptr() as *mut _,
@@ -91,29 +95,40 @@ unsafe fn query_key_full_path(key: HANDLE) -> Option<Vec<u16>> {
         return None;
     }
     // KEY_NAME_INFORMATION: ULONG NameLength; WCHAR Name[1];
+    // SAFETY: deref of first 4 bytes as u32 — buf is 4096 bytes, status and ret_len validated above.
     let name_len_bytes = *(buf.as_ptr() as *const u32) as usize;
     let char_count = name_len_bytes / 2;
     if char_count == 0 || char_count > 2048 {
         return None;
     }
     let buf_ptr = buf.as_ptr().add(4) as *const u16;
+    // SAFETY: from_raw_parts for char_count u16s starting at offset 4; buf is 4096 bytes, char_count ≤ 2048.
     let slice = std::slice::from_raw_parts(buf_ptr, char_count);
     Some(slice.to_vec())
 }
 
 /// Extract UNICODE_STRING into Rust String (lossy).
+///
+/// # SAFETY
+/// `ustr` must be a valid pointer to a UNICODE_STRING whose Buffer is valid for Length/2 WCHARs.
 unsafe fn ustr_to_string(ustr: *const UNICODE_STRING) -> Option<String> {
     if ustr.is_null() { return None; }
+    // SAFETY: deref of non-null UNICODE_STRING pointer — caller guarantees validity.
     let u = &*ustr;
     let cc = (u.Length / 2) as usize;
     if cc == 0 || u.Buffer.is_null() { return None; }
+    // SAFETY: from_raw_parts for cc WCHARs from UNICODE_STRING.Buffer; Length field bounds the region.
     Some(String::from_utf16_lossy(std::slice::from_raw_parts(u.Buffer, cc)))
 }
 
 /// Resolve OBJECT_ATTRIBUTES into a friendly registry path (HKLM\..., HKCU\...).
 /// Honors RootDirectory by combining its full path with ObjectName.
+///
+/// # SAFETY
+/// `attrs` must be a valid pointer to OBJECT_ATTRIBUTES with a live UNICODE_STRING ObjectName.
 unsafe fn resolve_attrs_friendly(attrs: *const OBJECT_ATTRIBUTES) -> Option<String> {
     if attrs.is_null() { return None; }
+    // SAFETY: deref of non-null OBJECT_ATTRIBUTES pointer — caller guarantees validity.
     let oa = &*attrs;
     let leaf = ustr_to_string(oa.ObjectName)?;
     let full_nt: Vec<u16> = if oa.RootDirectory.is_null() {
@@ -129,6 +144,9 @@ unsafe fn resolve_attrs_friendly(attrs: *const OBJECT_ATTRIBUTES) -> Option<Stri
 }
 
 /// Resolve open KEY handle to friendly path.
+///
+/// # SAFETY
+/// `key` must be a valid open registry HANDLE.
 unsafe fn resolve_handle_friendly(key: HANDLE) -> Option<String> {
     let nt = query_key_full_path(key)?;
     policy::reg::nt_to_friendly(&nt)
@@ -156,6 +174,7 @@ fn check_write_mode(friendly_key: &str, value_name: Option<String>) -> String {
 // Hook handlers
 // ---------------------------------------------------------------------------
 
+// SAFETY: Called by detour2 dispatcher with the same ABI as ntdll!NtCreateKey.
 unsafe extern "system" fn hook_nt_create_key(
     key_handle: *mut HANDLE,
     desired_access: u32,
@@ -166,6 +185,7 @@ unsafe extern "system" fn hook_nt_create_key(
     disposition: *mut u32,
 ) -> NTSTATUS {
     let call_original = || {
+        // SAFETY: detour2 guarantees trampoline matches FnNtCreateKey ABI.
         HOOK_CREATE_KEY.get().unwrap().call(
             key_handle, desired_access, object_attributes,
             title_index, class, create_options, disposition,
@@ -187,6 +207,7 @@ unsafe extern "system" fn hook_nt_create_key(
     call_original()
 }
 
+// SAFETY: Called by detour2 dispatcher with the same ABI as ntdll!NtSetValueKey.
 unsafe extern "system" fn hook_nt_set_value_key(
     key_handle: HANDLE,
     value_name: *mut UNICODE_STRING,
@@ -196,6 +217,7 @@ unsafe extern "system" fn hook_nt_set_value_key(
     data_size: u32,
 ) -> NTSTATUS {
     let call_original = || {
+        // SAFETY: detour2 guarantees trampoline matches FnNtSetValueKey ABI.
         HOOK_SET_VALUE_KEY.get().unwrap().call(
             key_handle, value_name, title_index, value_type, data, data_size,
         )
@@ -212,23 +234,41 @@ unsafe extern "system" fn hook_nt_set_value_key(
             return STATUS_ACCESS_DENIED;
         }
         if mode.eq_ignore_ascii_case("silent_ok") {
+            // Route the write to the launcher, which owns the authoritative
+            // on-disk RegOverlay (policy::reg_overlay). The hook no longer
+            // keeps its own in-memory overlay — there is exactly one source
+            // of truth for sandboxed registry state, and it lives in the
+            // launcher process. See architecture audit M-A1.
+            //
+            // Wire format for value_json: 4 LE bytes of REG_* type, then raw
+            // value bytes. The launcher decodes this when wiring RegWrite to
+            // policy::reg_overlay. If data is empty / null, value_json contains
+            // just the 4-byte type prefix (well-formed empty value).
+            let mut value_json = Vec::with_capacity(4 + data_size as usize);
+            value_json.extend_from_slice(&value_type.to_le_bytes());
             if !data.is_null() && data_size > 0 {
+                // SAFETY: from_raw_parts for data_size bytes — data is non-null and data_size > 0 per check above.
                 let bytes = std::slice::from_raw_parts(data as *const u8, data_size as usize);
-                if let Ok(mut ov) = crate::reg_overlay::overlay().lock() {
-                    ov.set_value(&friendly, &v_name.unwrap_or_default(), value_type, bytes);
-                }
+                value_json.extend_from_slice(bytes);
             }
-            return 0; // STATUS_SUCCESS — written to overlay, not real registry
+            let _ = crate::hooks::ipc_send_and_recv(ipc::Req::RegWrite {
+                key_path: friendly,
+                value_name: v_name.unwrap_or_default(),
+                value_json,
+            });
+            return 0; // STATUS_SUCCESS — write absorbed by launcher overlay
         }
     }
     call_original()
 }
 
+// SAFETY: Called by detour2 dispatcher with the same ABI as ntdll!NtDeleteValueKey.
 unsafe extern "system" fn hook_nt_delete_value_key(
     key_handle: HANDLE,
     value_name: *mut UNICODE_STRING,
 ) -> NTSTATUS {
     let call_original = || {
+        // SAFETY: detour2 guarantees trampoline matches FnNtDeleteValueKey ABI.
         HOOK_DELETE_VALUE_KEY.get().unwrap().call(key_handle, value_name)
     };
 
@@ -243,17 +283,22 @@ unsafe extern "system" fn hook_nt_delete_value_key(
             return STATUS_ACCESS_DENIED;
         }
         if mode.eq_ignore_ascii_case("silent_ok") {
-            if let Ok(mut ov) = crate::reg_overlay::overlay().lock() {
-                ov.delete_value(&friendly, &v_name.unwrap_or_default());
-            }
-            return 0; // STATUS_SUCCESS — tombstone in overlay
+            // Tombstone lives in the launcher's authoritative on-disk overlay.
+            // The hook no longer keeps a per-process tombstone set — see M-A1.
+            let _ = crate::hooks::ipc_send_and_recv(ipc::Req::RegDeleteValue {
+                key_path: friendly,
+                value_name: v_name.unwrap_or_default(),
+            });
+            return 0; // STATUS_SUCCESS — tombstone recorded by launcher
         }
     }
     call_original()
 }
 
+// SAFETY: Called by detour2 dispatcher with the same ABI as ntdll!NtDeleteKey.
 unsafe extern "system" fn hook_nt_delete_key(key_handle: HANDLE) -> NTSTATUS {
     let call_original = || {
+        // SAFETY: detour2 guarantees trampoline matches FnNtDeleteKey ABI.
         HOOK_DELETE_KEY.get().unwrap().call(key_handle)
     };
 
@@ -267,9 +312,10 @@ unsafe extern "system" fn hook_nt_delete_key(key_handle: HANDLE) -> NTSTATUS {
             return STATUS_ACCESS_DENIED;
         }
         if mode.eq_ignore_ascii_case("silent_ok") {
-            if let Ok(mut ov) = crate::reg_overlay::overlay().lock() {
-                ov.delete_key(&friendly);
-            }
+            // Key-delete tombstone lives in the launcher overlay (see M-A1).
+            let _ = crate::hooks::ipc_send_and_recv(ipc::Req::RegDeleteKey {
+                key_path: friendly,
+            });
             return 0;
         }
     }
@@ -285,6 +331,7 @@ unsafe extern "system" fn hook_nt_delete_key(key_handle: HANDLE) -> NTSTATUS {
 pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     // Resolve NtQueryKey (used by handlers to resolve key paths)
     if let Some(addr) = crate::hooks::ntdll_export("NtQueryKey\0".as_bytes()) {
+        // SAFETY: transmute of ntdll export address; ABI matches FnNtQueryKey signature.
         let f: FnNtQueryKey = std::mem::transmute(addr as usize);
         let _ = NT_QUERY_KEY.set(f);
     }
@@ -293,6 +340,7 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
         ($lock:expr, $sym:literal, $hook_fn:expr, $fn_ty:ty) => {{
             let addr = crate::hooks::ntdll_export($sym.as_bytes())
                 .ok_or_else(|| format!("ntdll export not found: {}", $sym))?;
+            // SAFETY: transmute of ntdll export address; ABI matches the hook function type.
             let target: $fn_ty = std::mem::transmute(addr as usize);
             let hook_ptr: $fn_ty = $hook_fn;
             let detour = GenericDetour::<$fn_ty>::new(target, hook_ptr)

@@ -25,7 +25,7 @@ use winapi::um::processthreadsapi::GetCurrentProcessId;
 use winapi::shared::ntdef::ULONG;
 
 use crate::anti_rec;
-use crate::hooks::{ipc_log, is_trace};
+use crate::hooks::{ipc_log, is_trace, STATUS_ACCESS_DENIED};
 use crate::process_tracker;
 
 // ---------------------------------------------------------------------------
@@ -62,6 +62,56 @@ type FnNtTerminateProcess = unsafe extern "system" fn(
     NTSTATUS,  // ExitStatus
 ) -> NTSTATUS;
 
+// Legacy NtCreateProcess (pre-Vista, but symbol still exported on Win10/11).
+// All scalar params widened to usize for detour2 Function trait compat on x64.
+//
+//   NTSTATUS NtCreateProcess(
+//       PHANDLE ProcessHandle,
+//       ACCESS_MASK DesiredAccess,
+//       POBJECT_ATTRIBUTES ObjectAttributes,
+//       HANDLE ParentProcess,
+//       BOOLEAN InheritObjectTable,
+//       HANDLE SectionHandle,
+//       HANDLE DebugPort,
+//       HANDLE ExceptionPort
+//   );
+type FnNtCreateProcess = unsafe extern "system" fn(
+    *mut HANDLE,             // ProcessHandle
+    usize,                   // DesiredAccess (ACCESS_MASK widened)
+    *const OBJECT_ATTRIBUTES,
+    HANDLE,                  // ParentProcess
+    usize,                   // InheritObjectTable (BOOLEAN widened)
+    HANDLE,                  // SectionHandle
+    HANDLE,                  // DebugPort
+    HANDLE,                  // ExceptionPort
+) -> NTSTATUS;
+
+// NtCreateProcessEx — extended variant. Same legacy code-path: section-backed
+// process creation that bypasses NtCreateUserProcess. Unconditionally denied.
+//
+//   NTSTATUS NtCreateProcessEx(
+//       PHANDLE ProcessHandle,
+//       ACCESS_MASK DesiredAccess,
+//       POBJECT_ATTRIBUTES ObjectAttributes,
+//       HANDLE ParentProcess,
+//       ULONG Flags,
+//       HANDLE SectionHandle,
+//       HANDLE DebugPort,
+//       HANDLE ExceptionPort,
+//       BOOLEAN InJob
+//   );
+type FnNtCreateProcessEx = unsafe extern "system" fn(
+    *mut HANDLE,             // ProcessHandle
+    usize,                   // DesiredAccess (ACCESS_MASK widened)
+    *const OBJECT_ATTRIBUTES,
+    HANDLE,                  // ParentProcess
+    usize,                   // Flags (ULONG widened)
+    HANDLE,                  // SectionHandle
+    HANDLE,                  // DebugPort
+    HANDLE,                  // ExceptionPort
+    usize,                   // InJob (BOOLEAN widened)
+) -> NTSTATUS;
+
 // PS_ATTRIBUTE for parent-spoof detection in NtCreateUserProcess attribute list.
 #[repr(C)]
 struct PS_ATTRIBUTE {
@@ -95,6 +145,8 @@ static HOOK_NT_OPEN_PROCESS: OnceLock<GenericDetour<FnNtOpenProcess>> = OnceLock
 static HOOK_NT_ASSIGN_JOB: OnceLock<GenericDetour<FnNtAssignProcessToJobObject>> = OnceLock::new();
 static HOOK_NT_SET_INFO_PROCESS: OnceLock<GenericDetour<FnNtSetInformationProcess>> = OnceLock::new();
 static HOOK_NT_TERMINATE_PROCESS: OnceLock<GenericDetour<FnNtTerminateProcess>> = OnceLock::new();
+static HOOK_NT_CREATE_PROCESS: OnceLock<GenericDetour<FnNtCreateProcess>> = OnceLock::new();
+static HOOK_NT_CREATE_PROCESS_EX: OnceLock<GenericDetour<FnNtCreateProcessEx>> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // NtOpenProcess hook
@@ -111,8 +163,6 @@ const DANGEROUS_ACCESS: u32 =
     0x0200 |  // PROCESS_SET_INFORMATION
     0x0800;   // PROCESS_SUSPEND_RESUME
 // NOT blocked: VM_READ (0x0010), QUERY_INFO (0x0400), QUERY_LIMITED (0x1000)
-
-const STATUS_ACCESS_DENIED: NTSTATUS = 0xC000_0022_u32 as NTSTATUS;
 
 unsafe extern "system" fn hook_nt_open_process(
     process_handle: *mut HANDLE,
@@ -283,6 +333,76 @@ unsafe extern "system" fn hook_nt_terminate_process(
     }
 
     call_original()
+}
+
+// ---------------------------------------------------------------------------
+// Legacy NtCreateProcess / NtCreateProcessEx hooks — unconditional deny
+// ---------------------------------------------------------------------------
+//
+// These are rarely-used legacy syscalls retained in ntdll for binary
+// compatibility with pre-Vista subsystems. Modern Windows uses
+// NtCreateUserProcess; no MS-supplied user-mode code path reaches these.
+//
+// They are dangerous because they accept a SectionHandle to a mapped image
+// and skip the entire RTL_USER_PROCESS_PARAMETERS / PS_ATTRIBUTE_LIST plumbing
+// that hooks.rs::hook_nt_create_user_process inspects. A sandboxed child can
+// NtCreateSection over an arbitrary EXE, then NtCreateProcessEx(parent=self,
+// section=...) — the spawned child has no APC-injected hook.dll, no parent
+// validation, no image denylist enforcement. Pure escape.
+//
+// Mitigation: unconditional STATUS_ACCESS_DENIED. We do not even consult
+// pid_owned / image path / section content. Returning early before any pointer
+// deref means null/garbage params are safe.
+
+unsafe extern "system" fn hook_nt_create_process(
+    _process_handle: *mut HANDLE,
+    _desired_access: usize,
+    _object_attributes: *const OBJECT_ATTRIBUTES,
+    _parent_process: HANDLE,
+    _inherit_object_table: usize,
+    _section_handle: HANDLE,
+    _debug_port: HANDLE,
+    _exception_port: HANDLE,
+) -> NTSTATUS {
+    // Anti-rec guard prevents reentry if our deny-path itself somehow loops
+    // back into ntdll (it doesn't, but defense-in-depth keeps invariants).
+    let Some(_guard) = anti_rec::enter() else {
+        return STATUS_ACCESS_DENIED;
+    };
+
+    if is_trace() {
+        let _ = crate::hooks::ipc_log_violation(ipc::Req::Log {
+            pid: unsafe { GetCurrentProcessId() },
+            level: ipc::LogLevel::Warn,
+            msg: format!("proc_create_legacy_blocked: NtCreateProcess"),
+        });
+    }
+    STATUS_ACCESS_DENIED
+}
+
+unsafe extern "system" fn hook_nt_create_process_ex(
+    _process_handle: *mut HANDLE,
+    _desired_access: usize,
+    _object_attributes: *const OBJECT_ATTRIBUTES,
+    _parent_process: HANDLE,
+    _flags: usize,
+    _section_handle: HANDLE,
+    _debug_port: HANDLE,
+    _exception_port: HANDLE,
+    _in_job: usize,
+) -> NTSTATUS {
+    let Some(_guard) = anti_rec::enter() else {
+        return STATUS_ACCESS_DENIED;
+    };
+
+    if is_trace() {
+        let _ = crate::hooks::ipc_log_violation(ipc::Req::Log {
+            pid: unsafe { GetCurrentProcessId() },
+            level: ipc::LogLevel::Warn,
+            msg: format!("proc_create_legacy_blocked: NtCreateProcessEx"),
+        });
+    }
+    STATUS_ACCESS_DENIED
 }
 
 // ---------------------------------------------------------------------------
@@ -511,13 +631,84 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
         .enable()
         .map_err(|e| format!("detour enable NtTerminateProcess: {:?}", e))?;
 
+    // Hook 6/7: Legacy NtCreateProcess / NtCreateProcessEx — unconditional deny.
+    // Best-effort install: if a particular Windows build does not export one of
+    // these (extremely unlikely on Win10/11 but theoretically possible on
+    // stripped-down server SKUs), buffer the error and continue. Failing the
+    // whole proc_guard install over a legacy hole would be worse than leaving
+    // that single rarely-used path unguarded.
+    install_nt_create_process_legacy();
+
     if is_trace() {
         ipc_log(ipc::LogLevel::Trace, "proc_guard_installed".into());
     }
     Ok(())
 }
 
+// Install the two legacy hooks. Both are best-effort — symbol resolution
+// failures or detour init failures are buffered, never propagated, so the
+// main install() path stays robust.
+unsafe fn install_nt_create_process_legacy() {
+    // NtCreateProcess
+    match crate::hooks::ntdll_export("NtCreateProcess\0".as_bytes()) {
+        Some(addr) => {
+            let target: FnNtCreateProcess = std::mem::transmute(addr as usize);
+            let hook_ptr: FnNtCreateProcess = hook_nt_create_process;
+            match GenericDetour::<FnNtCreateProcess>::new(target, hook_ptr) {
+                Ok(detour) => {
+                    let _ = HOOK_NT_CREATE_PROCESS.set(detour);
+                    if let Some(h) = HOOK_NT_CREATE_PROCESS.get() {
+                        if let Err(e) = h.enable() {
+                            crate::hooks::buffer_install_error(
+                                format!("detour enable NtCreateProcess: {:?}", e),
+                            );
+                        }
+                    }
+                }
+                Err(e) => crate::hooks::buffer_install_error(
+                    format!("detour init NtCreateProcess: {:?}", e),
+                ),
+            }
+        }
+        None => crate::hooks::buffer_install_error(
+            "NtCreateProcess not exported".to_string(),
+        ),
+    }
+
+    // NtCreateProcessEx
+    match crate::hooks::ntdll_export("NtCreateProcessEx\0".as_bytes()) {
+        Some(addr) => {
+            let target: FnNtCreateProcessEx = std::mem::transmute(addr as usize);
+            let hook_ptr: FnNtCreateProcessEx = hook_nt_create_process_ex;
+            match GenericDetour::<FnNtCreateProcessEx>::new(target, hook_ptr) {
+                Ok(detour) => {
+                    let _ = HOOK_NT_CREATE_PROCESS_EX.set(detour);
+                    if let Some(h) = HOOK_NT_CREATE_PROCESS_EX.get() {
+                        if let Err(e) = h.enable() {
+                            crate::hooks::buffer_install_error(
+                                format!("detour enable NtCreateProcessEx: {:?}", e),
+                            );
+                        }
+                    }
+                }
+                Err(e) => crate::hooks::buffer_install_error(
+                    format!("detour init NtCreateProcessEx: {:?}", e),
+                ),
+            }
+        }
+        None => crate::hooks::buffer_install_error(
+            "NtCreateProcessEx not exported".to_string(),
+        ),
+    }
+}
+
 pub unsafe fn uninstall() {
+    if let Some(h) = HOOK_NT_CREATE_PROCESS_EX.get() {
+        let _ = h.disable();
+    }
+    if let Some(h) = HOOK_NT_CREATE_PROCESS.get() {
+        let _ = h.disable();
+    }
     if let Some(h) = HOOK_NT_TERMINATE_PROCESS.get() {
         let _ = h.disable();
     }
@@ -529,5 +720,182 @@ pub unsafe fn uninstall() {
     }
     if let Some(h) = HOOK_NT_OPEN_PROCESS.get() {
         let _ = h.disable();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both legacy hooks must return STATUS_ACCESS_DENIED for any input —
+    /// including null pointers and zero scalar args — without dereferencing
+    /// anything. This is the contract that makes "unconditional deny" safe:
+    /// no params are inspected before the early-return.
+    #[test]
+    fn legacy_process_creation_denied() {
+        let expected = STATUS_ACCESS_DENIED;
+
+        let s1 = unsafe {
+            hook_nt_create_process(
+                std::ptr::null_mut(), // ProcessHandle
+                0,                    // DesiredAccess
+                std::ptr::null(),     // ObjectAttributes
+                std::ptr::null_mut(), // ParentProcess
+                0,                    // InheritObjectTable
+                std::ptr::null_mut(), // SectionHandle
+                std::ptr::null_mut(), // DebugPort
+                std::ptr::null_mut(), // ExceptionPort
+            )
+        };
+        assert_eq!(s1, expected, "NtCreateProcess must deny null-arg call");
+
+        let s2 = unsafe {
+            hook_nt_create_process_ex(
+                std::ptr::null_mut(), // ProcessHandle
+                0,                    // DesiredAccess
+                std::ptr::null(),     // ObjectAttributes
+                std::ptr::null_mut(), // ParentProcess
+                0,                    // Flags
+                std::ptr::null_mut(), // SectionHandle
+                std::ptr::null_mut(), // DebugPort
+                std::ptr::null_mut(), // ExceptionPort
+                0,                    // InJob
+            )
+        };
+        assert_eq!(s2, expected, "NtCreateProcessEx must deny null-arg call");
+    }
+
+    // -----------------------------------------------------------------------
+    // PID-reuse poisoning regression (P1-2 / T3)
+    // -----------------------------------------------------------------------
+    //
+    // Hook 5 (NtTerminateProcess → process_tracker::untrack) defends against:
+    //   1. our child dies → OS reuses its PID for a foreign process →
+    //   2. attacker calls into the foreign PID using PROCESS_VM_OPERATION etc.
+    //      → would succeed if `is_owned_child(reused_pid)` still returned true.
+    // These tests pin the untrack contract directly (decoupled from the
+    // OpenProcess→GetProcessId resolution chain).
+
+    #[test]
+    fn pid_reuse_after_terminate_does_not_lie() {
+        let fake_pid = 999_999u32;
+        crate::process_tracker::mark_spawned(fake_pid, 1, "fake_child.exe".into());
+        assert!(crate::process_tracker::is_owned_child(fake_pid));
+
+        // Simulate the untrack path the NtTerminateProcess hook would take.
+        crate::process_tracker::untrack(fake_pid);
+        assert!(
+            !crate::process_tracker::is_owned_child(fake_pid),
+            "after untrack, the PID must not look owned even if OS reuses it for a foreign process"
+        );
+    }
+
+    #[test]
+    fn untracked_pid_treated_as_foreign() {
+        let pid = 999_998u32;
+        // PID was never marked → must read as foreign.
+        assert!(!crate::process_tracker::is_owned_child(pid));
+    }
+
+    // -----------------------------------------------------------------------
+    // PS_ATTRIBUTE_LIST edge tests (M-T3)
+    // -----------------------------------------------------------------------
+    //
+    // The functions read `TotalLength` from the first usize of the buffer.
+    // The bounds expression `(total - size_of::<usize>()) / size_of::<PS_ATTRIBUTE>()`
+    // must not underflow on small `total` values.
+    //
+    // We can't pass a zero-length buffer (reading `TotalLength` itself would
+    // be UB), so for the "tiny total" cases we allocate a buffer at least
+    // size_of::<usize>() bytes and ENCODE the total value into the header.
+    //
+    // For the truly empty case we pass a null pointer (caller contract:
+    // null → early return false).
+
+    fn make_attr_buf(total_length: usize) -> Vec<u8> {
+        // Always allocate at least one usize so reading TotalLength is sound.
+        let mut buf = vec![0u8; std::mem::size_of::<usize>()];
+        let bytes = total_length.to_ne_bytes();
+        buf[..bytes.len()].copy_from_slice(&bytes);
+        buf
+    }
+
+    #[test]
+    fn attr_list_null_pointer_is_safe() {
+        assert!(!attribute_list_contains_parent_process(std::ptr::null()));
+        assert!(!attribute_list_contains_handle_list(std::ptr::null()));
+    }
+
+    #[test]
+    fn attr_list_tiny_total_is_safe() {
+        // total = 0 — header claims zero size; must not underflow / index.
+        let buf = make_attr_buf(0);
+        assert!(!attribute_list_contains_parent_process(buf.as_ptr() as _));
+        assert!(!attribute_list_contains_handle_list(buf.as_ptr() as _));
+    }
+
+    #[test]
+    fn attr_list_total_below_header_is_safe() {
+        // total = 4 < size_of::<usize>() (8 on x64) — must not underflow.
+        let buf = make_attr_buf(4);
+        assert!(!attribute_list_contains_parent_process(buf.as_ptr() as _));
+        assert!(!attribute_list_contains_handle_list(buf.as_ptr() as _));
+    }
+
+    #[test]
+    fn attr_list_only_header_no_attrs() {
+        // total = size_of::<usize>() — exactly the header, zero entries.
+        // (total - header) / sizeof::<PS_ATTRIBUTE>() must == 0, so the
+        // attr_count == 0 short-circuit fires.
+        let buf = make_attr_buf(std::mem::size_of::<usize>());
+        assert!(!attribute_list_contains_parent_process(buf.as_ptr() as _));
+        assert!(!attribute_list_contains_handle_list(buf.as_ptr() as _));
+    }
+
+    #[test]
+    fn attr_list_parent_with_value_zero_is_not_a_match() {
+        // A well-formed PARENT attribute (number=0) but with Value=0 must
+        // not be reported as parent-spoof — Value is the PID handle and
+        // a null handle is not a spoof.
+        let header_size = std::mem::size_of::<usize>();
+        let attr_size = std::mem::size_of::<PS_ATTRIBUTE>();
+        let total = header_size + attr_size;
+        let mut buf = vec![0u8; total];
+        // TotalLength
+        buf[..header_size].copy_from_slice(&total.to_ne_bytes());
+        // PS_ATTRIBUTE { Attribute: 0 (parent), Size: 8, Value: 0, ReturnLength: null }
+        // All zero by default — only Size needs setting, and Attribute=0 is parent.
+        // Attribute = 0 (number 0 = parent, no INPUT flag — still matches by lower 16 bits).
+        // The function checks `(Attribute & 0xFFFF) == 0 && Value != 0`.
+        // With Value=0, must return false.
+        assert!(!attribute_list_contains_parent_process(buf.as_ptr() as _));
+    }
+
+    #[test]
+    fn attr_list_with_both_parent_and_handle_list_detects_both() {
+        // Two attributes: PARENT (number=0, Value=fake_pid_handle) and
+        // HANDLE_LIST (number=2). Both detector functions must report true.
+        let header_size = std::mem::size_of::<usize>();
+        let attr_size = std::mem::size_of::<PS_ATTRIBUTE>();
+        let total = header_size + attr_size * 2;
+        let mut buf = vec![0u8; total];
+        // TotalLength
+        buf[..header_size].copy_from_slice(&total.to_ne_bytes());
+        // Build two PS_ATTRIBUTE entries in place.
+        let attrs_ptr = unsafe { buf.as_mut_ptr().add(header_size) } as *mut PS_ATTRIBUTE;
+        unsafe {
+            // [0] PARENT — number=0, Value=non-zero
+            (*attrs_ptr.add(0)).Attribute = 0x0002_0000; // PsAttributeParentProcess | INPUT
+            (*attrs_ptr.add(0)).Size = std::mem::size_of::<usize>();
+            (*attrs_ptr.add(0)).Value = 0xDEAD_BEEF;
+            (*attrs_ptr.add(0)).ReturnLength = std::ptr::null_mut();
+            // [1] HANDLE_LIST — number=2
+            (*attrs_ptr.add(1)).Attribute = 0x0002_0002; // PsAttributeHandleList | INPUT
+            (*attrs_ptr.add(1)).Size = std::mem::size_of::<usize>();
+            (*attrs_ptr.add(1)).Value = 0xCAFE_BABE;
+            (*attrs_ptr.add(1)).ReturnLength = std::ptr::null_mut();
+        }
+        assert!(attribute_list_contains_parent_process(buf.as_ptr() as _));
+        assert!(attribute_list_contains_handle_list(buf.as_ptr() as _));
     }
 }

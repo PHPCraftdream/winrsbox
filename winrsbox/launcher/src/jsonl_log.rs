@@ -81,19 +81,10 @@ impl JsonlLogger {
             Ok(s) => s,
             Err(_) => return,
         };
-        let should_flush = {
-            let mut buf = match self.buffer.lock() {
-                Ok(b) => b,
-                Err(_) => return,
-            };
+        if let Ok(mut buf) = self.buffer.lock() {
             buf.push(line);
-            buf.len() >= MAX_BUFFER
-        };
-        if should_flush {
-            self.maybe_flush();
-        } else {
-            self.maybe_flush();
         }
+        self.maybe_flush();
     }
 
     fn push_and_flush(&self, event: Event) {

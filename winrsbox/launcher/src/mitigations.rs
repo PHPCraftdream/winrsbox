@@ -4,11 +4,17 @@
 // Pure computation module: builds u64 bitmask from guard profile.
 // No Windows API calls here — those live in main.rs launch path.
 
-/// Mitigation policy v1 flags (first DWORD64).
+/// Mitigation policy v1 flags (first DWORD64 of the 16-byte
+/// PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY value).
+///
+/// Bit layout per Microsoft docs:
+///   DEP / ATL-Thunk / SEHOP are single-bit flags in bits 0–2.
+///   Remaining policies are 2-bit fields at 4-bit-aligned offsets.
+///   The "always on" variant sets bit 0 of the field (offset+0).
 pub mod v1 {
-    pub const DEP_ENABLE: u64                             = 0x01 << 36;
-    pub const DEP_ATL_THUNK_ENABLE: u64                   = 0x01 << 40;
-    pub const SEHOP_ENABLE: u64                           = 0x01 << 44;
+    pub const DEP_ENABLE: u64                             = 0x01 << 0;
+    pub const DEP_ATL_THUNK_ENABLE: u64                   = 0x01 << 1;
+    pub const SEHOP_ENABLE: u64                           = 0x01 << 2;
     pub const FORCE_RELOCATE_IMAGES_ALWAYS_ON: u64        = 0x01 << 8;
     pub const HEAP_TERMINATE_ALWAYS_ON: u64               = 0x01 << 12;
     pub const BOTTOM_UP_ASLR_ALWAYS_ON: u64               = 0x01 << 16;
@@ -27,12 +33,15 @@ pub mod v1 {
 
 /// Mitigation policy v2 flags (second DWORD64, Windows 10 1709+).
 pub mod v2 {
-    pub const RESTRICT_INDIRECT_BRANCH_PREDICTION: u64        = 0x01 << 16;
-    pub const SPECULATIVE_STORE_BYPASS_DISABLE: u64           = 0x01 << 24;
-    pub const CET_USER_SHADOW_STACKS_ALWAYS_ON: u64           = 0x01 << 40;
-    pub const CET_USER_SHADOW_STACKS_STRICT_MODE: u64         = 0x01 << 42;
-    pub const BLOCK_NON_CET_BINARIES_ALWAYS_ON: u64           = 0x01 << 52;
-    pub const XTENDED_CONTROL_FLOW_GUARD_ALWAYS_ON: u64       = 0x01 << 56;
+    pub const STRICT_CONTROL_FLOW_GUARD_ALWAYS_ON: u64     = 0x01 << 8;
+    pub const RESTRICT_INDIRECT_BRANCH_PREDICTION: u64     = 0x01 << 16;
+    pub const SPECULATIVE_STORE_BYPASS_DISABLE: u64        = 0x01 << 24;
+    pub const CET_USER_SHADOW_STACKS_ALWAYS_ON: u64        = 0x01 << 28;
+    pub const CET_USER_SHADOW_STACKS_STRICT_MODE: u64      = 0x01 << 29;
+    pub const USER_CET_SET_CONTEXT_IP_VALIDATION_ALWAYS_ON: u64 = 0x01 << 32;
+    pub const BLOCK_NON_CET_BINARIES_ALWAYS_ON: u64        = 0x01 << 36;
+    pub const CET_DYNAMIC_APIS_OUT_OF_PROC_ONLY_ALWAYS_ON: u64 = 0x01 << 48;
+    pub const FSCTL_SYSTEM_CALL_DISABLE_ALWAYS_ON: u64     = 0x01 << 56;
 }
 
 /// Guard profile as consumed by mitigations module.

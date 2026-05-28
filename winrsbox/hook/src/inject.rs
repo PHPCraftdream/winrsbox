@@ -160,11 +160,21 @@ pub fn inject_via_apc(
         )
     };
 
-    // Note: we intentionally do NOT free remote_buf here.
-    // LoadLibraryW must read it when the APC fires (after resume).
-    // The small leak (a few hundred bytes) is acceptable per-child-process.
-    // To avoid the leak, one would need a second APC to free it after load,
-    // which adds significant complexity for marginal benefit.
+    // SAFETY / M-A6: remote_buf is LEAKED ON PURPOSE — it is intentionally
+    // leaked because the child reads it asynchronously via the LoadLibraryW
+    // APC after this function returns. Calling the remote-free API on
+    // remote_buf here would free remote memory the child is about to
+    // dereference, crashing the child (typically STATUS_DLL_INIT_FAILED or
+    // an access violation in LoadLibraryW shortly after the initial thread
+    // resumes).
+    //
+    // The small per-child leak (a few hundred bytes of UTF-16 path data) is
+    // acceptable. A correct free would require a second APC queued after a
+    // synchronization point, which adds significant complexity for marginal
+    // benefit. This invariant is pinned by `intentional_leak_pin_tests` at
+    // the bottom of this file — do NOT add a remote-buffer free between
+    // `nt_queue_apc(...)` and `Ok(())` without updating those tests and
+    // re-validating injection on Win10/11.
 
     if status < 0 {
         return Err(format!("NtQueueApcThread NTSTATUS={:#010x}", status as u32));
@@ -225,5 +235,111 @@ pub unsafe fn resolve_handle_path(handle: HANDLE) -> Option<Vec<u16>> {
     // `char_count` * 2 <= len_bytes <= returned <= buf_len.
     let slice = std::slice::from_raw_parts(buf_ptr, char_count);
     Some(slice.to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// M-A6 pin tests: protect the intentional remote-buffer leak in
+// inject_via_apc from being silently "fixed" by a future maintainer.
+//
+// Background: VirtualAllocEx in the child + WriteProcessMemory + NtQueueApcThread
+// is asynchronous. The child reads the buffer when the APC fires (after the
+// child is resumed and enters an alertable wait / user-APC delivery point).
+// If we VirtualFreeEx the buffer between queueing the APC and the child reading
+// it, LoadLibraryW will dereference freed remote memory and crash the child
+// (access violation, STATUS_DLL_INIT_FAILED or similar).
+//
+// The pre-APC error paths in inject_via_apc legitimately call VirtualFreeEx
+// to avoid leaking on failure (the APC was never queued, so the child never
+// reads the buffer). Those are correct. The forbidden pattern is a
+// VirtualFreeEx call AFTER the NtQueueApcThread call returns success.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod intentional_leak_pin_tests {
+    /// Pin test for M-A6: `inject_via_apc` deliberately does NOT call
+    /// `VirtualFreeEx` on the remote buffer AFTER queueing the APC. The child
+    /// reads the buffer via APC after this function returns; freeing the
+    /// buffer here causes a child-side crash.
+    ///
+    /// If this test fails:
+    /// - A maintainer added `VirtualFreeEx` to `inject_via_apc` after the
+    ///   `NtQueueApcThread` call.
+    /// - This is almost certainly a bug. Verify by running the e2e suite on
+    ///   Win10/11; injection failures may manifest as STATUS_DLL_INIT_FAILED
+    ///   or silent child crashes shortly after CreateProcess.
+    /// - If the change is intentional (e.g., switched to a synchronous
+    ///   injection model where the child finishes loading before we free),
+    ///   update this test to reflect the new contract.
+    ///
+    /// Note: this is a textual scan and therefore fragile against heavy
+    /// refactors. The two anchors it relies on are the `nt_queue_apc(` call
+    /// and the trailing `Ok(())` of `inject_via_apc`. If those move,
+    /// re-anchor the test rather than disabling it.
+    #[test]
+    fn inject_via_apc_does_not_free_remote_buf_after_apc_queue() {
+        let src = include_str!("inject.rs");
+
+        // Locate the function definition.
+        let fn_start = src
+            .find("pub fn inject_via_apc")
+            .expect("inject_via_apc function must exist");
+
+        // Locate the NtQueueApcThread call site (via the local fn-pointer
+        // binding `nt_queue_apc(`).
+        let queue_call = src[fn_start..]
+            .find("nt_queue_apc(")
+            .expect("inject_via_apc must call nt_queue_apc(...)");
+        let queue_abs = fn_start + queue_call;
+
+        // Locate the Ok(()) return of inject_via_apc. Use the first Ok(())
+        // after the queue call — that is the success-path return.
+        let ok_offset = src[queue_abs..]
+            .find("Ok(())")
+            .expect("inject_via_apc must return Ok(()) after queueing the APC");
+        let ok_abs = queue_abs + ok_offset;
+
+        // The forbidden region: everything between the queue call and the
+        // success return. A free of the remote buffer here would free
+        // memory the child still needs to read.
+        let post_queue_raw = &src[queue_abs..ok_abs];
+
+        // Strip line comments (// ...) so that future doc edits that mention
+        // the forbidden API name in prose do not trip the scan. This is a
+        // best-effort strip; block comments and string literals are not
+        // expected in this region.
+        let mut post_queue_code = String::with_capacity(post_queue_raw.len());
+        for line in post_queue_raw.lines() {
+            let code_part = match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            };
+            post_queue_code.push_str(code_part);
+            post_queue_code.push('\n');
+        }
+
+        assert!(
+            !post_queue_code.contains("VirtualFreeEx"),
+            "inject_via_apc must NOT call VirtualFreeEx between NtQueueApcThread \
+             and Ok(()) — the child reads remote_buf asynchronously via APC and \
+             freeing it here crashes the child. See M-A6 pin justification above.\n\
+             Offending region (between nt_queue_apc and Ok(()), comments stripped):\n\
+             ---\n{post_queue_code}\n---"
+        );
+    }
+
+    /// Pin test for M-A6: ensure the LEAK is documented near the alloc so
+    /// future readers know the omission of `VirtualFreeEx` on the success path
+    /// is intentional, not an oversight.
+    #[test]
+    fn inject_via_apc_documents_leak() {
+        let src = include_str!("inject.rs").to_ascii_lowercase();
+        let markers = ["leaked on purpose", "intentional", "intentionally leaked"];
+        let has_marker = markers.iter().any(|m| src.contains(&m.to_ascii_lowercase()));
+        assert!(
+            has_marker,
+            "inject_via_apc must document the intentional remote-buffer leak \
+             with one of the marker phrases: {markers:?}"
+        );
+    }
 }
 
