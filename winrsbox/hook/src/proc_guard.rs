@@ -477,11 +477,196 @@ const SPAWN_DENYLIST: &[&str] = &[
     "cmstp.exe",         // Connection Manager — executes INF directives
 ];
 
-/// Check if an image path matches the spawn denylist. Returns true if blocked.
-pub fn is_denylisted(image_path: &str) -> bool {
+/// Extract the lowercased basename (final path component) from an image path.
+fn basename_of(image_path: &str) -> String {
     let lower = image_path.to_lowercase().replace('/', "\\");
-    let filename = lower.rsplit('\\').next().unwrap_or(&lower);
-    SPAWN_DENYLIST.iter().any(|entry| filename == *entry)
+    lower.rsplit('\\').next().unwrap_or(&lower).to_string()
+}
+
+/// Pure denylist-matching predicate over the two name signals we trust:
+/// the on-disk `basename` (always available) and the PE's `OriginalFilename`
+/// from its VERSIONINFO resource (available for signed system binaries).
+///
+/// Returns true if EITHER name matches the denylist. Matching on
+/// OriginalFilename defeats the copy-rename bypass (M3):
+/// `copy wsl.exe foo.exe & start foo.exe` — the basename `foo.exe` is not in
+/// the list, but the version resource still reports OriginalFilename `wsl.exe`.
+///
+/// Pure and filesystem-free so it is unit-testable. Both inputs are compared
+/// case-insensitively against the (lowercase) denylist entries.
+pub fn is_denied_by_names(basename: &str, original: Option<&str>) -> bool {
+    let basename_lc = basename.to_lowercase();
+    if SPAWN_DENYLIST.iter().any(|entry| basename_lc == *entry) {
+        return true;
+    }
+    if let Some(orig) = original {
+        let orig_lc = orig.to_lowercase();
+        if SPAWN_DENYLIST.iter().any(|entry| orig_lc == *entry) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if an image path matches the spawn denylist. Returns true if blocked.
+///
+/// Matches against both the on-disk basename AND the PE's OriginalFilename
+/// (read from the VERSIONINFO resource), so a copy-renamed denylisted binary
+/// is still caught (M3). OriginalFilename is best-effort: if the version
+/// resource is missing or the file is unreadable, only the basename is used.
+pub fn is_denylisted(image_path: &str) -> bool {
+    let basename = basename_of(image_path);
+    let original = original_filename(image_path);
+    is_denied_by_names(&basename, original.as_deref())
+}
+
+// ---------------------------------------------------------------------------
+// PE OriginalFilename extraction (VERSIONINFO resource) — M3
+// ---------------------------------------------------------------------------
+
+/// Read the `OriginalFilename` string from a PE file's VERSIONINFO resource.
+///
+/// Returns `None` if the file has no version resource, is unreadable by the
+/// sandbox (GetFileVersionInfoW fails), or the string is absent. Callers fall
+/// back to the basename in that case.
+///
+/// Cost: one cold version-resource read per process spawn. Not cached — the
+/// spawn hook is already a slow path.
+fn original_filename(image_path: &str) -> Option<String> {
+    use winapi::shared::minwindef::{DWORD, LPVOID, UINT, WORD};
+    use winapi::um::winver::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
+
+    // #[repr(C)] translation record from \VarFileInfo\Translation.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct LangAndCodepage {
+        language: WORD,
+        code_page: WORD,
+    }
+
+    if image_path.is_empty() {
+        return None;
+    }
+
+    // Null-terminated UTF-16 path for the W APIs.
+    let path_w: Vec<u16> = image_path.encode_utf16().chain(Some(0)).collect();
+
+    // SAFETY: `path_w` is a valid null-terminated UTF-16 string that outlives
+    // the call. `handle` is a stack-owned out-param. Returns 0 on failure
+    // (missing resource / unreadable file), which we check.
+    let mut handle: DWORD = 0;
+    let size = unsafe { GetFileVersionInfoSizeW(path_w.as_ptr(), &mut handle) };
+    if size == 0 {
+        return None;
+    }
+
+    // Backing store for the version block. Sized exactly per the API contract.
+    let mut block: Vec<u8> = vec![0u8; size as usize];
+
+    // SAFETY: `path_w` is valid as above; we pass the buffer we just allocated
+    // of `size` bytes and the matching `size`. On success it fills `block` with
+    // an opaque, self-relative version structure; on failure returns 0.
+    let ok = unsafe {
+        GetFileVersionInfoW(path_w.as_ptr(), 0, size, block.as_mut_ptr() as *mut _)
+    };
+    if ok == 0 {
+        return None;
+    }
+
+    // Resolve the (language, codepage) pair from the translation table.
+    let translation_sub: Vec<u16> =
+        "\\VarFileInfo\\Translation".encode_utf16().chain(Some(0)).collect();
+    let mut trans_ptr: LPVOID = std::ptr::null_mut();
+    let mut trans_len: UINT = 0;
+
+    // SAFETY: `block` holds a valid version structure (GetFileVersionInfoW
+    // succeeded). `translation_sub` is a valid null-terminated UTF-16 sub-block
+    // path. `trans_ptr`/`trans_len` are stack out-params. On success `trans_ptr`
+    // points INTO `block` (borrowed, valid while `block` lives) and `trans_len`
+    // is the byte length of the translation array. Returns 0 / leaves ptr null
+    // if absent.
+    let trans_ok = unsafe {
+        VerQueryValueW(
+            block.as_ptr() as *const _,
+            translation_sub.as_ptr(),
+            &mut trans_ptr,
+            &mut trans_len,
+        )
+    };
+
+    // Build the list of (lang, codepage) candidates. If there is no translation
+    // table, fall back to the common English/Unicode pair (0x0409, 0x04B0).
+    let mut candidates: Vec<LangAndCodepage> = Vec::new();
+    if trans_ok != 0
+        && !trans_ptr.is_null()
+        && (trans_len as usize) >= std::mem::size_of::<LangAndCodepage>()
+    {
+        let count = trans_len as usize / std::mem::size_of::<LangAndCodepage>();
+        // SAFETY: `trans_ptr` points to `count` consecutive LangAndCodepage
+        // records inside `block` (its length is `trans_len` bytes, and
+        // `count * size_of::<LangAndCodepage>() <= trans_len`). The data is
+        // valid for reads while `block` is alive (it is, below). The struct is
+        // #[repr(C)] with the documented WORD,WORD layout.
+        let slice = unsafe {
+            std::slice::from_raw_parts(trans_ptr as *const LangAndCodepage, count)
+        };
+        candidates.extend_from_slice(slice);
+    }
+    // Always try the conventional default last, in case the per-translation
+    // lookups miss (some binaries store strings under a different sub-block
+    // than their declared translation).
+    candidates.push(LangAndCodepage { language: 0x0409, code_page: 0x04B0 });
+
+    for lc in candidates {
+        let sub_block = format!(
+            "\\StringFileInfo\\{:04x}{:04x}\\OriginalFilename",
+            lc.language, lc.code_page
+        );
+        let sub_w: Vec<u16> = sub_block.encode_utf16().chain(Some(0)).collect();
+        let mut val_ptr: LPVOID = std::ptr::null_mut();
+        let mut val_len: UINT = 0;
+
+        // SAFETY: same invariants as the translation query — `block` is a valid
+        // version structure, `sub_w` is a valid null-terminated UTF-16 sub-block
+        // path, and the out-params are stack-owned. On success `val_ptr` points
+        // into `block` at a UTF-16 string of `val_len` characters (per the
+        // VerQueryValue contract for string values).
+        let val_ok = unsafe {
+            VerQueryValueW(
+                block.as_ptr() as *const _,
+                sub_w.as_ptr(),
+                &mut val_ptr,
+                &mut val_len,
+            )
+        };
+        if val_ok == 0 || val_ptr.is_null() || val_len == 0 {
+            continue;
+        }
+
+        // `val_len` is a count of UTF-16 code units INCLUDING the trailing NUL.
+        // Drop the terminator if present.
+        let mut char_count = val_len as usize;
+        // SAFETY: `val_ptr` references `char_count` valid UTF-16 units within
+        // `block` (alive here). We bound the slice to exactly the reported
+        // length before reading.
+        let wide = unsafe {
+            std::slice::from_raw_parts(val_ptr as *const u16, char_count)
+        };
+        if let Some(&last) = wide.last() {
+            if last == 0 {
+                char_count -= 1;
+            }
+        }
+        let s = String::from_utf16_lossy(&wide[..char_count]);
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    // Keep `block` explicitly alive until all borrowed pointers above are done.
+    drop(block);
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -897,5 +1082,89 @@ mod tests {
         }
         assert!(attribute_list_contains_parent_process(buf.as_ptr() as _));
         assert!(attribute_list_contains_handle_list(buf.as_ptr() as _));
+    }
+
+    // -----------------------------------------------------------------------
+    // M3 — content-based denylist (OriginalFilename) classification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn denylist_matches_basename() {
+        // Existing behavior preserved: a denylisted basename is blocked,
+        // regardless of OriginalFilename.
+        assert!(is_denylisted("C:\\Windows\\System32\\wsl.exe"));
+        assert!(is_denylisted("c:/windows/system32/WSL.EXE")); // case + slash
+        assert!(is_denylisted("rundll32.exe"));
+        assert!(!is_denylisted("C:\\Windows\\System32\\notepad.exe"));
+    }
+
+    #[test]
+    fn denied_by_names_basename_only() {
+        // Pure helper: basename hit, no original filename.
+        assert!(is_denied_by_names("wsl.exe", None));
+        assert!(is_denied_by_names("WSL.EXE", None)); // case-insensitive
+        assert!(!is_denied_by_names("foo.exe", None));
+        // Original present but also clean → not denied.
+        assert!(!is_denied_by_names("foo.exe", Some("notepad.exe")));
+    }
+
+    #[test]
+    fn denylist_matches_original_filename_when_renamed() {
+        // The copy-rename bypass: on-disk name is innocuous, but the PE's
+        // OriginalFilename still reports the denylisted name. Must be blocked.
+        assert!(is_denied_by_names("foo.exe", Some("wsl.exe")));
+        assert!(is_denied_by_names("totally_legit.exe", Some("WSL.EXE")));
+        assert!(is_denied_by_names("a.exe", Some("bash.exe")));
+        // Neither name denylisted → allowed.
+        assert!(!is_denied_by_names("a.exe", Some("b.exe")));
+    }
+
+    #[test]
+    fn original_filename_of_self_does_not_panic() {
+        // Read the running test exe's own version info. A test binary usually
+        // has no VERSIONINFO resource, so None is the expected (and acceptable)
+        // result — the contract is simply that this must not panic / UB.
+        let exe = std::env::current_exe().expect("current_exe");
+        let exe_str = exe.to_string_lossy().to_string();
+        let result = original_filename(&exe_str);
+        // Whatever it returns, a present value must be non-empty.
+        if let Some(name) = result {
+            assert!(!name.is_empty(), "OriginalFilename, if present, is non-empty");
+        }
+    }
+
+    #[test]
+    fn original_filename_missing_file_is_none() {
+        // Unreadable / nonexistent path → graceful None (fall back to basename).
+        assert_eq!(
+            original_filename("Z:\\no\\such\\path\\definitely-missing-xyz.exe"),
+            None
+        );
+        // Empty path → None, no panic.
+        assert_eq!(original_filename(""), None);
+    }
+
+    #[test]
+    fn original_filename_of_system_binary_when_available() {
+        // Best-effort end-to-end: a real signed system binary normally carries
+        // an OriginalFilename in its version resource. We do not hard-assert the
+        // exact value (it varies across Windows builds / SKUs and the file may
+        // be unreadable in some CI sandboxes); we only assert that IF we read a
+        // value, it is sane. This documents the live behavior without making the
+        // test flaky.
+        let candidates = [
+            "C:\\Windows\\System32\\notepad.exe",
+            "C:\\Windows\\System32\\cmd.exe",
+        ];
+        for path in candidates {
+            if let Some(name) = original_filename(path) {
+                assert!(!name.is_empty());
+                assert!(
+                    name.to_lowercase().ends_with(".exe")
+                        || !name.contains('\\'),
+                    "OriginalFilename should be a bare file name, got {name:?}"
+                );
+            }
+        }
     }
 }

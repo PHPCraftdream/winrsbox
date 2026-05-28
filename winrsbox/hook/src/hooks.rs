@@ -116,6 +116,18 @@ pub(crate) const STATUS_NOT_SUPPORTED: NTSTATUS = 0xC000_00BB_u32 as NTSTATUS;
 
 pub(crate) fn decide(dos_path: &str, write: bool) -> Decision {
     // dos_path is already lowercase from nt_to_dos_lower in extract_dos_path
+    //
+    // M5 (non-issue): the cache key is intentionally just (dos_path, write) —
+    // process depth and exe are NOT part of the key, and that is correct here.
+    // This HookCache is a per-process `static OnceLock<HookCache>` (one instance
+    // per loaded hook.dll). Depth is a property of the *process*, assigned once
+    // by the launcher (root = 0; child = parent_depth + 1 on SpawnedChild) and
+    // never mutated for a live PID. Every Req::Decide this process sends resolves
+    // server-side to this one constant depth (the launcher keys depth/exe off the
+    // connection's Hello pid). So within a single process the depth context is
+    // invariant, every cached entry is consistent with it, and the cross-process
+    // "depth-0 caches Passthrough, depth-3 reads it" poisoning is impossible:
+    // those are different processes with separate in-heap caches.
     if let Some(d) = cache().get_caseless(dos_path, write) {
         return d;
     }
@@ -771,6 +783,25 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
 
         if !skip("mitigations") {
             apply_mitigations(&guard);
+        }
+
+        // Arm the inject_guard deterministically now that every hook (incl.
+        // inject_guard's NtCreateThreadEx/NtQueueApcThread detours) is installed.
+        //
+        // M1 fix: previously arming happened lazily on the first successful IPC
+        // round-trip (ensure_ipc_and -> inject_guard::arm()), which only occurs
+        // on a process's first file/registry op. A process that issued a
+        // cross-process injection before any FS/reg op was still ARMED=false, so
+        // should_block() returned false and the injection sailed through. Tying
+        // arming to "hooks installed" closes that init-order window.
+        //
+        // arm() is a single `AtomicBool::store(true, Release)` — no allocation,
+        // no LoadLibrary, no syscall — so it is safe in this DllMain/loader-lock-
+        // adjacent context and idempotent. The ensure_ipc_and() call is kept as
+        // belt-and-suspenders for the `guard == "none"` path (where inject_guard
+        // is not installed, arming is a harmless no-op flag flip).
+        if !skip("inject") {
+            crate::inject_guard::arm();
         }
     }
 

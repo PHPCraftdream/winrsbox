@@ -125,22 +125,50 @@ impl HookedAttrs {
     /// Build a `HookedAttrs` that COPIES the original ObjectName UTF-16
     /// buffer into hook-owned memory, preserving every other field of
     /// `orig`. Use for the Passthrough path to close the TOCTOU
-    /// double-fetch gap on `UNICODE_STRING.Buffer`.
+    /// double-fetch gap on `UNICODE_STRING.Buffer` AND the handle race on
+    /// `OBJECT_ATTRIBUTES.RootDirectory`.
     ///
-    /// Returns `None` (signaling the caller to fall back to the original
-    /// pointer) when:
+    /// Two distinct cases:
+    ///
+    /// 1. `orig.RootDirectory.is_null()` (the common case — absolute
+    ///    paths): copy `orig.ObjectName.Buffer` verbatim into hook-owned
+    ///    memory and inherit `RootDirectory` (null) unchanged. The kernel
+    ///    re-reads `Buffer`; copying it closes the M-S2 double-fetch.
+    ///
+    /// 2. `orig.RootDirectory` is non-null (relative open, path
+    ///    interpreted against a directory HANDLE): the handle VALUE alone
+    ///    is racy. Audit H5 — a hostile thread can `NtClose` the directory
+    ///    handle and reopen a different directory in the same handle-table
+    ///    slot between our policy check and the kernel's resolution, so the
+    ///    same numeric handle now anchors a different directory. The Buffer
+    ///    copy is moot if the anchor races. Defense: resolve the handle to
+    ///    its absolute NT path NOW (via `crate::inject::resolve_handle_path`,
+    ///    the same helper `extract_dos_path` uses to make its policy
+    ///    decision), JOIN it with the ObjectName exactly as
+    ///    `extract_dos_path` does (`base + '\' + name`), store the absolute
+    ///    path in hook-owned memory, and set `RootDirectory = null`. The
+    ///    kernel then resolves a canonical absolute `\Device\...` path with
+    ///    no handle to race.
+    ///
+    /// Returns `None` (signaling the caller to FAIL CLOSED — see the
+    /// Passthrough call sites in fs_hooks.rs) when:
     ///   - `orig.ObjectName.is_null()` — no buffer to copy.
     ///   - `orig.ObjectName.Buffer.is_null()` — nothing to read.
     ///   - `orig.ObjectName.Length` is zero — empty name.
     ///   - `orig.ObjectName.Length > MAX_PASSTHROUGH_LEN_BYTES` — DoS
-    ///     amplification refusal; the kernel rejects this length too, so
-    ///     fall through and let the syscall fail naturally.
+    ///     amplification refusal on the largest, most suspicious inputs.
+    ///   - `orig.RootDirectory` is non-null but `resolve_handle_path`
+    ///     returns `None` — we cannot make the path absolute, so we cannot
+    ///     safely defuse the handle race. Fail closed.
+    ///   - the joined absolute path exceeds the `UNICODE_STRING.Length` u16
+    ///     ceiling (`MAX_PASSTHROUGH_LEN_BYTES`).
     ///
     /// SAFETY: `orig` must be a valid OBJECT_ATTRIBUTES with a readable
-    /// (possibly null) ObjectName for the duration of this call. The
-    /// returned HookedAttrs (if Some) inherits `orig.RootDirectory`,
-    /// `Attributes`, `SecurityDescriptor`, `SecurityQualityOfService`
-    /// verbatim — no modification.
+    /// (possibly null) ObjectName for the duration of this call. When
+    /// `RootDirectory` is null the returned HookedAttrs inherits it (and
+    /// `Attributes`, `SecurityDescriptor`, `SecurityQualityOfService`)
+    /// verbatim. When `RootDirectory` is non-null the returned attrs carry
+    /// a NULL RootDirectory and an absolute ObjectName instead.
     pub(crate) unsafe fn copy_passthrough(orig: &OBJECT_ATTRIBUTES) -> Option<Self> {
         if orig.ObjectName.is_null() {
             return None;
@@ -155,17 +183,86 @@ impl HookedAttrs {
         // Length is in bytes, but Buffer is u16; char count = Length/2.
         let char_count = (src.Length / 2) as usize;
         // SAFETY: src.Buffer is non-null and points to at least src.Length
-        // bytes per the NT UNICODE_STRING contract.
-        let slice = std::slice::from_raw_parts(src.Buffer, char_count);
-        // Copy the buffer into hook-owned heap memory. No null terminator
-        // appended — UNICODE_STRING is length-prefixed, not null-terminated,
-        // so we mirror what the caller passed exactly.
-        let nt_buf: Vec<u16> = slice.to_vec();
+        // bytes per the NT UNICODE_STRING contract (checked above).
+        let name_slice = std::slice::from_raw_parts(src.Buffer, char_count);
+
+        if !orig.RootDirectory.is_null() {
+            // --- H5: defuse the RootDirectory handle race -------------------
+            // Resolve the directory handle to its absolute NT path and join
+            // with the ObjectName, MIRRORING extract_dos_path() in hooks.rs
+            // (the join it used to make the policy decision): `base + '\' +
+            // name`. We must build the SAME path the classifier saw so the
+            // kernel resolves what policy approved.
+            //
+            // resolve_handle_path reads the handle exactly once here. That
+            // single read is inside the same TOCTOU window in principle, but
+            // turning a racy handle into an absolute path collapses the
+            // window: after this point we pass NO handle to the kernel, so
+            // there is nothing left for a concurrent NtClose/reopen to swap.
+            // SAFETY: orig.RootDirectory is non-null and, per the NT calling
+            // convention for our hook parameter, a valid open directory
+            // handle for the duration of this call.
+            let base = crate::inject::resolve_handle_path(orig.RootDirectory)?;
+            // Mirror of hooks.rs::extract_dos_path lines 186-188:
+            //     let mut full: Vec<u16> = base;
+            //     full.push(b'\\' as u16);
+            //     full.extend_from_slice(name_slice);
+            let mut nt_buf: Vec<u16> = base;
+            nt_buf.push(b'\\' as u16);
+            nt_buf.extend_from_slice(name_slice);
+
+            // The joined absolute path must still fit UNICODE_STRING.Length
+            // (a u16, max MAX_PASSTHROUGH_LEN_BYTES). If not, fail closed.
+            let joined_bytes = nt_buf.len().checked_mul(2)?;
+            if joined_bytes > MAX_PASSTHROUGH_LEN_BYTES as usize {
+                return None;
+            }
+            let len_bytes = joined_bytes as u16;
+
+            let ustr = UNICODE_STRING {
+                Length: len_bytes,
+                // Our own synthesized absolute path: a tight-but-valid
+                // MaximumLength == Length. The kernel write-back-on-reparse
+                // headroom concern (see the verbatim-copy branch below)
+                // applies to caller-supplied buffers whose MaximumLength
+                // signaled spare capacity; our absolute path is freshly
+                // built and not subject to that contract.
+                MaximumLength: len_bytes,
+                Buffer: nt_buf.as_ptr() as *mut u16,
+            };
+            let attrs = OBJECT_ATTRIBUTES {
+                Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+                // RootDirectory nulled: the path is now absolute, so the
+                // racy handle anchor is gone.
+                RootDirectory: std::ptr::null_mut(),
+                ObjectName: std::ptr::null_mut(),
+                Attributes: orig.Attributes,
+                SecurityDescriptor: orig.SecurityDescriptor,
+                SecurityQualityOfService: orig.SecurityQualityOfService,
+            };
+            return Some(HookedAttrs { nt_buf, ustr, attrs });
+        }
+
+        // --- Common case: absolute path, null RootDirectory ----------------
+        // Copy the caller's buffer into hook-owned heap memory (M-S2 TOCTOU
+        // defense on Buffer). Preserve MaximumLength headroom: the kernel may
+        // write back into the buffer on some NtCreateFile reparse paths and
+        // expects MaximumLength bytes of capacity. Allocate MaximumLength/2
+        // u16 slots, copy char_count chars in, leave the rest zero-padded.
+        //
+        // Malformed input guard: if MaximumLength < Length (a hostile or
+        // buggy caller), clamp MaximumLength up to Length so the allocation
+        // always covers the copied chars and the kernel never sees
+        // MaximumLength < Length.
+        let max_bytes = src.MaximumLength.max(src.Length);
+        let cap_chars = (max_bytes / 2) as usize;
+        // cap_chars >= char_count because max_bytes >= src.Length = char_count*2.
+        let mut nt_buf: Vec<u16> = vec![0u16; cap_chars];
+        nt_buf[..char_count].copy_from_slice(name_slice);
 
         let ustr = UNICODE_STRING {
             Length: src.Length,
-            // MaximumLength = Length (no slack — we own a tight copy).
-            MaximumLength: src.Length,
+            MaximumLength: max_bytes,
             Buffer: nt_buf.as_ptr() as *mut u16,
         };
         let attrs = OBJECT_ATTRIBUTES {
@@ -204,10 +301,16 @@ mod tests {
     /// Helper: build a fresh OBJECT_ATTRIBUTES wrapping a caller-supplied
     /// UNICODE_STRING. Used to simulate the "user-memory" input the kernel
     /// would see.
+    ///
+    /// RootDirectory is NULL here so `copy_passthrough` takes the common
+    /// verbatim-copy branch. A non-null RootDirectory would make
+    /// `copy_passthrough` call `resolve_handle_path` on the value (audit H5
+    /// handle-race defense), which is a real `NtQueryObject` syscall — not
+    /// something a pure unit test can satisfy with a fabricated handle.
     fn fake_orig(ustr: *mut UNICODE_STRING) -> OBJECT_ATTRIBUTES {
         OBJECT_ATTRIBUTES {
             Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: 0x1234_5678 as *mut _,
+            RootDirectory: std::ptr::null_mut(),
             ObjectName: ustr,
             Attributes: 0x42,
             SecurityDescriptor: 0xAAAA_BBBB as *mut _,
@@ -409,7 +512,11 @@ mod tests {
         let attrs_ptr = h.as_ptr_mut();
         // SAFETY: pointer valid for the lifetime of h.
         let attrs = unsafe { &*attrs_ptr };
-        assert_eq!(attrs.RootDirectory as usize, 0x1234_5678);
+        // Null RootDirectory (the common absolute-path case) is preserved
+        // verbatim as null. (Audit H5: a NON-null RootDirectory is instead
+        // resolved to an absolute path and nulled out — covered by
+        // copy_passthrough_nonnull_rootdir_becomes_absolute.)
+        assert!(attrs.RootDirectory.is_null());
         assert_eq!(attrs.Attributes, 0x42);
         assert_eq!(attrs.SecurityDescriptor as usize, 0xAAAA_BBBB);
         assert_eq!(attrs.SecurityQualityOfService as usize, 0xCCCC_DDDD);
@@ -440,5 +547,235 @@ mod tests {
         // Buffer must still point into h2.nt_buf.
         let ustr = unsafe { &*attrs.ObjectName };
         assert_eq!(ustr.Buffer as *const u16, h2.nt_buf.as_ptr());
+    }
+
+    /// Audit H5 / move-resilience — same as `as_ptr_mut_after_move_is_coherent`
+    /// but for the copy_passthrough constructor. After moving the
+    /// HookedAttrs, `as_ptr_mut()` must re-anchor ObjectName to the new
+    /// self's ustr, and ustr.Buffer must still point into the (moved) nt_buf
+    /// (Vec heap is address-stable across the move).
+    #[test]
+    fn copy_passthrough_as_ptr_mut_after_move_is_coherent() {
+        let mut user_mem: Vec<u16> = "abc".encode_utf16().collect();
+        let mut user_ustr = UNICODE_STRING {
+            Length: (user_mem.len() * 2) as u16,
+            MaximumLength: (user_mem.len() * 2) as u16,
+            Buffer: user_mem.as_mut_ptr(),
+        };
+        let orig = fake_orig(&mut user_ustr);
+
+        let h1 = unsafe { HookedAttrs::copy_passthrough(&orig).unwrap() };
+        // Move h1 into h2.
+        let mut h2 = h1;
+        let ptr = h2.as_ptr_mut();
+        let attrs = unsafe { &*ptr };
+        // ObjectName must point at &h2.ustr after the move.
+        assert_eq!(attrs.ObjectName as usize, &h2.ustr as *const _ as usize);
+        // Buffer must still point into h2.nt_buf.
+        let ustr = unsafe { &*attrs.ObjectName };
+        assert_eq!(ustr.Buffer as *const u16, h2.nt_buf.as_ptr());
+    }
+
+    /// Code-quality #3 — `copy_passthrough` must PRESERVE the caller's
+    /// MaximumLength (not clamp it to Length). The kernel may write back
+    /// into the buffer on some NtCreateFile reparse paths and relies on the
+    /// reported MaximumLength headroom. ObjectName Length = 10 bytes,
+    /// MaximumLength = 20 bytes → the copy must report MaximumLength = 20
+    /// and back it with a buffer of at least 10 u16 slots.
+    #[test]
+    fn copy_passthrough_preserves_maximum_length() {
+        // 5 chars = 10 bytes of Length; buffer physically holds 10 u16 so
+        // the MaximumLength=20 (10 u16) read-back capacity is real.
+        let mut user_mem: Vec<u16> = vec![b'a' as u16; 10];
+        let mut user_ustr = UNICODE_STRING {
+            Length: 10,
+            MaximumLength: 20,
+            Buffer: user_mem.as_mut_ptr(),
+        };
+        let orig = fake_orig(&mut user_ustr);
+        let mut h = unsafe { HookedAttrs::copy_passthrough(&orig).unwrap() };
+        let attrs = unsafe { &*h.as_ptr_mut() };
+        let ustr = unsafe { &*attrs.ObjectName };
+        assert_eq!(ustr.Length, 10, "Length must be preserved");
+        assert_eq!(ustr.MaximumLength, 20, "MaximumLength must be preserved (not clamped to Length)");
+        // The owned buffer must physically hold MaximumLength/2 = 10 u16 so
+        // a kernel write-back up to MaximumLength does not overrun.
+        assert_eq!(h.nt_buf.len(), 10, "buffer must be sized to MaximumLength/2");
+        // The first 5 chars carry the path; the tail is zero-padded.
+        assert_eq!(&h.nt_buf[..5], &[b'a' as u16; 5][..]);
+        assert_eq!(&h.nt_buf[5..], &[0u16; 5][..], "tail must be zero-padded");
+    }
+
+    /// Code-quality #3 (malformed-input guard) — when MaximumLength <
+    /// Length (hostile/buggy caller), MaximumLength is clamped UP to Length
+    /// so the kernel never sees MaximumLength < Length and the allocation
+    /// always covers the copied chars.
+    #[test]
+    fn copy_passthrough_clamps_malformed_maximum_length() {
+        let mut user_mem: Vec<u16> = vec![b'z' as u16; 4]; // 8 bytes
+        let mut user_ustr = UNICODE_STRING {
+            Length: 8,
+            MaximumLength: 2, // malformed: < Length
+            Buffer: user_mem.as_mut_ptr(),
+        };
+        let orig = fake_orig(&mut user_ustr);
+        let mut h = unsafe { HookedAttrs::copy_passthrough(&orig).unwrap() };
+        let attrs = unsafe { &*h.as_ptr_mut() };
+        let inner = unsafe { &*attrs.ObjectName };
+        assert_eq!(inner.Length, 8);
+        assert_eq!(inner.MaximumLength, 8, "MaximumLength must be clamped up to Length");
+        assert_eq!(h.nt_buf.len(), 4);
+    }
+
+    /// Audit H5 / M-S2 — oversized ObjectName returns None so the caller can
+    /// fail closed (no fall-through to the attacker pointer). Boundary:
+    /// 65535 bytes → None; 65534 (= MAX_PASSTHROUGH_LEN_BYTES) → Some.
+    #[test]
+    fn copy_passthrough_oversized_returns_none() {
+        // 65535 bytes — exceeds the u16 cap → None (Buffer never read).
+        let mut over_ustr = UNICODE_STRING {
+            Length: 65535,
+            MaximumLength: 65535,
+            Buffer: 0x1 as *mut u16,
+        };
+        let over = fake_orig(&mut over_ustr);
+        assert!(unsafe { HookedAttrs::copy_passthrough(&over) }.is_none());
+
+        // 65534 bytes — exactly the cap → Some (with a real backing buffer).
+        let mut payload: Vec<u16> = vec![b'a' as u16; (MAX_PASSTHROUGH_LEN_BYTES / 2) as usize];
+        let mut ok_ustr = UNICODE_STRING {
+            Length: MAX_PASSTHROUGH_LEN_BYTES,
+            MaximumLength: MAX_PASSTHROUGH_LEN_BYTES,
+            Buffer: payload.as_mut_ptr(),
+        };
+        let ok = fake_orig(&mut ok_ustr);
+        assert!(unsafe { HookedAttrs::copy_passthrough(&ok) }.is_some());
+    }
+
+    /// Audit M-S2 — with a NULL RootDirectory (the common absolute-path
+    /// case), the buffer is copied into hook-owned memory. Mutating the
+    /// caller's buffer after construction must NOT change the hook copy.
+    #[test]
+    fn copy_passthrough_null_rootdir_copies_buffer() {
+        let mut user_mem: Vec<u16> = "data.txt".encode_utf16().collect();
+        let orig_chars: Vec<u16> = user_mem.clone();
+        let mut user_ustr = UNICODE_STRING {
+            Length: (user_mem.len() * 2) as u16,
+            MaximumLength: (user_mem.len() * 2) as u16,
+            Buffer: user_mem.as_mut_ptr(),
+        };
+        let orig = fake_orig(&mut user_ustr); // RootDirectory is null
+        let mut h = unsafe { HookedAttrs::copy_passthrough(&orig).unwrap() };
+
+        // RootDirectory stays null; buffer must be a hook-owned copy.
+        let attrs = unsafe { &*h.as_ptr_mut() };
+        assert!(attrs.RootDirectory.is_null());
+        assert_ne!(
+            h.nt_buf.as_ptr(),
+            user_mem.as_ptr(),
+            "hook buffer must be a distinct allocation, not the caller's"
+        );
+
+        // Attacker overwrites the caller's buffer mid-syscall.
+        for c in user_mem.iter_mut() {
+            *c = b'X' as u16;
+        }
+        // The hook copy is unchanged — TOCTOU defense holds.
+        assert_eq!(&h.nt_buf[..orig_chars.len()], &orig_chars[..]);
+    }
+
+    /// Audit H5 — when RootDirectory is a NON-null directory handle, the
+    /// copy must resolve it to an absolute NT path, JOIN the ObjectName, and
+    /// NULL the RootDirectory so no racy handle reaches the kernel.
+    ///
+    /// This needs a real open directory handle (resolve_handle_path issues
+    /// an NtQueryObject syscall), so we open C:\Windows with backup
+    /// semantics. If the open or resolution fails on a locked-down host the
+    /// test logs and returns rather than hard-failing CI; the absolute-path
+    /// join is additionally exercised by the e2e escape harnesses.
+    #[test]
+    fn copy_passthrough_nonnull_rootdir_becomes_absolute() {
+        use winapi::um::fileapi::CreateFileW;
+        use winapi::um::fileapi::OPEN_EXISTING;
+        use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+        use winapi::um::winnt::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ,
+        };
+        // FILE_FLAG_BACKUP_SEMANTICS lives in winapi::um::winbase, a feature
+        // the hook crate does not enable (and Cargo.toml is out of scope for
+        // this change). Define the constant locally — required to open a
+        // *directory* as a handle. Value pinned by winnt.h / winbase.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+        let dir_w: Vec<u16> = r"C:\Windows".encode_utf16().chain(Some(0)).collect();
+        // SAFETY: dir_w is a null-terminated UTF-16 path; all other args are
+        // valid constants / null. Backup semantics is required to open a
+        // directory as a handle.
+        let dir_handle = unsafe {
+            CreateFileW(
+                dir_w.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        if dir_handle == INVALID_HANDLE_VALUE || dir_handle.is_null() {
+            eprintln!("[skip] could not open C:\\Windows as a directory handle");
+            return;
+        }
+
+        let mut name: Vec<u16> = "probe.txt".encode_utf16().collect();
+        let mut name_ustr = UNICODE_STRING {
+            Length: (name.len() * 2) as u16,
+            MaximumLength: (name.len() * 2) as u16,
+            Buffer: name.as_mut_ptr(),
+        };
+        let orig = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: dir_handle as *mut _,
+            ObjectName: &mut name_ustr,
+            Attributes: 0,
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
+        };
+
+        // SAFETY: orig is a valid OBJECT_ATTRIBUTES; dir_handle is a live
+        // directory handle for the duration of this call.
+        let copied = unsafe { HookedAttrs::copy_passthrough(&orig) };
+        // SAFETY: dir_handle is the handle we opened above; close it before
+        // any assertion can early-return so we never leak it.
+        unsafe { CloseHandle(dir_handle) };
+
+        let mut h = match copied {
+            Some(h) => h,
+            None => {
+                eprintln!("[skip] resolve_handle_path returned None for C:\\Windows");
+                return;
+            }
+        };
+
+        let attrs = unsafe { &*h.as_ptr_mut() };
+        // The racy handle anchor must be gone.
+        assert!(
+            attrs.RootDirectory.is_null(),
+            "RootDirectory must be nulled once the path is made absolute"
+        );
+        // The path must now be the resolved directory joined with the name.
+        let resolved = String::from_utf16_lossy(&h.nt_buf);
+        assert!(
+            resolved.contains("Windows"),
+            "absolute path must contain the resolved directory (got: {resolved})"
+        );
+        assert!(
+            resolved.ends_with("probe.txt"),
+            "absolute path must end with the joined ObjectName (got: {resolved})"
+        );
+        // Length must match the synthesized buffer (no stale handle-relative len).
+        let ustr = unsafe { &*attrs.ObjectName };
+        assert_eq!(ustr.Length as usize, h.nt_buf.len() * 2);
+        assert_eq!(ustr.MaximumLength, ustr.Length);
     }
 }

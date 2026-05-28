@@ -138,6 +138,78 @@ pub(crate) fn is_shell_target_denied(file: &str) -> bool {
     false
 }
 
+/// Number of leading characters of `lpFile` inspected when deciding whether a
+/// target is a "Unicode scheme attempt". A URI scheme per RFC 3986 is short and
+/// ASCII; 64 chars comfortably covers any legitimate scheme plus a margin while
+/// bounding the scan.
+const UNICODE_SCHEME_INSPECT_CHARS: usize = 64;
+
+/// Returns `true` when `file` looks like a URI scheme attempt whose scheme
+/// portion contains a non-ASCII character.
+///
+/// Motivation (M6): the denylist (`is_shell_target_denied`) lowercases ASCII
+/// per byte. An attacker can pass a scheme containing a non-ASCII homoglyph or
+/// case-fold that Explorer's URI canonicalizer folds DOWN to an ASCII scheme
+/// (e.g. `R\u{1E9E}NAS:notepad.exe`, where U+1E9E LATIN CAPITAL SHARP S may
+/// fold toward `ss`/`s` and reconstruct `runas:`), while our ASCII-only
+/// lowercasing leaves the non-ASCII byte untouched so the prefix never matches.
+///
+/// An AI-agent sandbox never legitimately passes a non-ASCII URI scheme — the
+/// scheme portion of any RFC-3986 URI is ASCII. So a scheme-like string with a
+/// non-ASCII scheme is treated as an attack and denied.
+///
+/// We must NOT blanket-reject non-ASCII in `lpFile`: `ShellExecute` `lpFile`
+/// can be a plain filesystem path with a Unicode name (e.g. `документ.txt` or
+/// `C:\Users\документ.txt`). The discriminator is the position of the first
+/// `:`:
+///
+/// 1. Inspect only the first `UNICODE_SCHEME_INSPECT_CHARS` chars.
+/// 2. Find the first `:`. None → not a scheme (a plain path), return `false`.
+/// 3. If that `:` is at char index 1 and char 0 is ASCII alphabetic, it's a
+///    drive letter (`C:\...`), not a scheme → return `false` (a Unicode
+///    filename after the drive letter is fine).
+/// 4. If the substring BEFORE the first `:` contains any non-ASCII char, the
+///    scheme is non-ASCII → return `true` (suspicious — deny).
+/// 5. Otherwise the scheme is ASCII; the normal `SHELL_DENY_PREFIXES` check
+///    handles it → return `false`.
+pub(crate) fn is_suspicious_unicode_scheme(file: &str) -> bool {
+    // Step 1: bound inspection to the first N chars (by char, not byte, so the
+    // index math below operates on whole code points).
+    let mut prefix_end = file.len();
+    for (count, (idx, _)) in file.char_indices().enumerate() {
+        if count == UNICODE_SCHEME_INSPECT_CHARS {
+            prefix_end = idx;
+            break;
+        }
+    }
+    let head = &file[..prefix_end];
+
+    // Step 2: locate the first ':' within the inspected head.
+    let Some(colon) = head.find(':') else {
+        // No early colon → not a scheme (plain path). Unicode filename allowed.
+        return false;
+    };
+
+    // Step 3: drive-letter case `X:` — colon at byte index 1, single ASCII
+    // alphabetic char before it. (For an ASCII drive letter the char index and
+    // byte index coincide, so `colon == 1` is exact here.)
+    let before = &head[..colon];
+    if colon == 1 {
+        let c0 = before.as_bytes()[0];
+        if c0.is_ascii_alphabetic() {
+            return false;
+        }
+    }
+
+    // Step 4: a non-ASCII char anywhere in the scheme portion is the attack.
+    if !before.is_ascii() {
+        return true;
+    }
+
+    // Step 5: ASCII scheme — leave it to the denylist check.
+    false
+}
+
 /// Scans `params` for any embedded denied URI. ShellExecute callers can pass
 /// the dangerous scheme via `lpParameters` instead of `lpFile` — e.g.
 /// `lpFile = "cmd.exe", lpParameters = "/c start ms-windows-store://..."`.
@@ -166,11 +238,17 @@ pub(crate) fn is_shell_params_denied(params: &str) -> bool {
 
 /// Combined check used by both ShellExecute hook entry points. Returns a
 /// short tag identifying which input matched so the violation log can
-/// distinguish `reason=file` from `reason=params`. Returns `None` when
-/// neither input matches.
+/// distinguish `reason=file`, `reason=unicode_scheme`, and `reason=params`.
+/// Returns `None` when no input matches.
+///
+/// `unicode_scheme` (M6) is checked on `file` before the ASCII denylist so a
+/// homoglyph/fold scheme that would slip past the byte-wise denylist is still
+/// denied. See `is_suspicious_unicode_scheme`.
 pub(crate) fn shell_deny_reason(file: &str, params: &str) -> Option<&'static str> {
     if is_shell_target_denied(file) {
         Some("file")
+    } else if is_suspicious_unicode_scheme(file) {
+        Some("unicode_scheme")
     } else if is_shell_params_denied(params) {
         Some("params")
     } else {
@@ -342,28 +420,65 @@ unsafe extern "system" fn hook_shell_execute_ex_w(
     };
 
     if !p_exec_info.is_null() {
-        // SAFETY: Caller of ShellExecuteExW is contractually obliged to pass
-        // a valid pointer to an initialized SHELLEXECUTEINFOW; we only read
-        // the prefix fields up to lpParameters.
+        // Validate the caller-declared `cbSize` BEFORE we read past the
+        // beginning of the struct or (on deny) write `hInstApp`. A caller that
+        // passes a struct smaller than our mirror (e.g. an older/truncated
+        // SHELLEXECUTEINFO) must not have `hInstApp` written into it — that
+        // field sits near the end of the struct and writing it could clobber
+        // memory past the caller's allocation.
+        //
+        // We compute the offset of `hInstApp` via `core::mem::offset_of!`
+        // (stable since Rust 1.77) so this stays correct if the mirror layout
+        // changes. A struct large enough to contain the whole `hInstApp` field
+        // can be safely written; a smaller one is still DENIED (a malformed
+        // struct must not get a free pass) but WITHOUT writing `hInstApp` — we
+        // return FALSE only, which the caller can always observe.
+        //
+        // SAFETY: `p_exec_info` is non-null (checked above). Reading `cbSize`
+        // (the first field, offset 0) is valid for any allocation a caller
+        // could legitimately pass to ShellExecuteExW, which must contain at
+        // least the `cbSize` field it is required to initialize.
+        let cb_size = (*p_exec_info).cbSize as usize;
+        const HINSTAPP_OFFSET: usize = core::mem::offset_of!(SHELLEXECUTEINFOW, hInstApp);
+        // Bytes the caller must have allocated for a write of `hInstApp` to be
+        // in-bounds: through the end of the field.
+        let hinstapp_end = HINSTAPP_OFFSET + core::mem::size_of::<HINSTANCE>();
+        let cbsize_ok_for_full_struct = cb_size >= core::mem::size_of::<SHELLEXECUTEINFOW>();
+        let cbsize_ok_for_hinstapp_write = cb_size >= hinstapp_end;
+
+        // SAFETY: `p_exec_info` is non-null and the caller contract guarantees
+        // the declared `cbSize` bytes are initialized & readable. We only read
+        // the prefix fields up to `lpParameters`; if `cbSize` is too small to
+        // even contain those, the reads below could touch uninitialized/OOB
+        // memory — but `lpParameters` lives well before `hInstApp`, so any
+        // struct large enough to be a valid ShellExecuteExW call covers them.
+        // The denylist/Unicode/params decision itself never writes the struct.
         let info_ref = &*p_exec_info;
         let file_str = read_lpcwstr(info_ref.lpFile).unwrap_or_default();
         let params_str = read_lpcwstr(info_ref.lpParameters).unwrap_or_default();
         if let Some(reason) = shell_deny_reason(&file_str, &params_str) {
+            // Note when the struct is too small to hold a full SHELLEXECUTEINFOW
+            // so the log records why we may have skipped the hInstApp write.
+            let truncated = !cbsize_ok_for_full_struct;
             if is_trace() {
                 crate::hooks::ipc_log_violation(ipc::Req::Log {
                     pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
                     level: ipc::LogLevel::Warn,
                     msg: format!(
-                        "shell_execute_ex_blocked reason={reason} file={file_str} params={params_str}"
+                        "shell_execute_ex_blocked reason={reason} cbSize={cb_size} truncated={truncated} file={file_str} params={params_str}"
                     ),
                 });
             }
-            // Report SE_ERR_ACCESSDENIED via hInstApp per shellapi.h
-            // contract and return FALSE.
-            // SAFETY: p_exec_info is non-null and points to a writable
-            // struct allocated by the caller; hInstApp is part of the
-            // documented struct prefix.
-            (*p_exec_info).hInstApp = SE_ERR_ACCESSDENIED as *mut c_void as HINSTANCE;
+            if cbsize_ok_for_hinstapp_write {
+                // Report SE_ERR_ACCESSDENIED via hInstApp per shellapi.h
+                // contract and return FALSE.
+                // SAFETY: p_exec_info is non-null and the caller declared a
+                // `cbSize` (>= hinstapp_end) large enough to contain the whole
+                // `hInstApp` field, so this write is in-bounds.
+                (*p_exec_info).hInstApp = SE_ERR_ACCESSDENIED as *mut c_void as HINSTANCE;
+            }
+            // Deny regardless: a struct too small to hold `hInstApp` is still
+            // refused (return FALSE) without the write.
             return FALSE;
         }
     }
@@ -681,6 +796,120 @@ mod tests {
                 "expected params to be denied: {wrapped}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // M6 — Unicode-scheme detection.
+    // -----------------------------------------------------------------
+
+    /// A scheme whose name contains a non-ASCII homoglyph/fold (here U+1E9E
+    /// LATIN CAPITAL SHARP S inside `R...NAS:`) is flagged as suspicious so it
+    /// cannot slip past the ASCII byte-wise denylist.
+    #[test]
+    fn unicode_scheme_runas_denied() {
+        assert!(is_suspicious_unicode_scheme("R\u{1E9E}NAS:x"));
+    }
+
+    /// A plain ASCII scheme is NOT flagged by the Unicode check — it is the
+    /// `SHELL_DENY_PREFIXES` denylist's job to match `runas:` and friends.
+    #[test]
+    fn ascii_scheme_not_flagged_by_unicode_check() {
+        assert!(!is_suspicious_unicode_scheme("runas:x"));
+        // And the denylist does catch it, confirming separation of concerns.
+        assert!(is_shell_target_denied("runas:x"));
+    }
+
+    /// A drive-letter path with a Unicode filename must NOT be flagged: the
+    /// only early colon is the `C:` drive letter, which is explicitly exempt.
+    #[test]
+    fn drive_letter_path_not_flagged() {
+        assert!(!is_suspicious_unicode_scheme("C:\\Users\\документ.txt"));
+        // Lowercase drive letter too.
+        assert!(!is_suspicious_unicode_scheme("d:\\папка\\файл.txt"));
+    }
+
+    /// A UNC path with a Unicode filename and no early colon must NOT be
+    /// flagged (step 2 returns false when no `:` precedes path separators).
+    #[test]
+    fn unicode_filename_no_scheme_not_flagged() {
+        assert!(!is_suspicious_unicode_scheme("\\\\server\\share\\документ.txt"));
+    }
+
+    /// A plain relative path with no colon at all is not a scheme.
+    #[test]
+    fn plain_relative_path_not_flagged() {
+        assert!(!is_suspicious_unicode_scheme("notepad.exe"));
+    }
+
+    /// Extra coverage: an all-ASCII relative path that contains a colon only
+    /// AFTER a separator (so the first colon is not in a scheme position) is
+    /// not treated as a Unicode scheme. The first `:` is found before the
+    /// backslash here, but the scheme portion is ASCII, so step 5 applies.
+    #[test]
+    fn ascii_scheme_with_unicode_after_colon_not_flagged() {
+        // ASCII scheme, Unicode only in the opaque part → handled by denylist,
+        // not by the Unicode-scheme check.
+        assert!(!is_suspicious_unicode_scheme("mailto:документ@пример.рф"));
+    }
+
+    /// Empty input is never a scheme.
+    #[test]
+    fn empty_not_flagged_as_unicode_scheme() {
+        assert!(!is_suspicious_unicode_scheme(""));
+    }
+
+    /// The combined `shell_deny_reason` reports `unicode_scheme` for a
+    /// homoglyph scheme passed via `lpFile`, and still reports `file` /
+    /// `params` for ASCII denylist hits.
+    #[test]
+    fn shell_deny_reason_reports_unicode_scheme() {
+        assert_eq!(
+            shell_deny_reason("R\u{1E9E}NAS:notepad.exe", ""),
+            Some("unicode_scheme")
+        );
+        // ASCII denylist hit still wins as `file`.
+        assert_eq!(shell_deny_reason("runas:x", ""), Some("file"));
+        // Benign drive-letter path with Unicode filename → not denied.
+        assert_eq!(
+            shell_deny_reason("C:\\Users\\документ.txt", "/c echo hi"),
+            None
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // code-quality #1 — SHELLEXECUTEINFOW cbSize validation.
+    // -----------------------------------------------------------------
+
+    /// Documents the layout invariant the `hook_shell_execute_ex_w` cbSize
+    /// guard relies on: a write of `hInstApp` is in-bounds only when the
+    /// caller's `cbSize` is at least `offset_of!(hInstApp) + size_of::<HINSTANCE>()`.
+    /// If a fabricated struct's `cbSize` is smaller than that, the hook must
+    /// deny WITHOUT writing `hInstApp` (return FALSE only). We cannot easily
+    /// exercise the detoured FFI path in a `--lib` unit test (the detour is
+    /// not installed), so we lock the offset arithmetic that drives that
+    /// decision here.
+    #[test]
+    fn cbsize_too_small_does_not_write_past_struct() {
+        let full = core::mem::size_of::<SHELLEXECUTEINFOW>();
+        let hinstapp_off = core::mem::offset_of!(SHELLEXECUTEINFOW, hInstApp);
+        let hinstapp_end = hinstapp_off + core::mem::size_of::<HINSTANCE>();
+
+        // hInstApp must lie fully inside the struct.
+        assert!(hinstapp_end <= full, "hInstApp field extends past struct end");
+        // The field has non-zero size and a non-zero offset (it is not the
+        // first field), so a too-small struct really can omit it.
+        assert!(hinstapp_off > 0);
+
+        // Mirror the runtime decision for a few representative cbSize values.
+        let writes_hinstapp = |cb: usize| cb >= hinstapp_end;
+        // A struct truncated before hInstApp must NOT be written.
+        assert!(!writes_hinstapp(hinstapp_off));
+        assert!(!writes_hinstapp(hinstapp_end - 1));
+        assert!(!writes_hinstapp(0));
+        // A full / oversized struct may be written.
+        assert!(writes_hinstapp(hinstapp_end));
+        assert!(writes_hinstapp(full));
+        assert!(writes_hinstapp(full + 16));
     }
 
     /// `is_shell_params_denied` must not panic on multi-byte UTF-8 input that
