@@ -28,6 +28,7 @@ winapi     = { version = "0.3", features = [
     "psapi",
     "winuser",
     "errhandlingapi",
+    "winver",
 ] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 once_cell  = "1"

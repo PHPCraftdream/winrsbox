@@ -81,9 +81,18 @@ static HOOK_SET_CONTEXT: OnceLock<GenericDetour<FnNtSetContextThread>> = OnceLoc
 
 static ARMED: AtomicBool = AtomicBool::new(false);
 
-/// Arm inject_guard after process initialization completes.
-/// Called from hooks.rs after the first IPC Hello is sent (meaning the
-/// process has finished loading, CRT init, etc. and user code is running).
+/// Arm inject_guard. Idempotent: a single `AtomicBool` store, safe to call any
+/// number of times and from any context (no allocation, no LoadLibrary, no
+/// syscall — safe under loader lock / DllMain).
+///
+/// Called from two sites (M1 fix):
+///   1. hooks.rs `install_hooks`, right after every detour is installed — this
+///      is the deterministic, primary trigger ("hooks are live → arm").
+///   2. ipc_client.rs `ensure_ipc_and`, on the first successful IPC round-trip —
+///      kept as belt-and-suspenders. Harmless because the store is idempotent.
+///
+/// Before the fix, only site (2) existed, so a process that injected before its
+/// first FS/registry op was still un-armed and `should_block` returned false.
 pub fn arm() {
     ARMED.store(true, Ordering::Release);
 }
@@ -535,6 +544,18 @@ pub unsafe fn uninstall() {
 mod tests {
     use super::*;
 
+    // ARMED is a process-global AtomicBool, and cargo runs these tests on
+    // parallel threads in one binary. Tests that mutate ARMED must not race each
+    // other (a stray arm() from one test would flip the gate another test is
+    // asserting on). Serialize them through this lock. Poison is recovered with
+    // into_inner() so an assertion failure in one test does not cascade into
+    // spurious .lock() panics in the others (§B2 Mutex-poisoning discipline).
+    static ARMED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn armed_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        ARMED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     #[test]
     fn is_self_process_pseudo_handle() {
         assert!(unsafe { is_self_process(-1isize as HANDLE) });
@@ -569,6 +590,7 @@ mod tests {
 
     #[test]
     fn not_armed_by_default() {
+        let _g = armed_test_guard();
         // ARMED starts false; reset for safety
         ARMED.store(false, Ordering::Release);
         assert!(!is_armed());
@@ -577,8 +599,70 @@ mod tests {
 
     #[test]
     fn should_block_system_pid_even_when_armed() {
+        let _g = armed_test_guard();
         ARMED.store(true, Ordering::Release);
         assert!(!should_block(64)); // csrss
+        ARMED.store(false, Ordering::Release);
+    }
+
+    /// M1: arm() is a single atomic store, hence idempotent — calling it
+    /// repeatedly is harmless and leaves the guard armed. This is the property
+    /// that lets install_hooks() AND ensure_ipc_and() both call it.
+    #[test]
+    fn arm_is_idempotent() {
+        let _g = armed_test_guard();
+        ARMED.store(false, Ordering::Release);
+        arm();
+        assert!(is_armed());
+        arm();
+        arm();
+        assert!(is_armed(), "repeated arm() must remain armed");
+        ARMED.store(false, Ordering::Release);
+    }
+
+    /// M1: after arm(), a cross-process op targeting a non-system PID from a
+    /// non-system caller is blocked. The arming gate (Filter 2) is the thing
+    /// install_hooks() now flips deterministically; this test pins that flipping
+    /// it changes the should_block() outcome for the foreign-PID case.
+    ///
+    /// `is_system_caller()` walks the *live* test-harness stack, so we branch on
+    /// it to stay deterministic across environments: the load-bearing assertion
+    /// is that when the caller is non-system (the normal case in the test
+    /// binary), arming turns should_block(foreign) from false into true.
+    #[test]
+    fn should_block_after_arm_blocks_foreign_pid() {
+        const FOREIGN_PID: u32 = 999_999; // well above SYSTEM_PID_THRESHOLD
+
+        let _g = armed_test_guard();
+        ARMED.store(false, Ordering::Release);
+        // Un-armed: never blocks, regardless of caller/pid (Filter 2 short-circuit).
+        assert!(!should_block(FOREIGN_PID), "un-armed guard must not block");
+
+        arm();
+        if is_system_caller() {
+            // Degenerate environment (entire stack classified system): Filter 1
+            // still allows. We can't force a non-system frame here, so just
+            // assert the gate is armed.
+            assert!(is_armed());
+        } else {
+            assert!(
+                should_block(FOREIGN_PID),
+                "armed + non-system caller + foreign pid must block",
+            );
+        }
+        ARMED.store(false, Ordering::Release);
+    }
+
+    /// M1 deterministic-arm contract pin: arm() must leave is_armed() true.
+    /// install_hooks() relies on this so the inject hooks become active the
+    /// moment all detours are installed, not on the first IPC round-trip.
+    #[test]
+    fn arm_sets_is_armed_contract() {
+        let _g = armed_test_guard();
+        ARMED.store(false, Ordering::Release);
+        assert!(!is_armed());
+        arm();
+        assert!(is_armed(), "arm() must set the ARMED gate");
         ARMED.store(false, Ordering::Release);
     }
 

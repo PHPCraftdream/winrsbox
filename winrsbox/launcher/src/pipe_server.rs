@@ -518,7 +518,10 @@ const PERSISTENCE_DENY_SUFFIXES: &[&str] = &[
     r"\software\microsoft\windows nt\currentversion\image file execution options",
     r"\software\microsoft\windows nt\currentversion\silentprocessexit",
     r"\system\currentcontrolset\control\session manager\appcertdlls",
-    r"\system\currentcontrolset\services\",
+    // No trailing backslash: segment-anchored matching denies both the
+    // Services hive root and any subkey under it (sandbox must never write
+    // a service registration anywhere).
+    r"\system\currentcontrolset\services",
 
     // ─── H-S4 new entries ───────────────────────────────────────────────────
     // Classic autorun under HKCU and HKLM (Run / RunOnce / RunOnceEx and
@@ -542,13 +545,13 @@ const PERSISTENCE_DENY_SUFFIXES: &[&str] = &[
 
     // COM hijack — InprocServer32 / LocalServer32 under any CLSID loads
     // the attacker DLL into every COM client.
-    r"\software\classes\clsid\",
+    r"\software\classes\clsid",
 
     // File / URL association hijack — the existing match is substring, so
     // `\shell\open\command` catches `HKCU\Software\Classes\<ext>\shell\open\command`
     // for every extension, plus the equivalent under HKLM and HKCR.
     r"\shell\open\command",
-    r"\shellex\contextmenuhandlers\",
+    r"\shellex\contextmenuhandlers",
 
     // cmd.exe autorun — runs on every cmd.exe invocation.
     r"\software\microsoft\command processor\autorun",
@@ -564,14 +567,46 @@ const PERSISTENCE_DENY_SUFFIXES: &[&str] = &[
     r"\security\trusted locations",
 ];
 
+/// Return `true` if `fragment` occurs in `key_lower` aligned to path-segment
+/// boundaries: the fragment starts with `\` (left-anchored to a segment edge)
+/// and the character immediately after the match is either end-of-string or
+/// `\` (right-anchored). This blocks mid-segment false positives — e.g. the
+/// fragment `\run` must NOT match `...\runtime\...` or `...\brundlefly\...`,
+/// only `...\run` (root) or `...\run\...` (subkey).
+///
+/// Note: a segment-aligned occurrence is denied wherever it appears in the
+/// key, regardless of hive prefix — a sandboxed process must never write a
+/// persistence key anywhere, even nested under an attacker-crafted parent.
+fn segment_contains(key_lower: &str, fragment: &str) -> bool {
+    let bytes = key_lower.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = key_lower[start..].find(fragment) {
+        let abs = start + pos;
+        let after = abs + fragment.len();
+        let right_ok = after == key_lower.len() || bytes[after] == b'\\';
+        if right_ok {
+            return true;
+        }
+        // Advance past this occurrence and keep scanning for a later,
+        // properly-anchored match.
+        start = abs + 1;
+        if start >= key_lower.len() {
+            break;
+        }
+    }
+    false
+}
+
 /// Return `true` if `key_path` is a denied registry persistence vector.
 /// Pure function — extracted from the RegDecide handler for unit testing.
-/// Matching is case-insensitive via internal lowercase conversion.
+/// Matching is case-insensitive (internal ASCII lowercase) and segment-anchored
+/// (see `segment_contains`) so unrelated keys that merely contain a denied
+/// fragment mid-segment are not over-matched.
 fn is_persistence_denied(key_path: &str) -> bool {
     let lower = key_path.to_ascii_lowercase();
     PERSISTENCE_DENY_SUFFIXES
         .iter()
-        .any(|s| lower.contains(s))
+        .any(|s| segment_contains(&lower, s))
 }
 
 fn handle_connection(
@@ -1043,6 +1078,83 @@ mod tests {
     #[test]
     fn persistence_empty_path_allowed() {
         assert!(!is_persistence_denied(""));
+    }
+
+    // ─── Audit C1/C4: segment-anchored matching, boundaries pinned ──────────
+
+    #[test]
+    fn persistence_run_key_root_and_value_denied() {
+        // C4: the Run key root itself (a value write AT Run) must be denied,
+        // not just subkeys under it.
+        assert!(is_persistence_denied(
+            r"HKLM\Software\Microsoft\Windows\CurrentVersion\Run"
+        ));
+        assert!(is_persistence_denied(
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Evil"
+        ));
+    }
+
+    #[test]
+    fn persistence_services_root_and_subkey_denied() {
+        // C4: hive root (no trailing component) AND subkey both denied.
+        assert!(is_persistence_denied(r"HKLM\System\CurrentControlSet\Services"));
+        assert!(is_persistence_denied(
+            r"HKLM\System\CurrentControlSet\Services\EvilSvc"
+        ));
+    }
+
+    #[test]
+    fn persistence_classes_clsid_root_and_subkey_denied() {
+        // De-trailing-slashed entry still matches both forms.
+        assert!(is_persistence_denied(r"HKCU\Software\Classes\CLSID"));
+        assert!(is_persistence_denied(
+            r"HKCU\Software\Classes\CLSID\{0000000A-0000-0000-C000-000000000046}\InprocServer32"
+        ));
+    }
+
+    #[test]
+    fn persistence_does_not_overmatch_midsegment() {
+        // C1: the critical negatives. A fragment must match only at segment
+        // boundaries — never mid-segment. These would all FALSE-POSITIVE under
+        // the old naive `.contains()` and must now be allowed.
+        assert!(!is_persistence_denied(r"HKCU\Software\MyVendor\Runtime\Settings")); // "run" inside "runtime"
+        assert!(!is_persistence_denied(r"HKCU\Software\MyVendor\ServicesManager\Cfg")); // "services" inside "servicesmanager"
+        assert!(!is_persistence_denied(r"HKCU\Software\Brundlefly\Data")); // "run" mid-segment
+        assert!(!is_persistence_denied(r"HKCU\Software\Classes\CLSIDExtra\X")); // "clsid" inside "clsidextra"
+    }
+
+    #[test]
+    fn persistence_segment_aligned_anywhere_is_denied() {
+        // A segment-aligned persistence path is denied wherever it appears,
+        // even nested under an attacker-crafted parent — the sandbox must never
+        // write it anywhere. This is intended (documented in segment_contains).
+        assert!(is_persistence_denied(
+            r"HKCU\Software\X\System\CurrentControlSet\Services\Fake"
+        ));
+        // ...but a NON-segment-aligned lookalike must NOT match.
+        assert!(!is_persistence_denied(
+            r"HKCU\Software\XSystem\CurrentControlSet\ServicesY\Fake"
+        ));
+    }
+
+    #[test]
+    fn segment_contains_boundary_semantics() {
+        // Direct unit test of the matcher's anchoring.
+        assert!(segment_contains(r"a\run", r"\run")); // end-of-string
+        assert!(segment_contains(r"a\run\b", r"\run")); // followed by '\'
+        assert!(!segment_contains(r"a\runtime", r"\run")); // followed by other char
+        assert!(!segment_contains(r"arun", r"\run")); // no left boundary
+        assert!(segment_contains(r"x\run\run", r"\run")); // second occurrence anchored
+    }
+
+    #[test]
+    fn persistence_count_pinned() {
+        // Pin the list length so a silently-dropped entry fails a test.
+        assert_eq!(
+            PERSISTENCE_DENY_SUFFIXES.len(),
+            23,
+            "PERSISTENCE_DENY_SUFFIXES length drifted — update tests + threat model"
+        );
     }
 
     // ─── Audit M-A3: handler concurrency cap ────────────────────────────────

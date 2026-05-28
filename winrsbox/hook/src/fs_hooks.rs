@@ -213,17 +213,34 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
 
     match decision.mode {
         Mode::Passthrough => {
-            // TOCTOU defense (audit M-S2): copy the caller's UNICODE_STRING.Buffer
-            // into hook-owned memory and pass that to the kernel, so a concurrent
-            // attacker thread cannot mutate the path between our check and the
-            // kernel's read. Falls through to original pointer for oversized /
-            // empty inputs — the kernel rejects those itself.
+            // TOCTOU defense (audit M-S2 + H5): copy the caller's
+            // UNICODE_STRING.Buffer into hook-owned memory AND resolve any
+            // RootDirectory handle to an absolute path, then pass that to the
+            // kernel — so a concurrent attacker thread can neither mutate the
+            // path nor swap the directory anchor between our check and the
+            // kernel's read.
             // SAFETY: object_attributes is non-null (checked above via extract_dos_path).
-            let mut copy = HookedAttrs::copy_passthrough(&*object_attributes);
-            let attrs_ptr = copy
-                .as_mut()
-                .map(|h| h.as_ptr_mut())
-                .unwrap_or(object_attributes);
+            let mut copy = match HookedAttrs::copy_passthrough(&*object_attributes) {
+                Some(c) => c,
+                None => {
+                    // Oversized / unresolvable path — fail CLOSED rather than
+                    // handing the attacker-owned pointer to the kernel with no
+                    // TOCTOU defense (audit H5 secondary).
+                    if is_trace() {
+                        crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+                            pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                            level: ipc::LogLevel::Warn,
+                            msg: "passthrough_copy_failed_fail_closed".to_string(),
+                        });
+                    }
+                    if !file_handle.is_null() {
+                        *file_handle = std::ptr::null_mut();
+                    }
+                    set_io_status(io_status_block, STATUS_ACCESS_DENIED);
+                    return STATUS_ACCESS_DENIED;
+                }
+            };
+            let attrs_ptr = copy.as_ptr_mut();
             HOOK_NT_CREATE_FILE.get().unwrap().call(
                 file_handle, desired_access, attrs_ptr, io_status_block,
                 allocation_size, file_attributes, share_access, create_disposition,
@@ -357,14 +374,29 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
 
     match decision.mode {
         Mode::Passthrough => {
-            // TOCTOU defense (audit M-S2): copy the caller's path bytes into
-            // hook-owned memory before handing the syscall to the kernel.
+            // TOCTOU defense (audit M-S2 + H5): copy the caller's path bytes
+            // into hook-owned memory and resolve any RootDirectory handle to
+            // an absolute path before handing the syscall to the kernel.
             // SAFETY: object_attributes is non-null.
-            let mut copy = HookedAttrs::copy_passthrough(&*object_attributes);
-            let attrs_ptr = copy
-                .as_mut()
-                .map(|h| h.as_ptr_mut())
-                .unwrap_or(object_attributes);
+            let mut copy = match HookedAttrs::copy_passthrough(&*object_attributes) {
+                Some(c) => c,
+                None => {
+                    // Oversized / unresolvable path — fail CLOSED (audit H5).
+                    if is_trace() {
+                        crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+                            pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                            level: ipc::LogLevel::Warn,
+                            msg: "passthrough_copy_failed_fail_closed".to_string(),
+                        });
+                    }
+                    if !file_handle.is_null() {
+                        *file_handle = std::ptr::null_mut();
+                    }
+                    set_io_status(io_status_block, STATUS_ACCESS_DENIED);
+                    return STATUS_ACCESS_DENIED;
+                }
+            };
+            let attrs_ptr = copy.as_ptr_mut();
             HOOK_NT_OPEN_FILE.get().unwrap().call(
                 file_handle, desired_access, attrs_ptr,
                 io_status_block, share_access, open_options,
@@ -448,13 +480,26 @@ pub(crate) unsafe extern "system" fn hook_nt_query_attributes_file(
     let decision = decide(&dos, false);
     match decision.mode {
         Mode::Passthrough => {
-            // TOCTOU defense: copy caller's path before kernel re-read.
+            // TOCTOU defense (audit M-S2 + H5): copy caller's path and
+            // resolve any RootDirectory handle before the kernel re-read.
+            // No io_status_block param on this syscall — just return on
+            // fail-closed.
             // SAFETY: object_attributes is non-null.
-            let mut copy = HookedAttrs::copy_passthrough(&*object_attributes);
-            let attrs_ptr = copy
-                .as_mut()
-                .map(|h| h.as_ptr_mut())
-                .unwrap_or(object_attributes);
+            let mut copy = match HookedAttrs::copy_passthrough(&*object_attributes) {
+                Some(c) => c,
+                None => {
+                    // Oversized / unresolvable path — fail CLOSED (audit H5).
+                    if is_trace() {
+                        crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+                            pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                            level: ipc::LogLevel::Warn,
+                            msg: "passthrough_copy_failed_fail_closed".to_string(),
+                        });
+                    }
+                    return STATUS_ACCESS_DENIED;
+                }
+            };
+            let attrs_ptr = copy.as_ptr_mut();
             HOOK_NT_QUERY_ATTRIBUTES_FILE
                 .get()
                 .unwrap()
@@ -545,13 +590,26 @@ pub(crate) unsafe extern "system" fn hook_nt_query_full_attributes_file(
     let decision = decide(&dos, false);
     match decision.mode {
         Mode::Passthrough => {
-            // TOCTOU defense: copy caller's path before kernel re-read.
+            // TOCTOU defense (audit M-S2 + H5): copy caller's path and
+            // resolve any RootDirectory handle before the kernel re-read.
+            // No io_status_block param on this syscall — just return on
+            // fail-closed.
             // SAFETY: object_attributes is non-null.
-            let mut copy = HookedAttrs::copy_passthrough(&*object_attributes);
-            let attrs_ptr = copy
-                .as_mut()
-                .map(|h| h.as_ptr_mut())
-                .unwrap_or(object_attributes);
+            let mut copy = match HookedAttrs::copy_passthrough(&*object_attributes) {
+                Some(c) => c,
+                None => {
+                    // Oversized / unresolvable path — fail CLOSED (audit H5).
+                    if is_trace() {
+                        crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+                            pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                            level: ipc::LogLevel::Warn,
+                            msg: "passthrough_copy_failed_fail_closed".to_string(),
+                        });
+                    }
+                    return STATUS_ACCESS_DENIED;
+                }
+            };
+            let attrs_ptr = copy.as_ptr_mut();
             HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
                 .get()
                 .unwrap()
