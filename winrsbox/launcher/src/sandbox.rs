@@ -198,14 +198,23 @@ pub(crate) fn launch_suspended(cwd: &Path, target_args: &[String], guard: crate:
         crate::GuardLevel::None => mitigations::Profile::None,
         crate::GuardLevel::Scan => mitigations::Profile::Scan,
         crate::GuardLevel::Full => mitigations::Profile::Full,
+        crate::GuardLevel::Static => mitigations::Profile::Static,
     };
     let (v1, v2) = mitigations::compute(profile);
-    // Strip BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON — kernel enforces this at
-    // image-load time. With it set BEFORE hook.dll loads, kernel32!LoadLibrary
-    // would refuse our unsigned hook.dll and brick the sandbox. hook::apply_
-    // mitigations re-applies the runtime SignaturePolicy flag once hook.dll
-    // has finished installing detours.
-    let create_v1 = v1 & !miti_v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
+    // Strip the two bits that would brick our own bootstrap if enforced BEFORE
+    // hook.dll loads + installs its detours:
+    //   * BLOCK_NON_MICROSOFT_BINARIES — kernel refuses the unsigned hook.dll
+    //     at LoadLibrary time.
+    //   * PROHIBIT_DYNAMIC_CODE — blocks detour2 from allocating/patching the
+    //     executable trampolines it needs to install the ntdll hooks.
+    // Both are re-applied at RUNTIME by hook::apply_mitigations, AFTER all
+    // detours are in place (existing executable code keeps running; only the
+    // guest's *future* dynamic code / unsigned loads are then blocked). These
+    // two only appear in Profile::Static; Full carries neither (it's JIT-safe),
+    // so for Full this strip is a no-op.
+    let create_v1 = v1
+        & !miti_v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON
+        & !miti_v1::PROHIBIT_DYNAMIC_CODE_ALWAYS_ON;
     let has_mitigations = (create_v1 != 0) || (v2 != 0);
     // Stack-allocated 16-byte buffer; must outlive CreateProcessW (the kernel
     // reads from the pointer stored in the attribute list, not a copy).

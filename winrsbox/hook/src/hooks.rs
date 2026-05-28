@@ -836,9 +836,9 @@ fn apply_mitigations(guard: &str) {
     use winapi::um::winnt::PROCESS_MITIGATION_POLICY;
 
     // ExtensionPointDisablePolicy (6): blocks AppInit_DLLs, SetWindowsHookEx, IFEO.
-    // Applied only in full mode — some programs (cargo, compilers) may load DLLs
-    // that rely on extension points during startup.
-    if guard == "full" {
+    // Applied in full and static — this is JIT-safe hardening (it blocks
+    // injection INTO us, not our own code generation).
+    if guard == "full" || guard == "static" {
         let ext_disable_flags: u32 = 1;
         // SAFETY: ext_disable_flags is valid for PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY.
         unsafe {
@@ -850,7 +850,14 @@ fn apply_mitigations(guard: &str) {
         }
     }
 
-    if guard == "full" {
+    // DynamicCode + Signature are the JIT/unsigned-code killers — they break
+    // node/V8, .NET, Python .pyd, Node .node. Applied ONLY in `static` (hard
+    // containment, opt-in for pure-static targets), never in `full`. This is
+    // the runtime half of the M4 split; the create-time half lives in
+    // launcher mitigations::Profile::Static. SignaturePolicy is applied here
+    // (not at create time) precisely because hook.dll is unsigned and must
+    // load first.
+    if guard == "static" {
         // DynamicCodePolicy (2): blocks RWX/JIT
         let dyn_code_flags: u32 = 1; // ProhibitDynamicCode = bit 0
         // SAFETY: same — 4-byte struct with Flags DWORD.
