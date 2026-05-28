@@ -24,10 +24,8 @@ use winapi::ctypes::c_void;
 use winapi::um::processthreadsapi::GetCurrentProcessId;
 
 use crate::anti_rec;
-use crate::hooks::{ipc_log, is_trace};
+use crate::hooks::{ipc_log, is_trace, STATUS_ACCESS_DENIED};
 use crate::process_tracker;
-
-const STATUS_ACCESS_DENIED: NTSTATUS = 0xC000_0022_u32 as NTSTATUS;
 
 // ---------------------------------------------------------------------------
 // Hook 1: NtAdjustPrivilegesToken — block enabling dangerous privileges

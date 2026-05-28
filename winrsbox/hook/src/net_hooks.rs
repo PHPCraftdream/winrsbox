@@ -37,23 +37,31 @@ static WSA_SET_LAST_ERROR: OnceLock<FnWsaSetLastError> = OnceLock::new();
 
 /// Parse a sockaddr buffer into (host_string, port). Returns None on
 /// unsupported family or short buffer.
+///
+/// # SAFETY
+/// Caller must ensure `addr` is valid for `len` bytes. Null is handled internally.
 pub unsafe fn parse_sockaddr(addr: *const c_void, len: i32) -> Option<(String, u16)> {
     if addr.is_null() || len < 16 {
         return None;
     }
+    // SAFETY: addr is non-null and len >= 16, verified above.
     let family = *(addr as *const u16);
     match family {
         AF_INET => {
             // sockaddr_in: { u16 family; u16 port (BE); u8 addr[4]; ... }
+            // SAFETY: len >= 16 confirmed above; offsets 2..8 are within bounds for AF_INET.
             let port_be = *((addr as *const u8).add(2) as *const u16);
             let port = u16::from_be(port_be);
+            // SAFETY: from_raw_parts for 4 bytes starting at offset 4 — within the 16-byte sockaddr_in.
             let ip = std::slice::from_raw_parts((addr as *const u8).add(4), 4);
             Some((format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]), port))
         }
         AF_INET6 if len >= 28 => {
             // sockaddr_in6: { u16 family; u16 port (BE); u32 flowinfo; u8 addr[16]; u32 scope }
+            // SAFETY: len >= 28 confirmed by match guard; offsets 2..4 (port) and 8..24 (addr) are in bounds.
             let port_be = *((addr as *const u8).add(2) as *const u16);
             let port = u16::from_be(port_be);
+            // SAFETY: from_raw_parts for 16 bytes starting at offset 8 — within the 28-byte sockaddr_in6.
             let ip = std::slice::from_raw_parts((addr as *const u8).add(8), 16);
             let s = format!(
                 "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
@@ -94,12 +102,15 @@ fn is_connection_denied(host: &str, port: u16) -> bool {
 // Hook
 // ---------------------------------------------------------------------------
 
+// SAFETY: Called by detour2 dispatcher with the same ABI as ws2_32!connect.
+// All pointer args originate from the caller and are passed through to the original.
 unsafe extern "system" fn hook_connect(
     s: usize,
     name: *const c_void,
     namelen: i32,
 ) -> i32 {
     let call_original = || {
+        // SAFETY: detour2 guarantees the trampoline pointer is valid and matches FnConnect ABI.
         HOOK_CONNECT.get().unwrap().call(s, name, namelen)
     };
 
@@ -140,6 +151,7 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     // Resolve WSASetLastError for setting error code on deny
     let set_err_addr = GetProcAddress(hmod, b"WSASetLastError\0".as_ptr() as *const i8);
     if !set_err_addr.is_null() {
+        // SAFETY: transmute of GetProcAddress result; ABI matches FnWsaSetLastError.
         let f: FnWsaSetLastError = std::mem::transmute(set_err_addr as usize);
         let _ = WSA_SET_LAST_ERROR.set(f);
     }
@@ -149,6 +161,7 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     if connect_addr.is_null() {
         return Err("ws2_32!connect not found".into());
     }
+    // SAFETY: transmute of GetProcAddress result; ABI matches FnConnect (ws2_32!connect signature).
     let target: FnConnect = std::mem::transmute(connect_addr as usize);
     let hook_ptr: FnConnect = hook_connect;
     let detour = GenericDetour::<FnConnect>::new(target, hook_ptr)

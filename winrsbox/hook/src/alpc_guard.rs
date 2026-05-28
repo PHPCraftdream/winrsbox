@@ -26,8 +26,7 @@ use ntapi::winapi::shared::ntdef::{HANDLE, NTSTATUS, OBJECT_ATTRIBUTES, UNICODE_
 use winapi::ctypes::c_void;
 
 use crate::anti_rec;
-
-const STATUS_ACCESS_DENIED: NTSTATUS = 0xC000_0022_u32 as NTSTATUS;
+use crate::hooks::STATUS_ACCESS_DENIED;
 
 type FnNtAlpcConnectPort = unsafe extern "system" fn(
     *mut HANDLE,            // PortHandle (out)
@@ -52,11 +51,13 @@ const DANGEROUS_PORT_SUBSTRINGS: &[&str] = &[
     "ole",          // COM/OLE activation service
     "actkernel",    // COM activation kernel port
     "comlaunch",    // COM launch service
-    // Security services (NEW)
+    "dcomlaunch",   // \RPC Control\dcomlaunch — DcomLaunch (spawns COM servers as SYSTEM)
+    // Security services / privilege brokers
     "lsarpc",       // \RPC Control\LSARPC — LSA policy queries
     "samr",         // \RPC Control\samr — SAM database (account enum)
     "winreg",       // \RPC Control\winreg — remote registry
     "seclogon",     // \RPC Control\seclogon — secondary logon / RunAs (priv escalation)
+    "appinfo",      // \RPC Control\appinfo — UAC elevation broker (AppInfo service)
     "wmsgk",        // WMsgKMessagePort — window message dispatch
     // WMI direct ALPC bypass (sandbox uses direct LRPC to WMI service
     // instead of CoCreateInstance(WbemLocator) which com_guard catches)
@@ -65,6 +66,12 @@ const DANGEROUS_PORT_SUBSTRINGS: &[&str] = &[
     "spool",        // \RPC Control\spoolss — Print Spooler RPC (PrintNightmare class)
     "schedule",     // \RPC Control\schedule — Task Scheduler direct LRPC
                     // (bypass for Schedule.Service COM which com_guard blocks)
+    // Deployment / session / reporting brokers
+    "appxsvc",      // \RPC Control\appxsvc — AppX deployment service
+    "appx",         // \RPC Control\appx* — AppX activation (prefix also matches appxsvc)
+    "pchsvc",       // \RPC Control\pchsvc — Problem Reports / PCH service (RPC named pipe)
+    "terminalserver", // \RPC Control\terminalserver — Terminal Services RPC
+    "iiscertobj",   // \RPC Control\iiscertobj — IIS Cert (rarely present, defense in depth)
     // NOTE: "epmapper" intentionally NOT blocked — COM activation needs it
     // for endpoint resolution; com_guard catches dangerous CLSIDs before
     // epmapper is contacted. Blocking epmapper breaks legit COM (verified
@@ -82,6 +89,7 @@ fn is_dangerous_port(name: &str) -> bool {
     DANGEROUS_PORT_SUBSTRINGS.iter().any(|&p| segment.starts_with(p))
 }
 
+// SAFETY: Called by detour2 dispatcher with ntdll!NtAlpcConnectPort ABI.
 unsafe extern "system" fn hook_nt_alpc_connect_port(
     port_handle: *mut HANDLE,
     port_name: *mut UNICODE_STRING,
@@ -96,6 +104,7 @@ unsafe extern "system" fn hook_nt_alpc_connect_port(
     timeout: *mut i64,
 ) -> NTSTATUS {
     let call_original = || {
+        // SAFETY: detour2 trampoline matches FnNtAlpcConnectPort ABI.
         HOOK_ALPC_CONNECT.get().unwrap().call(
             port_handle, port_name, object_attributes, port_attributes,
             flags, required_server_sid, connection_message, buffer_length,
@@ -108,9 +117,11 @@ unsafe extern "system" fn hook_nt_alpc_connect_port(
     };
 
     if !port_name.is_null() {
+        // SAFETY: deref of non-null UNICODE_STRING pointer — ntdll guarantees validity on entry.
         let ustr = &*port_name;
         let char_count = (ustr.Length / 2) as usize;
         if char_count > 0 && !ustr.Buffer.is_null() {
+            // SAFETY: from_raw_parts for char_count WCHARs from UNICODE_STRING.Buffer; Length bounds the region.
             let name_slice = std::slice::from_raw_parts(ustr.Buffer, char_count);
             let name = String::from_utf16_lossy(name_slice);
             if is_dangerous_port(&name) {
@@ -129,9 +140,12 @@ unsafe extern "system" fn hook_nt_alpc_connect_port(
     call_original()
 }
 
+/// # SAFETY
+/// Must be called from install_hooks() in DllMain context with anti_rec entered.
 pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     let addr = crate::hooks::ntdll_export("NtAlpcConnectPort\0".as_bytes())
         .ok_or("NtAlpcConnectPort not found")?;
+    // SAFETY: transmute of ntdll export address; ABI matches FnNtAlpcConnectPort signature.
     let target: FnNtAlpcConnectPort = std::mem::transmute(addr as usize);
     let hook_ptr: FnNtAlpcConnectPort = hook_nt_alpc_connect_port;
     let detour = GenericDetour::<FnNtAlpcConnectPort>::new(target, hook_ptr)
@@ -142,6 +156,8 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// # SAFETY
+/// Must be called from DLL_PROCESS_DETACH only.
 pub unsafe fn uninstall() {
     if let Some(h) = HOOK_ALPC_CONNECT.get() { let _ = h.disable(); }
 }
@@ -174,10 +190,28 @@ mod tests {
         // Task Scheduler direct LRPC
         assert!(is_dangerous_port(r"\RPC Control\schedule"));
 
+        // Audit M-S4: UAC / deployment / session / reporting brokers
+        assert!(is_dangerous_port(r"\RPC Control\appinfo"));
+        assert!(is_dangerous_port(r"\RPC Control\appxsvc"));
+        assert!(is_dangerous_port(r"\RPC Control\dcomlaunch"));
+        assert!(is_dangerous_port(r"\RPC Control\pchsvc"));
+        assert!(is_dangerous_port(r"\RPC Control\terminalserver"));
+        assert!(is_dangerous_port(r"\RPC Control\iiscertobj"));
+        // "appx" is a prefix of "appxsvc" — any port starting with "appx"
+        // matches (intended: covers \RPC Control\AppXDeploymentClient etc.).
+        assert!(is_dangerous_port(r"\RPC Control\AppXDeploymentClient"));
+
         // Negative — must NOT be blocked
         assert!(!is_dangerous_port("lsass"));
         assert!(!is_dangerous_port("epmapper"));
         assert!(!is_dangerous_port("DnsResolver"));
+
+        // Audit M-S4 regression: bare common prefixes must NOT match — only
+        // segments that start with a full denied token. The check is
+        // `segment.starts_with(pattern)`, so a shorter segment like "app"
+        // cannot start with the longer pattern "appinfo" / "appx".
+        assert!(!is_dangerous_port(r"\RPC Control\app"));
+        assert!(!is_dangerous_port(r"\RPC Control\dcom"));
 
         // False-positive regression: "ole" substring inside a segment
         // must NOT match when the segment does not start with "ole".

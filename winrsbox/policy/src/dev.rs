@@ -75,16 +75,41 @@ pub fn classify_device(path: &str) -> DeviceKind {
     if lower.contains(r"device\null") || lower == "nul" || lower.ends_with(r"\nul") {
         return DeviceKind::Null;
     }
+    // Credential-extraction surfaces — deny by default (audit M-S1).
+    // KsecDD brokers LSASS calls; certain IOCTL_KSEC_* opcodes leak LSA-isolated
+    // data and DPAPI master keys without ever opening a handle to LSASS itself.
+    // CNG / CNGBootInfo expose similar key-material / boot-time crypto info-leaks.
+    // Previously these fell through to SystemQuery (read-OK); now explicit deny.
+    // Check CNGBootInfo before CNG so the longer prefix wins.
+    if is_device_name(&lower, "cngbootinfo")
+        || is_device_name(&lower, "ksecdd")
+        || is_device_name(&lower, "cng")
+    {
+        return DeviceKind::Unknown;
+    }
     // Default: SystemQuery (read OK, write denied).
     // Modern GUI/UWP/Node processes open many internal device handles during
-    // startup (KsecDD, Cng, CMNotify, DeviceApi, Lanmanredirector, UWP services).
-    // Denying all unknown devices by default broke notepad and node — the
-    // actual escape vectors are covered by other layers: CoW for files, WFP
-    // for network, ALPC guard for COM/RPC, dangerous-pipe list, raw-disk
-    // blocks above. SystemQuery permits read access (needed for crypto
-    // sessions, mount queries, device info) and denies writes through
+    // startup (CMNotify, DeviceApi, Lanmanredirector, UWP services). Denying
+    // all unknown devices by default broke notepad and node — the actual
+    // escape vectors are covered by other layers: CoW for files, WFP for
+    // network, ALPC guard for COM/RPC, dangerous-pipe list, raw-disk blocks,
+    // and credential-surface blocks (KsecDD/CNG) above. SystemQuery permits
+    // read access (mount queries, device info) and denies writes through
     // unrecognized device handles.
     DeviceKind::SystemQuery
+}
+
+/// Matches the canonical NT device-object forms for a given device name,
+/// e.g. for `name = "ksecdd"`: `\device\ksecdd`, `device\ksecdd`, and
+/// either form followed by `\` + sub-path. Input `lower` must already be
+/// lowercased.
+fn is_device_name(lower: &str, name: &str) -> bool {
+    let backslash = format!(r"\device\{name}");
+    let bare = &backslash[1..]; // "device\\<name>"
+    if lower == backslash || lower == bare { return true; }
+    let backslash_sub = format!(r"\device\{name}\");
+    let bare_sub = &backslash_sub[1..];
+    lower.starts_with(&backslash_sub) || lower.starts_with(bare_sub)
 }
 
 /// Pipes that give access to dangerous system services.
@@ -265,6 +290,44 @@ mod tests {
     fn classify_system_query_devices() {
         assert_eq!(classify_device(r"\device\mountpointmanager"), DeviceKind::SystemQuery);
         assert_eq!(classify_device(r"device\ipt"), DeviceKind::SystemQuery);
+    }
+
+    #[test]
+    fn classify_ksecdd_is_unknown() {
+        // KsecDD brokers LSASS / DPAPI calls — credential-extraction surface.
+        // Audit M-S1: moved from SystemQuery (read-OK) to Unknown (deny).
+        assert_eq!(classify_device(r"\device\ksecdd"), DeviceKind::Unknown);
+        assert_eq!(classify_device(r"device\ksecdd"), DeviceKind::Unknown);
+    }
+
+    #[test]
+    fn classify_cng_is_unknown() {
+        // CNG (Cryptography Next Generation) exposes key-material info-leaks.
+        // Audit M-S1: moved from SystemQuery (read-OK) to Unknown (deny).
+        assert_eq!(classify_device(r"\device\cng"), DeviceKind::Unknown);
+        assert_eq!(classify_device(r"device\cng"), DeviceKind::Unknown);
+    }
+
+    #[test]
+    fn classify_cngbootinfo_is_unknown() {
+        // CNGBootInfo exposes boot-time crypto state / key material.
+        // Audit M-S1: moved from SystemQuery (read-OK) to Unknown (deny).
+        assert_eq!(classify_device(r"\device\cngbootinfo"), DeviceKind::Unknown);
+        assert_eq!(classify_device(r"device\cngbootinfo"), DeviceKind::Unknown);
+    }
+
+    #[test]
+    fn classify_credential_surface_does_not_overmatch() {
+        // A pipe or filesystem path that merely contains "cng" or "ksecdd"
+        // as a substring must NOT be misclassified — only canonical
+        // \Device\<Name> forms.
+        assert_eq!(classify_device(r"\device\namedpipe\cng"), DeviceKind::NamedPipe);
+        assert_eq!(
+            classify_device(r"\device\harddiskvolume1\windows\system32\drivers\cng.sys"),
+            DeviceKind::HarddiskVolume,
+        );
+        // Different device whose name happens to start with "cng" must not match.
+        assert_eq!(classify_device(r"\device\cngfoo"), DeviceKind::SystemQuery);
     }
 
     #[test]

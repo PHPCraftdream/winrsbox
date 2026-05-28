@@ -64,3 +64,11 @@ harness = false
 [[bench]]
 name = "net_hooks"
 harness = false
+
+[[bench]]
+name = "path_traversal"
+harness = false
+
+[[bench]]
+name = "decide_full"
+harness = false

@@ -5,7 +5,12 @@
 // Mode::Cow semantic (unified, no Redirect variant):
 //   cow_from = None  → pure redirect (overlay already exists or read path)
 //   cow_from = Some  → real CoW (copy original file before redirecting)
+//
+// This file is the "shared infra + orchestration" module.
+// IPC client plumbing lives in ipc_client.rs.
+// FS hook implementations live in fs_hooks.rs.
 
+use std::borrow::Cow;
 use std::sync::OnceLock;
 // Use winapi's c_void to match signatures expected by winapi/ntapi functions.
 use winapi::ctypes::c_void;
@@ -13,52 +18,40 @@ use winapi::ctypes::c_void;
 use detour2::GenericDetour;
 use ntapi::ntioapi::IO_STATUS_BLOCK;
 use ntapi::winapi::shared::ntdef::{
-    HANDLE, NTSTATUS, OBJECT_ATTRIBUTES, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
+    HANDLE, NTSTATUS, OBJECT_ATTRIBUTES, UNICODE_STRING,
 };
 use ntapi::winapi::um::winnt::ACCESS_MASK;
-use policy::{Decision, Mode};
+use policy::Decision;
 use winapi::um::processthreadsapi::{GetCurrentProcessId, GetProcessId};
 
 use crate::anti_rec;
-use crate::cache::HookCache;
 use crate::inject;
 
 // ---------------------------------------------------------------------------
-// Nt* function type aliases
+// Re-exports from ipc_client — keep existing call sites working.
+// (crate::hooks::ipc_log, is_trace, ipc_log_violation, ipc_send_and_recv,
+//  ntdll_export, flush_install_errors, SANDBOX_CWD, etc.)
 // ---------------------------------------------------------------------------
+pub(crate) use crate::ipc_client::{
+    buffer_install_error,
+    cache,
+    ipc_decide,
+    ipc_log,
+    ipc_log_violation,
+    ipc_record_overlay,
+    ipc_register_child,
+    ipc_send_and_recv,
+    ipc_spawned_child,
+    is_trace,
+    DLL_PATH,
+    PIPE_NAME,
+    SANDBOX_CWD,
+    TRACE_ENABLED,
+};
 
-type FnNtCreateFile = unsafe extern "system" fn(
-    *mut HANDLE,            // FileHandle
-    ACCESS_MASK,            // DesiredAccess
-    *mut OBJECT_ATTRIBUTES, // ObjectAttributes
-    *mut IO_STATUS_BLOCK,   // IoStatusBlock
-    *mut i64,               // AllocationSize
-    u32,                    // FileAttributes
-    u32,                    // ShareAccess
-    u32,                    // CreateDisposition
-    u32,                    // CreateOptions
-    *mut c_void,            // EaBuffer
-    u32,                    // EaLength
-) -> NTSTATUS;
-
-type FnNtOpenFile = unsafe extern "system" fn(
-    *mut HANDLE,            // FileHandle
-    ACCESS_MASK,            // DesiredAccess
-    *mut OBJECT_ATTRIBUTES, // ObjectAttributes
-    *mut IO_STATUS_BLOCK,   // IoStatusBlock
-    u32,                    // ShareAccess
-    u32,                    // OpenOptions
-) -> NTSTATUS;
-
-type FnNtQueryAttributesFile = unsafe extern "system" fn(
-    *mut OBJECT_ATTRIBUTES, // ObjectAttributes
-    *mut c_void,            // FileInformation
-) -> NTSTATUS;
-
-type FnNtQueryFullAttributesFile = unsafe extern "system" fn(
-    *mut OBJECT_ATTRIBUTES, // ObjectAttributes
-    *mut c_void,            // FileInformation
-) -> NTSTATUS;
+// ---------------------------------------------------------------------------
+// NtCreateUserProcess type alias + OnceLock (stays here; install_hooks uses it)
+// ---------------------------------------------------------------------------
 
 type FnNtCreateUserProcess = unsafe extern "system" fn(
     *mut HANDLE,            // ProcessHandle
@@ -74,85 +67,49 @@ type FnNtCreateUserProcess = unsafe extern "system" fn(
     *mut c_void,            // AttributeList
 ) -> NTSTATUS;
 
+static HOOK_NT_CREATE_USER_PROCESS: OnceLock<GenericDetour<FnNtCreateUserProcess>> =
+    OnceLock::new();
+
 // FnNtQueryDirectoryFile, FnNtSetInformationFile, FnNtFsControlFile
 // moved to dir_filter.rs and fs_metadata_guard.rs respectively.
 
 // ---------------------------------------------------------------------------
-// Detour storage
+// Write-access detection
 // ---------------------------------------------------------------------------
 
-static HOOK_NT_CREATE_FILE: OnceLock<GenericDetour<FnNtCreateFile>> = OnceLock::new();
-static HOOK_NT_OPEN_FILE: OnceLock<GenericDetour<FnNtOpenFile>> = OnceLock::new();
-static HOOK_NT_QUERY_ATTRIBUTES_FILE: OnceLock<GenericDetour<FnNtQueryAttributesFile>> =
-    OnceLock::new();
-static HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE: OnceLock<GenericDetour<FnNtQueryFullAttributesFile>> =
-    OnceLock::new();
-static HOOK_NT_CREATE_USER_PROCESS: OnceLock<GenericDetour<FnNtCreateUserProcess>> =
-    OnceLock::new();
-// HOOK_NT_QUERY_DIRECTORY_FILE moved to dir_filter.rs
-// HOOK_NT_SET_INFO_FILE, HOOK_NT_FS_CONTROL_FILE moved to fs_metadata_guard.rs
+pub const GENERIC_WRITE: u32 = 0x4000_0000;
+pub const FILE_WRITE_DATA: u32 = 0x0000_0002;
+pub const FILE_APPEND_DATA: u32 = 0x0000_0004;
+pub const DELETE: u32 = 0x0001_0000;
+pub const WRITE_DAC: u32 = 0x0004_0000;
+pub const WRITE_OWNER: u32 = 0x0008_0000;
+
+pub const FILE_CREATE: u32 = 0x0000_0002;
+pub const FILE_OPEN_IF: u32 = 0x0000_0003;
+pub const FILE_OVERWRITE: u32 = 0x0000_0004;
+pub const FILE_OVERWRITE_IF: u32 = 0x0000_0005;
+pub const FILE_SUPERSEDE: u32 = 0x0000_0000;
+
+pub fn is_write_access(desired: ACCESS_MASK, disposition: u32) -> bool {
+    let write_bits =
+        GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER;
+    desired & write_bits != 0
+        || matches!(disposition, FILE_CREATE | FILE_OPEN_IF | FILE_OVERWRITE | FILE_OVERWRITE_IF | FILE_SUPERSEDE)
+}
 
 // ---------------------------------------------------------------------------
-// IPC / cache globals
+// STATUS codes
 // ---------------------------------------------------------------------------
 
-static CACHE: OnceLock<HookCache> = OnceLock::new();
-
-// Per-thread IPC connection. Each thread gets its own SyncClient so file-system
-// calls don't serialize on a global mutex. The launcher pipe server handles
-// each connection concurrently via spawn_blocking, giving real parallelism on
-// multithreaded targets.
-thread_local! {
-    static IPC_CLIENT: std::cell::RefCell<Option<ipc::SyncClient>> =
-        const { std::cell::RefCell::new(None) };
-    static HELLO_SENT: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-}
-
-static PIPE_NAME: OnceLock<String> = OnceLock::new();
-static DLL_PATH: OnceLock<String> = OnceLock::new();
-pub(crate) static SANDBOX_CWD: OnceLock<String> = OnceLock::new();
+pub(crate) const STATUS_ACCESS_DENIED: NTSTATUS = 0xC000_0022_u32 as NTSTATUS;
+pub(crate) const STATUS_OBJECT_NAME_NOT_FOUND: NTSTATUS = 0xC000_0034_u32 as NTSTATUS;
+pub(crate) const STATUS_PRIVILEGE_NOT_HELD: NTSTATUS = 0xC000_0061_u32 as NTSTATUS;
 
 // ---------------------------------------------------------------------------
-// Install-error buffer (P2-5)
-//
-// At install_hooks() time the IPC pipe may not yet be connected (Hello hasn't
-// been sent), so ipc_log() would silently drop messages.  We buffer them here
-// and flush on the first successful Hello.
+// decide() — consults cache then IPC
 // ---------------------------------------------------------------------------
-static INSTALL_ERRORS: OnceLock<std::sync::Mutex<Vec<String>>> = OnceLock::new();
 
-fn buffer_install_error(msg: String) {
-    let buf = INSTALL_ERRORS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
-    if let Ok(mut v) = buf.lock() {
-        v.push(msg);
-    }
-}
-
-pub(crate) fn flush_install_errors() {
-    if let Some(buf) = INSTALL_ERRORS.get() {
-        if let Ok(mut v) = buf.lock() {
-            for msg in v.drain(..) {
-                ipc_log(ipc::LogLevel::Warn, msg);
-            }
-        }
-    }
-}
-static TRACE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Consecutive IPC failures counter for fail-closed self-termination (P1-3 audit fix).
-static IPC_CONSECUTIVE_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-const IPC_FAIL_THRESHOLD: u32 = 10;
-
-pub(crate) fn is_trace() -> bool {
-    TRACE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-fn cache() -> &'static HookCache {
-    CACHE.get_or_init(HookCache::new)
-}
-
-fn decide(dos_path: &str, write: bool) -> Decision {
+pub(crate) fn decide(dos_path: &str, write: bool) -> Decision {
     // dos_path is already lowercase from nt_to_dos_lower in extract_dos_path
     if let Some(d) = cache().get_caseless(dos_path, write) {
         return d;
@@ -160,190 +117,6 @@ fn decide(dos_path: &str, write: bool) -> Decision {
     let d = ipc_decide(dos_path, write);
     cache().insert(dos_path, write, d.clone());
     d
-}
-
-fn ensure_ipc_and<R>(f: impl FnOnce(&mut Option<ipc::SyncClient>) -> R) -> Option<R> {
-    let mut sent = false;
-    let result = IPC_CLIENT.with_borrow_mut(|opt| {
-        if opt.is_none() {
-            if let Some(name) = PIPE_NAME.get() {
-                *opt = ipc::SyncClient::connect(name).ok();
-                // Send Hello on first connection
-                if opt.is_some() && !HELLO_SENT.get() {
-                    let pid = unsafe { GetCurrentProcessId() };
-                    let exe = get_own_exe_path();
-                    let _ = opt.as_mut().unwrap().send(&ipc::Req::Hello {
-                        pid,
-                        exe_path: exe,
-                    });
-                    sent = true;
-                }
-            }
-        }
-        if opt.is_some() {
-            Some(f(opt))
-        } else {
-            None
-        }
-    });
-    if sent {
-        HELLO_SENT.set(true);
-        flush_install_errors();
-        crate::inject_guard::arm();
-    }
-    result
-}
-
-fn ipc_decide(dos_lower: &str, write: bool) -> Decision {
-    let result = ensure_ipc_and(|opt| {
-        if let Some(client) = opt.as_mut() {
-            let req = ipc::Req::Decide {
-                dos_path: dos_lower.to_owned(),
-                write,
-            };
-            if let Ok(ipc::Resp::Decision(d)) = client.send(&req) {
-                return Some(d);
-            }
-        }
-        None
-    });
-
-    match result {
-        Some(Some(d)) => {
-            IPC_CONSECUTIVE_FAILURES.store(0, std::sync::atomic::Ordering::Relaxed);
-            d
-        }
-        _ => {
-            // IPC failure — increment counter, possibly self-terminate (fail-closed).
-            let n = IPC_CONSECUTIVE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if n >= IPC_FAIL_THRESHOLD {
-                eprintln!(
-                    "[hook] CRITICAL: {} consecutive IPC failures — \
-                     sandbox launcher dead/hung, self-terminating",
-                    n,
-                );
-                unsafe {
-                    winapi::um::processthreadsapi::TerminateProcess(
-                        winapi::um::processthreadsapi::GetCurrentProcess(),
-                        0xC0000005,
-                    );
-                }
-                // Unreachable after TerminateProcess, but satisfies type checker.
-                std::process::exit(1);
-            }
-            // Below threshold — return Passthrough (grace period for transient pipe hiccups).
-            Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None }
-        }
-    }
-}
-
-fn ipc_record_overlay(orig: &str, overlay: &str) {
-    let _ = ensure_ipc_and(|opt| {
-        if let Some(client) = opt.as_mut() {
-            let _ = client.send(&ipc::Req::RecordOverlay {
-                orig: orig.to_owned(),
-                overlay: overlay.to_owned(),
-            });
-        }
-    });
-}
-
-fn ipc_register_child(pid: u32) {
-    let _ = ensure_ipc_and(|opt| {
-        if let Some(client) = opt.as_mut() {
-            let _ = client.send(&ipc::Req::RegisterChild { pid });
-        }
-    });
-}
-
-fn ipc_spawned_child(parent_pid: u32, child_pid: u32, child_exe: String) {
-    let _ = ensure_ipc_and(|opt| {
-        if let Some(client) = opt.as_mut() {
-            let _ = client.send(&ipc::Req::SpawnedChild {
-                parent_pid,
-                child_pid,
-                child_exe,
-            });
-        }
-    });
-}
-
-/// Send a request and return the Resp if the pipe is connected.
-/// Used by reg_hooks for RegDecide, net_hooks for NetDecide, etc.
-pub(crate) fn ipc_send_and_recv(req: ipc::Req) -> Option<ipc::Resp> {
-    ensure_ipc_and(|opt| {
-        if let Some(client) = opt.as_mut() {
-            return client.send(&req).ok();
-        }
-        None
-    }).flatten()
-}
-
-pub(crate) fn ipc_log_violation(req: ipc::Req) -> Option<()> {
-    ensure_ipc_and(|opt| {
-        if let Some(client) = opt.as_mut() {
-            let _ = client.send(&req);
-        }
-    })
-}
-
-pub(crate) fn ipc_log(level: ipc::LogLevel, msg: String) {
-    let pid = unsafe { GetCurrentProcessId() };
-    let _ = ensure_ipc_and(|opt| {
-        if let Some(client) = opt.as_mut() {
-            let _ = client.send(&ipc::Req::Log { pid, level, msg });
-        }
-    });
-}
-
-/// Get the current process executable path (lowercased).
-fn get_own_exe_path() -> String {
-    let mut buf = [0u16; 512];
-    // SAFETY: buf is valid, len matches. GetModuleFileNameW writes a null-terminated string.
-    let len = unsafe { winapi::um::libloaderapi::GetModuleFileNameW(
-        std::ptr::null_mut(),
-        buf.as_mut_ptr(),
-        buf.len() as u32,
-    )};
-    if len == 0 {
-        return String::new();
-    }
-    let s = String::from_utf16_lossy(&buf[..len as usize]);
-    s.to_ascii_lowercase()
-}
-
-/// Extract the executable path from RTL_USER_PROCESS_PARAMETERS.
-/// Returns empty string if extraction fails.
-unsafe fn extract_child_exe(params: *mut c_void) -> String {
-    if params.is_null() {
-        return String::new();
-    }
-    // RTL_USER_PROCESS_PARAMETERS layout on x64 Windows 10/11:
-    //   0x00: MaximumLength (ULONG), Length (ULONG)
-    //   0x08: Flags (ULONG), DebugFlags (ULONG)
-    //   0x10: ConsoleHandle (HANDLE), ConsoleFlags (ULONG) + pad
-    //   0x20: StandardInput (HANDLE)
-    //   0x28: StandardOutput (HANDLE)
-    //   0x30: StandardError (HANDLE)
-    //   0x38: CurrentDirectory (CURDIR — 0x18 bytes)
-    //   0x50: DllPath (UNICODE_STRING — 0x10 bytes)
-    //   0x60: ImagePathName (UNICODE_STRING — 0x10 bytes)
-    //   0x70: CommandLine (UNICODE_STRING)
-    //
-    // Reading ImagePathName at offset 0x60 (NT path to child executable).
-    let params_ptr = params as *const u8;
-    let image_path_offset = 0x60usize;
-    let ustr_ptr = params_ptr.add(image_path_offset) as *const UNICODE_STRING;
-    if ustr_ptr.is_null() {
-        return String::new();
-    }
-    let ustr = &*ustr_ptr;
-    let char_count = (ustr.Length / 2) as usize;
-    if char_count == 0 || ustr.Buffer.is_null() {
-        return String::new();
-    }
-    let name_slice = std::slice::from_raw_parts(ustr.Buffer, char_count);
-    policy::path::nt_to_dos_lower(name_slice).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -374,32 +147,8 @@ pub(crate) unsafe fn set_io_status(block: *mut IO_STATUS_BLOCK, status: NTSTATUS
 // The Vec MUST outlive any UNICODE_STRING / OBJECT_ATTRIBUTES that borrows
 // its data pointer.
 // ---------------------------------------------------------------------------
-fn make_overlay_nt_buf(overlay_dos: &str) -> Vec<u16> {
+pub(crate) fn make_overlay_nt_buf(overlay_dos: &str) -> Vec<u16> {
     policy::path::dos_to_nt(overlay_dos)
-}
-
-// ---------------------------------------------------------------------------
-// Write-access detection
-// ---------------------------------------------------------------------------
-
-pub const GENERIC_WRITE: u32 = 0x4000_0000;
-pub const FILE_WRITE_DATA: u32 = 0x0000_0002;
-pub const FILE_APPEND_DATA: u32 = 0x0000_0004;
-pub const DELETE: u32 = 0x0001_0000;
-pub const WRITE_DAC: u32 = 0x0004_0000;
-pub const WRITE_OWNER: u32 = 0x0008_0000;
-
-pub const FILE_CREATE: u32 = 0x0000_0002;
-pub const FILE_OPEN_IF: u32 = 0x0000_0003;
-pub const FILE_OVERWRITE: u32 = 0x0000_0004;
-pub const FILE_OVERWRITE_IF: u32 = 0x0000_0005;
-pub const FILE_SUPERSEDE: u32 = 0x0000_0000;
-
-pub fn is_write_access(desired: ACCESS_MASK, disposition: u32) -> bool {
-    let write_bits =
-        GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER;
-    desired & write_bits != 0
-        || matches!(disposition, FILE_CREATE | FILE_OPEN_IF | FILE_OVERWRITE | FILE_OVERWRITE_IF | FILE_SUPERSEDE)
 }
 
 // ---------------------------------------------------------------------------
@@ -411,7 +160,7 @@ pub fn is_write_access(desired: ACCESS_MASK, disposition: u32) -> bool {
 /// # SAFETY
 /// `attrs` and its ObjectName must be valid for reads for the duration of the
 /// call (guaranteed by NT calling convention for hook parameters).
-unsafe fn extract_dos_path(attrs: *const OBJECT_ATTRIBUTES) -> Option<String> {
+pub(crate) unsafe fn extract_dos_path(attrs: *const OBJECT_ATTRIBUTES) -> Option<String> {
     if attrs.is_null() {
         return None;
     }
@@ -438,7 +187,7 @@ unsafe fn extract_dos_path(attrs: *const OBJECT_ATTRIBUTES) -> Option<String> {
     policy::path::nt_to_dos_lower(name_slice)
 }
 
-unsafe fn extract_raw_nt_path(attrs: *const OBJECT_ATTRIBUTES) -> Option<String> {
+pub(crate) unsafe fn extract_raw_nt_path(attrs: *const OBJECT_ATTRIBUTES) -> Option<String> {
     if attrs.is_null() { return None; }
     let obj = &*attrs;
     if obj.ObjectName.is_null() { return None; }
@@ -449,6 +198,35 @@ unsafe fn extract_raw_nt_path(attrs: *const OBJECT_ATTRIBUTES) -> Option<String>
     Some(String::from_utf16_lossy(name_slice))
 }
 
+/// Mirror NTFS canonicalization: NTFS strips trailing dots and spaces from
+/// each path segment when resolving file names. Our denylist comparisons must
+/// do the same; otherwise paths like `C:\.winrsbox.  ` bypass the
+/// `.ends_with(r"\.winrsbox")` check while the kernel still opens the real
+/// `.winrsbox` directory.
+///
+/// Borrowed-fast-path: when no segment ends with `.` or ` `, returns the input
+/// untouched. Hot path for typical paths (Windows path roots, drive letters,
+/// well-formed file names) allocates nothing.
+///
+/// Drive-letter handling: `C:` ends in `:` so it's untouched. `C:.` becomes
+/// `C:` (trailing dot stripped). The `\\?\` long-path prefix splits to
+/// `["", "", "?", "C:", ...]` and each non-trailing-dot/space segment passes
+/// through unchanged.
+pub(crate) fn strip_trailing_dot_space(s: &str) -> Cow<'_, str> {
+    let needs_strip = s.split('\\').any(|seg| seg.ends_with('.') || seg.ends_with(' '));
+    if !needs_strip {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut first = true;
+    for seg in s.split('\\') {
+        if !first { out.push('\\'); } else { first = false; }
+        let trimmed = seg.trim_end_matches(|c: char| c == '.' || c == ' ');
+        out.push_str(trimmed);
+    }
+    Cow::Owned(out)
+}
+
 /// Returns Some(STATUS_ACCESS_DENIED) if the raw NT path or create options
 /// indicate a path-traversal / escape vector. None → caller should continue.
 ///
@@ -457,9 +235,18 @@ unsafe fn extract_raw_nt_path(attrs: *const OBJECT_ATTRIBUTES) -> Option<String>
 ///   2. GLOBALROOT alternate namespace — bypasses DOS-form classifier
 ///   3. ADS (Alternate Data Streams) — colon after drive letter (non-standard)
 ///   4. 8.3 short names (e.g. `PROGRA~1`) — bypass classifier + CoW pipeline
+///   5. Sandbox state hide (`.winrsbox`) — masked with NAME_NOT_FOUND
+///
+/// All path comparisons use a single canonical form: ASCII-lowercased AND
+/// per-segment trailing dot/space stripped, mirroring how the NT kernel +
+/// NTFS will canonicalize the path before opening it. ASCII-only lowercase
+/// is intentional: every denylist substring (`\.winrsbox`, `globalroot`,
+/// etc.) is ASCII; non-ASCII bytes pass through untouched and therefore
+/// cannot collapse into an ASCII denylist match (or escape one) via
+/// Unicode case-fold mismatches with the kernel's `RtlDowncaseUnicodeString`.
 ///
 /// SAFETY: `attrs` must be valid per NT calling convention.
-unsafe fn check_path_traversal(attrs: *const OBJECT_ATTRIBUTES, create_options: u32) -> Option<NTSTATUS> {
+pub(crate) unsafe fn check_path_traversal(attrs: *const OBJECT_ATTRIBUTES, create_options: u32) -> Option<NTSTATUS> {
     // 1. FILE_OPEN_BY_FILE_ID — path ignored, opens by FileID instead
     const FILE_OPEN_BY_FILE_ID: u32 = 0x00002000;
     if create_options & FILE_OPEN_BY_FILE_ID != 0 {
@@ -469,7 +256,14 @@ unsafe fn check_path_traversal(attrs: *const OBJECT_ATTRIBUTES, create_options: 
 
     // 2. GLOBALROOT namespace — \??\GLOBALROOT\Device\...
     let raw_nt = extract_raw_nt_path(attrs)?;
-    let lower = raw_nt.to_ascii_lowercase();
+    // Canonicalize ONCE: ASCII-lowercase + per-segment trailing-dot/space strip.
+    // The kernel + NTFS apply both transformations before resolving the path,
+    // so every denylist comparison below must see the same canonical form.
+    // ASCII-only lowercase ensures non-ASCII bytes (e.g. U+0130) pass through
+    // untouched and cannot accidentally fold into / out of an ASCII denylist.
+    let lower_ascii = raw_nt.to_ascii_lowercase();
+    let lower = strip_trailing_dot_space(&lower_ascii);
+    let lower: &str = lower.as_ref();
     if lower.contains(r"\??\globalroot") || lower.contains(r"\globalroot\") {
         if is_trace() { ipc_log(ipc::LogLevel::Trace, format!("fs_block_globalroot: {}", raw_nt)); }
         return Some(STATUS_ACCESS_DENIED);
@@ -477,7 +271,7 @@ unsafe fn check_path_traversal(attrs: *const OBJECT_ATTRIBUTES, create_options: 
 
     // 3. ADS — colon after drive-letter colon (\??\C:\path\file.txt:hidden)
     //    Strip \??\ prefix, check for a second colon after the drive-letter colon.
-    if let Some(after_prefix) = strip_nt_dos_prefix(&lower) {
+    if let Some(after_prefix) = strip_nt_dos_prefix(lower) {
         let bytes = after_prefix.as_bytes();
         if bytes.len() >= 3 && bytes[1] == b':' {
             // Skip drive-letter colon at index 1, look for another colon after it
@@ -501,7 +295,7 @@ unsafe fn check_path_traversal(attrs: *const OBJECT_ATTRIBUTES, create_options: 
     //    and the CoW redirect (overlay path built from 8.3 doesn't redirect
     //    correctly). Legit Windows code uses full long names; 8.3 in a request
     //    is a strong escape signal.
-    if needs_short_name_resolve(&lower) {
+    if needs_short_name_resolve(lower) {
         if is_trace() { ipc_log(ipc::LogLevel::Trace, format!("fs_block_short_name: {}", raw_nt)); }
         return Some(STATUS_ACCESS_DENIED);
     }
@@ -538,7 +332,7 @@ fn strip_nt_dos_prefix(lower: &str) -> Option<&str> {
 /// pipe). None otherwise → caller should call the original Nt* function.
 ///
 /// SAFETY: `attrs` must be valid per NT calling convention.
-unsafe fn check_device_block(attrs: *const OBJECT_ATTRIBUTES) -> Option<NTSTATUS> {
+pub(crate) unsafe fn check_device_block(attrs: *const OBJECT_ATTRIBUTES) -> Option<NTSTATUS> {
     let dev_path = extract_raw_nt_path(attrs)?;
     let utf16: Vec<u16> = dev_path.encode_utf16().collect();
     let device = policy::dev::nt_to_device_path(&utf16)?;
@@ -566,7 +360,7 @@ unsafe fn check_device_block(attrs: *const OBJECT_ATTRIBUTES) -> Option<NTSTATUS
 // blocking the create-side (separate task).
 
 /// Check if a path contains an 8.3 short-name pattern (tilde followed by digit).
-fn needs_short_name_resolve(path: &str) -> bool {
+pub(crate) fn needs_short_name_resolve(path: &str) -> bool {
     let bytes = path.as_bytes();
     for i in 0..bytes.len().saturating_sub(1) {
         if bytes[i] == b'~' && bytes[i + 1].is_ascii_digit() {
@@ -580,7 +374,7 @@ fn needs_short_name_resolve(path: &str) -> bool {
 // CoW helper
 // ---------------------------------------------------------------------------
 
-fn prepare_overlay(decision: &Decision) -> Option<String> {
+pub(crate) fn prepare_overlay(decision: &Decision) -> Option<String> {
     let overlay_path = decision.overlay.as_ref()?;
     let overlay_dos = overlay_path.to_string_lossy().into_owned();
 
@@ -599,523 +393,95 @@ fn prepare_overlay(decision: &Decision) -> Option<String> {
     Some(overlay_dos)
 }
 
-// ---------------------------------------------------------------------------
-// STATUS codes
-// ---------------------------------------------------------------------------
-
-const STATUS_ACCESS_DENIED: NTSTATUS = 0xC000_0022_u32 as NTSTATUS;
-const STATUS_OBJECT_NAME_NOT_FOUND: NTSTATUS = 0xC000_0034_u32 as NTSTATUS;
-
-// ---------------------------------------------------------------------------
-// Hook implementations
-// ---------------------------------------------------------------------------
-
-unsafe extern "system" fn hook_nt_create_file(
-    file_handle: *mut HANDLE,
-    desired_access: ACCESS_MASK,
-    object_attributes: *mut OBJECT_ATTRIBUTES,
-    io_status_block: *mut IO_STATUS_BLOCK,
-    allocation_size: *mut i64,
-    file_attributes: u32,
-    share_access: u32,
-    create_disposition: u32,
-    create_options: u32,
-    ea_buffer: *mut c_void,
-    ea_length: u32,
-) -> NTSTATUS {
-    macro_rules! call_original {
-        () => {
-            HOOK_NT_CREATE_FILE.get().unwrap().call(
-                file_handle, desired_access, object_attributes, io_status_block,
-                allocation_size, file_attributes, share_access, create_disposition,
-                create_options, ea_buffer, ea_length,
-            )
-        };
+/// Materialize a Mock-mode overlay file exactly once.
+///
+/// On the first call for a given `overlay_path`, the parent directory is
+/// created (idempotent) and `payload` is written. On subsequent calls — when
+/// `overlay_path` already exists — this is a no-op. Errors from the underlying
+/// filesystem operations are swallowed: the hook's redirected open will
+/// surface any real problem through normal NTSTATUS channels.
+///
+/// Idempotency is load-bearing for two reasons:
+///   1. Performance: Mock-targeted paths can be opened thousands of times
+///      (config files, registry-like polls). Rewriting on every open is a
+///      pointless storm.
+///   2. Correctness: concurrent threads opening the same path used to race
+///      `std::fs::write`, producing torn writes or transient empty files.
+pub(crate) fn materialize_mock_overlay(overlay_path: &std::path::Path, payload: &[u8]) {
+    if overlay_path.exists() {
+        return;
     }
-
-    let Some(_guard) = anti_rec::enter() else {
-        return call_original!();
-    };
-
-    // SAFETY: object_attributes valid per NT calling convention for the call duration.
-
-    // Early-deny: path-traversal vectors (GLOBALROOT, FILE_OPEN_BY_FILE_ID, ADS)
-    if let Some(status) = check_path_traversal(object_attributes as *const _, create_options) {
-        set_io_status(io_status_block, status);
-        return status;
+    if let Some(parent) = overlay_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
-
-    let Some(dos) = extract_dos_path(object_attributes as *const _) else {
-        // Not a DOS path — check if it's a device path that should be blocked.
-        if let Some(status) = check_device_block(object_attributes as *const _) {
-            set_io_status(io_status_block, status);
-            return status;
-        }
-        return call_original!();
-    };
-
-    // P2-4 fix: check 8.3 short-name on the JOINED path (covers RootDirectory-relative opens)
-    if needs_short_name_resolve(&dos) {
-        if is_trace() {
-            ipc_log(ipc::LogLevel::Trace, format!("fs_block_short_name_joined: {}", dos));
-        }
-        set_io_status(io_status_block, STATUS_ACCESS_DENIED);
-        return STATUS_ACCESS_DENIED;
-    }
-
-    let write = is_write_access(desired_access, create_disposition);
-    // Note: 8.3 short-name paths are blocked in check_path_traversal (raw path) and above (joined path).
-    let decision = decide(&dos, write);
-
-    match decision.mode {
-        Mode::Passthrough => {
-            call_original!()
-        }
-        Mode::Deny => {
-            if is_trace() {
-                ipc_log(ipc::LogLevel::Trace, format!("DENY NtCreateFile: {dos} write={write}"));
-            }
-            if !file_handle.is_null() {
-                *file_handle = std::ptr::null_mut();
-            }
-            // SAFETY: set_io_status writes offset 0 of IO_STATUS_BLOCK union.
-            set_io_status(io_status_block, STATUS_ACCESS_DENIED);
-            STATUS_ACCESS_DENIED
-        }
-        Mode::Cow => {
-            let Some(overlay_dos) = prepare_overlay(&decision) else {
-                return call_original!();
-            };
-            let lower = dos.to_lowercase();
-            ipc_record_overlay(&lower, &overlay_dos);
-            cache().invalidate(&lower);
-
-            // SCOPE: nt_buf must outlive new_ustr and new_attrs.
-            let nt_buf = make_overlay_nt_buf(&overlay_dos);
-            let char_count = nt_buf.len().saturating_sub(1);
-            let mut new_ustr = UNICODE_STRING {
-                Length: (char_count * 2) as u16,
-                MaximumLength: (nt_buf.len() * 2) as u16,
-                Buffer: nt_buf.as_ptr() as *mut u16,
-            };
-            // SAFETY: object_attributes is non-null (checked above via extract_dos_path).
-            let orig = &*object_attributes;
-            let mut new_attrs = OBJECT_ATTRIBUTES {
-                Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-                RootDirectory: std::ptr::null_mut(),
-                ObjectName: &mut new_ustr,
-                Attributes: orig.Attributes | OBJ_CASE_INSENSITIVE,
-                SecurityDescriptor: orig.SecurityDescriptor,
-                SecurityQualityOfService: orig.SecurityQualityOfService,
-            };
-            HOOK_NT_CREATE_FILE.get().unwrap().call(
-                file_handle, desired_access, &mut new_attrs, io_status_block,
-                allocation_size, file_attributes, share_access, create_disposition,
-                create_options, ea_buffer, ea_length,
-            )
-        }
-        Mode::Mock => {
-            let Some(payload) = decision.mock_payload else {
-                return call_original!();
-            };
-            let Some(ref overlay_path) = decision.overlay else {
-                return call_original!();
-            };
-            if let Some(parent) = overlay_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(overlay_path, &payload);
-            let overlay_dos = overlay_path.to_string_lossy().into_owned();
-
-            // SCOPE: nt_buf must outlive new_ustr and new_attrs.
-            let nt_buf = make_overlay_nt_buf(&overlay_dos);
-            let char_count = nt_buf.len().saturating_sub(1);
-            let mut new_ustr = UNICODE_STRING {
-                Length: (char_count * 2) as u16,
-                MaximumLength: (nt_buf.len() * 2) as u16,
-                Buffer: nt_buf.as_ptr() as *mut u16,
-            };
-            // SAFETY: object_attributes is non-null.
-            let orig = &*object_attributes;
-            let mut new_attrs = OBJECT_ATTRIBUTES {
-                Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-                RootDirectory: std::ptr::null_mut(),
-                ObjectName: &mut new_ustr,
-                Attributes: orig.Attributes | OBJ_CASE_INSENSITIVE,
-                SecurityDescriptor: orig.SecurityDescriptor,
-                // SecurityQualityOfService must be null for file objects; copying
-                // it from orig causes STATUS_INVALID_PARAMETER on NT file opens.
-                SecurityQualityOfService: std::ptr::null_mut(),
-            };
-            HOOK_NT_CREATE_FILE.get().unwrap().call(
-                file_handle, desired_access, &mut new_attrs, io_status_block,
-                allocation_size, file_attributes, share_access,
-                create_disposition, create_options, ea_buffer, ea_length,
-            )
-        }
-    }
+    let _ = std::fs::write(overlay_path, payload);
 }
 
-unsafe extern "system" fn hook_nt_open_file(
-    file_handle: *mut HANDLE,
-    desired_access: ACCESS_MASK,
-    object_attributes: *mut OBJECT_ATTRIBUTES,
-    io_status_block: *mut IO_STATUS_BLOCK,
-    share_access: u32,
-    open_options: u32,
-) -> NTSTATUS {
-    macro_rules! call_original {
-        () => {
-            HOOK_NT_OPEN_FILE.get().unwrap().call(
-                file_handle, desired_access, object_attributes,
-                io_status_block, share_access, open_options,
-            )
-        };
+// ---------------------------------------------------------------------------
+// Extract child exe from RTL_USER_PROCESS_PARAMETERS
+// ---------------------------------------------------------------------------
+
+/// Maximum number of UTF-16 code units in a Windows path. NT object names
+/// (incl. UNC + \\?\ paths) cap at 32768 chars. Anything longer is malformed
+/// or hostile (kernel returned garbage from a wrong offset).
+const MAX_PATH_CHARS: usize = 32768;
+
+/// Extract the executable path from RTL_USER_PROCESS_PARAMETERS.
+/// Returns empty string if extraction fails.
+//
+// SAFETY:
+// - `params` must point to a kernel-allocated `RTL_USER_PROCESS_PARAMETERS`
+//   structure as populated by `NtCreateUserProcess` /
+//   `RtlCreateProcessParametersEx`.
+// - The struct layout is undocumented but stable on Windows 10/11 x64:
+//   `ImagePathName` (UNICODE_STRING) lives at offset 0x60 (verified
+//   empirically; matches the layout reported by reactos/wine and confirmed
+//   against ntdll!_RTL_USER_PROCESS_PARAMETERS in WinDbg).
+// - The struct's total size is always >= 0x500 in practice (the standard
+//   layout is ~0x4F0 + variable-length env block), so reading the 16-byte
+//   `UNICODE_STRING` header at offset 0x60 is safe even without explicit
+//   length validation.
+// - The `UNICODE_STRING.Buffer` pointer is kernel-allocated and valid for
+//   the lifetime of the process-params structure (i.e., across this call).
+// - If `params.is_null()` we early-return without dereferencing.
+//
+// Validity guards:
+// - We bound the `.Length` field to MAX_PATH_CHARS (32768 UTF-16 units)
+//   before slicing.
+// - We treat `.Buffer == null` or `.Length == 0` as "no image path",
+//   returning an empty string.
+//
+// Failure mode: if Microsoft ever shifts the offset (e.g., Windows 12),
+// we'll read garbage and return a non-existent path — the comparison
+// against the launcher's `allowed_image` list / denylist will fail
+// closed (deny).
+unsafe fn extract_child_exe(params: *mut c_void) -> String {
+    if params.is_null() {
+        return String::new();
     }
-
-    let Some(_guard) = anti_rec::enter() else {
-        return call_original!();
-    };
-
-    // SAFETY: object_attributes valid per NT calling convention.
-
-    // Early-deny: path-traversal vectors (GLOBALROOT, FILE_OPEN_BY_FILE_ID, ADS)
-    if let Some(status) = check_path_traversal(object_attributes as *const _, open_options) {
-        set_io_status(io_status_block, status);
-        return status;
+    // RTL_USER_PROCESS_PARAMETERS layout on x64 Windows 10/11:
+    //   0x60: ImagePathName (UNICODE_STRING — 0x10 bytes)
+    let params_ptr = params as *const u8;
+    let image_path_offset = 0x60usize;
+    let ustr_ptr = params_ptr.add(image_path_offset) as *const UNICODE_STRING;
+    let ustr = &*ustr_ptr;
+    if ustr.Buffer.is_null() || ustr.Length == 0 {
+        return String::new();
     }
-
-    let Some(dos) = extract_dos_path(object_attributes as *const _) else {
-        if let Some(status) = check_device_block(object_attributes as *const _) {
-            set_io_status(io_status_block, status);
-            return status;
-        }
-        return call_original!();
-    };
-
-    // P2-4 fix: check 8.3 short-name on the JOINED path (covers RootDirectory-relative opens)
-    if needs_short_name_resolve(&dos) {
-        if is_trace() {
-            ipc_log(ipc::LogLevel::Trace, format!("fs_block_short_name_joined: {}", dos));
-        }
-        set_io_status(io_status_block, STATUS_ACCESS_DENIED);
-        return STATUS_ACCESS_DENIED;
+    let char_count = (ustr.Length / 2) as usize;
+    // Sanity bound: a real ImagePathName never approaches 32K UTF-16 chars.
+    // If we read garbage from a shifted offset, this catches the obviously
+    // bogus case and fails closed.
+    if char_count > MAX_PATH_CHARS {
+        return String::new();
     }
-
-    let write_bits =
-        GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER;
-    let write = desired_access & write_bits != 0;
-    // Note: 8.3 short-name paths are blocked in check_path_traversal (raw path) and above (joined path).
-    let decision = decide(&dos, write);
-
-    match decision.mode {
-        Mode::Passthrough => call_original!(),
-        Mode::Deny => {
-            if !file_handle.is_null() {
-                *file_handle = std::ptr::null_mut();
-            }
-            // SAFETY: set_io_status writes offset 0 of IO_STATUS_BLOCK union.
-            set_io_status(io_status_block, STATUS_ACCESS_DENIED);
-            STATUS_ACCESS_DENIED
-        }
-        Mode::Cow => {
-            let Some(overlay_dos) = prepare_overlay(&decision) else {
-                return call_original!();
-            };
-            let lower = dos.to_lowercase();
-            ipc_record_overlay(&lower, &overlay_dos);
-            cache().invalidate(&lower);
-
-            // SCOPE: nt_buf must outlive new_ustr and new_attrs.
-            let nt_buf = make_overlay_nt_buf(&overlay_dos);
-            let char_count = nt_buf.len().saturating_sub(1);
-            let mut new_ustr = UNICODE_STRING {
-                Length: (char_count * 2) as u16,
-                MaximumLength: (nt_buf.len() * 2) as u16,
-                Buffer: nt_buf.as_ptr() as *mut u16,
-            };
-            // SAFETY: object_attributes is non-null.
-            let orig = &*object_attributes;
-            let mut new_attrs = OBJECT_ATTRIBUTES {
-                Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-                RootDirectory: std::ptr::null_mut(),
-                ObjectName: &mut new_ustr,
-                Attributes: orig.Attributes | OBJ_CASE_INSENSITIVE,
-                SecurityDescriptor: orig.SecurityDescriptor,
-                SecurityQualityOfService: orig.SecurityQualityOfService,
-            };
-            HOOK_NT_OPEN_FILE.get().unwrap().call(
-                file_handle, desired_access, &mut new_attrs,
-                io_status_block, share_access, open_options,
-            )
-        }
-        Mode::Mock => {
-            let Some(payload) = decision.mock_payload else {
-                return call_original!();
-            };
-            let Some(ref overlay_path) = decision.overlay else {
-                return call_original!();
-            };
-            if let Some(parent) = overlay_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(overlay_path, &payload);
-            let overlay_dos = overlay_path.to_string_lossy().into_owned();
-
-            // SCOPE: nt_buf must outlive new_ustr and new_attrs.
-            let nt_buf = make_overlay_nt_buf(&overlay_dos);
-            let char_count = nt_buf.len().saturating_sub(1);
-            let mut new_ustr = UNICODE_STRING {
-                Length: (char_count * 2) as u16,
-                MaximumLength: (nt_buf.len() * 2) as u16,
-                Buffer: nt_buf.as_ptr() as *mut u16,
-            };
-            // SAFETY: object_attributes is non-null.
-            let orig = &*object_attributes;
-            let mut new_attrs = OBJECT_ATTRIBUTES {
-                Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-                RootDirectory: std::ptr::null_mut(),
-                ObjectName: &mut new_ustr,
-                Attributes: orig.Attributes | OBJ_CASE_INSENSITIVE,
-                SecurityDescriptor: orig.SecurityDescriptor,
-                // SecurityQualityOfService must be null for file objects.
-                SecurityQualityOfService: std::ptr::null_mut(),
-            };
-            HOOK_NT_OPEN_FILE.get().unwrap().call(
-                file_handle, desired_access, &mut new_attrs,
-                io_status_block, share_access, open_options,
-            )
-        }
-    }
+    let name_slice = std::slice::from_raw_parts(ustr.Buffer, char_count);
+    policy::path::nt_to_dos_lower(name_slice).unwrap_or_default()
 }
 
-unsafe extern "system" fn hook_nt_query_attributes_file(
-    object_attributes: *mut OBJECT_ATTRIBUTES,
-    file_information: *mut c_void,
-) -> NTSTATUS {
-    let Some(_guard) = anti_rec::enter() else {
-        return HOOK_NT_QUERY_ATTRIBUTES_FILE
-            .get()
-            .unwrap()
-            .call(object_attributes, file_information);
-    };
-
-    // SAFETY: object_attributes valid per NT calling convention.
-    let Some(dos) = extract_dos_path(object_attributes as *const _) else {
-        return HOOK_NT_QUERY_ATTRIBUTES_FILE
-            .get()
-            .unwrap()
-            .call(object_attributes, file_information);
-    };
-
-    let decision = decide(&dos, false);
-    match decision.mode {
-        Mode::Passthrough => HOOK_NT_QUERY_ATTRIBUTES_FILE
-            .get()
-            .unwrap()
-            .call(object_attributes, file_information),
-        Mode::Deny => STATUS_ACCESS_DENIED,
-        Mode::Mock => {
-            let Some(ref overlay_path) = decision.overlay else {
-                return HOOK_NT_QUERY_ATTRIBUTES_FILE
-                    .get()
-                    .unwrap()
-                    .call(object_attributes, file_information);
-            };
-            // If overlay missing, materialize mock payload first so the
-            // redirected query observes the mocked file instead of ENOENT.
-            if !overlay_path.exists() {
-                if let Some(ref payload) = decision.mock_payload {
-                    if let Some(parent) = overlay_path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    let _ = std::fs::write(overlay_path, payload);
-                } else {
-                    return HOOK_NT_QUERY_ATTRIBUTES_FILE
-                        .get()
-                        .unwrap()
-                        .call(object_attributes, file_information);
-                }
-            }
-            let overlay_dos = overlay_path.to_string_lossy().into_owned();
-            // SCOPE: nt_buf must outlive new_ustr and new_attrs.
-            let nt_buf = make_overlay_nt_buf(&overlay_dos);
-            let char_count = nt_buf.len().saturating_sub(1);
-            let mut new_ustr = UNICODE_STRING {
-                Length: (char_count * 2) as u16,
-                MaximumLength: (nt_buf.len() * 2) as u16,
-                Buffer: nt_buf.as_ptr() as *mut u16,
-            };
-            // SAFETY: object_attributes is non-null.
-            let orig = &*object_attributes;
-            let mut new_attrs = OBJECT_ATTRIBUTES {
-                Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-                RootDirectory: std::ptr::null_mut(),
-                ObjectName: &mut new_ustr,
-                Attributes: orig.Attributes | OBJ_CASE_INSENSITIVE,
-                SecurityDescriptor: orig.SecurityDescriptor,
-                SecurityQualityOfService: orig.SecurityQualityOfService,
-            };
-            HOOK_NT_QUERY_ATTRIBUTES_FILE
-                .get()
-                .unwrap()
-                .call(&mut new_attrs, file_information)
-        }
-        Mode::Cow => {
-            let Some(ref overlay_path) = decision.overlay else {
-                return HOOK_NT_QUERY_ATTRIBUTES_FILE
-                    .get()
-                    .unwrap()
-                    .call(object_attributes, file_information);
-            };
-            if !overlay_path.exists() {
-                return HOOK_NT_QUERY_ATTRIBUTES_FILE
-                    .get()
-                    .unwrap()
-                    .call(object_attributes, file_information);
-            }
-            let overlay_dos = overlay_path.to_string_lossy().into_owned();
-            // SCOPE: nt_buf must outlive new_ustr and new_attrs.
-            let nt_buf = make_overlay_nt_buf(&overlay_dos);
-            let char_count = nt_buf.len().saturating_sub(1);
-            let mut new_ustr = UNICODE_STRING {
-                Length: (char_count * 2) as u16,
-                MaximumLength: (nt_buf.len() * 2) as u16,
-                Buffer: nt_buf.as_ptr() as *mut u16,
-            };
-            // SAFETY: object_attributes is non-null.
-            let orig = &*object_attributes;
-            let mut new_attrs = OBJECT_ATTRIBUTES {
-                Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-                RootDirectory: std::ptr::null_mut(),
-                ObjectName: &mut new_ustr,
-                Attributes: orig.Attributes | OBJ_CASE_INSENSITIVE,
-                SecurityDescriptor: orig.SecurityDescriptor,
-                SecurityQualityOfService: orig.SecurityQualityOfService,
-            };
-            HOOK_NT_QUERY_ATTRIBUTES_FILE
-                .get()
-                .unwrap()
-                .call(&mut new_attrs, file_information)
-        }
-    }
-}
-
-unsafe extern "system" fn hook_nt_query_full_attributes_file(
-    object_attributes: *mut OBJECT_ATTRIBUTES,
-    file_information: *mut c_void,
-) -> NTSTATUS {
-    let Some(_guard) = anti_rec::enter() else {
-        return HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
-            .get()
-            .unwrap()
-            .call(object_attributes, file_information);
-    };
-
-    // SAFETY: object_attributes valid per NT calling convention.
-    let Some(dos) = extract_dos_path(object_attributes as *const _) else {
-        return HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
-            .get()
-            .unwrap()
-            .call(object_attributes, file_information);
-    };
-
-    let decision = decide(&dos, false);
-    match decision.mode {
-        Mode::Passthrough => HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
-            .get()
-            .unwrap()
-            .call(object_attributes, file_information),
-        Mode::Deny => STATUS_ACCESS_DENIED,
-        Mode::Mock => {
-            let Some(ref overlay_path) = decision.overlay else {
-                return HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
-                    .get()
-                    .unwrap()
-                    .call(object_attributes, file_information);
-            };
-            // If overlay missing, materialize mock payload first so the
-            // redirected query observes the mocked file instead of ENOENT.
-            if !overlay_path.exists() {
-                if let Some(ref payload) = decision.mock_payload {
-                    if let Some(parent) = overlay_path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    let _ = std::fs::write(overlay_path, payload);
-                } else {
-                    return HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
-                        .get()
-                        .unwrap()
-                        .call(object_attributes, file_information);
-                }
-            }
-            let overlay_dos = overlay_path.to_string_lossy().into_owned();
-            // SCOPE: nt_buf must outlive new_ustr and new_attrs.
-            let nt_buf = make_overlay_nt_buf(&overlay_dos);
-            let char_count = nt_buf.len().saturating_sub(1);
-            let mut new_ustr = UNICODE_STRING {
-                Length: (char_count * 2) as u16,
-                MaximumLength: (nt_buf.len() * 2) as u16,
-                Buffer: nt_buf.as_ptr() as *mut u16,
-            };
-            // SAFETY: object_attributes is non-null.
-            let orig = &*object_attributes;
-            let mut new_attrs = OBJECT_ATTRIBUTES {
-                Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-                RootDirectory: std::ptr::null_mut(),
-                ObjectName: &mut new_ustr,
-                Attributes: orig.Attributes | OBJ_CASE_INSENSITIVE,
-                SecurityDescriptor: orig.SecurityDescriptor,
-                SecurityQualityOfService: orig.SecurityQualityOfService,
-            };
-            HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
-                .get()
-                .unwrap()
-                .call(&mut new_attrs, file_information)
-        }
-        Mode::Cow => {
-            let Some(ref overlay_path) = decision.overlay else {
-                return HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
-                    .get()
-                    .unwrap()
-                    .call(object_attributes, file_information);
-            };
-            if !overlay_path.exists() {
-                return HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
-                    .get()
-                    .unwrap()
-                    .call(object_attributes, file_information);
-            }
-            let overlay_dos = overlay_path.to_string_lossy().into_owned();
-            // SCOPE: nt_buf must outlive new_ustr and new_attrs.
-            let nt_buf = make_overlay_nt_buf(&overlay_dos);
-            let char_count = nt_buf.len().saturating_sub(1);
-            let mut new_ustr = UNICODE_STRING {
-                Length: (char_count * 2) as u16,
-                MaximumLength: (nt_buf.len() * 2) as u16,
-                Buffer: nt_buf.as_ptr() as *mut u16,
-            };
-            // SAFETY: object_attributes is non-null.
-            let orig = &*object_attributes;
-            let mut new_attrs = OBJECT_ATTRIBUTES {
-                Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-                RootDirectory: std::ptr::null_mut(),
-                ObjectName: &mut new_ustr,
-                Attributes: orig.Attributes | OBJ_CASE_INSENSITIVE,
-                SecurityDescriptor: orig.SecurityDescriptor,
-                SecurityQualityOfService: orig.SecurityQualityOfService,
-            };
-            HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
-                .get()
-                .unwrap()
-                .call(&mut new_attrs, file_information)
-        }
-    }
-}
-
-// NtSetInformationFile + NtFsControlFile hooks moved to fs_metadata_guard.rs
-
-// NtQueryDirectoryFile hook moved to dir_filter.rs
+// ---------------------------------------------------------------------------
+// NtCreateUserProcess hook
+// ---------------------------------------------------------------------------
 
 const THREAD_CREATE_FLAGS_CREATE_SUSPENDED: u32 = 0x0000_0001;
 
@@ -1272,6 +638,14 @@ pub(crate) unsafe fn ntdll_export(name: &[u8]) -> Option<*const ()> {
 /// loader lock held. Only Win32 APIs safe in DllMain are used here
 /// (GetModuleHandleW, GetProcAddress, VirtualAlloc via detour internals).
 pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::fs_hooks::{
+        HOOK_NT_CREATE_FILE, HOOK_NT_OPEN_FILE,
+        HOOK_NT_QUERY_ATTRIBUTES_FILE, HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE,
+        FnNtCreateFile, FnNtOpenFile, FnNtQueryAttributesFile, FnNtQueryFullAttributesFile,
+        hook_nt_create_file, hook_nt_open_file,
+        hook_nt_query_attributes_file, hook_nt_query_full_attributes_file,
+    };
+
     if let Ok(pipe) = std::env::var("FS_SANDBOX_PIPE") {
         let _ = PIPE_NAME.set(pipe);
     }
@@ -1377,6 +751,11 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         if !skip("service") {
             if let Err(e) = crate::service_guard::install() {
                 buffer_install_error(format!("service_guard install failed: {:?}", e));
+            }
+        }
+        if !skip("shell") {
+            if let Err(e) = crate::shell_guard::install() {
+                buffer_install_error(format!("shell_guard install failed: {:?}", e));
             }
         }
         if !skip("system") {
@@ -1487,6 +866,7 @@ fn apply_mitigations(guard: &str) {
 /// the process is tearing down.
 pub unsafe fn uninstall_hooks() {
     crate::system_guard::uninstall();
+    crate::shell_guard::uninstall();
     crate::service_guard::uninstall();
     crate::com_guard::uninstall();
     crate::proc_guard::uninstall();
@@ -1497,10 +877,10 @@ pub unsafe fn uninstall_hooks() {
     crate::reg_hooks::uninstall();
     crate::inject_guard::uninstall();
     crate::memory_guard::uninstall();
-    if let Some(h) = HOOK_NT_CREATE_FILE.get() { let _ = h.disable(); }
-    if let Some(h) = HOOK_NT_OPEN_FILE.get() { let _ = h.disable(); }
-    if let Some(h) = HOOK_NT_QUERY_ATTRIBUTES_FILE.get() { let _ = h.disable(); }
-    if let Some(h) = HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE.get() { let _ = h.disable(); }
+    if let Some(h) = crate::fs_hooks::HOOK_NT_CREATE_FILE.get() { let _ = h.disable(); }
+    if let Some(h) = crate::fs_hooks::HOOK_NT_OPEN_FILE.get() { let _ = h.disable(); }
+    if let Some(h) = crate::fs_hooks::HOOK_NT_QUERY_ATTRIBUTES_FILE.get() { let _ = h.disable(); }
+    if let Some(h) = crate::fs_hooks::HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_NT_CREATE_USER_PROCESS.get() { let _ = h.disable(); }
     crate::fs_metadata_guard::uninstall();
     crate::dir_filter::uninstall();
@@ -1509,6 +889,8 @@ pub unsafe fn uninstall_hooks() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use policy::{Decision, Mode};
+    use std::path::PathBuf;
 
     #[test]
     fn write_access_flags() {
@@ -1519,5 +901,258 @@ mod tests {
         assert!(is_write_access(0, FILE_OVERWRITE_IF));
         assert!(is_write_access(0, FILE_SUPERSEDE));
         assert!(!is_write_access(0, 1)); // FILE_OPEN
+    }
+
+    /// Build a path inside the OS temp dir that is unique per test invocation,
+    /// without pulling in the `tempfile` crate (forbidden by scope rules).
+    fn unique_temp_path(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "winrsbox-hook-test-{tag}-{pid}-{nanos}-{seq}",
+        ));
+        p
+    }
+
+    /// Mock-overlay materialization MUST be a no-op once the overlay file
+    /// already exists. Regression test for the per-open `fs::write` storm:
+    /// the second call with a different payload must NOT overwrite the
+    /// file content produced by the first call.
+    #[test]
+    fn mock_write_idempotent_when_exists() {
+        let dir = unique_temp_path("mock-idem");
+        let overlay = dir.join("payload.bin");
+        let first: &[u8] = b"first-write";
+        let second: &[u8] = b"SECOND-WRITE-MUST-NOT-LAND";
+
+        // First call materializes the file.
+        materialize_mock_overlay(&overlay, first);
+        assert!(overlay.exists(), "first materialize should create the file");
+        let after_first = std::fs::read(&overlay).expect("read after first");
+        assert_eq!(after_first, first);
+
+        // Second call must be a no-op: content unchanged.
+        materialize_mock_overlay(&overlay, second);
+        let after_second = std::fs::read(&overlay).expect("read after second");
+        assert_eq!(
+            after_second, first,
+            "second materialize must NOT overwrite existing overlay"
+        );
+
+        // Cleanup — best-effort, ignore failures.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `prepare_overlay` must return `None` when the Decision claims Mode::Cow
+    /// but carries no overlay path. The caller relies on this signal to fail
+    /// closed (return STATUS_ACCESS_DENIED) instead of leaking the write to
+    /// the real filesystem.
+    #[test]
+    fn prepare_overlay_none_when_overlay_field_missing() {
+        let d = Decision {
+            mode: Mode::Cow,
+            overlay: None,
+            cow_from: None,
+            mock_payload: None,
+        };
+        assert!(prepare_overlay(&d).is_none());
+    }
+
+    /// `prepare_overlay` returns `Some(<dos string>)` when an overlay path is
+    /// present, matching the lossy stringification of the supplied PathBuf.
+    #[test]
+    fn prepare_overlay_some_when_overlay_field_present() {
+        // Use a unique temp dir so create_dir_all (called inside prepare_overlay)
+        // succeeds without polluting an arbitrary location like c:\overlay.
+        let dir = unique_temp_path("prep-some");
+        let overlay = dir.join("redirect.bin");
+        let expected = overlay.to_string_lossy().into_owned();
+
+        let d = Decision {
+            mode: Mode::Cow,
+            overlay: Some(overlay.clone()),
+            cow_from: None,
+            mock_payload: None,
+        };
+        let got = prepare_overlay(&d).expect("Some when overlay field is set");
+        assert_eq!(got, expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── path-normalization tests ────────────────────────────────────────────
+    // M-S3: NTFS strips trailing dot/space from each path segment; the kernel
+    // resolves "C:\.winrsbox." to "C:\.winrsbox". Our denylist check must do
+    // the same, otherwise it slips through ends_with(r"\.winrsbox").
+
+    #[test]
+    fn trailing_dot_in_winrsbox_segment_caught() {
+        let path = r"C:\sandbox\.winrsbox.";
+        let normalized = strip_trailing_dot_space(path);
+        assert_eq!(normalized.as_ref(), r"C:\sandbox\.winrsbox");
+    }
+
+    #[test]
+    fn trailing_space_in_winrsbox_segment_caught() {
+        let path = "C:\\sandbox\\.winrsbox  ";
+        let normalized = strip_trailing_dot_space(path);
+        assert_eq!(normalized.as_ref(), r"C:\sandbox\.winrsbox");
+    }
+
+    #[test]
+    fn trailing_mix_dot_space_segments_caught() {
+        let path = "C:\\sand box. \\.winrsbox.";
+        let normalized = strip_trailing_dot_space(path);
+        assert_eq!(normalized.as_ref(), r"C:\sand box\.winrsbox");
+    }
+
+    #[test]
+    fn normal_path_no_allocation() {
+        let path = r"C:\Users\test\file.txt";
+        let normalized = strip_trailing_dot_space(path);
+        assert!(matches!(normalized, Cow::Borrowed(_)),
+            "well-formed path must not allocate");
+    }
+
+    #[test]
+    fn unc_prefix_passes_through() {
+        // \\?\ split-by-\: ["", "", "?", "C:", "folder.", "file.txt"]
+        // After per-segment strip: ["", "", "?", "C:", "folder", "file.txt"]
+        // Rejoined: \\?\C:\folder\file.txt
+        let path = r"\\?\C:\folder.\file.txt";
+        let normalized = strip_trailing_dot_space(path);
+        assert_eq!(normalized.as_ref(), r"\\?\C:\folder\file.txt");
+    }
+
+    #[test]
+    fn nt_prefix_question_mark_passes_through() {
+        // \??\ NT-form prefix: same per-segment treatment.
+        let path = r"\??\C:\folder.\file.txt";
+        let normalized = strip_trailing_dot_space(path);
+        assert_eq!(normalized.as_ref(), r"\??\C:\folder\file.txt");
+    }
+
+    #[test]
+    fn drive_letter_only_unchanged() {
+        // C: has no trailing dot or space; must round-trip exactly.
+        let path = "C:";
+        let normalized = strip_trailing_dot_space(path);
+        assert_eq!(normalized.as_ref(), "C:");
+        assert!(matches!(normalized, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn drive_letter_with_trailing_dot_normalized() {
+        // C:. → C:  (NTFS strips the trailing dot)
+        let path = r"C:.";
+        let normalized = strip_trailing_dot_space(path);
+        assert_eq!(normalized.as_ref(), r"C:");
+    }
+
+    #[test]
+    fn drive_letter_root_path_unchanged() {
+        let path = r"C:\\foo\\bar";
+        let normalized = strip_trailing_dot_space(path);
+        assert_eq!(normalized.as_ref(), r"C:\\foo\\bar");
+    }
+
+    #[test]
+    fn ascii_lowercase_preserves_non_ascii() {
+        // U+0130 (LATIN CAPITAL LETTER I WITH DOT ABOVE) must NOT collapse
+        // into "i" or "i\u{307}". Rust's to_lowercase() folds it to a two-char
+        // sequence; the NT kernel folds it to "i". Either fold can split-brain
+        // a denylist check. ASCII-only lowercase leaves it as U+0130, which
+        // is what every comparison site must see.
+        let path = "C:\\WINRSBOX\u{0130}MARKER";
+        let lower = path.to_ascii_lowercase();
+        assert_eq!(lower, "c:\\winrsbox\u{0130}marker",
+            "U+0130 must pass through untouched");
+    }
+
+    #[test]
+    fn winrsbox_with_unicode_suffix_does_not_match_denylist() {
+        // Adversarial: attacker can't bypass the .winrsbox hide check by
+        // appending U+0130 (which kernel folds to ASCII 'i', producing a
+        // different on-disk path). ASCII-only lowercase leaves U+0130 alone,
+        // so ends_with(r"\.winrsbox") cannot match. Kernel resolves to
+        // "C:\.winrsboxi" — a different path that does not contain our
+        // sandbox state.
+        let path = "C:\\.WINRSBOX\u{0130}";
+        let lower = path.to_ascii_lowercase();
+        let canon = strip_trailing_dot_space(&lower);
+        assert!(!canon.ends_with(r"\.winrsbox"));
+        assert!(!canon.contains(r"\.winrsbox\"));
+    }
+
+    /// Adversarial: full canonicalization pipeline (as used in
+    /// `check_path_traversal`) must catch a trailing-dot `.winrsbox` segment.
+    /// Before the fix this slipped past ends_with(r"\.winrsbox"); after the
+    /// fix it's caught and the sandbox state stays hidden.
+    #[test]
+    fn winrsbox_hide_catches_trailing_dot() {
+        let raw = r"\??\C:\sandbox\.WINRSBOX.";
+        let lower = raw.to_ascii_lowercase();
+        let canon = strip_trailing_dot_space(&lower);
+        assert!(canon.contains(r"\.winrsbox\") || canon.ends_with(r"\.winrsbox"),
+            "trailing dot must be stripped before .winrsbox denylist check (got: {})",
+            canon.as_ref());
+    }
+
+    /// Adversarial: trailing space variant.
+    #[test]
+    fn winrsbox_hide_catches_trailing_space() {
+        let raw = "\\??\\C:\\sandbox\\.WINRSBOX ";
+        let lower = raw.to_ascii_lowercase();
+        let canon = strip_trailing_dot_space(&lower);
+        assert!(canon.ends_with(r"\.winrsbox"),
+            "trailing space must be stripped (got: {})", canon.as_ref());
+    }
+
+    /// Adversarial: trailing-dot inside an intermediate `.winrsbox.` segment
+    /// (not the final segment of the path) still matches the
+    /// `lower.contains(r"\.winrsbox\")` form.
+    #[test]
+    fn winrsbox_hide_catches_intermediate_segment_trailing_dot() {
+        // After NTFS canonicalization the kernel opens \.winrsbox\sub\file
+        let raw = r"\??\C:\sandbox\.winrsbox.\sub\file";
+        let lower = raw.to_ascii_lowercase();
+        let canon = strip_trailing_dot_space(&lower);
+        assert!(canon.contains(r"\.winrsbox\"),
+            "intermediate trailing dot must be stripped (got: {})", canon.as_ref());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// status_constant_tests — pin canonical NT status codes.
+//
+// These tests catch anyone who accidentally changes the canonical value of a
+// status code constant. Sibling guard modules import these from here; a typo
+// or unit-mismatch would split-brain the sandbox (some guards return
+// ACCESS_DENIED, others return some random garbage from the typo).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod status_constant_tests {
+    use super::*;
+
+    #[test]
+    fn status_access_denied_is_canonical() {
+        assert_eq!(STATUS_ACCESS_DENIED, 0xC000_0022_u32 as i32);
+    }
+
+    #[test]
+    fn status_object_name_not_found_is_canonical() {
+        assert_eq!(STATUS_OBJECT_NAME_NOT_FOUND, 0xC000_0034_u32 as i32);
+    }
+
+    #[test]
+    fn status_privilege_not_held_is_canonical() {
+        assert_eq!(STATUS_PRIVILEGE_NOT_HELD, 0xC000_0061_u32 as i32);
     }
 }

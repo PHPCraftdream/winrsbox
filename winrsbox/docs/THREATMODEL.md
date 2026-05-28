@@ -25,7 +25,7 @@ Last updated: `8de757f` (2026-05-26).
 | `c4bed1b` | **memory_guard** -- NtMapViewOfSection foreign-proc deny |
 | `0d1f837` | **system_guard** -- NtShutdownSystem + NtSetSystemInformation deny |
 | `818e0ee` | escape_unmap/map_foreign tests bypass proc_guard to exercise memory_guard directly |
-| `535f1bd` | ipc_decide fail-closed after 10 consecutive failures |
+| `535f1bd` | ipc_decide fail-closed after 3 consecutive failures (tightened from 10, audit T1) |
 | `5b8a979` | proc_guard: NtTerminateProcess hook untrack child PID on exit |
 | `f74930e` | Kernel Event signaling for hook.dll injection verification (P1-1) |
 | `8de757f` | **alpc_guard** -- wmi/wbem port patterns; exact startsWith segment match |
@@ -183,10 +183,15 @@ allowed to run unhooked.
 #### IPC fail-closed
 
 The in-process IPC channel (sandbox child -> launcher policy server) counts
-consecutive failures. After **10 consecutive IPC failures** the sandboxed child
+consecutive failures. After **3 consecutive IPC failures** the sandboxed child
 calls `TerminateProcess(GetCurrentProcess(), 1)` and exits. This prevents a
 child from operating in a degraded / partially-hooked state where policy
 decisions default to allow.
+
+3 is chosen to fail closed quickly under adversarial pipe-kill; transient
+hiccups are rare and 3 successive failures with retry already represents
+~10s of latency. The threshold is pinned by a unit test in
+`hook/src/ipc_client.rs` (`fail_threshold_pinned_to_three`).
 
 **Code**: `hook/src/ipc.rs:ipc_decide`.
 
@@ -405,7 +410,7 @@ when elevated launcher infrastructure exists.
 | Host shutdown/reboot + kernel param modification | NtShutdownSystem + NtSetSystemInformation deny | `0d1f837` |
 | WMI/WBEM via direct ALPC (bypassing com_guard) | wbem* port patterns in alpc_guard | `8de757f` |
 | Console* false-positives in alpc_guard | Exact startsWith segment match | `8de757f` |
-| IPC silent fail-open | Fail-closed after 10 consecutive failures | `535f1bd` |
+| IPC silent fail-open | Fail-closed after 3 consecutive failures (tightened from 10, audit T1) | `535f1bd` |
 | PID-reuse poisoning (stale tracker entry) | NtTerminateProcess untrack | `5b8a979` |
 | Hook injection not verified (child ran unhooked on DLL fail) | Kernel Event + WaitForSingleObject, fail-closed on timeout | `f74930e` |
 | P0 escape via FILE_OPEN_IF disposition | Fixed disposition handling + full audit | `dabe30f` |
@@ -463,7 +468,7 @@ Layer 4: ntdll / win32 inline hooks
   |-- UI hooks (SendInput, keybd_event, mouse_event, BlockInput, SetCursorPos,
   |             FindWindow*, PostMessage*, SendMessage*, OpenClipboard, GetClipboardData)
   |
-Layer 5: IPC fail-closed (10 consecutive failures -> self-terminate)
+Layer 5: IPC fail-closed (3 consecutive failures -> self-terminate)
   |
 Layer 6: WFP kernel network filtering (RFC1918 + SMB/NetBIOS block)
   |

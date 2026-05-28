@@ -66,6 +66,10 @@ const fn dir_info_name_offsets(class: u32) -> Option<(usize, usize)> {
 ///
 /// Returns `true` if filtering was applied (buffer may have been modified).
 /// If the only entry was `.winrsbox`, returns `true` and sets `*only_hidden = true`.
+///
+/// # SAFETY
+/// `buf` must point to a writable region of `total_size` bytes containing a valid
+/// NtQueryDirectoryFile linked-list buffer for the given `class`.
 unsafe fn filter_dot_winrsbox(
     buf: *mut u8,
     total_size: usize,
@@ -83,11 +87,14 @@ unsafe fn filter_dot_winrsbox(
     *only_hidden = false;
 
     while cur < end {
+        // SAFETY: deref of NextEntryOffset (offset 0) — cur is within [buf, buf+total_size).
         let next_off = *(cur as *const u32) as usize;
+        // SAFETY: deref of FileNameLength at class-specific offset — cur is within bounds.
         let name_len = *(cur.add(name_len_off) as *const u32) as usize;
         if name_len >= 2 && name_len <= 22 {
             let name_ptr = cur.add(name_off) as *const u16;
             let chars = name_len / 2;
+            // SAFETY: from_raw_parts for `chars` u16s at FileName offset; name_len ≤ 22 and cur is within the buffer.
             let name_slice = std::slice::from_raw_parts(name_ptr, chars);
             let is_winrsbox = chars == 9
                 && (name_slice[0] == '.' as u16)
@@ -110,6 +117,7 @@ unsafe fn filter_dot_winrsbox(
                     } else {
                         (prev_next + next_off) as u32
                     };
+                    // SAFETY: writing patched NextEntryOffset to previous entry; prev is a valid in-buffer pointer.
                     *(prev as *mut u32) = new_next;
                 } else if next_off == 0 {
                     *only_hidden = true;
@@ -118,6 +126,7 @@ unsafe fn filter_dot_winrsbox(
                     // First of multiple entries — shift the rest of the buffer left
                     let shift = next_off;
                     let remain = (end as usize) - (cur as usize) - shift;
+                    // SAFETY: ptr::copy shifts remaining entries left over cur; regions may overlap, which is valid for copy (memmove).
                     std::ptr::copy(cur.add(shift), cur, remain);
                     continue;
                 }
@@ -138,6 +147,7 @@ unsafe fn filter_dot_winrsbox(
 // Hook implementation
 // ---------------------------------------------------------------------------
 
+// SAFETY: Called by detour2 dispatcher with ntdll!NtQueryDirectoryFile ABI.
 unsafe extern "system" fn hook_nt_query_directory_file(
     file_handle: HANDLE,
     event: HANDLE,
@@ -152,6 +162,7 @@ unsafe extern "system" fn hook_nt_query_directory_file(
     restart_scan: u8,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
+        // SAFETY: detour2 trampoline matches FnNtQueryDirectoryFile ABI.
         return HOOK_NT_QUERY_DIRECTORY_FILE.get().unwrap().call(
             file_handle, event, apc_routine, apc_context, io_status_block,
             file_information, length, file_information_class,
@@ -159,6 +170,7 @@ unsafe extern "system" fn hook_nt_query_directory_file(
         );
     };
 
+    // SAFETY: detour2 trampoline matches FnNtQueryDirectoryFile ABI; same args passed through.
     let status = HOOK_NT_QUERY_DIRECTORY_FILE.get().unwrap().call(
         file_handle, event, apc_routine, apc_context, io_status_block,
         file_information, length, file_information_class,
@@ -173,6 +185,7 @@ unsafe extern "system" fn hook_nt_query_directory_file(
     if io_status_block.is_null() || file_information.is_null() {
         return status;
     }
+    // SAFETY: read of IoStatusBlock.Information at offset 8 on x64 — pointer validated non-null above.
     let info_size = *((io_status_block as *const u8).add(8) as *const usize);
     if info_size == 0 {
         return status;
@@ -210,6 +223,7 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
         ($lock:expr, $sym:literal, $hook_fn:expr, $fn_ty:ty) => {{
             let addr = hooks::ntdll_export($sym.as_bytes())
                 .ok_or_else(|| format!("ntdll export not found: {}", $sym))?;
+            // SAFETY: transmute of ntdll export address; ABI matches the hook function type.
             let target: $fn_ty = std::mem::transmute(addr as usize);
             let hook_ptr: $fn_ty = $hook_fn;
             let detour = GenericDetour::<$fn_ty>::new(target, hook_ptr)

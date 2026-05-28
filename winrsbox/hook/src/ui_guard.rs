@@ -60,6 +60,9 @@ static HOOK_SEND_MESSAGE_A:    OnceLock<GenericDetour<FnSendMessageA>>    = Once
 /// Returns true when `hwnd` is a window owned by a process **other** than us.
 /// For cross-process HWNDs we deny PostMessage/SendMessage. Own-process
 /// windows still work normally.
+///
+/// # SAFETY
+/// `hwnd` may be any HWND value; null is handled internally.
 unsafe fn is_foreign_hwnd(hwnd: HWND) -> bool {
     if hwnd.is_null() { return false; }
     let mut pid: DWORD = 0;
@@ -80,28 +83,33 @@ fn report_and_kill(api: &str) -> ! {
         ipc_log(ipc::LogLevel::Warn,
             format!("INPUT-INJECT DENY: {api} — terminating process"));
     }
-    // Mirror memory_guard kill pattern: terminate self, then loop to prevent return.
+    // SAFETY: TerminateProcess on own handle is always valid; intentional self-termination.
     unsafe {
         winapi::um::processthreadsapi::TerminateProcess(
             winapi::um::processthreadsapi::GetCurrentProcess(),
             0xC000_0005,
         );
     }
+    // SAFETY: Sleep(INFINITE-like) after TerminateProcess — defensive loop in case terminate is async.
     loop {
         unsafe { winapi::um::synchapi::Sleep(1000) };
     }
 }
 
+// SAFETY: Called by detour2 dispatcher with user32!SendInput ABI.
 unsafe extern "system" fn hook_send_input(n: UINT, inputs: *mut INPUT, sz: i32) -> UINT {
     let Some(_g) = anti_rec::enter() else {
+        // SAFETY: detour2 trampoline matches FnSendInput ABI.
         return HOOK_SEND_INPUT.get().unwrap().call(n, inputs, sz);
     };
     let _ = _g; // guard held until report_and_kill diverges
     report_and_kill("SendInput")
 }
 
+// SAFETY: Called by detour2 dispatcher with user32!keybd_event ABI.
 unsafe extern "system" fn hook_keybd_event(b: u8, s: u8, f: DWORD, ex: usize) {
     let Some(_g) = anti_rec::enter() else {
+        // SAFETY: detour2 trampoline matches FnKeybdEvent ABI.
         HOOK_KEYBD_EVENT.get().unwrap().call(b, s, f, ex);
         return;
     };
@@ -109,8 +117,10 @@ unsafe extern "system" fn hook_keybd_event(b: u8, s: u8, f: DWORD, ex: usize) {
     report_and_kill("keybd_event")
 }
 
+// SAFETY: Called by detour2 dispatcher with user32!mouse_event ABI.
 unsafe extern "system" fn hook_mouse_event(f: DWORD, x: DWORD, y: DWORD, d: DWORD, ex: usize) {
     let Some(_g) = anti_rec::enter() else {
+        // SAFETY: detour2 trampoline matches FnMouseEvent ABI.
         HOOK_MOUSE_EVENT.get().unwrap().call(f, x, y, d, ex);
         return;
     };
@@ -118,16 +128,20 @@ unsafe extern "system" fn hook_mouse_event(f: DWORD, x: DWORD, y: DWORD, d: DWOR
     report_and_kill("mouse_event")
 }
 
+// SAFETY: Called by detour2 dispatcher with user32!BlockInput ABI.
 unsafe extern "system" fn hook_block_input(fblock: BOOL) -> BOOL {
     let Some(_g) = anti_rec::enter() else {
+        // SAFETY: detour2 trampoline matches FnBlockInput ABI.
         return HOOK_BLOCK_INPUT.get().unwrap().call(fblock);
     };
     let _ = _g;
     report_and_kill("BlockInput")
 }
 
+// SAFETY: Called by detour2 dispatcher with user32!SetCursorPos ABI.
 unsafe extern "system" fn hook_set_cursor_pos(x: i32, y: i32) -> BOOL {
     let Some(_g) = anti_rec::enter() else {
+        // SAFETY: detour2 trampoline matches FnSetCursorPos ABI.
         return HOOK_SET_CURSOR_POS.get().unwrap().call(x, y);
     };
     let _ = _g;
@@ -141,10 +155,13 @@ unsafe extern "system" fn hook_set_cursor_pos(x: i32, y: i32) -> BOOL {
 // bypassing our user-mode patch. SendInput-class hooks (the actual Win+R
 // vector) work reliably. Job UI restrictions cover the rest in principle.
 
+// SAFETY: Called by detour2 dispatcher with user32!FindWindowW ABI.
 unsafe extern "system" fn hook_find_window_w(class: LPCWSTR, name: LPCWSTR) -> HWND {
     let Some(_g) = anti_rec::enter() else {
+        // SAFETY: detour2 trampoline matches FnFindWindowW ABI.
         return HOOK_FIND_WINDOW_W.get().unwrap().call(class, name);
     };
+    // SAFETY: detour2 trampoline matches FnFindWindowW ABI; same args passed through.
     let hwnd = HOOK_FIND_WINDOW_W.get().unwrap().call(class, name);
     if is_foreign_hwnd(hwnd) {
         log_soft_deny("FindWindowW", "foreign HWND");
@@ -153,10 +170,13 @@ unsafe extern "system" fn hook_find_window_w(class: LPCWSTR, name: LPCWSTR) -> H
     hwnd
 }
 
+// SAFETY: Called by detour2 dispatcher with user32!FindWindowA ABI.
 unsafe extern "system" fn hook_find_window_a(class: LPCSTR, name: LPCSTR) -> HWND {
     let Some(_g) = anti_rec::enter() else {
+        // SAFETY: detour2 trampoline matches FnFindWindowA ABI.
         return HOOK_FIND_WINDOW_A.get().unwrap().call(class, name);
     };
+    // SAFETY: detour2 trampoline matches FnFindWindowA ABI; same args passed through.
     let hwnd = HOOK_FIND_WINDOW_A.get().unwrap().call(class, name);
     if is_foreign_hwnd(hwnd) {
         log_soft_deny("FindWindowA", "foreign HWND");
@@ -165,12 +185,15 @@ unsafe extern "system" fn hook_find_window_a(class: LPCSTR, name: LPCSTR) -> HWN
     hwnd
 }
 
+// SAFETY: Called by detour2 dispatcher with user32!FindWindowExW ABI.
 unsafe extern "system" fn hook_find_window_ex_w(
     parent: HWND, child: HWND, class: LPCWSTR, name: LPCWSTR,
 ) -> HWND {
     let Some(_g) = anti_rec::enter() else {
+        // SAFETY: detour2 trampoline matches FnFindWindowExW ABI.
         return HOOK_FIND_WINDOW_EX_W.get().unwrap().call(parent, child, class, name);
     };
+    // SAFETY: detour2 trampoline matches FnFindWindowExW ABI; same args passed through.
     let hwnd = HOOK_FIND_WINDOW_EX_W.get().unwrap().call(parent, child, class, name);
     if is_foreign_hwnd(hwnd) {
         log_soft_deny("FindWindowExW", "foreign HWND");
@@ -179,12 +202,15 @@ unsafe extern "system" fn hook_find_window_ex_w(
     hwnd
 }
 
+// SAFETY: Called by detour2 dispatcher with user32!FindWindowExA ABI.
 unsafe extern "system" fn hook_find_window_ex_a(
     parent: HWND, child: HWND, class: LPCSTR, name: LPCSTR,
 ) -> HWND {
     let Some(_g) = anti_rec::enter() else {
+        // SAFETY: detour2 trampoline matches FnFindWindowExA ABI.
         return HOOK_FIND_WINDOW_EX_A.get().unwrap().call(parent, child, class, name);
     };
+    // SAFETY: detour2 trampoline matches FnFindWindowExA ABI; same args passed through.
     let hwnd = HOOK_FIND_WINDOW_EX_A.get().unwrap().call(parent, child, class, name);
     if is_foreign_hwnd(hwnd) {
         log_soft_deny("FindWindowExA", "foreign HWND");
@@ -193,26 +219,32 @@ unsafe extern "system" fn hook_find_window_ex_a(
     hwnd
 }
 
+// SAFETY: Called by detour2 dispatcher with user32!OpenClipboard ABI.
 unsafe extern "system" fn hook_open_clipboard(hwnd: HWND) -> BOOL {
     let Some(_g) = anti_rec::enter() else {
+        // SAFETY: detour2 trampoline matches FnOpenClipboard ABI.
         return HOOK_OPEN_CLIPBOARD.get().unwrap().call(hwnd);
     };
     log_soft_deny("OpenClipboard", "denied");
     0
 }
 
+// SAFETY: Called by detour2 dispatcher with user32!GetClipboardData ABI.
 unsafe extern "system" fn hook_get_clipboard_data(format: UINT) -> HANDLE {
     let Some(_g) = anti_rec::enter() else {
+        // SAFETY: detour2 trampoline matches FnGetClipboardData ABI.
         return HOOK_GET_CLIPBOARD.get().unwrap().call(format);
     };
     log_soft_deny("GetClipboardData", "denied");
     std::ptr::null_mut()
 }
 
+// SAFETY: Called by detour2 dispatcher with user32!PostMessageW ABI.
 unsafe extern "system" fn hook_post_message_w(
     hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM,
 ) -> BOOL {
     let Some(_g) = anti_rec::enter() else {
+        // SAFETY: detour2 trampoline matches FnPostMessageW ABI.
         return HOOK_POST_MESSAGE_W.get().unwrap().call(hwnd, msg, wparam, lparam);
     };
     if is_foreign_hwnd(hwnd) {
@@ -222,10 +254,12 @@ unsafe extern "system" fn hook_post_message_w(
     HOOK_POST_MESSAGE_W.get().unwrap().call(hwnd, msg, wparam, lparam)
 }
 
+// SAFETY: Called by detour2 dispatcher with user32!PostMessageA ABI.
 unsafe extern "system" fn hook_post_message_a(
     hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM,
 ) -> BOOL {
     let Some(_g) = anti_rec::enter() else {
+        // SAFETY: detour2 trampoline matches FnPostMessageA ABI.
         return HOOK_POST_MESSAGE_A.get().unwrap().call(hwnd, msg, wparam, lparam);
     };
     if is_foreign_hwnd(hwnd) {
@@ -235,10 +269,12 @@ unsafe extern "system" fn hook_post_message_a(
     HOOK_POST_MESSAGE_A.get().unwrap().call(hwnd, msg, wparam, lparam)
 }
 
+// SAFETY: Called by detour2 dispatcher with user32!SendMessageW ABI.
 unsafe extern "system" fn hook_send_message_w(
     hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM,
 ) -> isize {
     let Some(_g) = anti_rec::enter() else {
+        // SAFETY: detour2 trampoline matches FnSendMessageW ABI.
         return HOOK_SEND_MESSAGE_W.get().unwrap().call(hwnd, msg, wparam, lparam);
     };
     if is_foreign_hwnd(hwnd) {
@@ -248,10 +284,12 @@ unsafe extern "system" fn hook_send_message_w(
     HOOK_SEND_MESSAGE_W.get().unwrap().call(hwnd, msg, wparam, lparam)
 }
 
+// SAFETY: Called by detour2 dispatcher with user32!SendMessageA ABI.
 unsafe extern "system" fn hook_send_message_a(
     hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM,
 ) -> isize {
     let Some(_g) = anti_rec::enter() else {
+        // SAFETY: detour2 trampoline matches FnSendMessageA ABI.
         return HOOK_SEND_MESSAGE_A.get().unwrap().call(hwnd, msg, wparam, lparam);
     };
     if is_foreign_hwnd(hwnd) {
@@ -261,9 +299,12 @@ unsafe extern "system" fn hook_send_message_a(
     HOOK_SEND_MESSAGE_A.get().unwrap().call(hwnd, msg, wparam, lparam)
 }
 
+/// # SAFETY
+/// Must be called from install_hooks() in DllMain context with anti_rec entered.
 pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     // Resolve user32 module — load if not already loaded.
     let user32_w: Vec<u16> = "user32.dll\0".encode_utf16().collect();
+    // SAFETY: FFI call to LoadLibraryW with null-terminated wide string; no outstanding borrows.
     let user32 = winapi::um::libloaderapi::LoadLibraryW(user32_w.as_ptr());
     if user32.is_null() {
         return Err("LoadLibraryW(user32.dll) failed".into());
@@ -274,7 +315,8 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
             let addr = winapi::um::libloaderapi::GetProcAddress(
                 user32, concat!($sym, "\0").as_ptr() as *const _);
             if !addr.is_null() {
-                let target: $ty = std::mem::transmute(addr);
+                // SAFETY: transmute of GetProcAddress result; ABI matches the hook function type $ty.
+                let target: $ty = std::mem::transmute(addr as usize);
                 let hook_ptr: $ty = $hook;
                 if let Ok(detour) = GenericDetour::<$ty>::new(target, hook_ptr) {
                     $lock.set(detour).ok();
@@ -311,6 +353,8 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// # SAFETY
+/// Must be called from DLL_PROCESS_DETACH only.
 pub unsafe fn uninstall() {
     if let Some(h) = HOOK_SEND_INPUT.get()     { let _ = h.disable(); }
     if let Some(h) = HOOK_KEYBD_EVENT.get()    { let _ = h.disable(); }
