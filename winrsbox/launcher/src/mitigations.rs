@@ -50,6 +50,9 @@ pub enum Profile {
     None,
     Scan,
     Full,
+    /// Hard containment: Full + the JIT/unsigned-code killers
+    /// (ProhibitDynamicCode + BlockNonMicrosoftBinaries). Opt-in only.
+    Static,
 }
 
 /// Compute (v1, v2) bitmask for the given guard profile.
@@ -70,9 +73,14 @@ pub fn compute(profile: Profile) -> (u64, u64) {
             (m1, 0)
         }
         Profile::Full => {
-            let m1 = v1::PROHIBIT_DYNAMIC_CODE_ALWAYS_ON
-                   | v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON
-                   | v1::EXTENSION_POINT_DISABLE_ALWAYS_ON
+            // JIT-SAFE hardening: Scan's bits PLUS the v2 speculative-execution
+            // mitigations. Deliberately NO ProhibitDynamicCode and NO
+            // BlockNonMicrosoftBinaries — those break JIT runtimes (node/V8,
+            // .NET) and unsigned native extensions (Python .pyd, Node .node),
+            // which ARE the canonical sandboxed workload. Containment in full
+            // mode rests on the ntdll hooks + Job Object + ASLR, matched to the
+            // real adversary (a misbehaving agent, not a hand-rolled exploit).
+            let m1 = v1::EXTENSION_POINT_DISABLE_ALWAYS_ON
                    | v1::FORCE_RELOCATE_IMAGES_ALWAYS_ON
                    | v1::HEAP_TERMINATE_ALWAYS_ON
                    | v1::BOTTOM_UP_ASLR_ALWAYS_ON
@@ -83,6 +91,20 @@ pub fn compute(profile: Profile) -> (u64, u64) {
             let m2 = v2::RESTRICT_INDIRECT_BRANCH_PREDICTION
                    | v2::SPECULATIVE_STORE_BYPASS_DISABLE;
             (m1, m2)
+        }
+        Profile::Static => {
+            // Hard containment (opt-in): Full + the two JIT/unsigned-code
+            // killers. Closes the direct-syscall + fresh-ntdll hook-bypass
+            // surface that user-mode hooking fundamentally cannot. Breaks JIT
+            // and unsigned native extensions — only for pure-static targets.
+            // hook.dll itself is unsigned, so BLOCK_NON_MICROSOFT is stripped
+            // from the CREATE-time bitmap (sandbox.rs) and re-applied at RUNTIME
+            // (hook::apply_mitigations) after hook.dll has loaded.
+            let (full_m1, full_m2) = compute(Profile::Full);
+            let m1 = full_m1
+                   | v1::PROHIBIT_DYNAMIC_CODE_ALWAYS_ON
+                   | v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
+            (m1, full_m2)
         }
     }
 }
@@ -132,15 +154,14 @@ mod tests {
     }
 
     #[test]
-    fn full_includes_dynamic_code_prohibition() {
+    fn full_is_jit_safe_excludes_dynamic_code_and_signing() {
+        // The whole point of the M4 redefinition: full mode must NOT carry the
+        // JIT/unsigned-code killers, so node/python/cargo run under it.
         let (m1, _) = compute(Profile::Full);
-        assert_ne!(m1 & v1::PROHIBIT_DYNAMIC_CODE_ALWAYS_ON, 0);
-    }
-
-    #[test]
-    fn full_includes_block_non_ms() {
-        let (m1, _) = compute(Profile::Full);
-        assert_ne!(m1 & v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON, 0);
+        assert_eq!(m1 & v1::PROHIBIT_DYNAMIC_CODE_ALWAYS_ON, 0,
+            "full must not prohibit dynamic code (breaks JIT)");
+        assert_eq!(m1 & v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON, 0,
+            "full must not require signed binaries (breaks .pyd/.node)");
     }
 
     #[test]
@@ -155,6 +176,44 @@ mod tests {
         let (scan_m1, _) = compute(Profile::Scan);
         let (full_m1, _) = compute(Profile::Full);
         assert_eq!(full_m1 & scan_m1, scan_m1, "full should include all scan bits");
+    }
+
+    #[test]
+    fn static_includes_dynamic_code_prohibition() {
+        let (m1, _) = compute(Profile::Static);
+        assert_ne!(m1 & v1::PROHIBIT_DYNAMIC_CODE_ALWAYS_ON, 0);
+    }
+
+    #[test]
+    fn static_includes_block_non_ms() {
+        let (m1, _) = compute(Profile::Static);
+        assert_ne!(m1 & v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON, 0);
+    }
+
+    #[test]
+    fn static_is_superset_of_full() {
+        let (full_m1, full_m2) = compute(Profile::Full);
+        let (static_m1, static_m2) = compute(Profile::Static);
+        assert_eq!(static_m1 & full_m1, full_m1, "static should include all full bits");
+        assert_eq!(static_m2, full_m2, "static shares full's v2 bits");
+    }
+
+    #[test]
+    fn static_create_time_strip_still_loads_hook_dll() {
+        // Both BLOCK_NON_MICROSOFT and PROHIBIT_DYNAMIC_CODE must be strippable
+        // from the create-time bitmap so our bootstrap survives: the unsigned
+        // hook.dll can load (signing), and detour2 can allocate/patch the
+        // executable trampolines (dynamic code). Both re-applied at runtime
+        // after detours are installed. Mirrors the strip in sandbox.rs.
+        let (m1, _) = compute(Profile::Static);
+        let create_v1 = m1
+            & !v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON
+            & !v1::PROHIBIT_DYNAMIC_CODE_ALWAYS_ON;
+        assert_eq!(create_v1 & v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON, 0);
+        assert_eq!(create_v1 & v1::PROHIBIT_DYNAMIC_CODE_ALWAYS_ON, 0);
+        // The pure-hardening bits survive (they don't block our bootstrap).
+        assert_ne!(create_v1 & v1::BOTTOM_UP_ASLR_ALWAYS_ON, 0);
+        assert_ne!(create_v1 & v1::STRICT_HANDLE_CHECKS_ALWAYS_ON, 0);
     }
 
     #[test]
@@ -185,24 +244,29 @@ mod tests {
     // policies are create-time-only — there is no SetProcessMitigationPolicy
     // for STRICT_HANDLE_CHECKS, FORCE_RELOCATE_IMAGES, or HIGH_ENTROPY_ASLR.
 
-    /// Full mode minus the runtime-applied BLOCK_NON_MICROSOFT bit. Locks in
+    /// Static mode minus the runtime-applied BLOCK_NON_MICROSOFT bit. Locks in
     /// every create-time-only policy we expect the kernel to enforce on the
-    /// suspended child before hook.dll loads.
+    /// suspended child before hook.dll loads. (Static is the only profile that
+    /// carries the runtime-stripped bit after the M4 split; Full is JIT-safe.)
     #[test]
-    fn full_create_time_bitmap_retains_all_required_v1_bits() {
-        let (full_m1, _) = compute(Profile::Full);
-        let create_v1 = full_m1 & !v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
+    fn static_create_time_bitmap_retains_all_required_v1_bits() {
+        let (static_m1, _) = compute(Profile::Static);
+        let create_v1 = static_m1
+            & !v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON
+            & !v1::PROHIBIT_DYNAMIC_CODE_ALWAYS_ON;
 
-        // BLOCK_NON_MICROSOFT_BINARIES must be CLEARED at create time —
-        // otherwise hook.dll (unsigned) is rejected by the kernel image loader.
+        // Both bootstrap-killers must be CLEARED at create time and re-applied
+        // at runtime: BLOCK_NON_MICROSOFT (else the unsigned hook.dll is
+        // rejected by the kernel image loader) and PROHIBIT_DYNAMIC_CODE (else
+        // detour2 can't allocate/patch executable trampolines).
         assert_eq!(create_v1 & v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON, 0,
             "create-time bitmap must NOT include BLOCK_NON_MICROSOFT_BINARIES");
+        assert_eq!(create_v1 & v1::PROHIBIT_DYNAMIC_CODE_ALWAYS_ON, 0,
+            "create-time bitmap must NOT include PROHIBIT_DYNAMIC_CODE (blocks detour install)");
 
-        // ALL other Full-mode v1 bits must survive — none of these are
+        // ALL other Static v1 bits must survive — none of these are
         // re-settable at runtime via SetProcessMitigationPolicy, so the kernel
         // ONLY learns about them through this create-time bitmap.
-        assert_ne!(create_v1 & v1::PROHIBIT_DYNAMIC_CODE_ALWAYS_ON, 0,
-            "PROHIBIT_DYNAMIC_CODE_ALWAYS_ON missing from create-time bitmap");
         assert_ne!(create_v1 & v1::FORCE_RELOCATE_IMAGES_ALWAYS_ON, 0,
             "FORCE_RELOCATE_IMAGES_ALWAYS_ON missing from create-time bitmap");
         assert_ne!(create_v1 & v1::HEAP_TERMINATE_ALWAYS_ON, 0,
@@ -249,16 +313,29 @@ mod tests {
         assert_ne!(scan_m1 & v1::EXTENSION_POINT_DISABLE_ALWAYS_ON, 0);
     }
 
-    /// The Full create-time bitmap differs from the raw Full bitmap by
-    /// EXACTLY one bit (BLOCK_NON_MICROSOFT). Catches any future drift where
-    /// a maintainer adds another "runtime-only" exception without thinking it
-    /// through.
+    /// The Static create-time bitmap differs from the raw Static bitmap by
+    /// EXACTLY the two bootstrap-killers (BLOCK_NON_MICROSOFT +
+    /// PROHIBIT_DYNAMIC_CODE). Catches any future drift where a maintainer adds
+    /// another "runtime-only" exception without thinking it through. (Full
+    /// carries neither, so the strip is a no-op there — the invariant only has
+    /// teeth on Static.)
     #[test]
-    fn create_time_strip_is_exactly_block_non_ms() {
+    fn create_time_strip_is_exactly_block_non_ms_and_dynamic_code() {
+        let (static_m1, _) = compute(Profile::Static);
+        let create_v1 = static_m1
+            & !v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON
+            & !v1::PROHIBIT_DYNAMIC_CODE_ALWAYS_ON;
+        let diff = static_m1 ^ create_v1;
+        assert_eq!(
+            diff,
+            v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON | v1::PROHIBIT_DYNAMIC_CODE_ALWAYS_ON,
+            "create-time strip must remove exactly the two bootstrap-killers"
+        );
+        // Full, by contrast, has nothing to strip — it's JIT-safe.
         let (full_m1, _) = compute(Profile::Full);
-        let create_v1 = full_m1 & !v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
-        let diff = full_m1 ^ create_v1;
-        assert_eq!(diff, v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON,
-            "create-time strip must remove exactly BLOCK_NON_MICROSOFT and nothing else");
+        assert_eq!(full_m1 & v1::BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON, 0,
+            "full must not carry BLOCK_NON_MICROSOFT");
+        assert_eq!(full_m1 & v1::PROHIBIT_DYNAMIC_CODE_ALWAYS_ON, 0,
+            "full must not carry PROHIBIT_DYNAMIC_CODE");
     }
 }

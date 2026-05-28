@@ -138,45 +138,36 @@ const REGDB_E_CLASSNOTREG: i32 = 0x8004_0154_u32 as i32;
 // WinRT activation denylist (case-insensitive prefix match on runtime class name)
 // ---------------------------------------------------------------------------
 
-// NOTE on `windows.devices` umbrella entry:
+// DENYLIST PHILOSOPHY — block the tunnel, not the bed.
 //
-// We deliberately deny the entire `Windows.Devices.*` namespace as a single
-// policy choice rather than enumerating each leaf (`Bluetooth`, `Usb`, `Hid`,
-// `SmartCards`, `PointOfService`, `Geolocation`, `Sensors`, `Radios`, ...).
-// The sandbox has no legitimate need for any device-control or device-data API:
-//   * Any subspace is a plausible exfil vector (Geolocation, Radios, Sensors).
-//   * Any subspace is a plausible peripheral-spoofing vector (Hid, Usb, Bluetooth).
-//   * New Windows.Devices.* leaves added by future Windows releases are
-//     automatically covered without requiring a denylist update.
-// If a sandboxed workload legitimately needs (e.g.) Geolocation, the correct
-// path is a launcher-side capability grant rather than poking holes in this
-// umbrella block.
+// We deny ONLY WinRT classes that let the guest cross the containment boundary:
+// spawn/launch something outside the jail, modify the host, or set up
+// delayed/persistent execution the sandbox can't see. We do NOT block classes
+// the guest uses to arrange its own cell (CoreApplication, Threading,
+// Notifications, Devices.Enumeration, Activation) — those broke legitimate
+// apps (notepad's UWP host uses CoreApplication) without buying any
+// containment. Pure info-leak / PII / recon classes (Diagnostics, UserProfile,
+// Contacts, device sensors) are out of scope per the threat model
+// (escape + system modification; network/clipboard/GUI/recon excluded), and
+// network is handled by WFP, not here.
+//
+// Each entry below is justified by ESCAPE or HOST-MODIFICATION, not "scary".
 const WINRT_DENY_PREFIXES: &[&str] = &[
-    "windows.system.launcher",                  // LaunchUriAsync, LaunchFileAsync
-    "windows.system.remotelauncher",
-    "windows.system.diagnostics",               // ProcessDiagnosticInfo
-    "windows.applicationmodel.appservice",
-    "windows.applicationmodel.background",      // BackgroundTaskRegistration
-    "windows.management.deployment",            // PackageManager
-    "windows.storage.pickers",                  // FileOpenPicker
-    "windows.system.remotedesktop",
-    "windows.system.remotesystems",
-    "windows.networking.sockets",               // socket via WinRT (defense-in-depth)
-    "windows.ui.notifications",                 // toast persistence
+    // ── spawn / launch outside the jail (escape) ──
+    "windows.system.launcher",                  // LaunchUriAsync / LaunchFileAsync → external app
+    "windows.system.remotelauncher",            // launch on a remote device
+    "windows.system.remotedesktop",             // remote-desktop session
+    "windows.system.remotesystems",             // cross-device app launch
+    "windows.applicationmodel.appservice",      // IPC channel into another package
+    "windows.storage.pickers",                  // broker-mediated file handle outside the CoW overlay
+    // ── host modification ──
+    "windows.management.deployment",            // PackageManager — installs/removes AppX
+    "windows.system.power",                     // PowerManager.RequestShutdown/Restart (pairs w/ NtShutdownSystem hook)
+    // ── persistence / delayed execution outside our process ──
     "windows.system.scheduler",                 // TaskScheduler equivalent
-    "windows.system.power",                     // PowerManager.RequestShutdown/Restart
-    "windows.system.threading",                 // ThreadPoolTimer delayed callbacks
-    "windows.system.userprofile",
-    "windows.system.profile",                   // hardware-id exfil
-    "windows.devices",                          // umbrella: Bluetooth/USB/HID/etc — see note above
-    "windows.foundation.diagnostics",           // user-mode ETW
-    "windows.ui.notifications.management",      // toast exfil
-    "windows.applicationmodel.core",
-    "windows.applicationmodel.activation",
-    "windows.applicationmodel.contacts",
-    "windows.applicationmodel.appointments",
-    "windows.security.credentials",             // PasswordVault credential extraction
-    "windows.security.exchangeactivesyncprovisioning",
+    "windows.applicationmodel.background",      // BackgroundTaskRegistration — system runs it later
+    // ── credential theft (in scope, consistent with LSA/SAM ALPC blocks) ──
+    "windows.security.credentials",             // PasswordVault.RetrieveAll
 ];
 
 /// Returns true if `name` matches any denied WinRT activation class prefix
@@ -615,7 +606,7 @@ mod tests {
         // Other denylist entries.
         assert!(is_winrt_class_denied("Windows.Management.Deployment.PackageManager"));
         assert!(is_winrt_class_denied("Windows.Storage.Pickers.FileOpenPicker"));
-        assert!(is_winrt_class_denied("Windows.System.Diagnostics.ProcessDiagnosticInfo"));
+        assert!(is_winrt_class_denied("Windows.System.Power.PowerManager"));
         assert!(is_winrt_class_denied("Windows.ApplicationModel.AppService.AppServiceConnection"));
 
         // NOT denied — different sub-namespace under Windows.
@@ -671,32 +662,53 @@ mod tests {
     /// Update this number deliberately when adding/removing entries.
     #[test]
     fn winrt_deny_list_count_pinned() {
-        assert_eq!(WINRT_DENY_PREFIXES.len(), 25);
+        assert_eq!(WINRT_DENY_PREFIXES.len(), 11);
     }
 
-    /// Spot-checks for the newly added entries — each one should match a
-    /// realistic class name that exists in the Windows.* namespace.
+    /// Boundary-crossing classes (escape / host-modification / persistence /
+    /// credential theft) MUST be denied.
     #[test]
-    fn newly_added_winrt_prefixes_match_realistic_classes() {
+    fn winrt_boundary_crossing_classes_denied() {
+        // spawn / launch outside the jail
+        assert!(is_winrt_class_denied("Windows.System.Launcher.LaunchUriAsync"));
+        assert!(is_winrt_class_denied("Windows.System.RemoteLauncher.RemoteLauncher"));
+        assert!(is_winrt_class_denied("Windows.System.RemoteDesktop.InteractiveSession"));
+        assert!(is_winrt_class_denied("Windows.System.RemoteSystems.RemoteSystem"));
+        assert!(is_winrt_class_denied("Windows.ApplicationModel.AppService.AppServiceConnection"));
+        assert!(is_winrt_class_denied("Windows.Storage.Pickers.FileOpenPicker"));
+        // host modification
+        assert!(is_winrt_class_denied("Windows.Management.Deployment.PackageManager"));
         assert!(is_winrt_class_denied("Windows.System.Power.PowerManager"));
-        assert!(is_winrt_class_denied("Windows.System.Threading.ThreadPoolTimer"));
-        assert!(is_winrt_class_denied("Windows.System.UserProfile.GlobalizationPreferences"));
-        assert!(is_winrt_class_denied("Windows.System.Profile.AnalyticsInfo"));
-        // Devices umbrella covers every leaf.
-        assert!(is_winrt_class_denied("Windows.Devices.Bluetooth.BluetoothDevice"));
-        assert!(is_winrt_class_denied("Windows.Devices.Usb.UsbDevice"));
-        assert!(is_winrt_class_denied("Windows.Devices.HumanInterfaceDevice.HidDevice"));
-        assert!(is_winrt_class_denied("Windows.Devices.Geolocation.Geolocator"));
-        assert!(is_winrt_class_denied("Windows.Devices.Radios.Radio"));
-        assert!(is_winrt_class_denied("Windows.Foundation.Diagnostics.LoggingChannel"));
-        assert!(is_winrt_class_denied("Windows.UI.Notifications.Management.UserNotificationListener"));
-        assert!(is_winrt_class_denied("Windows.ApplicationModel.Core.CoreApplication"));
-        assert!(is_winrt_class_denied("Windows.ApplicationModel.Activation.LaunchActivatedEventArgs"));
-        assert!(is_winrt_class_denied("Windows.ApplicationModel.Contacts.Contact"));
-        assert!(is_winrt_class_denied("Windows.ApplicationModel.Appointments.Appointment"));
+        // persistence / delayed execution
+        assert!(is_winrt_class_denied("Windows.System.Scheduler.TaskScheduler"));
+        assert!(is_winrt_class_denied("Windows.ApplicationModel.Background.BackgroundTaskRegistration"));
+        // credential theft
         assert!(is_winrt_class_denied("Windows.Security.Credentials.PasswordVault"));
-        assert!(is_winrt_class_denied(
-            "Windows.Security.ExchangeActiveSyncProvisioning.EasClientDeviceInformation"
-        ));
+    }
+
+    /// Self-arrangement / info-leak / device / network classes are NOT denied —
+    /// blocking them broke legitimate apps (notepad's UWP host uses
+    /// CoreApplication) without any containment benefit. This is the M4/#2
+    /// "block the tunnel, not the bed" stance; these assertions guard against a
+    /// future over-broad re-expansion of the denylist.
+    #[test]
+    fn winrt_self_arrangement_classes_allowed() {
+        // The notepad case — UWP app host. Must NOT be blocked.
+        assert!(!is_winrt_class_denied("Windows.ApplicationModel.Core.CoreApplication"));
+        assert!(!is_winrt_class_denied("Windows.ApplicationModel.Activation.LaunchActivatedEventArgs"));
+        // In-process timers / threading — guest arranging its own callbacks.
+        assert!(!is_winrt_class_denied("Windows.System.Threading.ThreadPoolTimer"));
+        // Device enumeration / sensors — info-leak at most, out of scope; and
+        // Devices.Enumeration is used by many ordinary apps.
+        assert!(!is_winrt_class_denied("Windows.Devices.Enumeration.DeviceInformation"));
+        assert!(!is_winrt_class_denied("Windows.Devices.Bluetooth.BluetoothDevice"));
+        // Recon / PII — out of scope per threat model.
+        assert!(!is_winrt_class_denied("Windows.System.Diagnostics.ProcessDiagnosticInfo"));
+        assert!(!is_winrt_class_denied("Windows.System.Profile.AnalyticsInfo"));
+        assert!(!is_winrt_class_denied("Windows.ApplicationModel.Contacts.Contact"));
+        // Notifications — GUI, out of scope.
+        assert!(!is_winrt_class_denied("Windows.UI.Notifications.ToastNotificationManager"));
+        // Network — handled by WFP, not here.
+        assert!(!is_winrt_class_denied("Windows.Networking.Sockets.StreamSocket"));
     }
 }

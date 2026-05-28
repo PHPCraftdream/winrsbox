@@ -54,8 +54,17 @@ pub(crate) enum GuardLevel {
     None,
     /// Content-aware scan: allow executable memory, block direct syscalls in content.
     Scan,
-    /// Full protection: scan + pre-launch .text scan + DLL .text scan.
+    /// Full protection: scan + pre-launch .text scan + JIT-safe kernel
+    /// mitigations (ASLR/heap/handle/image-load/spec-exec). Deliberately does
+    /// NOT prohibit dynamic code or require signed DLLs, so JIT runtimes
+    /// (node/V8/.NET) and unsigned native extensions (Python .pyd, Node .node)
+    /// run normally. Containment rests on the ntdll hooks + Job Object.
     Full,
+    /// Hard containment (opt-in): full + ProhibitDynamicCode + signed-only DLLs.
+    /// Closes the direct-syscall / fresh-ntdll hook-bypass surface that
+    /// user-mode hooking cannot — at the cost of breaking JIT and unsigned
+    /// native extensions. Only for pure-static targets.
+    Static,
 }
 
 #[derive(Parser, Debug)]
@@ -354,6 +363,7 @@ async fn main() -> Result<()> {
         GuardLevel::None => "none",
         GuardLevel::Scan => "scan",
         GuardLevel::Full => "full",
+        GuardLevel::Static => "static",
     });
     if cli.allow_rwx {
         std::env::set_var("FS_SANDBOX_ALLOW_RWX", "1");
@@ -387,22 +397,24 @@ async fn main() -> Result<()> {
     }?;
     std::env::set_var("FS_SANDBOX_INIT_EVENT", &init_event_name);
 
-    // Trust-based guard level override: signed binaries get scan (JIT-friendly)
-    // instead of full (kernel blocks JIT). Unsigned stays at user's chosen level.
-    let effective_guard = if cli.guard == GuardLevel::Full {
+    // Guard level is taken verbatim — no trust-based downgrade. Full mode is
+    // now JIT-safe (no ProhibitDynamicCode / signed-only), so unsigned dev
+    // tools (node/python/cargo/git) run correctly under it; there is no longer
+    // any reason to drop signed targets to scan. Hard containment that breaks
+    // JIT is the explicit, opt-in `--guard static` tier. For `static` on an
+    // unsigned target we warn that third-party DLL loads will be blocked at
+    // runtime (hook.dll itself is exempt: stripped at create-time, re-applied
+    // after it loads).
+    let effective_guard = cli.guard;
+    if effective_guard == GuardLevel::Static {
         let trust = winrsbox::trust::verify_signature(std::path::Path::new(&target_args[0]));
         if trust.is_trusted() {
-            println!("[sandbox] trust: {trust} → scan mode (JIT-friendly)");
-            // Override FS_SANDBOX_GUARD so hook.dll uses scan too
-            std::env::set_var("FS_SANDBOX_GUARD", "scan");
-            GuardLevel::Scan
+            println!("[sandbox] guard: static (hard containment) — target is {trust}");
         } else {
-            println!("[sandbox] trust: unsigned → full mode (kernel mitigations)");
-            cli.guard
+            println!("[sandbox] guard: static (hard containment) — target is unsigned; \
+                      JIT and unsigned native extensions (.pyd/.node) will be blocked");
         }
-    } else {
-        cli.guard
-    };
+    }
 
     let proc_info = sandbox::launch_suspended(&project_root, &target_args, effective_guard)?;
 
@@ -413,8 +425,12 @@ async fn main() -> Result<()> {
     // accept loop with this slot still set to 0.
     root_target_pid.store(proc_info.dwProcessId, Ordering::Release);
 
-    // Pre-launch code integrity scan (full guard + not skipped).
-    if effective_guard == GuardLevel::Full && !cli.no_pre_scan {
+    // Pre-launch code integrity scan (full/static guard + not skipped).
+    // The direct-syscall scan matters most for `full` (which allows JIT and so
+    // can't rely on ProhibitDynamicCode); `static` runs it too as belt-and-suspenders.
+    if (effective_guard == GuardLevel::Full || effective_guard == GuardLevel::Static)
+        && !cli.no_pre_scan
+    {
         if let Err(e) = inject::pre_launch_scan(
             proc_info.hProcess,
             &target_args[0],
