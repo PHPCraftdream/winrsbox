@@ -55,10 +55,15 @@ pub enum PolicyError {
 }
 
 pub(crate) fn ensure_lower(s: &str) -> std::borrow::Cow<'_, str> {
+    // ASCII-only fold matches what the kernel uses (RtlDowncaseUnicodeString
+    // for ASCII chars) AND every hook-side path comparison. Unicode
+    // to_lowercase() would fold U+0130 to "i\u{307}", diverging from
+    // kernel canonicalization and enabling bypass via inconsistent
+    // normalization.
     if s.bytes().all(|b| !b.is_ascii_uppercase()) {
         std::borrow::Cow::Borrowed(s)
     } else {
-        std::borrow::Cow::Owned(s.to_lowercase())
+        std::borrow::Cow::Owned(s.to_ascii_lowercase())
     }
 }
 
@@ -66,6 +71,24 @@ pub(crate) fn ensure_lower(s: &str) -> std::borrow::Cow<'_, str> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn ensure_lower_is_ascii_only() {
+        assert_eq!(ensure_lower("CamelCase").as_ref(), "camelcase");
+        assert_eq!(ensure_lower("already-lower").as_ref(), "already-lower");
+        // U+0130 (LATIN CAPITAL LETTER I WITH DOT ABOVE) must pass through
+        // untouched — Unicode to_lowercase() would fold it to "i\u{307}",
+        // diverging from the kernel's ASCII-only RtlDowncaseUnicodeString.
+        let input = "C:\\WIN\u{0130}DIR";
+        assert_eq!(ensure_lower(input).as_ref(), "c:\\win\u{0130}dir");
+    }
+
+    #[test]
+    fn ensure_lower_fast_path_borrows() {
+        let s = "already-lowercase-ascii";
+        let result = ensure_lower(s);
+        assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
+    }
 
     #[test]
     fn fresh_db_defaults_passthrough_cow() {

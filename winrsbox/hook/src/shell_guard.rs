@@ -57,6 +57,28 @@ const SHELL_DENY_PREFIXES: &[&str] = &[
     "ms-screensketch:",
     "ms-yourphone:",
     "ms-paint:",
+    // Edge browser activation — spawned by sihost / AppX outside our injection.
+    "microsoft-edge:",
+    "microsoft-edge-holographic:",
+    // Phone / SMS / mail / calendar / news handlers — all dispatched to the
+    // shell-registered default app outside our process tree.
+    "tel:",
+    "sms:",
+    "webcal:",
+    "mailto:",
+    "feed:",
+    "news:",
+    "nntp:",
+    // Windows Search activation.
+    "search-ms:",
+    // Third-party AppX-style URI handlers (common LOLBin escape targets).
+    "steam:",
+    "epicgames:",
+    "spotify:",
+    "discord:",
+    "slack:",
+    "zoommtg:",
+    "msteams:",
     // AppX activation via Explorer — `shell:AppsFolder\<AUMID>`.
     "shell:appsfolder\\",
     "shell:appsfolder/",
@@ -114,6 +136,46 @@ pub(crate) fn is_shell_target_denied(file: &str) -> bool {
         }
     }
     false
+}
+
+/// Scans `params` for any embedded denied URI. ShellExecute callers can pass
+/// the dangerous scheme via `lpParameters` instead of `lpFile` — e.g.
+/// `lpFile = "cmd.exe", lpParameters = "/c start ms-windows-store://..."`.
+/// We scan up to the first 1024 bytes of the lowercased parameter string for
+/// any denylist entry occurring as a substring. Returns `true` on the first
+/// match.
+///
+/// Substring (not prefix) scan is intentional because the dangerous scheme
+/// may appear after a `start`, `/c`, redirection metacharacters, or quoting.
+pub(crate) fn is_shell_params_denied(params: &str) -> bool {
+    if params.is_empty() {
+        return false;
+    }
+    // Find a UTF-8-safe byte index at or below the scan cap. Because Windows
+    // shell parameters are overwhelmingly ASCII and the indexing happens at
+    // the boundary of the byte cap, we step back to the previous char
+    // boundary to avoid panicking on a multibyte split.
+    let cap = params.len().min(1024);
+    let mut idx = cap;
+    while idx > 0 && !params.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    let scan = params[..idx].to_ascii_lowercase();
+    SHELL_DENY_PREFIXES.iter().any(|p| scan.contains(p))
+}
+
+/// Combined check used by both ShellExecute hook entry points. Returns a
+/// short tag identifying which input matched so the violation log can
+/// distinguish `reason=file` from `reason=params`. Returns `None` when
+/// neither input matches.
+pub(crate) fn shell_deny_reason(file: &str, params: &str) -> Option<&'static str> {
+    if is_shell_target_denied(file) {
+        Some("file")
+    } else if is_shell_params_denied(params) {
+        Some("params")
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -246,19 +308,21 @@ unsafe extern "system" fn hook_shell_execute_w(
         return call_original();
     };
 
-    if let Some(file_str) = read_lpcwstr(lp_file) {
-        if is_shell_target_denied(&file_str) {
-            if is_trace() {
-                crate::hooks::ipc_log_violation(ipc::Req::Log {
-                    pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
-                    level: ipc::LogLevel::Warn,
-                    msg: format!("shell_execute_blocked: {file_str}"),
-                });
-            }
-            // ShellExecuteW returns HINSTANCE; values <= 32 indicate error.
-            // 5 == SE_ERR_ACCESSDENIED.
-            return SE_ERR_ACCESSDENIED as *mut c_void as HINSTANCE;
+    let file_str = read_lpcwstr(lp_file).unwrap_or_default();
+    let params_str = read_lpcwstr(lp_parameters).unwrap_or_default();
+    if let Some(reason) = shell_deny_reason(&file_str, &params_str) {
+        if is_trace() {
+            crate::hooks::ipc_log_violation(ipc::Req::Log {
+                pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                level: ipc::LogLevel::Warn,
+                msg: format!(
+                    "shell_execute_blocked reason={reason} file={file_str} params={params_str}"
+                ),
+            });
         }
+        // ShellExecuteW returns HINSTANCE; values <= 32 indicate error.
+        // 5 == SE_ERR_ACCESSDENIED.
+        return SE_ERR_ACCESSDENIED as *mut c_void as HINSTANCE;
     }
 
     call_original()
@@ -280,25 +344,27 @@ unsafe extern "system" fn hook_shell_execute_ex_w(
     if !p_exec_info.is_null() {
         // SAFETY: Caller of ShellExecuteExW is contractually obliged to pass
         // a valid pointer to an initialized SHELLEXECUTEINFOW; we only read
-        // the prefix fields up to lpFile.
+        // the prefix fields up to lpParameters.
         let info_ref = &*p_exec_info;
-        if let Some(file_str) = read_lpcwstr(info_ref.lpFile) {
-            if is_shell_target_denied(&file_str) {
-                if is_trace() {
-                    crate::hooks::ipc_log_violation(ipc::Req::Log {
-                        pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
-                        level: ipc::LogLevel::Warn,
-                        msg: format!("shell_execute_blocked: {file_str}"),
-                    });
-                }
-                // Report SE_ERR_ACCESSDENIED via hInstApp per shellapi.h
-                // contract and return FALSE.
-                // SAFETY: p_exec_info is non-null and points to a writable
-                // struct allocated by the caller; hInstApp is part of the
-                // documented struct prefix.
-                (*p_exec_info).hInstApp = SE_ERR_ACCESSDENIED as *mut c_void as HINSTANCE;
-                return FALSE;
+        let file_str = read_lpcwstr(info_ref.lpFile).unwrap_or_default();
+        let params_str = read_lpcwstr(info_ref.lpParameters).unwrap_or_default();
+        if let Some(reason) = shell_deny_reason(&file_str, &params_str) {
+            if is_trace() {
+                crate::hooks::ipc_log_violation(ipc::Req::Log {
+                    pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                    level: ipc::LogLevel::Warn,
+                    msg: format!(
+                        "shell_execute_ex_blocked reason={reason} file={file_str} params={params_str}"
+                    ),
+                });
             }
+            // Report SE_ERR_ACCESSDENIED via hInstApp per shellapi.h
+            // contract and return FALSE.
+            // SAFETY: p_exec_info is non-null and points to a writable
+            // struct allocated by the caller; hInstApp is part of the
+            // documented struct prefix.
+            (*p_exec_info).hInstApp = SE_ERR_ACCESSDENIED as *mut c_void as HINSTANCE;
+            return FALSE;
         }
     }
 
@@ -502,5 +568,132 @@ mod tests {
         // for the duration of this call.
         let decoded = unsafe { read_lpcwstr(s.as_ptr()) };
         assert_eq!(decoded.as_deref(), Some("ms-settings:network"));
+    }
+
+    /// Pin the size of `SHELL_DENY_PREFIXES`. Update this number deliberately
+    /// when adding or removing entries.
+    #[test]
+    fn shell_deny_list_count_pinned() {
+        assert_eq!(SHELL_DENY_PREFIXES.len(), 37);
+    }
+
+    /// Sanity check: `PREFIX_INSPECT_CHARS` must be large enough to cover the
+    /// longest denylist entry. `microsoft-edge-holographic:` is 27 chars.
+    #[test]
+    fn prefix_inspect_chars_accommodates_longest_entry() {
+        let longest = SHELL_DENY_PREFIXES
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            longest <= PREFIX_INSPECT_CHARS,
+            "longest denylist entry ({longest}) exceeds PREFIX_INSPECT_CHARS ({PREFIX_INSPECT_CHARS})"
+        );
+    }
+
+    /// New schemes added in H2/H3: Microsoft Edge variants.
+    #[test]
+    fn microsoft_edge_uri_denied() {
+        assert!(is_shell_target_denied("microsoft-edge:https://evil.example/"));
+        assert!(is_shell_target_denied("MICROSOFT-EDGE:about:blank"));
+        assert!(is_shell_target_denied("microsoft-edge-holographic:foo"));
+    }
+
+    /// New schemes: tel / sms / webcal / mailto handlers.
+    #[test]
+    fn telephony_and_calendar_schemes_denied() {
+        assert!(is_shell_target_denied("tel:+15555550100"));
+        assert!(is_shell_target_denied("sms:+15555550100?body=hi"));
+        assert!(is_shell_target_denied("webcal://example.com/cal.ics"));
+        assert!(is_shell_target_denied("mailto:alice@example.com"));
+    }
+
+    /// New schemes: news / feed / nntp / search-ms.
+    #[test]
+    fn news_feed_search_schemes_denied() {
+        assert!(is_shell_target_denied("feed://example.com/rss"));
+        assert!(is_shell_target_denied("news:alt.test"));
+        assert!(is_shell_target_denied("nntp://news.example.com/group"));
+        assert!(is_shell_target_denied("search-ms:query=test"));
+    }
+
+    /// New schemes: third-party app activations.
+    #[test]
+    fn third_party_app_schemes_denied() {
+        assert!(is_shell_target_denied("steam://run/12345"));
+        assert!(is_shell_target_denied("epicgames://launch"));
+        assert!(is_shell_target_denied("spotify:track:abc"));
+        assert!(is_shell_target_denied("discord://invite/foo"));
+        assert!(is_shell_target_denied("slack://open"));
+        assert!(is_shell_target_denied("zoommtg://zoom.us/join?confno=123"));
+        assert!(is_shell_target_denied("msteams://teams.microsoft.com/l/team/..."));
+    }
+
+    /// `lpParameters` substring scan: explorer.exe + shell:AppsFolder\... and
+    /// cmd.exe + /c start ms-windows-store://... must both deny via the
+    /// params channel.
+    #[test]
+    fn lp_parameters_uri_denied() {
+        // Classic escape: launcher target is benign, payload hides in args.
+        assert!(is_shell_params_denied("shell:AppsFolder\\evil"));
+        assert!(is_shell_params_denied("/c start ms-windows-store://app/0"));
+        // shell_deny_reason should report `params` (not `file`) for these.
+        assert_eq!(
+            shell_deny_reason("explorer.exe", "shell:AppsFolder\\evil"),
+            Some("params")
+        );
+        assert_eq!(
+            shell_deny_reason("cmd.exe", "/c start ms-windows-store://app/0"),
+            Some("params")
+        );
+        // Confirms case-insensitive substring scan picks up an embedded URI.
+        assert!(is_shell_params_denied(
+            "/c \"start MICROSOFT-EDGE:https://evil/\""
+        ));
+    }
+
+    /// Benign parameters must not be denied — guards against regressions
+    /// where the params substring scan would flag harmless text.
+    #[test]
+    fn lp_parameters_benign_not_denied() {
+        assert!(!is_shell_params_denied("/c echo hello"));
+        assert!(!is_shell_params_denied("--flag value"));
+        assert!(!is_shell_params_denied(""));
+        // File-only deny still works through the combined helper.
+        assert_eq!(
+            shell_deny_reason("ms-settings:network", "/c echo hi"),
+            Some("file")
+        );
+        assert_eq!(shell_deny_reason("notepad.exe", "/c echo hi"), None);
+    }
+
+    /// Coverage mirror for the WinRT side (lives in com_guard) — verifies
+    /// every shell deny prefix matches via the params substring scan as well.
+    /// Renamed to match the requested test name.
+    #[test]
+    fn coverage_of_every_listed_winrt_prefix_via_params() {
+        for p in SHELL_DENY_PREFIXES {
+            // Embed the prefix inside a benign-looking parameter string.
+            let wrapped = format!("/c start {p}target");
+            assert!(
+                is_shell_params_denied(&wrapped),
+                "expected params to be denied: {wrapped}"
+            );
+        }
+    }
+
+    /// `is_shell_params_denied` must not panic on multi-byte UTF-8 input that
+    /// crosses the 1024-byte scan cap.
+    #[test]
+    fn params_scan_handles_multibyte_boundary() {
+        // Build a >1024-byte string whose 1024th byte falls inside a
+        // multi-byte character. Each '€' is 3 UTF-8 bytes.
+        let mut s = String::new();
+        while s.len() < 1100 {
+            s.push('€');
+        }
+        // Must not panic; benign content should not match.
+        assert!(!is_shell_params_denied(&s));
     }
 }

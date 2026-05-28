@@ -183,6 +183,25 @@ pub(crate) fn passthrough() -> Decision {
     Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None }
 }
 
+/// Segment-aware path containment check: returns true iff `path_lower`
+/// equals `root_lower` or is a descendant of it. Prevents the sibling-prefix
+/// bug where naive `starts_with` matches `c:\proj` against `c:\projevil\...`.
+///
+/// Both inputs MUST already be normalized to the same casefold (lowercase)
+/// and use `\` separators. An empty root refuses to match (defense against
+/// misconfiguration where an unset root would otherwise match every path).
+pub(crate) fn path_contained_in(path_lower: &str, root_lower: &str) -> bool {
+    let root = root_lower.trim_end_matches('\\');
+    if root.is_empty() {
+        return false;
+    }
+    if !path_lower.starts_with(root) {
+        return false;
+    }
+    let n = root.len();
+    path_lower.len() == n || path_lower.as_bytes().get(n) == Some(&b'\\')
+}
+
 // ── Policy decide methods (impl block lives here, Policy defined in lib.rs) ──
 
 use crate::Policy;
@@ -237,7 +256,7 @@ impl Policy {
         let lower = ensure_lower(dos_path);
 
         // project_root always passthrough
-        if lower.starts_with(self.inner.project_root_lower.trim_end_matches('\\')) {
+        if path_contained_in(&lower, &self.inner.project_root_lower) {
             return TracedDecision {
                 decision: db::RuleMode::Passthrough,
                 target_path: None,
@@ -405,7 +424,7 @@ impl Policy {
     pub(crate) fn compute(&self, dos_path: &str, write_access: bool, depth: Option<u8>, exe_lower: Option<&str>) -> Decision {
         let lower = ensure_lower(dos_path);
 
-        if lower.starts_with(self.inner.project_root_lower.trim_end_matches('\\')) {
+        if path_contained_in(&lower, &self.inner.project_root_lower) {
             return Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None };
         }
 
@@ -480,7 +499,39 @@ impl Policy {
 
 #[cfg(test)]
 mod tests {
-    use super::cache_key;
+    use super::{cache_key, path_contained_in};
+
+    #[test]
+    fn path_contained_exact_match() {
+        assert!(path_contained_in(r"c:\proj", r"c:\proj"));
+        assert!(path_contained_in(r"c:\proj", r"c:\proj\"));
+    }
+
+    #[test]
+    fn path_contained_subdir_match() {
+        assert!(path_contained_in(r"c:\proj\src\main.rs", r"c:\proj"));
+    }
+
+    #[test]
+    fn path_not_contained_sibling_prefix() {
+        // The bug this guards against: a sibling dir whose name starts with
+        // the root must NOT be treated as inside the root.
+        assert!(!path_contained_in(r"c:\projevil\file", r"c:\proj"));
+        assert!(!path_contained_in(r"c:\projects\foo", r"c:\proj"));
+        assert!(!path_contained_in(r"c:\proj.txt", r"c:\proj"));
+    }
+
+    #[test]
+    fn path_not_contained_disjoint() {
+        assert!(!path_contained_in(r"c:\other", r"c:\proj"));
+    }
+
+    #[test]
+    fn path_contained_empty_root_refused() {
+        // An empty/unset root must never match every path.
+        assert!(!path_contained_in(r"c:\any\path", ""));
+        assert!(!path_contained_in(r"c:\any\path", r"\"));
+    }
 
     #[test]
     fn cache_key_write_flag_differs() {

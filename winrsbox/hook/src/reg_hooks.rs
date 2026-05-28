@@ -29,7 +29,7 @@ use ntapi::winapi::shared::ntdef::{HANDLE, NTSTATUS, OBJECT_ATTRIBUTES, UNICODE_
 use winapi::ctypes::c_void;
 
 use crate::anti_rec;
-use crate::hooks::STATUS_ACCESS_DENIED;
+use crate::hooks::{STATUS_ACCESS_DENIED, STATUS_NOT_SUPPORTED};
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -61,6 +61,103 @@ type FnNtDeleteValueKey = unsafe extern "system" fn(
 
 type FnNtDeleteKey = unsafe extern "system" fn(HANDLE) -> NTSTATUS;
 
+// ---- Persistence-escape syscall signatures ---------------------------------
+//
+// Width convention (matches the existing reg/fs hook style and detour2's
+// `Function` trait): ACCESS_MASK / ULONG / DWORD parameters are typed as
+// `usize` here to widen them to the native register size, so the trampoline
+// dispatch matches what ntdll's stubs put on the stack/in registers.
+
+type FnNtRenameKey = unsafe extern "system" fn(
+    HANDLE,                 // KeyHandle
+    *mut UNICODE_STRING,    // NewName
+) -> NTSTATUS;
+
+type FnNtSaveKey = unsafe extern "system" fn(
+    HANDLE,                 // KeyHandle
+    HANDLE,                 // FileHandle
+) -> NTSTATUS;
+
+type FnNtSaveKeyEx = unsafe extern "system" fn(
+    HANDLE,                 // KeyHandle
+    HANDLE,                 // FileHandle
+    usize,                  // Format (ULONG)
+) -> NTSTATUS;
+
+type FnNtRestoreKey = unsafe extern "system" fn(
+    HANDLE,                 // KeyHandle
+    HANDLE,                 // FileHandle
+    usize,                  // Flags (ULONG)
+) -> NTSTATUS;
+
+type FnNtLoadKey = unsafe extern "system" fn(
+    *mut OBJECT_ATTRIBUTES, // TargetKey
+    *mut OBJECT_ATTRIBUTES, // SourceFile
+) -> NTSTATUS;
+
+type FnNtLoadKeyEx = unsafe extern "system" fn(
+    *mut OBJECT_ATTRIBUTES, // TargetKey
+    *mut OBJECT_ATTRIBUTES, // SourceFile
+    usize,                  // Flags (ULONG)
+    HANDLE,                 // TrustClassKey
+    HANDLE,                 // Event
+    usize,                  // DesiredAccess (ACCESS_MASK)
+    *mut HANDLE,            // RootHandle
+    *mut c_void,            // IoStatus (PIO_STATUS_BLOCK)
+) -> NTSTATUS;
+
+type FnNtUnloadKey = unsafe extern "system" fn(
+    *mut OBJECT_ATTRIBUTES, // TargetKey
+) -> NTSTATUS;
+
+type FnNtUnloadKey2 = unsafe extern "system" fn(
+    *mut OBJECT_ATTRIBUTES, // TargetKey
+    usize,                  // Flags (ULONG)
+) -> NTSTATUS;
+
+type FnNtUnloadKeyEx = unsafe extern "system" fn(
+    *mut OBJECT_ATTRIBUTES, // TargetKey
+    HANDLE,                 // Event
+) -> NTSTATUS;
+
+type FnNtReplaceKey = unsafe extern "system" fn(
+    *mut OBJECT_ATTRIBUTES, // NewFile
+    HANDLE,                 // TargetHandle
+    *mut OBJECT_ATTRIBUTES, // OldFile
+) -> NTSTATUS;
+
+// ---- KTM (transacted) signatures -------------------------------------------
+//
+// All three append a Transaction HANDLE to the corresponding non-transacted
+// signature. NtOpenKey/NtOpenKeyEx aren't currently hooked in this crate, so
+// the non-transacted shape is reconstructed here for the trampoline alias.
+
+type FnNtCreateKeyTransacted = unsafe extern "system" fn(
+    *mut HANDLE,            // KeyHandle
+    usize,                  // DesiredAccess (ACCESS_MASK)
+    *mut OBJECT_ATTRIBUTES, // ObjectAttributes
+    usize,                  // TitleIndex (ULONG)
+    *mut UNICODE_STRING,    // Class
+    usize,                  // CreateOptions (ULONG)
+    HANDLE,                 // Transaction
+    *mut u32,               // Disposition
+) -> NTSTATUS;
+
+type FnNtOpenKeyTransacted = unsafe extern "system" fn(
+    *mut HANDLE,            // KeyHandle
+    usize,                  // DesiredAccess (ACCESS_MASK)
+    *mut OBJECT_ATTRIBUTES, // ObjectAttributes
+    HANDLE,                 // Transaction
+) -> NTSTATUS;
+
+type FnNtOpenKeyTransactedEx = unsafe extern "system" fn(
+    *mut HANDLE,            // KeyHandle
+    usize,                  // DesiredAccess (ACCESS_MASK)
+    *mut OBJECT_ATTRIBUTES, // ObjectAttributes
+    usize,                  // OpenOptions (ULONG)
+    HANDLE,                 // Transaction
+) -> NTSTATUS;
+
 type FnNtQueryKey = unsafe extern "system" fn(
     HANDLE,                 // KeyHandle
     u32,                    // KeyInformationClass
@@ -77,6 +174,23 @@ static HOOK_CREATE_KEY: OnceLock<GenericDetour<FnNtCreateKey>> = OnceLock::new()
 static HOOK_SET_VALUE_KEY: OnceLock<GenericDetour<FnNtSetValueKey>> = OnceLock::new();
 static HOOK_DELETE_VALUE_KEY: OnceLock<GenericDetour<FnNtDeleteValueKey>> = OnceLock::new();
 static HOOK_DELETE_KEY: OnceLock<GenericDetour<FnNtDeleteKey>> = OnceLock::new();
+
+// Persistence-escape hooks (unconditional deny → STATUS_ACCESS_DENIED).
+static HOOK_RENAME_KEY:   OnceLock<GenericDetour<FnNtRenameKey>>   = OnceLock::new();
+static HOOK_SAVE_KEY:     OnceLock<GenericDetour<FnNtSaveKey>>     = OnceLock::new();
+static HOOK_SAVE_KEY_EX:  OnceLock<GenericDetour<FnNtSaveKeyEx>>   = OnceLock::new();
+static HOOK_RESTORE_KEY:  OnceLock<GenericDetour<FnNtRestoreKey>>  = OnceLock::new();
+static HOOK_LOAD_KEY:     OnceLock<GenericDetour<FnNtLoadKey>>     = OnceLock::new();
+static HOOK_LOAD_KEY_EX:  OnceLock<GenericDetour<FnNtLoadKeyEx>>   = OnceLock::new();
+static HOOK_UNLOAD_KEY:   OnceLock<GenericDetour<FnNtUnloadKey>>   = OnceLock::new();
+static HOOK_UNLOAD_KEY_2: OnceLock<GenericDetour<FnNtUnloadKey2>>  = OnceLock::new();
+static HOOK_UNLOAD_KEY_EX:OnceLock<GenericDetour<FnNtUnloadKeyEx>> = OnceLock::new();
+static HOOK_REPLACE_KEY:  OnceLock<GenericDetour<FnNtReplaceKey>>  = OnceLock::new();
+
+// KTM transacted variants (unconditional → STATUS_NOT_SUPPORTED).
+static HOOK_CREATE_KEY_TRANSACTED:    OnceLock<GenericDetour<FnNtCreateKeyTransacted>>    = OnceLock::new();
+static HOOK_OPEN_KEY_TRANSACTED:      OnceLock<GenericDetour<FnNtOpenKeyTransacted>>      = OnceLock::new();
+static HOOK_OPEN_KEY_TRANSACTED_EX:   OnceLock<GenericDetour<FnNtOpenKeyTransactedEx>>    = OnceLock::new();
 
 // Resolved at install time, used for path lookup in handlers.
 static NT_QUERY_KEY: OnceLock<FnNtQueryKey> = OnceLock::new();
@@ -347,6 +461,285 @@ unsafe extern "system" fn hook_nt_delete_key(key_handle: HANDLE) -> NTSTATUS {
 }
 
 // ---------------------------------------------------------------------------
+// Persistence-escape hook handlers (unconditional deny)
+//
+// These syscalls bypass the regular Nt(Create|Set|Delete)Key path:
+//   * NtRenameKey                — moves a key under a new name
+//   * NtSaveKey / NtSaveKeyEx    — dumps a live hive to disk
+//   * NtRestoreKey               — replaces a hive with on-disk contents
+//   * NtLoadKey / NtLoadKeyEx    — mounts an arbitrary on-disk hive
+//   * NtUnloadKey / 2 / Ex       — unmounts a hive (DoS / persistence)
+//   * NtReplaceKey               — atomic hive replace at the next boot
+//
+// They aren't gated by the launcher's regrules policy and there's no
+// sensible "overlay" semantics — fail-closed.
+// ---------------------------------------------------------------------------
+
+/// Emit a violation log if tracing is on.
+fn log_persistence_blocked(syscall: &str, target: Option<String>) {
+    if !crate::ipc_client::is_trace() {
+        return;
+    }
+    // SAFETY: GetCurrentProcessId never fails / never dereferences a pointer.
+    let pid = unsafe { winapi::um::processthreadsapi::GetCurrentProcessId() };
+    let msg = match target {
+        Some(t) if !t.is_empty() => format!(
+            "reg_persistence_blocked: syscall={syscall} target={t}",
+        ),
+        _ => format!("reg_persistence_blocked: syscall={syscall}"),
+    };
+    let _ = crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+        pid,
+        level: ipc::LogLevel::Warn,
+        msg,
+    });
+}
+
+// SAFETY: Called by detour2 dispatcher with the NtRenameKey ABI.
+unsafe extern "system" fn hook_nt_rename_key(
+    key_handle: HANDLE,
+    new_name: *mut UNICODE_STRING,
+) -> NTSTATUS {
+    let Some(_guard) = anti_rec::enter() else {
+        return HOOK_RENAME_KEY.get().unwrap().call(key_handle, new_name);
+    };
+    let target = if !key_handle.is_null() {
+        resolve_handle_friendly(key_handle).or_else(|| ustr_to_string(new_name as *const _))
+    } else {
+        ustr_to_string(new_name as *const _)
+    };
+    log_persistence_blocked("NtRenameKey", target);
+    STATUS_ACCESS_DENIED
+}
+
+// SAFETY: Called by detour2 dispatcher with the NtSaveKey ABI.
+unsafe extern "system" fn hook_nt_save_key(
+    key_handle: HANDLE,
+    file_handle: HANDLE,
+) -> NTSTATUS {
+    let Some(_guard) = anti_rec::enter() else {
+        return HOOK_SAVE_KEY.get().unwrap().call(key_handle, file_handle);
+    };
+    let target = resolve_handle_friendly(key_handle);
+    log_persistence_blocked("NtSaveKey", target);
+    STATUS_ACCESS_DENIED
+}
+
+// SAFETY: Called by detour2 dispatcher with the NtSaveKeyEx ABI.
+unsafe extern "system" fn hook_nt_save_key_ex(
+    key_handle: HANDLE,
+    file_handle: HANDLE,
+    format: usize,
+) -> NTSTATUS {
+    let Some(_guard) = anti_rec::enter() else {
+        return HOOK_SAVE_KEY_EX.get().unwrap().call(key_handle, file_handle, format);
+    };
+    let target = resolve_handle_friendly(key_handle);
+    log_persistence_blocked("NtSaveKeyEx", target);
+    STATUS_ACCESS_DENIED
+}
+
+// SAFETY: Called by detour2 dispatcher with the NtRestoreKey ABI.
+unsafe extern "system" fn hook_nt_restore_key(
+    key_handle: HANDLE,
+    file_handle: HANDLE,
+    flags: usize,
+) -> NTSTATUS {
+    let Some(_guard) = anti_rec::enter() else {
+        return HOOK_RESTORE_KEY.get().unwrap().call(key_handle, file_handle, flags);
+    };
+    let target = resolve_handle_friendly(key_handle);
+    log_persistence_blocked("NtRestoreKey", target);
+    STATUS_ACCESS_DENIED
+}
+
+// SAFETY: Called by detour2 dispatcher with the NtLoadKey ABI.
+unsafe extern "system" fn hook_nt_load_key(
+    target_key: *mut OBJECT_ATTRIBUTES,
+    source_file: *mut OBJECT_ATTRIBUTES,
+) -> NTSTATUS {
+    let Some(_guard) = anti_rec::enter() else {
+        return HOOK_LOAD_KEY.get().unwrap().call(target_key, source_file);
+    };
+    let target = resolve_attrs_friendly(target_key as *const _);
+    log_persistence_blocked("NtLoadKey", target);
+    STATUS_ACCESS_DENIED
+}
+
+// SAFETY: Called by detour2 dispatcher with the NtLoadKeyEx ABI.
+unsafe extern "system" fn hook_nt_load_key_ex(
+    target_key: *mut OBJECT_ATTRIBUTES,
+    source_file: *mut OBJECT_ATTRIBUTES,
+    flags: usize,
+    trust_class_key: HANDLE,
+    event: HANDLE,
+    desired_access: usize,
+    root_handle: *mut HANDLE,
+    io_status: *mut c_void,
+) -> NTSTATUS {
+    let Some(_guard) = anti_rec::enter() else {
+        return HOOK_LOAD_KEY_EX.get().unwrap().call(
+            target_key, source_file, flags, trust_class_key,
+            event, desired_access, root_handle, io_status,
+        );
+    };
+    let target = resolve_attrs_friendly(target_key as *const _);
+    log_persistence_blocked("NtLoadKeyEx", target);
+    // Defensive: caller may inspect *RootHandle on failure. Null it so they
+    // can't accidentally use a stale or uninitialised HANDLE.
+    if !root_handle.is_null() {
+        *root_handle = std::ptr::null_mut();
+    }
+    STATUS_ACCESS_DENIED
+}
+
+// SAFETY: Called by detour2 dispatcher with the NtUnloadKey ABI.
+unsafe extern "system" fn hook_nt_unload_key(
+    target_key: *mut OBJECT_ATTRIBUTES,
+) -> NTSTATUS {
+    let Some(_guard) = anti_rec::enter() else {
+        return HOOK_UNLOAD_KEY.get().unwrap().call(target_key);
+    };
+    let target = resolve_attrs_friendly(target_key as *const _);
+    log_persistence_blocked("NtUnloadKey", target);
+    STATUS_ACCESS_DENIED
+}
+
+// SAFETY: Called by detour2 dispatcher with the NtUnloadKey2 ABI.
+unsafe extern "system" fn hook_nt_unload_key_2(
+    target_key: *mut OBJECT_ATTRIBUTES,
+    flags: usize,
+) -> NTSTATUS {
+    let Some(_guard) = anti_rec::enter() else {
+        return HOOK_UNLOAD_KEY_2.get().unwrap().call(target_key, flags);
+    };
+    let target = resolve_attrs_friendly(target_key as *const _);
+    log_persistence_blocked("NtUnloadKey2", target);
+    STATUS_ACCESS_DENIED
+}
+
+// SAFETY: Called by detour2 dispatcher with the NtUnloadKeyEx ABI.
+unsafe extern "system" fn hook_nt_unload_key_ex(
+    target_key: *mut OBJECT_ATTRIBUTES,
+    event: HANDLE,
+) -> NTSTATUS {
+    let Some(_guard) = anti_rec::enter() else {
+        return HOOK_UNLOAD_KEY_EX.get().unwrap().call(target_key, event);
+    };
+    let target = resolve_attrs_friendly(target_key as *const _);
+    log_persistence_blocked("NtUnloadKeyEx", target);
+    STATUS_ACCESS_DENIED
+}
+
+// SAFETY: Called by detour2 dispatcher with the NtReplaceKey ABI.
+unsafe extern "system" fn hook_nt_replace_key(
+    new_file: *mut OBJECT_ATTRIBUTES,
+    target_handle: HANDLE,
+    old_file: *mut OBJECT_ATTRIBUTES,
+) -> NTSTATUS {
+    let Some(_guard) = anti_rec::enter() else {
+        return HOOK_REPLACE_KEY.get().unwrap().call(new_file, target_handle, old_file);
+    };
+    let target = resolve_handle_friendly(target_handle)
+        .or_else(|| resolve_attrs_friendly(new_file as *const _));
+    log_persistence_blocked("NtReplaceKey", target);
+    STATUS_ACCESS_DENIED
+}
+
+// ---------------------------------------------------------------------------
+// KTM transacted variants — STATUS_NOT_SUPPORTED.
+//
+// CLR / RegOpenKeyTransacted go through these. Returning NOT_SUPPORTED
+// matches the kernel's behaviour on systems where KTM is disabled and is
+// less suspicious to the caller than ACCESS_DENIED.
+// ---------------------------------------------------------------------------
+
+fn log_transacted_blocked(syscall: &str, target: Option<String>) {
+    if !crate::ipc_client::is_trace() {
+        return;
+    }
+    // SAFETY: GetCurrentProcessId is always safe.
+    let pid = unsafe { winapi::um::processthreadsapi::GetCurrentProcessId() };
+    let msg = match target {
+        Some(t) if !t.is_empty() => format!(
+            "reg_transacted_blocked: syscall={syscall} target={t}",
+        ),
+        _ => format!("reg_transacted_blocked: syscall={syscall}"),
+    };
+    let _ = crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+        pid,
+        level: ipc::LogLevel::Warn,
+        msg,
+    });
+}
+
+// SAFETY: Called by detour2 dispatcher with the NtCreateKeyTransacted ABI.
+unsafe extern "system" fn hook_nt_create_key_transacted(
+    key_handle: *mut HANDLE,
+    desired_access: usize,
+    object_attributes: *mut OBJECT_ATTRIBUTES,
+    title_index: usize,
+    class: *mut UNICODE_STRING,
+    create_options: usize,
+    transaction: HANDLE,
+    disposition: *mut u32,
+) -> NTSTATUS {
+    let Some(_guard) = anti_rec::enter() else {
+        return HOOK_CREATE_KEY_TRANSACTED.get().unwrap().call(
+            key_handle, desired_access, object_attributes,
+            title_index, class, create_options, transaction, disposition,
+        );
+    };
+    let target = resolve_attrs_friendly(object_attributes as *const _);
+    log_transacted_blocked("NtCreateKeyTransacted", target);
+    if !key_handle.is_null() {
+        *key_handle = std::ptr::null_mut();
+    }
+    STATUS_NOT_SUPPORTED
+}
+
+// SAFETY: Called by detour2 dispatcher with the NtOpenKeyTransacted ABI.
+unsafe extern "system" fn hook_nt_open_key_transacted(
+    key_handle: *mut HANDLE,
+    desired_access: usize,
+    object_attributes: *mut OBJECT_ATTRIBUTES,
+    transaction: HANDLE,
+) -> NTSTATUS {
+    let Some(_guard) = anti_rec::enter() else {
+        return HOOK_OPEN_KEY_TRANSACTED.get().unwrap().call(
+            key_handle, desired_access, object_attributes, transaction,
+        );
+    };
+    let target = resolve_attrs_friendly(object_attributes as *const _);
+    log_transacted_blocked("NtOpenKeyTransacted", target);
+    if !key_handle.is_null() {
+        *key_handle = std::ptr::null_mut();
+    }
+    STATUS_NOT_SUPPORTED
+}
+
+// SAFETY: Called by detour2 dispatcher with the NtOpenKeyTransactedEx ABI.
+unsafe extern "system" fn hook_nt_open_key_transacted_ex(
+    key_handle: *mut HANDLE,
+    desired_access: usize,
+    object_attributes: *mut OBJECT_ATTRIBUTES,
+    open_options: usize,
+    transaction: HANDLE,
+) -> NTSTATUS {
+    let Some(_guard) = anti_rec::enter() else {
+        return HOOK_OPEN_KEY_TRANSACTED_EX.get().unwrap().call(
+            key_handle, desired_access, object_attributes, open_options, transaction,
+        );
+    };
+    let target = resolve_attrs_friendly(object_attributes as *const _);
+    log_transacted_blocked("NtOpenKeyTransactedEx", target);
+    if !key_handle.is_null() {
+        *key_handle = std::ptr::null_mut();
+    }
+    STATUS_NOT_SUPPORTED
+}
+
+// ---------------------------------------------------------------------------
 // Install / Uninstall
 // ---------------------------------------------------------------------------
 
@@ -380,12 +773,73 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     install_reg!(HOOK_DELETE_VALUE_KEY, "NtDeleteValueKey\0", hook_nt_delete_value_key, FnNtDeleteValueKey);
     install_reg!(HOOK_DELETE_KEY,       "NtDeleteKey\0",      hook_nt_delete_key,       FnNtDeleteKey);
 
+    // Best-effort installs for persistence-escape + KTM hooks. Don't fail the
+    // whole reg_hooks install if a single Ex variant isn't exported by the
+    // running ntdll (e.g. NtUnloadKey2 only exists on Win8+).
+    macro_rules! install_best_effort {
+        ($lock:expr, $sym:literal, $hook_fn:expr, $fn_ty:ty) => {{
+            match crate::hooks::ntdll_export($sym.as_bytes()) {
+                Some(addr) => {
+                    // SAFETY: transmute of ntdll export address; ABI matches hook fn type.
+                    let target: $fn_ty = std::mem::transmute(addr as usize);
+                    let hook_ptr: $fn_ty = $hook_fn;
+                    match GenericDetour::<$fn_ty>::new(target, hook_ptr) {
+                        Ok(detour) => {
+                            let _ = $lock.set(detour);
+                            if let Some(h) = $lock.get() {
+                                if let Err(e) = h.enable() {
+                                    crate::hooks::buffer_install_error(
+                                        format!("detour enable {}: {:?}", $sym, e),
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => crate::hooks::buffer_install_error(
+                            format!("detour init {}: {:?}", $sym, e),
+                        ),
+                    }
+                }
+                None => crate::hooks::buffer_install_error(
+                    format!("ntdll export not found: {}", $sym),
+                ),
+            }
+        }};
+    }
+
+    install_best_effort!(HOOK_RENAME_KEY,    "NtRenameKey\0",    hook_nt_rename_key,    FnNtRenameKey);
+    install_best_effort!(HOOK_SAVE_KEY,      "NtSaveKey\0",      hook_nt_save_key,      FnNtSaveKey);
+    install_best_effort!(HOOK_SAVE_KEY_EX,   "NtSaveKeyEx\0",    hook_nt_save_key_ex,   FnNtSaveKeyEx);
+    install_best_effort!(HOOK_RESTORE_KEY,   "NtRestoreKey\0",   hook_nt_restore_key,   FnNtRestoreKey);
+    install_best_effort!(HOOK_LOAD_KEY,      "NtLoadKey\0",      hook_nt_load_key,      FnNtLoadKey);
+    install_best_effort!(HOOK_LOAD_KEY_EX,   "NtLoadKeyEx\0",    hook_nt_load_key_ex,   FnNtLoadKeyEx);
+    install_best_effort!(HOOK_UNLOAD_KEY,    "NtUnloadKey\0",    hook_nt_unload_key,    FnNtUnloadKey);
+    install_best_effort!(HOOK_UNLOAD_KEY_2,  "NtUnloadKey2\0",   hook_nt_unload_key_2,  FnNtUnloadKey2);
+    install_best_effort!(HOOK_UNLOAD_KEY_EX, "NtUnloadKeyEx\0",  hook_nt_unload_key_ex, FnNtUnloadKeyEx);
+    install_best_effort!(HOOK_REPLACE_KEY,   "NtReplaceKey\0",   hook_nt_replace_key,   FnNtReplaceKey);
+
+    install_best_effort!(HOOK_CREATE_KEY_TRANSACTED,  "NtCreateKeyTransacted\0",  hook_nt_create_key_transacted,  FnNtCreateKeyTransacted);
+    install_best_effort!(HOOK_OPEN_KEY_TRANSACTED,    "NtOpenKeyTransacted\0",    hook_nt_open_key_transacted,    FnNtOpenKeyTransacted);
+    install_best_effort!(HOOK_OPEN_KEY_TRANSACTED_EX, "NtOpenKeyTransactedEx\0",  hook_nt_open_key_transacted_ex, FnNtOpenKeyTransactedEx);
+
     Ok(())
 }
 
 /// # SAFETY
 /// Must be called from DLL_PROCESS_DETACH only.
 pub unsafe fn uninstall() {
+    if let Some(h) = HOOK_OPEN_KEY_TRANSACTED_EX.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_OPEN_KEY_TRANSACTED.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_CREATE_KEY_TRANSACTED.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_REPLACE_KEY.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_UNLOAD_KEY_EX.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_UNLOAD_KEY_2.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_UNLOAD_KEY.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_LOAD_KEY_EX.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_LOAD_KEY.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_RESTORE_KEY.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_SAVE_KEY_EX.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_SAVE_KEY.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_RENAME_KEY.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_DELETE_KEY.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_DELETE_VALUE_KEY.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_SET_VALUE_KEY.get() { let _ = h.disable(); }
@@ -449,5 +903,172 @@ mod tests {
                 "spelling {non_match:?} must not match silent_ok",
             );
         }
+    }
+
+    // ── persistence-escape hooks: unconditional deny ─────────────────────
+    //
+    // Each test calls the hook directly with NULL arguments. The handler's
+    // anti_rec guard is acquired (no other hook is on this thread), name
+    // resolution gracefully returns None on NULL pointers, and the handler
+    // returns the deny code. These exercise the bare deny path without
+    // requiring live kernel handles.
+
+    #[test]
+    fn nt_rename_key_denied() {
+        assert_eq!(
+            unsafe { hook_nt_rename_key(std::ptr::null_mut(), std::ptr::null_mut()) },
+            crate::hooks::STATUS_ACCESS_DENIED
+        );
+    }
+
+    #[test]
+    fn nt_save_key_denied() {
+        assert_eq!(
+            unsafe { hook_nt_save_key(std::ptr::null_mut(), std::ptr::null_mut()) },
+            crate::hooks::STATUS_ACCESS_DENIED
+        );
+    }
+
+    #[test]
+    fn nt_save_key_ex_denied() {
+        assert_eq!(
+            unsafe { hook_nt_save_key_ex(std::ptr::null_mut(), std::ptr::null_mut(), 0) },
+            crate::hooks::STATUS_ACCESS_DENIED
+        );
+    }
+
+    #[test]
+    fn nt_restore_key_denied() {
+        assert_eq!(
+            unsafe { hook_nt_restore_key(std::ptr::null_mut(), std::ptr::null_mut(), 0) },
+            crate::hooks::STATUS_ACCESS_DENIED
+        );
+    }
+
+    #[test]
+    fn nt_load_key_denied() {
+        assert_eq!(
+            unsafe { hook_nt_load_key(std::ptr::null_mut(), std::ptr::null_mut()) },
+            crate::hooks::STATUS_ACCESS_DENIED
+        );
+    }
+
+    #[test]
+    fn nt_load_key_ex_denied_and_nulls_root_handle() {
+        // Stash a sentinel in RootHandle; the hook must overwrite it with NULL
+        // so the caller can't observe a stale handle on the deny path.
+        let mut root: HANDLE = 0x1234_5678 as HANDLE;
+        let status = unsafe {
+            hook_nt_load_key_ex(
+                std::ptr::null_mut(),  // TargetKey
+                std::ptr::null_mut(),  // SourceFile
+                0,                     // Flags
+                std::ptr::null_mut(),  // TrustClassKey
+                std::ptr::null_mut(),  // Event
+                0,                     // DesiredAccess
+                &mut root,             // RootHandle (sentinel)
+                std::ptr::null_mut(),  // IoStatus
+            )
+        };
+        assert_eq!(status, crate::hooks::STATUS_ACCESS_DENIED);
+        assert!(root.is_null(), "RootHandle must be nulled on deny");
+    }
+
+    #[test]
+    fn nt_unload_key_denied() {
+        assert_eq!(
+            unsafe { hook_nt_unload_key(std::ptr::null_mut()) },
+            crate::hooks::STATUS_ACCESS_DENIED
+        );
+    }
+
+    #[test]
+    fn nt_unload_key_2_denied() {
+        assert_eq!(
+            unsafe { hook_nt_unload_key_2(std::ptr::null_mut(), 0) },
+            crate::hooks::STATUS_ACCESS_DENIED
+        );
+    }
+
+    #[test]
+    fn nt_unload_key_ex_denied() {
+        assert_eq!(
+            unsafe { hook_nt_unload_key_ex(std::ptr::null_mut(), std::ptr::null_mut()) },
+            crate::hooks::STATUS_ACCESS_DENIED
+        );
+    }
+
+    #[test]
+    fn nt_replace_key_denied() {
+        assert_eq!(
+            unsafe {
+                hook_nt_replace_key(
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            crate::hooks::STATUS_ACCESS_DENIED
+        );
+    }
+
+    // ── KTM transacted variants: STATUS_NOT_SUPPORTED ────────────────────
+
+    #[test]
+    fn nt_create_key_transacted_not_supported() {
+        let mut key: HANDLE = 0xDEAD_BEEF as HANDLE;
+        let status = unsafe {
+            hook_nt_create_key_transacted(
+                &mut key,
+                0,                     // DesiredAccess
+                std::ptr::null_mut(),  // ObjectAttributes
+                0,                     // TitleIndex
+                std::ptr::null_mut(),  // Class
+                0,                     // CreateOptions
+                std::ptr::null_mut(),  // Transaction
+                std::ptr::null_mut(),  // Disposition
+            )
+        };
+        assert_eq!(status, crate::hooks::STATUS_NOT_SUPPORTED);
+        assert!(key.is_null(), "KeyHandle out-param must be nulled");
+    }
+
+    #[test]
+    fn nt_open_key_transacted_not_supported() {
+        let mut key: HANDLE = 0xDEAD_BEEF as HANDLE;
+        let status = unsafe {
+            hook_nt_open_key_transacted(
+                &mut key,
+                0,                     // DesiredAccess
+                std::ptr::null_mut(),  // ObjectAttributes
+                std::ptr::null_mut(),  // Transaction
+            )
+        };
+        assert_eq!(status, crate::hooks::STATUS_NOT_SUPPORTED);
+        assert!(key.is_null(), "KeyHandle out-param must be nulled");
+    }
+
+    #[test]
+    fn nt_open_key_transacted_ex_not_supported() {
+        let mut key: HANDLE = 0xDEAD_BEEF as HANDLE;
+        let status = unsafe {
+            hook_nt_open_key_transacted_ex(
+                &mut key,
+                0,                     // DesiredAccess
+                std::ptr::null_mut(),  // ObjectAttributes
+                0,                     // OpenOptions
+                std::ptr::null_mut(),  // Transaction
+            )
+        };
+        assert_eq!(status, crate::hooks::STATUS_NOT_SUPPORTED);
+        assert!(key.is_null(), "KeyHandle out-param must be nulled");
+    }
+
+    /// Pin the KTM status code value reachable via the reg_hooks module so
+    /// any future change to STATUS_NOT_SUPPORTED has to update the canonical
+    /// pin test in `hooks::status_constant_tests` too.
+    #[test]
+    fn status_not_supported_value() {
+        assert_eq!(crate::hooks::STATUS_NOT_SUPPORTED, 0xC000_00BB_u32 as i32);
     }
 }
