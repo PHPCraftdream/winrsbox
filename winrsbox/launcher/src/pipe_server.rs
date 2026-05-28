@@ -3,28 +3,62 @@
 use ipc::{read_msg, write_msg, LogLevel, Req, Resp};
 use policy::Policy;
 use std::{
-    ffi::OsStr,
+    ffi::{c_void, OsStr},
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
         Arc,
     },
 };
 use tokio::sync::Semaphore;
 use windows::{
-    core::HRESULT,
+    core::{HRESULT, PCWSTR},
     Win32::{
-        Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE},
-        Storage::FileSystem::PIPE_ACCESS_DUPLEX,
-        System::Pipes::{
-            ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe,
-            PIPE_TYPE_BYTE, PIPE_WAIT,
+        Foundation::{CloseHandle, HLOCAL, LocalFree, ERROR_PIPE_CONNECTED, HANDLE},
+        Security::{
+            GetTokenInformation, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+            TokenUser, TOKEN_QUERY, TOKEN_USER,
+        },
+        Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX},
+        System::{
+            Pipes::{
+                ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe,
+                GetNamedPipeClientProcessId,
+                PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+            },
+            Threading::{GetCurrentProcess, OpenProcessToken},
         },
     },
 };
 use winrsbox::hot_stats::{HotStats, ThrottledFlusher};
 use winrsbox::jsonl_log;
+
+// ─── C3 Part 2: raw advapi32 bindings for SDDL/SID conversion ─────────────────
+//
+// The `Win32_Security_Authorization` feature of `windows-0.61` exposes these,
+// but enabling it would touch Cargo.toml — out of scope per task. Declaring
+// them by hand is cheap and keeps the patch isolated to pipe_server.rs.
+// All three functions live in advapi32.dll and use the standard `BOOL`
+// convention (nonzero = success). Signatures match MSDN verbatim.
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    /// Returns the SDDL string form of `sid` in a LocalAlloc'd buffer.
+    /// Caller must `LocalFree` the returned pointer. Returns 0 on failure.
+    fn ConvertSidToStringSidW(sid: PSID, stringsid: *mut *mut u16) -> i32;
+
+    /// Parses an SDDL string and returns a LocalAlloc'd
+    /// PSECURITY_DESCRIPTOR. Returns 0 on failure.
+    fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        stringsecuritydescriptor: PCWSTR,
+        stringsdrevision: u32,
+        securitydescriptor: *mut PSECURITY_DESCRIPTOR,
+        securitydescriptorsize: *mut u32,
+    ) -> i32;
+}
+
+/// SDDL_REVISION_1 — the only revision the W variant accepts.
+const SDDL_REVISION_1: u32 = 1;
 
 // ─── Stats ───────────────────────────────────────────────────────────────────
 
@@ -36,6 +70,178 @@ pub(crate) struct Stats {
     pub(crate) mock_: AtomicU64,
     pub(crate) cow: AtomicU64,
     pub(crate) violations: AtomicU64,
+}
+
+// ─── C3 Part 2: per-launcher security descriptor for the IPC pipe ─────────────
+
+/// Owns the heap allocation behind the security descriptor returned by
+/// `ConvertStringSecurityDescriptorToSecurityDescriptorW`. We keep it alive
+/// for the entire lifetime of the pipe accept loop because every
+/// `CreateNamedPipeW` call dereferences `SECURITY_ATTRIBUTES.lpSecurityDescriptor`.
+///
+/// SAFETY contract: the raw pointer behind `sd` is the LocalAlloc'd buffer
+/// returned by the SDDL converter. We intentionally never call `LocalFree`
+/// on it — this is a one-time allocation at startup, and process exit
+/// reclaims it via OS teardown. Calling `LocalFree` would risk a
+/// use-after-free if the SD were referenced after the wrapper drops.
+struct PipeSecurity {
+    /// LocalAlloc'd security descriptor returned by SDDL conversion.
+    /// Kept around purely so the field is not optimized away; the actual
+    /// pointer used by Win32 is the one stored in `sa.lpSecurityDescriptor`.
+    #[allow(dead_code)]
+    sd: PSECURITY_DESCRIPTOR,
+    /// SECURITY_ATTRIBUTES pointing into `sd`. Kept stable so the address
+    /// passed to `CreateNamedPipeW` remains valid across iterations.
+    sa: SECURITY_ATTRIBUTES,
+}
+
+// SAFETY: PSECURITY_DESCRIPTOR / SECURITY_ATTRIBUTES contain raw pointers to a
+//         heap buffer that lives for the entire process. After construction
+//         the buffer is read-only and the OS reads it from arbitrary threads
+//         when servicing CreateNamedPipeW — i.e. it is already required to be
+//         safe to dereference cross-thread.
+unsafe impl Send for PipeSecurity {}
+unsafe impl Sync for PipeSecurity {}
+
+/// Query the current process's user SID, format it as a string SID, and
+/// build a security descriptor via SDDL that grants `GENERIC_READ |
+/// GENERIC_WRITE` to that SID only. Everything else (including SYSTEM, other
+/// users, and remote callers) is denied because we provide an explicit DACL
+/// containing exactly one ACE.
+///
+/// SDDL layout: `D:P(A;;GRGW;;;<user_sid>)`
+///   • `D:`     — DACL section
+///   • `P`      — DACL_PROTECTED (no inheritance from any container)
+///   • `(A;;GRGW;;;sid)` — Allow ACE granting GENERIC_READ + GENERIC_WRITE
+///                        (covers everything a pipe client and server need:
+///                        read/write data, attributes, EAs, SYNCHRONIZE).
+///
+/// Same-user different-session caveat: the user SID is identical across
+/// logon sessions of the same Windows user, so an attacker process running
+/// under the same user account in a different session WILL pass this DACL.
+/// The Part 3 client-PID check rejects such attackers — the SDDL is the
+/// first wall, the PID validation is the second.
+fn build_pipe_security() -> anyhow::Result<PipeSecurity> {
+    // ── 1. Get current process user SID ────────────────────────────────────
+    // SAFETY: GetCurrentProcess returns a pseudo-handle; OpenProcessToken with
+    //         TOKEN_QUERY is the documented way to query our own token.
+    let mut token = HANDLE::default();
+    unsafe {
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .map_err(|e| anyhow::anyhow!("OpenProcessToken failed: {e}"))?;
+    }
+    // Two-step GetTokenInformation: first call sizes the buffer.
+    let mut needed: u32 = 0;
+    // SAFETY: passing None for the buffer + 0 length is the documented
+    //         pattern for getting the required size; we ignore the error
+    //         return and read `needed` regardless.
+    let _ = unsafe {
+        GetTokenInformation(token, TokenUser, None, 0, &mut needed)
+    };
+    if needed == 0 {
+        unsafe { CloseHandle(token).ok() };
+        anyhow::bail!("GetTokenInformation(TokenUser) size query returned 0");
+    }
+    let mut buf = vec![0u8; needed as usize];
+    let mut got: u32 = 0;
+    // SAFETY: buf is sized to `needed`; we pass its pointer and length.
+    let info_result = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr() as *mut _),
+            needed,
+            &mut got,
+        )
+    };
+    unsafe { CloseHandle(token).ok() };
+    info_result.map_err(|e| anyhow::anyhow!("GetTokenInformation(TokenUser) failed: {e}"))?;
+
+    // SAFETY: buf was filled by GetTokenInformation with a TOKEN_USER struct
+    //         followed by the SID bytes. The buffer outlives this read.
+    let token_user: &TOKEN_USER = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
+    let user_sid = token_user.User.Sid;
+    if user_sid.is_invalid() {
+        anyhow::bail!("TokenUser returned an invalid SID");
+    }
+
+    // ── 2. Convert SID to string form (raw advapi32) ───────────────────────
+    let mut sid_pwstr: *mut u16 = std::ptr::null_mut();
+    // SAFETY: user_sid is valid for the lifetime of `buf` (still alive);
+    //         ConvertSidToStringSidW LocalAlloc's into sid_pwstr on success.
+    let ok = unsafe { ConvertSidToStringSidW(user_sid, &mut sid_pwstr) };
+    if ok == 0 || sid_pwstr.is_null() {
+        anyhow::bail!("ConvertSidToStringSidW failed");
+    }
+    // SAFETY: sid_pwstr is a null-terminated wide string allocated by Win32.
+    let sid_str = unsafe {
+        let mut len = 0usize;
+        while *sid_pwstr.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(sid_pwstr, len);
+        String::from_utf16_lossy(slice)
+    };
+    // Free the SID string buffer — we copied its contents.
+    // SAFETY: sid_pwstr came from LocalAlloc'd ConvertSidToStringSidW; LocalFree
+    //         is the matched deallocator.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(sid_pwstr as *mut c_void)));
+    }
+
+    // ── 3. Build SDDL and convert to SECURITY_DESCRIPTOR (raw advapi32) ────
+    let sddl = format!("D:P(A;;GRGW;;;{sid_str})");
+    let sddl_w: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+    let mut psd_ptr: PSECURITY_DESCRIPTOR = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: sddl_w is null-terminated; psd_ptr is a stack out-param;
+    //         the SDDL converter LocalAlloc's the descriptor and stores
+    //         its pointer in `psd_ptr` on success.
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl_w.as_ptr()),
+            SDDL_REVISION_1,
+            &mut psd_ptr,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 || psd_ptr.is_invalid() {
+        anyhow::bail!(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW failed (sddl={sddl})",
+        );
+    }
+
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: psd_ptr.0,
+        bInheritHandle: windows::core::BOOL(0),
+    };
+    Ok(PipeSecurity { sd: psd_ptr, sa })
+}
+
+// ─── C3 Part 3: validate that the connecting client is one of our own PIDs ────
+
+/// Return true iff `client_pid` is either the root sandboxed target or any
+/// process we have already tracked in `global_proc_info` (root + SpawnedChild
+/// grandchildren + Hello'd processes).
+///
+/// Chicken-and-egg note: the very first IPC the launcher sees is the root
+/// child's `Hello`, sent before any `SpawnedChild` has fired. The launcher
+/// inserts the root PID into `global_proc_info` **before** `ResumeThread`
+/// in `main.rs` (the PROC_INFO insert block immediately precedes
+/// `ResumeThread(proc_info.hThread)`), so by the time hook.dll's
+/// `CreateFileW(\\.\pipe\...)` returns, the root PID is already a key in
+/// the map. The explicit `root_target_pid` match below is therefore mostly
+/// defence-in-depth: even if the insertion order were ever reordered, the
+/// connection from the root would still pass.
+fn is_owned_client_pid(client_pid: u32, root_target_pid: u32) -> bool {
+    if client_pid == 0 {
+        return false;
+    }
+    if root_target_pid != 0 && client_pid == root_target_pid {
+        return true;
+    }
+    // Map populated by the Hello / SpawnedChild handlers below.
+    crate::global_proc_info().pin().contains_key(&client_pid)
 }
 
 // ─── Pipe accept loop ─────────────────────────────────────────────────────────
@@ -61,11 +267,33 @@ pub(crate) async fn pipe_accept_loop(
     violations_log: PathBuf,
     hot_stats: Arc<HotStats>,
     flusher: Arc<ThrottledFlusher>,
-) {
+    // C3 Part 3: PID of the root sandboxed target. Cross-checked with
+    // GetNamedPipeClientProcessId on every new connection so an unrelated
+    // same-user process cannot impersonate the hooked target.
+    //
+    // Shared as `Arc<AtomicU32>` because the accept loop spawns BEFORE
+    // `launch_suspended` produces the root PID. The launcher publishes the
+    // PID via `store(.., Release)` after `CreateProcessW`, long before the
+    // root child can connect (it stays suspended until `ResumeThread`). A
+    // value of `0` here means "not yet known" and the validation falls
+    // back to a `global_proc_info` lookup; the root insertion in main.rs
+    // immediately before `ResumeThread` covers that path too.
+    root_target_pid: Arc<AtomicU32>,
+) -> anyhow::Result<()> {
     let pipe_name_wide: Vec<u16> = OsStr::new(pipe_name)
         .encode_wide()
         .chain(Some(0))
         .collect();
+
+    // C3 Part 2: build the launcher-user-only DACL once at startup. The
+    // descriptor is referenced by every `CreateNamedPipeW` call below, so we
+    // wrap it in an Arc to keep the heap pointer stable for the loop's
+    // lifetime. Failure here is fail-closed — the launcher refuses to start
+    // the IPC server without a hardened SD.
+    let pipe_sec = Arc::new(
+        build_pipe_security()
+            .map_err(|e| anyhow::anyhow!("C3: pipe SD construction failed: {e}"))?,
+    );
 
     // Audit M-A3: bound handler-task concurrency. Each accepted connection
     // acquires one permit before `spawn_blocking`; the permit drops when the
@@ -75,36 +303,93 @@ pub(crate) async fn pipe_accept_loop(
     // `spawn_blocking` itself.
     let handler_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS));
 
+    // C3 Part 1: the first iteration must request FILE_FLAG_FIRST_PIPE_INSTANCE
+    // so the kernel refuses our CreateNamedPipeW if another process already
+    // owns this pipe name. Subsequent iterations must NOT request that flag
+    // (it is illegal once an instance exists).
+    let mut first = true;
+
     loop {
         // Create a new pipe instance for each incoming connection.
-        // PIPE_ACCESS_DUPLEX  = FILE_FLAGS_AND_ATTRIBUTES(3)  (from Win32_Storage_FileSystem)
-        // PIPE_TYPE_BYTE | PIPE_WAIT = NAMED_PIPE_MODE(0)
-        // SAFETY: pipe_name_wide is a valid null-terminated UTF-16 string.
-        // Convert HANDLE to isize immediately so it is Send across .await boundaries.
-        // HANDLE is *mut c_void which is not Send; isize is.
-        let ph: isize = unsafe {
+        //
+        // C3 Part 1: the first CreateNamedPipeW call carries
+        //   FILE_FLAG_FIRST_PIPE_INSTANCE — fails if a competing server with
+        //   the same name already exists.
+        // C3 Part 1: ALL calls carry PIPE_REJECT_REMOTE_CLIENTS — refuses
+        //   connections that come in over SMB (remote logon sessions).
+        // C3 Part 2: ALL calls pass the launcher-user-only DACL built above
+        //   via `pipe_sec.sa`.
+        //
+        // PIPE_ACCESS_DUPLEX                              = FILE_FLAGS_AND_ATTRIBUTES(3)
+        // FILE_FLAG_FIRST_PIPE_INSTANCE                   = FILE_FLAGS_AND_ATTRIBUTES(0x00080000)
+        // PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT = NAMED_PIPE_MODE(0)
+        // PIPE_REJECT_REMOTE_CLIENTS                      = NAMED_PIPE_MODE(0x00000008)
+        let dw_open_mode = if first {
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
+        } else {
+            PIPE_ACCESS_DUPLEX
+        };
+        let dw_pipe_mode =
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
+
+        // SAFETY: pipe_name_wide is a valid null-terminated UTF-16 string;
+        //         pipe_sec.sa is a SECURITY_ATTRIBUTES with a valid SD that
+        //         lives for the entire loop (owned by `pipe_sec`).
+        // Convert HANDLE to isize immediately (and capture any error as a
+        // formatted String) so the Result that crosses .await is Send. The
+        // raw `windows::core::Error` wraps an HRESULT whose pointer fields
+        // make it `!Send`.
+        let create_result: Result<isize, String> = unsafe {
             let h = CreateNamedPipeW(
-                windows::core::PCWSTR(pipe_name_wide.as_ptr()),
-                PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_BYTE | PIPE_WAIT,
+                PCWSTR(pipe_name_wide.as_ptr()),
+                dw_open_mode,
+                dw_pipe_mode,
                 255,    // max instances
                 65536,  // out buffer size
                 65536,  // in buffer size
                 0,      // default timeout
-                None,   // security attributes
+                Some(&pipe_sec.sa as *const SECURITY_ATTRIBUTES),
             );
             if h.is_invalid() {
-                // INVALID_HANDLE_VALUE sentinel
-                -1isize
+                // CreateNamedPipeW reports failure via INVALID_HANDLE_VALUE +
+                // GetLastError. windows::core::Error::from_win32() reads the
+                // calling thread's last-error code captured by the API itself.
+                // Format to String here so the value is Send across .await.
+                Err(format!("{:?}", windows::core::Error::from_win32()))
             } else {
-                h.0 as isize
+                Ok(h.0 as isize)
             }
         };
 
-        if ph == -1 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            continue;
-        }
+        let ph: isize = match create_result {
+            Ok(ph) => ph,
+            Err(err) => {
+                if first {
+                    // C3 Part 1 fail-closed: if the first instance creation
+                    // fails — most commonly because another process already
+                    // owns the pipe name (ERROR_ACCESS_DENIED / ERROR_PIPE_BUSY
+                    // / ERROR_ALREADY_EXISTS) — abort the launcher. Continuing
+                    // would silently degrade to a co-tenant on a pipe controlled
+                    // by an attacker.
+                    return Err(anyhow::anyhow!(
+                        "CreateNamedPipeW(FIRST_PIPE_INSTANCE) failed for {pipe_name}: {err} \
+                         — pipe name collision, possible attack",
+                    ));
+                }
+                // Subsequent failures: transient kernel pressure (e.g. too many
+                // instances). Log and back off briefly, then retry. The pipe
+                // namespace stays owned by us because the first instance
+                // succeeded.
+                eprintln!(
+                    "[pipe] CreateNamedPipeW (instance) failed: {err} — retrying",
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        // After the first successful CreateNamedPipeW the FIRST_PIPE_INSTANCE
+        // flag MUST NOT be passed again.
+        first = false;
 
         // ConnectNamedPipe blocks until a client connects — run in spawn_blocking
         // to avoid blocking the async executor (§B11).
@@ -131,6 +416,50 @@ pub(crate) async fn pipe_accept_loop(
         let connected = connect_result.unwrap_or(false);
         if !connected {
             // SAFETY: ph is the isize repr of our pipe handle; close on error.
+            unsafe { CloseHandle(HANDLE(ph as *mut _)).ok() };
+            continue;
+        }
+
+        // C3 Part 3: validate the newly connected client BEFORE the handler
+        // task takes the handle. GetNamedPipeClientProcessId is meaningful only
+        // after the connection completes (post ConnectNamedPipe). The PID it
+        // returns is the OS's record of which process called CreateFileW on
+        // the server-side handle — kernel-vouched, not user-controllable.
+        //
+        // Failure cases handled identically: disconnect and continue the
+        // accept loop, never run a handler task for an unverified client.
+        let mut client_pid: u32 = 0;
+        // SAFETY: pipe handle is valid (we just finished ConnectNamedPipe on it).
+        let pid_ok = unsafe {
+            GetNamedPipeClientProcessId(HANDLE(ph as *mut _), &mut client_pid).is_ok()
+        };
+        if !pid_ok {
+            eprintln!(
+                "[pipe] GetNamedPipeClientProcessId failed on new connection — disconnecting",
+            );
+            // SAFETY: ph is the isize repr of our pipe handle.
+            unsafe { DisconnectNamedPipe(HANDLE(ph as *mut _)).ok() };
+            unsafe { CloseHandle(HANDLE(ph as *mut _)).ok() };
+            continue;
+        }
+        let root_pid_snapshot = root_target_pid.load(Ordering::Acquire);
+        if !is_owned_client_pid(client_pid, root_pid_snapshot) {
+            eprintln!(
+                "[pipe] WARN: rejecting connection from non-owned pid={client_pid} \
+                 (root_target_pid={root_pid_snapshot})",
+            );
+            stats.violations.fetch_add(1, Ordering::Relaxed);
+            hot_stats
+                .totals
+                .violations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            jsonl_log::log_immediate(jsonl_log::Event::violation(
+                client_pid,
+                "PipeClientNotOwned",
+                &format!("root_target_pid={root_pid_snapshot}"),
+            ));
+            // SAFETY: ph is the isize repr of our pipe handle.
+            unsafe { DisconnectNamedPipe(HANDLE(ph as *mut _)).ok() };
             unsafe { CloseHandle(HANDLE(ph as *mut _)).ok() };
             continue;
         }
@@ -174,6 +503,8 @@ pub(crate) async fn pipe_accept_loop(
             unsafe { CloseHandle(h).ok() };
         });
     }
+
+    Ok(())
 }
 
 /// Registry-key substrings that always deny on write — every entry here
@@ -756,5 +1087,33 @@ mod tests {
         .await
         .expect("acquire should succeed once a permit is freed");
         assert!(after.is_ok());
+    }
+
+    // ─── C3: pipe security descriptor & PID validation ──────────────────────
+
+    /// `build_pipe_security` should succeed on any normal user token.
+    #[test]
+    fn c3_pipe_security_builds_for_current_user() {
+        let sec = build_pipe_security().expect("SD construction failed");
+        // The SECURITY_ATTRIBUTES should reference a non-null SD pointer.
+        assert!(!sec.sa.lpSecurityDescriptor.is_null());
+        // SDDL string lookup pointer equality holds — sd and sa point to same buf.
+        assert_eq!(sec.sd.0, sec.sa.lpSecurityDescriptor);
+    }
+
+    /// `is_owned_client_pid` accepts the root PID even when client is missing
+    /// from `global_proc_info` (chicken-and-egg between Hello and validation).
+    #[test]
+    fn c3_owned_pid_matches_root_target() {
+        let root = 12345u32;
+        assert!(is_owned_client_pid(root, root));
+    }
+
+    /// `is_owned_client_pid` rejects PID 0 and any unknown PID when no map entry.
+    #[test]
+    fn c3_owned_pid_rejects_zero_and_unknown() {
+        assert!(!is_owned_client_pid(0, 12345));
+        // 99999 is neither root nor in the map.
+        assert!(!is_owned_client_pid(99999, 12345));
     }
 }

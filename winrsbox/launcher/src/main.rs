@@ -19,7 +19,7 @@ use winrsbox::jsonl_log;
 use std::{
     path::PathBuf,
     sync::{
-        atomic::Ordering,
+        atomic::{AtomicU32, Ordering},
         Arc,
     },
 };
@@ -144,6 +144,7 @@ use windows::{
     core::PCWSTR,
     Win32::{
         Foundation::{CloseHandle, HANDLE},
+        Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG},
         System::Threading::{
             CreateEventW, GetExitCodeProcess, OpenProcess, ResumeThread,
             WaitForMultipleObjects, WaitForSingleObject, INFINITE,
@@ -151,6 +152,42 @@ use windows::{
         },
     },
 };
+
+/// Build the kernel-Event name used by hook.dll to signal "initialised" to
+/// the launcher (H1 fix). Format:
+///     Local\fs-sandbox-init-<pid>-<32 lowercase hex chars>
+///
+/// The 32-char suffix is 16 bytes of cryptographically-strong entropy from
+/// `BCryptGenRandom` — 128 bits, the same budget you'd spend on a UUID.
+/// The launcher process keeps the only kernel handle returned by
+/// `CreateEventW`; the hook.dll opens the same object by name via the
+/// `FS_SANDBOX_INIT_EVENT` env var (set on this process and inherited by
+/// the suspended child via CreateProcessW's environment block).
+///
+/// If `BCryptGenRandom` ever fails (it really shouldn't — the system RNG is
+/// always available), we fall back to the predictable PID-only name so the
+/// handshake still works. A panic here would brick every launch.
+pub(crate) fn build_random_event_name(pid: u32) -> String {
+    let mut rand_bytes = [0u8; 16];
+    // SAFETY: FFI call to bcrypt!BCryptGenRandom; pbbuffer is a valid
+    // mutable 16-byte slice and BCRYPT_USE_SYSTEM_PREFERRED_RNG means
+    // halgorithm is unused.
+    let status = unsafe {
+        BCryptGenRandom(None, &mut rand_bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+    };
+    if status.0 < 0 {
+        // RNG unavailable — degrade to legacy predictable name rather than
+        // brick the launch. The TOCTOU window is bounded by the 5-second
+        // hello-handshake timeout in the launcher.
+        return format!("Local\\fs-sandbox-init-{}", pid);
+    }
+    let mut suffix = String::with_capacity(32);
+    for b in rand_bytes.iter() {
+        use std::fmt::Write;
+        let _ = write!(&mut suffix, "{:02x}", b);
+    }
+    format!("Local\\fs-sandbox-init-{}-{}", pid, suffix)
+}
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
@@ -250,6 +287,13 @@ async fn main() -> Result<()> {
         cfg_path.parent().unwrap().join("hot-stats.json"),
     ));
 
+    // C3 Part 3: shared slot for the root sandboxed target's PID. The
+    // accept loop reads this on every new connection to validate the
+    // client's PID matches our own root or one of its tracked children.
+    // It starts at 0 ("unknown") and is published below, immediately after
+    // `launch_suspended`, well before the child is resumed and can connect.
+    let root_target_pid: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+
     // ── Pipe server (accept loop in background task) ──────────────────────
     {
         let policy = Arc::clone(&policy);
@@ -259,9 +303,28 @@ async fn main() -> Result<()> {
         let violations_log2 = violations_log.clone();
         let hot_stats2 = Arc::clone(&hot_stats);
         let flusher2 = Arc::clone(&flusher);
+        let root_pid_slot = Arc::clone(&root_target_pid);
 
         tokio::spawn(async move {
-            pipe_server::pipe_accept_loop(&pipe_name2, policy, stats, child_pids, violations_log2, hot_stats2, flusher2).await;
+            if let Err(e) = pipe_server::pipe_accept_loop(
+                &pipe_name2,
+                policy,
+                stats,
+                child_pids,
+                violations_log2,
+                hot_stats2,
+                flusher2,
+                root_pid_slot,
+            )
+            .await
+            {
+                // C3 Part 1: fail-closed for first-instance collision and any
+                // other unrecoverable accept-loop error. Killing the launcher
+                // here is the correct response — continuing without IPC
+                // protection would silently degrade the sandbox to passthrough.
+                eprintln!("[FATAL] pipe accept loop terminated: {e:#}");
+                std::process::exit(0xC000_0142u32 as i32);
+            }
         });
     }
 
@@ -309,7 +372,15 @@ async fn main() -> Result<()> {
     }
 
     // Create kernel Event for hook.dll init signaling.
-    let init_event_name = format!("Local\\fs-sandbox-init-{}", std::process::id());
+    //
+    // H1 fix: the event name embeds a 128-bit random suffix so a same-session
+    // attacker cannot guess the name and SetEvent() it ahead of the real
+    // hook.dll. The `Local\` namespace already scopes the object to this
+    // logon session; the random suffix raises the bar from "any same-user
+    // process can OpenEvent" to "attacker must enumerate the object-manager
+    // directory or read our env vars" (the env var is propagated through
+    // CreateProcessW's environment block to the target only).
+    let init_event_name = build_random_event_name(std::process::id());
     let event_name_wide: Vec<u16> = init_event_name.encode_utf16().chain(Some(0)).collect();
     let init_event = unsafe {
         CreateEventW(None, false, false, PCWSTR(event_name_wide.as_ptr()))
@@ -334,6 +405,13 @@ async fn main() -> Result<()> {
     };
 
     let proc_info = sandbox::launch_suspended(&project_root, &target_args, effective_guard)?;
+
+    // C3 Part 3: publish the root PID to the pipe accept loop so it can
+    // validate `GetNamedPipeClientProcessId` against our own target on every
+    // new IPC connection. This must happen BEFORE `ResumeThread` below; the
+    // target stays suspended until then, so no connection can reach the
+    // accept loop with this slot still set to 0.
+    root_target_pid.store(proc_info.dwProcessId, Ordering::Release);
 
     // Pre-launch code integrity scan (full guard + not skipped).
     if effective_guard == GuardLevel::Full && !cli.no_pre_scan {
@@ -681,5 +759,54 @@ mod cmdline_tests {
     fn cmd_c_echo() {
         let args = vec!["cmd.exe".into(), "/c".into(), "echo hello".into()];
         assert_eq!(build_cmdline(&args), r#"cmd.exe /c "echo hello""#);
+    }
+}
+
+#[cfg(test)]
+mod hello_event_name_tests {
+    //! H1 regression tests for the randomized hello-event name.
+
+    use super::build_random_event_name;
+
+    /// Asserts the new format exactly:
+    ///     Local\fs-sandbox-init-<pid>-<32 lowercase hex chars>
+    #[test]
+    fn format_includes_pid_and_32_hex_suffix() {
+        let name = build_random_event_name(4242);
+        let prefix = "Local\\fs-sandbox-init-4242-";
+        assert!(
+            name.starts_with(prefix),
+            "missing pid-anchored prefix: {name}",
+        );
+        let suffix = &name[prefix.len()..];
+        assert_eq!(suffix.len(), 32, "suffix is not 32 chars: {name}");
+        assert!(
+            suffix.chars().all(|c| {
+                c.is_ascii_hexdigit() && (!c.is_ascii_alphabetic() || c.is_ascii_lowercase())
+            }),
+            "suffix has non-lowercase-hex chars: {suffix}",
+        );
+    }
+
+    /// Two consecutive runs must produce different names. Collision is
+    /// 2^-128 per pair — effectively never on any real test bot. If this
+    /// flakes, the RNG is broken and we have bigger problems.
+    #[test]
+    fn two_consecutive_calls_differ() {
+        let a = build_random_event_name(1);
+        let b = build_random_event_name(1);
+        assert_ne!(a, b, "two random names collided: {a} vs {b}");
+    }
+
+    /// Sanity: a batch of 16 names are all distinct. Catches a wedged RNG
+    /// that returns zeros more reliably than the two-sample test.
+    #[test]
+    fn batch_of_sixteen_all_distinct() {
+        use std::collections::HashSet;
+        let mut seen: HashSet<String> = HashSet::new();
+        for _ in 0..16 {
+            let name = build_random_event_name(7);
+            assert!(seen.insert(name.clone()), "duplicate random name: {name}");
+        }
     }
 }
