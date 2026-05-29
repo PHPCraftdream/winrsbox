@@ -203,7 +203,7 @@ pub fn nt_to_friendly(raw: &[u16]) -> Option<String> {
         if let Some(after_sid) = rest.find('\\') {
             let sid = &rest[..after_sid];
             let path = &rest[after_sid + 1..];
-            if sid.contains("-500") || rest.starts_with(".default") {
+            if sid.rsplit('-').next() == Some("500") || rest.starts_with(".default") {
                 Some(format!("hkcu\\{path}"))
             } else {
                 Some(format!("hku\\{sid}\\{path}"))
@@ -221,7 +221,14 @@ pub fn nt_to_friendly(raw: &[u16]) -> Option<String> {
 pub fn friendly_to_overlay(friendly: &str, root: &Path) -> PathBuf {
     let sanitized = friendly.replace('/', "\\");
     let sanitized = sanitized.trim_start_matches('\\');
-    root.join(sanitized)
+    let mut out = root.to_path_buf();
+    for component in std::path::Path::new(sanitized).components() {
+        match component {
+            std::path::Component::Normal(c) => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 pub fn values_json_path(overlay_key_dir: &Path) -> PathBuf {
@@ -410,5 +417,59 @@ mod tests {
         let root = Path::new(r"\sb");
         let result = friendly_to_overlay(r"\hklm\foo", root);
         assert_eq!(result, PathBuf::from(r"\sb\hklm\foo"));
+    }
+
+    // ── registry overlay escape regression (audit fix #4) ──────────────
+
+    #[test]
+    fn overlay_dotdot_stripped() {
+        let root = Path::new(r"C:\sb\workreg");
+        let evil = r"hklm\software\..\..\..\windows\system32";
+        let result = friendly_to_overlay(evil, root);
+        assert!(
+            result.starts_with(root),
+            "registry overlay {result:?} must stay under root {root:?}",
+        );
+        assert!(
+            !result.to_str().unwrap().contains(".."),
+            "registry overlay {result:?} must not contain '..' components",
+        );
+    }
+
+    #[test]
+    fn overlay_many_dotdot_does_not_escape() {
+        let root = Path::new(r"\sb\reg");
+        let traversal = r"hklm\a\..\..\..\..\..\..\..\evil";
+        let result = friendly_to_overlay(traversal, root);
+        assert!(
+            result.starts_with(root),
+            "even many '..' must not escape: {result:?}",
+        );
+    }
+
+    // ── SID RID-500 heuristic regression (audit fix #5) ────────────────
+
+    #[test]
+    fn sid_with_500_substring_not_hkcu() {
+        let raw: Vec<u16> = r"\Registry\User\S-1-5-21-1234-5001500-9012-1000\Software\Foo".encode_utf16().collect();
+        let result = nt_to_friendly(&raw).unwrap();
+        assert!(
+            result.starts_with("hku\\"),
+            "SID with -500 substring (not RID) must route to HKU, got: {result}",
+        );
+        assert!(
+            result.contains("s-1-5-21-1234-5001500-9012-1000"),
+            "SID must be preserved in HKU path: {result}",
+        );
+    }
+
+    #[test]
+    fn sid_with_exact_rid_500_is_hkcu() {
+        let raw: Vec<u16> = r"\Registry\User\S-1-5-21-123-456-789-500\Software\Bar".encode_utf16().collect();
+        let result = nt_to_friendly(&raw).unwrap();
+        assert!(
+            result.starts_with("hkcu\\"),
+            "SID with exact RID 500 must route to HKCU, got: {result}",
+        );
     }
 }

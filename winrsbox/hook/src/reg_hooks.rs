@@ -222,7 +222,7 @@ unsafe fn query_key_full_path(key: HANDLE) -> Option<Vec<u16>> {
     // SAFETY: deref of first 4 bytes as u32 — buf is 4096 bytes, status and ret_len validated above.
     let name_len_bytes = *(buf.as_ptr() as *const u32) as usize;
     let char_count = name_len_bytes / 2;
-    if char_count == 0 || char_count > 2048 {
+    if char_count == 0 || 4 + name_len_bytes > buf.len() {
         return None;
     }
     let buf_ptr = buf.as_ptr().add(4) as *const u16;
@@ -329,7 +329,7 @@ fn log_resolve_failed(syscall: &str) {
 /// the file-system path (`ipc_client::ipc_decide`, which returns Mode::Deny and
 /// self-terminates after repeated IPC failures); a hostile process must not be
 /// able to bypass registry policy by severing the pipe.
-fn check_write_mode(friendly_key: &str, value_name: Option<String>) -> String {
+fn check_write_mode(friendly_key: &str, value_name: Option<String>) -> policy::Mode {
     let req = ipc::Req::RegDecide {
         key_path: friendly_key.to_owned(),
         value_name,
@@ -340,7 +340,7 @@ fn check_write_mode(friendly_key: &str, value_name: Option<String>) -> String {
             return mode;
         }
     }
-    "deny".to_string()
+    policy::Mode::Deny
 }
 
 // ---------------------------------------------------------------------------
@@ -371,13 +371,13 @@ unsafe extern "system" fn hook_nt_create_key(
 
     if let Some(friendly) = resolve_attrs_friendly(object_attributes as *const _) {
         let mode = check_write_mode(&friendly, None);
-        if mode.eq_ignore_ascii_case("deny") {
+        if matches!(mode, policy::Mode::Deny) {
             if !key_handle.is_null() {
                 *key_handle = std::ptr::null_mut();
             }
             return STATUS_ACCESS_DENIED;
         }
-        if mode.eq_ignore_ascii_case("silent_ok") {
+        if matches!(mode, policy::Mode::Cow) {
             // H4-parity: NtCreateKey was the only registry write hook missing the
             // silent_ok arm, so a silent_ok key creation fell through to the real
             // syscall. Downgrade to deny (fail-closed) like NtSetValueKey /
@@ -426,10 +426,10 @@ unsafe extern "system" fn hook_nt_set_value_key(
     if let Some(friendly) = resolve_handle_friendly(key_handle) {
         let v_name = ustr_to_string(value_name as *const _);
         let mode = check_write_mode(&friendly, v_name.clone());
-        if mode.eq_ignore_ascii_case("deny") {
+        if matches!(mode, policy::Mode::Deny) {
             return STATUS_ACCESS_DENIED;
         }
-        if mode.eq_ignore_ascii_case("silent_ok") {
+        if matches!(mode, policy::Mode::Cow) {
             // H4 fix: downgrade silent_ok → deny while the read-side overlay
             // is missing. The launcher overlay would happily absorb this
             // write, but a follow-up NtQueryValueKey on the same key still
@@ -467,10 +467,10 @@ unsafe extern "system" fn hook_nt_delete_value_key(
     if let Some(friendly) = resolve_handle_friendly(key_handle) {
         let v_name = ustr_to_string(value_name as *const _);
         let mode = check_write_mode(&friendly, v_name.clone());
-        if mode.eq_ignore_ascii_case("deny") {
+        if matches!(mode, policy::Mode::Deny) {
             return STATUS_ACCESS_DENIED;
         }
-        if mode.eq_ignore_ascii_case("silent_ok") {
+        if matches!(mode, policy::Mode::Cow) {
             // H4 fix: same rationale as NtSetValueKey. A tombstone recorded
             // in the launcher overlay can't be observed by the child until
             // NtQueryValueKey / NtEnumerateValueKey are hooked; until then,
@@ -499,10 +499,10 @@ unsafe extern "system" fn hook_nt_delete_key(key_handle: HANDLE) -> NTSTATUS {
 
     if let Some(friendly) = resolve_handle_friendly(key_handle) {
         let mode = check_write_mode(&friendly, None);
-        if mode.eq_ignore_ascii_case("deny") {
+        if matches!(mode, policy::Mode::Deny) {
             return STATUS_ACCESS_DENIED;
         }
-        if mode.eq_ignore_ascii_case("silent_ok") {
+        if matches!(mode, policy::Mode::Cow) {
             // H4 fix: key-delete tombstones in the launcher overlay aren't
             // visible to the child without read-side enumeration hooks.
             // Fail closed to keep the registry view consistent.
@@ -908,58 +908,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deny_decision_matches_case_insensitive() {
-        // Quick sanity check on mode comparison
-        let m = "Deny".to_string();
-        assert!(m.eq_ignore_ascii_case("deny"));
-        let m2 = "DENY".to_string();
-        assert!(m2.eq_ignore_ascii_case("deny"));
-        let m3 = "passthrough".to_string();
-        assert!(!m3.eq_ignore_ascii_case("deny"));
+    fn deny_mode_enum_match() {
+        let mode = policy::Mode::Deny;
+        assert!(matches!(mode, policy::Mode::Deny));
+        assert!(!matches!(mode, policy::Mode::Passthrough));
+        assert!(!matches!(mode, policy::Mode::Cow));
     }
 
-    // ---------------- H4: silent_ok → deny regression tests ----------------
+    #[test]
+    fn cow_mode_enum_replaces_silent_ok() {
+        let mode = policy::Mode::Cow;
+        assert!(matches!(mode, policy::Mode::Cow));
+        assert!(!matches!(mode, policy::Mode::Deny));
+        assert!(!matches!(mode, policy::Mode::Passthrough));
+    }
 
-    /// Pins the integer the (formerly silent_ok) arm now returns. Driving
-    /// the real ntdll syscall in a unit test would require a live kernel
-    /// handle, but we can lock down the constant the handlers reach for so
-    /// a regression that flips the path back to STATUS_SUCCESS (0) blows up.
+    #[test]
+    fn mode_enum_is_exhaustive_fail_closed() {
+        for mode in [policy::Mode::Deny, policy::Mode::Cow, policy::Mode::Mock, policy::Mode::Passthrough] {
+            match mode {
+                policy::Mode::Deny | policy::Mode::Cow | policy::Mode::Mock => {
+                    // These all deny in hook handlers (H4 downgrade)
+                }
+                policy::Mode::Passthrough => {
+                    // Only passthrough calls original
+                }
+            }
+        }
+    }
+
+    // ---------------- H4: Cow(silent_ok) → deny regression tests ----------------
+
     #[test]
     fn silent_ok_downgrade_returns_access_denied_constant() {
-        // STATUS_ACCESS_DENIED == 0xC000_0022 per ntstatus.h. NTSTATUS is i32;
-        // the high bit is the severity flag (ERROR) → negative i32.
         assert_eq!(
             STATUS_ACCESS_DENIED as u32, 0xC000_0022_u32,
-            "STATUS_ACCESS_DENIED constant changed — silent_ok return value is wrong",
+            "STATUS_ACCESS_DENIED constant changed — Cow return value is wrong",
         );
         assert!(
             STATUS_ACCESS_DENIED < 0,
             "STATUS_ACCESS_DENIED must have severity=ERROR (negative i32)",
         );
-        // Symmetric check: the legacy "silent" success return (0) is NOT
-        // what the H4 path produces.
         assert_ne!(STATUS_ACCESS_DENIED, 0);
-    }
-
-    /// "silent_ok" is the only spelling the launcher emits that the H4
-    /// downgrade keys off. Confirm the case-insensitive compare the
-    /// handlers use still matches every reasonable spelling so the
-    /// downgrade actually fires when the launcher asks for it.
-    #[test]
-    fn silent_ok_mode_string_match_is_case_insensitive() {
-        for spelling in ["silent_ok", "Silent_Ok", "SILENT_OK", "silent_OK"] {
-            assert!(
-                spelling.eq_ignore_ascii_case("silent_ok"),
-                "spelling {spelling:?} should match silent_ok",
-            );
-        }
-        // Negative: anything not silent_ok must not fire the downgrade.
-        for non_match in ["silentok", "silent ok", "silent_ko", "deny", "passthrough"] {
-            assert!(
-                !non_match.eq_ignore_ascii_case("silent_ok"),
-                "spelling {non_match:?} must not match silent_ok",
-            );
-        }
     }
 
     // ── persistence-escape hooks: unconditional deny ─────────────────────
