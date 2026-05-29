@@ -177,7 +177,24 @@ pub(crate) fn make_overlay_nt_buf(overlay_dos: &str) -> Vec<u16> {
 /// # SAFETY
 /// `attrs` and its ObjectName must be valid for reads for the duration of the
 /// call (guaranteed by NT calling convention for hook parameters).
-pub(crate) unsafe fn extract_dos_path(attrs: *const OBJECT_ATTRIBUTES) -> Option<String> {
+/// Resolve OBJECT_ATTRIBUTES for an FS hook in ONE pass, reading any
+/// `RootDirectory` directory handle **exactly once**. Returns:
+///   - the DOS path (lowercased) used for the policy decision, AND
+///   - `Some(absolute_nt_path)` when the open was RootDirectory-RELATIVE — the
+///     single resolution, owned by us, to be reused verbatim for the kernel
+///     passthrough (`HookedAttrs::copy_passthrough_inner`). Reusing it instead
+///     of re-resolving the handle in `copy_passthrough` closes the H5
+///     double-resolve window: a concurrent `NtClose`+reopen of the directory
+///     handle between the decision and the kernel call can no longer make the
+///     path policy approved differ from the path the kernel opens.
+///   - `None` for the absolute-path case (no `RootDirectory` handle, hence no
+///     race) — the caller keeps the existing verbatim-copy passthrough.
+///
+/// Returns `None` overall when no DOS path can be derived (caller then passes
+/// through / device-blocks, exactly as with the former `extract_dos_path`).
+pub(crate) unsafe fn resolve_for_hook(
+    attrs: *const OBJECT_ATTRIBUTES,
+) -> Option<(String, Option<Vec<u16>>)> {
     if attrs.is_null() {
         return None;
     }
@@ -194,14 +211,25 @@ pub(crate) unsafe fn extract_dos_path(attrs: *const OBJECT_ATTRIBUTES) -> Option
     let name_slice = std::slice::from_raw_parts(ustr.Buffer, char_count);
 
     if !obj.RootDirectory.is_null() {
+        // Resolve the directory handle ONCE; the resulting absolute NT path is
+        // reused for both the policy decision and the kernel passthrough.
         let base = inject::resolve_handle_path(obj.RootDirectory)?;
         let mut full: Vec<u16> = base;
         full.push(b'\\' as u16);
         full.extend_from_slice(name_slice);
-        return policy::path::nt_to_dos_lower(&full);
+        let dos = policy::path::nt_to_dos_lower(&full)?;
+        return Some((dos, Some(full)));
     }
 
-    policy::path::nt_to_dos_lower(name_slice)
+    let dos = policy::path::nt_to_dos_lower(name_slice)?;
+    Some((dos, None))
+}
+
+/// DOS path for policy matching. Thin wrapper over [`resolve_for_hook`] (which
+/// performs the single handle resolution) — kept for callers that only need
+/// the path string and don't pass through to the kernel.
+pub(crate) unsafe fn extract_dos_path(attrs: *const OBJECT_ATTRIBUTES) -> Option<String> {
+    resolve_for_hook(attrs).map(|(dos, _)| dos)
 }
 
 pub(crate) unsafe fn extract_raw_nt_path(attrs: *const OBJECT_ATTRIBUTES) -> Option<String> {

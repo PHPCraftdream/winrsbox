@@ -170,6 +170,21 @@ impl HookedAttrs {
     /// verbatim. When `RootDirectory` is non-null the returned attrs carry
     /// a NULL RootDirectory and an absolute ObjectName instead.
     pub(crate) unsafe fn copy_passthrough(orig: &OBJECT_ATTRIBUTES) -> Option<Self> {
+        Self::copy_passthrough_inner(orig, None)
+    }
+
+    /// As [`copy_passthrough`], but accepts the hook's already-resolved
+    /// absolute NT path for the RootDirectory-relative case. When
+    /// `pre_resolved_abs` is `Some`, the directory handle is NOT resolved here
+    /// — the path is taken verbatim from the single resolution the hook made
+    /// (see `hooks::resolve_for_hook`), closing the H5 double-resolve window.
+    /// When `None`, behaves exactly as the standalone `copy_passthrough`
+    /// (resolves the handle internally) — used by tests and any caller without
+    /// a pre-resolution.
+    pub(crate) unsafe fn copy_passthrough_inner(
+        orig: &OBJECT_ATTRIBUTES,
+        pre_resolved_abs: Option<&[u16]>,
+    ) -> Option<Self> {
         if orig.ObjectName.is_null() {
             return None;
         }
@@ -202,14 +217,20 @@ impl HookedAttrs {
             // SAFETY: orig.RootDirectory is non-null and, per the NT calling
             // convention for our hook parameter, a valid open directory
             // handle for the duration of this call.
-            let base = crate::inject::resolve_handle_path(orig.RootDirectory)?;
-            // Mirror of hooks.rs::extract_dos_path lines 186-188:
-            //     let mut full: Vec<u16> = base;
-            //     full.push(b'\\' as u16);
-            //     full.extend_from_slice(name_slice);
-            let mut nt_buf: Vec<u16> = base;
-            nt_buf.push(b'\\' as u16);
-            nt_buf.extend_from_slice(name_slice);
+            // Prefer the hook's single pre-resolved absolute path (H5: avoids a
+            // SECOND resolve_handle_path here that could race the decision's
+            // resolution). Fall back to resolving once when not provided
+            // (standalone/test callers). Both produce base + '\' + name.
+            let nt_buf: Vec<u16> = match pre_resolved_abs {
+                Some(abs) => abs.to_vec(),
+                None => {
+                    let base = crate::inject::resolve_handle_path(orig.RootDirectory)?;
+                    let mut full: Vec<u16> = base;
+                    full.push(b'\\' as u16);
+                    full.extend_from_slice(name_slice);
+                    full
+                }
+            };
 
             // The joined absolute path must still fit UNICODE_STRING.Length
             // (a u16, max MAX_PASSTHROUGH_LEN_BYTES). If not, fail closed.
