@@ -126,8 +126,14 @@ pub fn pattern_matches_prefix(pattern: &str, path: &str) -> bool {
     if pattern.is_empty() {
         return true;
     }
-    let pat_segs: Vec<&str> = pattern.split('\\').collect();
-    let path_segs: Vec<&str> = path.split('\\').collect();
+    // Drop empty segments from consecutive / leading / trailing backslashes: the
+    // NT path parser collapses `\\` to a single separator, so a hostile
+    // `c:\\windows\\system32` must still match a `c:\windows\system32` deny rule
+    // rather than splitting into `["c:", "", "windows", ...]` and failing the
+    // match at the empty segment. Both sides are filtered symmetrically so
+    // equivalent path forms still compare equal.
+    let pat_segs: Vec<&str> = pattern.split('\\').filter(|s| !s.is_empty()).collect();
+    let path_segs: Vec<&str> = path.split('\\').filter(|s| !s.is_empty()).collect();
     prefix_match(&pat_segs, &path_segs)
 }
 
@@ -348,6 +354,18 @@ mod glob_tests {
     #[test]
     fn prefix_path_shorter_than_pattern() {
         assert!(!pattern_matches_prefix(r"c:\a\b\c", r"c:\a"));
+    }
+
+    #[test]
+    fn prefix_consecutive_backslashes_do_not_bypass() {
+        // Hostile doubled / extra separators collapse like the NT parser does,
+        // so they still match a deny rule (audit C1).
+        assert!(pattern_matches_prefix(r"c:\windows\system32", "c:\\\\windows\\\\system32\\\\cmd.exe"));
+        assert!(pattern_matches_prefix(r"c:\windows", "c:\\\\windows\\foo"));
+        // Trailing separators are harmless too.
+        assert!(pattern_matches_prefix(r"c:\windows", "c:\\windows\\"));
+        // Sanity: genuinely different paths still do not match.
+        assert!(!pattern_matches_prefix(r"c:\windows", r"c:\winnt\system32"));
     }
 
     #[test]

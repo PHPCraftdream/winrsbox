@@ -69,12 +69,32 @@ unsafe extern "system" fn hook_nt_adjust_privileges_token(
 
     // Enabling privileges: check if any dangerous privilege is being enabled.
     // TOKEN_PRIVILEGES: PrivilegeCount(u32) + LUID_AND_ATTRIBUTES[N]
-    // LUID_AND_ATTRIBUTES: LUID(u64) + Attributes(u32)
+    // LUID_AND_ATTRIBUTES: LUID(u64) + Attributes(u32) = 12 bytes each.
     // SE_PRIVILEGE_ENABLED = 0x00000002
-    if !new_state.is_null() {
+    //
+    // SAFETY/DoS: `new_state` and `buffer_length` come from the (hostile)
+    // caller; neither is trusted. `PrivilegeCount` is attacker-controlled, so
+    // it MUST be bounded before driving the read. We require the byte span we
+    // intend to touch — 4 (PrivilegeCount) + count*12 — to fit inside the
+    // caller-declared `buffer_length`, AND cap count to MAX_PRIVS so a caller
+    // that lies about a huge buffer still can't drive an unbounded read.
+    // Real tokens carry ~35 privileges; 256 is generous headroom. If anything
+    // fails to validate we can't classify the request and fall through to the
+    // original syscall (same as every other "can't inspect" path here) — we do
+    // not invent a new deny that would break legitimate AdjustTokenPrivileges.
+    const PRIV_ENTRY_SIZE: u32 = 12; // sizeof(LUID_AND_ATTRIBUTES)
+    const PRIV_HEADER_SIZE: u32 = 4; // sizeof(PrivilegeCount)
+    const MAX_PRIVS: u32 = 256;
+    if !new_state.is_null() && buffer_length >= PRIV_HEADER_SIZE {
         let count = *(new_state as *const u32);
-        if count > 0 && count < 100 {
-            let entries = (new_state as *const u8).add(4) as *const [u8; 12];
+        // Required span; checked_mul/add guard against overflow on a hostile
+        // count, and the result must fit the declared buffer length.
+        let required = count
+            .checked_mul(PRIV_ENTRY_SIZE)
+            .and_then(|body| body.checked_add(PRIV_HEADER_SIZE));
+        let fits = matches!(required, Some(req) if req <= buffer_length);
+        if count > 0 && count <= MAX_PRIVS && fits {
+            let entries = (new_state as *const u8).add(PRIV_HEADER_SIZE as usize) as *const [u8; 12];
             for i in 0..count as usize {
                 let entry = &*entries.add(i);
                 let attrs = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);

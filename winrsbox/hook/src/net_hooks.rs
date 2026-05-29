@@ -95,7 +95,11 @@ fn is_connection_denied(host: &str, port: u16) -> bool {
             return !allow;
         }
     }
-    false
+    // Fail-closed: the launcher is the only trust boundary. If IPC fails or the
+    // response is malformed, the adversary may have severed the pipe to bypass
+    // network policy — deny rather than allow. (Localhost dev traffic is handled
+    // earlier in hook_connect and never reaches here unless block_localhost.)
+    true
 }
 
 // ---------------------------------------------------------------------------

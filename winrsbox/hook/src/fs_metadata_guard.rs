@@ -131,6 +131,44 @@ unsafe fn resolve_dest_path(root: HANDLE, name: &str) -> Option<String> {
     }
 }
 
+/// Returns true if a rename/hardlink destination is an escape vector and must
+/// be denied. The previous code only checked `starts_with(sandbox_root)`, which
+/// a `..` segment defeats: the literal string `c:\sandbox\..\..\windows\x`
+/// passes the prefix test, then the kernel collapses `..` and writes outside
+/// the sandbox. This mirrors the create-side denylist in
+/// `hooks::check_path_traversal` (parent-dir traversal, `.winrsbox` state dir,
+/// GLOBALROOT, 8.3 short-names), applied to the resolved lowercase DOS path.
+fn dest_is_escape(dest_lower: &str) -> bool {
+    // Parent/self traversal — check the RAW path: a segment consisting only of
+    // dots/spaces (`.`, `..`, `...`, `. `) is either traversal or an NTFS
+    // trailing-dot trick. Must run BEFORE strip_trailing_dot_space, which would
+    // collapse `..` into an empty segment and hide it.
+    if dest_lower
+        .split('\\')
+        .any(|seg| !seg.is_empty() && seg.bytes().all(|b| b == b'.' || b == b' '))
+    {
+        return true;
+    }
+    // Mirror NTFS per-segment trailing dot/space stripping before substring
+    // checks so `.winrsbox.` cannot slip past `ends_with(r"\.winrsbox")`.
+    let canon = hooks::strip_trailing_dot_space(dest_lower);
+    let canon: &str = canon.as_ref();
+    // GLOBALROOT alternate namespace bypasses the DOS-form classifier.
+    if canon.contains(r"\globalroot\") || canon.contains(r"\??\globalroot") {
+        return true;
+    }
+    // 8.3 short-name (e.g. PROGRA~1) — kernel resolves to a full path, bypassing
+    // the classifier and the CoW overlay. Consistent with the create-side block.
+    if hooks::needs_short_name_resolve(canon) {
+        return true;
+    }
+    // Sandbox state directory must stay invisible and untouchable.
+    if canon.contains(r"\.winrsbox\") || canon.ends_with(r"\.winrsbox") {
+        return true;
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Hook implementations
 // ---------------------------------------------------------------------------
@@ -186,6 +224,20 @@ unsafe extern "system" fn hook_nt_set_information_file(
             let dest_name = String::from_utf16_lossy(name_slice);
 
             if let Some(dest) = resolve_dest_path(root, &dest_name) {
+                // Escape-vector denylist (traversal, .winrsbox, GLOBALROOT,
+                // 8.3 short-name) — mirrors create-side check_path_traversal.
+                // Runs regardless of SANDBOX_CWD: it rejects on path SHAPE, so a
+                // `..` traversal can't defeat the containment check below.
+                if dest_is_escape(&dest) {
+                    if hooks::is_trace() {
+                        hooks::ipc_log(ipc::LogLevel::Trace,
+                            format!("fs_setinfo_block_escape class={} dest={}", class, dest));
+                    }
+                    if !iosb.is_null() {
+                        hooks::set_io_status(iosb, STATUS_ACCESS_DENIED);
+                    }
+                    return STATUS_ACCESS_DENIED;
+                }
                 // Check if destination is outside sandbox root
                 if let Some(sandbox_root) = hooks::SANDBOX_CWD.get() {
                     if !dest.starts_with(&sandbox_root.to_lowercase()) {
