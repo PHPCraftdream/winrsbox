@@ -915,24 +915,22 @@ fn handle_connection(
                 let is_persistence = is_persistence_denied(&key_lower);
                 let (mode, denied) = if write && is_persistence {
                     eprintln!("[reg] DENY {key_path} value={value_name:?}");
-                    ("deny", true)
+                    (policy::Mode::Deny, true)
                 } else if write && (key_lower.contains(r"\software\") || key_lower.ends_with(r"\software")) {
-                    // Non-persistence HKCU\Software writes → silent success
-                    // (program thinks it wrote, sandbox absorbs it)
-                    ("silent_ok", false)
+                    (policy::Mode::Cow, false)
                 } else if write {
-                    ("silent_ok", false)
+                    (policy::Mode::Cow, false)
                 } else {
-                    ("passthrough", false)
+                    (policy::Mode::Passthrough, false)
                 };
                 hot_stats.totals.reg_decides.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if denied { hot_stats.totals.reg_denies.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                 hot_stats.record_reg(&key_path, write, denied);
                 if denied {
-                    jsonl_log::log(jsonl_log::Event::reg_decide(&key_path, write, mode));
+                    jsonl_log::log(jsonl_log::Event::reg_decide(&key_path, write, &format!("{mode:?}")));
                 }
                 flusher.maybe_flush();
-                Resp::RegDecision { mode: mode.into(), value_json: None }
+                Resp::RegDecision { mode, value_json: None }
             }
             Req::RegWrite { key_path, value_name, .. } => {
                 println!("[reg] write: {key_path}\\{value_name}");

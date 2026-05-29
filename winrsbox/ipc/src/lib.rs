@@ -93,7 +93,7 @@ pub enum Resp {
     Decision(Decision),
     Ok,
     Err(String),
-    RegDecision { mode: String, value_json: Option<Vec<u8>> },
+    RegDecision { mode: policy::Mode, value_json: Option<Vec<u8>> },
     NetDecision { allow: bool },
     MemDecision { allow: bool },
 }
@@ -112,6 +112,9 @@ pub enum IpcError {
 pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), IpcError> {
     let bytes = bincode::serde::encode_to_vec(msg, bincode::config::standard())
         .map_err(|e| IpcError::Encode(e.to_string()))?;
+    if bytes.len() > MAX_MSG_LEN {
+        return Err(IpcError::Encode(format!("message too large to send: {} bytes (max {MAX_MSG_LEN})", bytes.len())));
+    }
     let len = bytes.len() as u32;
     w.write_all(&len.to_le_bytes())?;
     w.write_all(&bytes)?;
@@ -435,12 +438,12 @@ mod tests {
 
     #[test]
     fn resp_reg_decision_roundtrip() {
-        let msg = Resp::RegDecision { mode: "cow".into(), value_json: Some(vec![42]) };
+        let msg = Resp::RegDecision { mode: policy::Mode::Cow, value_json: Some(vec![42]) };
         let mut buf = Cursor::new(Vec::new());
         write_msg(&mut buf, &msg).unwrap();
         buf.set_position(0);
         let dec: Resp = read_msg(&mut buf).unwrap();
-        match dec { Resp::RegDecision { mode, value_json } => { assert_eq!(mode, "cow"); assert_eq!(value_json, Some(vec![42])); }, _ => panic!() }
+        match dec { Resp::RegDecision { mode, value_json } => { assert_eq!(mode, policy::Mode::Cow); assert_eq!(value_json, Some(vec![42])); }, _ => panic!() }
     }
 
     #[test]

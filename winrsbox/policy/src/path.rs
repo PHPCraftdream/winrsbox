@@ -98,14 +98,23 @@ pub fn dos_to_nt(dos: &str) -> Vec<u16> {
 }
 
 /// C:\Users\x\foo.txt + sandbox_root → <root>\C\Users\x\foo.txt
+///
+/// Only `Normal` path components are pushed onto `root`. Any `..`, absolute
+/// prefix, root directory, or `.` component is silently dropped, preventing
+/// a crafted DOS path from traversing outside the overlay root.
 pub fn mirror_into_overlay(dos_lower: &str, root: &Path) -> PathBuf {
-    // Replace "C:" with "C" as a directory component
     let sanitized = dos_lower
         .replace(':', "")
         .replace('/', "\\");
-    // Remove leading backslash if present
     let sanitized = sanitized.trim_start_matches('\\');
-    root.join(sanitized)
+    let mut out = root.to_path_buf();
+    for component in Path::new(sanitized).components() {
+        match component {
+            std::path::Component::Normal(c) => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 // ─── Glob matching ───────────────────────────────────────────────────────────
@@ -660,6 +669,49 @@ mod conv_tests {
         let root = std::path::Path::new(r"\sb");
         let result = mirror_into_overlay(r"c:\a\b\c\d\e\f.txt", root);
         assert_eq!(result, std::path::PathBuf::from(r"\sb\c\a\b\c\d\e\f.txt"));
+    }
+
+    // ── path-traversal escape regression (audit fix #1 — CRITICAL) ──────
+
+    #[test]
+    fn mirror_dotdot_stripped() {
+        let root = std::path::Path::new(r"\sb");
+        let result = mirror_into_overlay(r"c:\allowed\..\..\..\windows\system32\evil.dll", root);
+        assert!(
+            result.starts_with(root),
+            "overlay path {result:?} must stay under sandbox root {root:?}",
+        );
+        assert!(
+            !result.to_str().unwrap().contains(".."),
+            "overlay path {result:?} must not contain '..' components",
+        );
+        assert_eq!(result, std::path::PathBuf::from(r"\sb\c\allowed\windows\system32\evil.dll"));
+    }
+
+    #[test]
+    fn mirror_absolute_component_stripped() {
+        let root = std::path::Path::new(r"\sb");
+        let evil = r"\windows\system32\evil.dll";
+        let result = mirror_into_overlay(evil, root);
+        assert!(result.starts_with(root));
+    }
+
+    #[test]
+    fn mirror_curdir_stripped() {
+        let root = std::path::Path::new(r"\sb");
+        let result = mirror_into_overlay(r"c:\users\.\.\file.txt", root);
+        assert!(!result.to_str().unwrap().contains(r"\."));
+    }
+
+    #[test]
+    fn mirror_many_dotdot_does_not_escape() {
+        let root = std::path::Path::new(r"\sb");
+        let traversal = r"c:\a\..\..\..\..\..\..\..\..\windows\system32\cmd.exe";
+        let result = mirror_into_overlay(traversal, root);
+        assert!(
+            result.starts_with(root),
+            "even many '..' must not escape root: {result:?}",
+        );
     }
 
     // pretty_assertions demo: shadows std assert_eq for richer diffs on mismatch.
