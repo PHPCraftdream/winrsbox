@@ -606,6 +606,17 @@ const PERSISTENCE_DENY_SUFFIXES: &[&str] = &[
     // Substring catches `\office\<ver>\<app>\security\trusted locations` for
     // every Office version (16.0, 15.0, ...) and every app (word, excel, ...).
     r"\security\trusted locations",
+
+    // ─── per-user COM hijack (H2) ───────────────────────────────────────────
+    // When HKCR\CLSID is opened for write, the kernel resolves to the per-user
+    // classes hive: \Registry\User\<SID>_Classes\CLSID\... which nt_to_friendly
+    // maps to hku\<sid>_classes\clsid\... — the \software\classes\clsid entry
+    // above does not match this form. Use `_classes\clsid` to catch the
+    // underscore-joined per-user hive segment.
+    r"_classes\clsid",
+    // ─── HKCU\Environment persistence (M6) ──────────────────────────────────
+    // UserInitMprLogonScript, PATH manipulation, DLL search-order via env vars.
+    r"\environment",
 ];
 
 /// Return `true` if `fragment` occurs in `key_lower` aligned to path-segment
@@ -1236,7 +1247,7 @@ mod tests {
         // Pin the list length so a silently-dropped entry fails a test.
         assert_eq!(
             PERSISTENCE_DENY_SUFFIXES.len(),
-            23,
+            25,
             "PERSISTENCE_DENY_SUFFIXES length drifted — update tests + threat model"
         );
     }
@@ -1295,6 +1306,23 @@ mod tests {
         assert!(!sec.sa.lpSecurityDescriptor.is_null());
         // SDDL string lookup pointer equality holds — sd and sa point to same buf.
         assert_eq!(sec.sd.0, sec.sa.lpSecurityDescriptor);
+    }
+
+    #[test]
+    fn persistence_per_user_classes_clsid_denied() {
+        // H2: per-user COM hijack via HKU\<SID>_Classes\CLSID
+        assert!(is_persistence_denied(
+            r"hku\s-1-5-21-123456789-123456789-123456789-1001_classes\clsid\{deadbeef}\InprocServer32"
+        ));
+    }
+
+    #[test]
+    fn persistence_hkcu_environment_denied() {
+        // M6: HKCU\Environment for logon persistence
+        assert!(is_persistence_denied(r"hkcu\environment"));
+        assert!(is_persistence_denied(
+            r"hkcu\environment\UserInitMprLogonScript"
+        ));
     }
 
     /// `is_owned_client_pid` accepts the root PID even when client is missing

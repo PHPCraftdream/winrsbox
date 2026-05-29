@@ -15,7 +15,7 @@ use crate::hooked_attrs::HookedAttrs;
 use crate::hooks::{
     check_path_traversal, check_device_block, decide, resolve_for_hook,
     is_write_access, materialize_mock_overlay,
-    needs_short_name_resolve, prepare_overlay, set_io_status, ipc_record_overlay,
+    prepare_overlay, set_io_status, ipc_record_overlay,
     STATUS_ACCESS_DENIED,
 };
 use crate::ipc_client::{cache, ipc_log, is_trace};
@@ -160,15 +160,27 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
             set_io_status(io_status_block, status);
             return status;
         }
+        if is_write_access(desired_access, create_disposition)
+            && crate::hooks::is_fs_device_path(object_attributes as *const _)
+        {
+            if is_trace() {
+                ipc_log(ipc::LogLevel::Trace, "fs_block_device_volume_write".into());
+            }
+            set_io_status(io_status_block, STATUS_ACCESS_DENIED);
+            return STATUS_ACCESS_DENIED;
+        }
         return call_original!();
     };
 
-    if needs_short_name_resolve(&dos) {
-        if is_trace() {
-            ipc_log(ipc::LogLevel::Trace, format!("fs_block_short_name_joined: {}", dos));
+    {
+        let canon = crate::hooks::canonicalize_for_denylist(&dos);
+        if let Some((status, reason)) = crate::hooks::canonical_denylist_status(&canon) {
+            if is_trace() {
+                ipc_log(ipc::LogLevel::Trace, format!("fs_block_{reason}_resolved: {dos}"));
+            }
+            set_io_status(io_status_block, status);
+            return status;
         }
-        set_io_status(io_status_block, STATUS_ACCESS_DENIED);
-        return STATUS_ACCESS_DENIED;
     }
 
     if is_ea_present(ea_buffer as *const _, ea_length) {
@@ -344,15 +356,27 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
             set_io_status(io_status_block, status);
             return status;
         }
+        if (desired_access & (crate::hooks::GENERIC_WRITE | crate::hooks::FILE_WRITE_DATA | crate::hooks::FILE_APPEND_DATA | crate::hooks::DELETE | crate::hooks::WRITE_DAC | crate::hooks::WRITE_OWNER)) != 0
+            && crate::hooks::is_fs_device_path(object_attributes as *const _)
+        {
+            if is_trace() {
+                ipc_log(ipc::LogLevel::Trace, "fs_block_device_volume_write".into());
+            }
+            set_io_status(io_status_block, STATUS_ACCESS_DENIED);
+            return STATUS_ACCESS_DENIED;
+        }
         return call_original!();
     };
 
-    if needs_short_name_resolve(&dos) {
-        if is_trace() {
-            ipc_log(ipc::LogLevel::Trace, format!("fs_block_short_name_joined: {}", dos));
+    {
+        let canon = crate::hooks::canonicalize_for_denylist(&dos);
+        if let Some((status, reason)) = crate::hooks::canonical_denylist_status(&canon) {
+            if is_trace() {
+                ipc_log(ipc::LogLevel::Trace, format!("fs_block_{reason}_resolved: {dos}"));
+            }
+            set_io_status(io_status_block, status);
+            return status;
         }
-        set_io_status(io_status_block, STATUS_ACCESS_DENIED);
-        return STATUS_ACCESS_DENIED;
     }
 
     let write_bits =
