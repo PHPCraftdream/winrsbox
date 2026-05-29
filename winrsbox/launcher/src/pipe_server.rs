@@ -686,12 +686,33 @@ fn handle_connection(
                 Resp::Ok
             }
             Req::SpawnedChild { parent_pid, child_pid, child_exe } => {
-                println!("[sandbox] child spawned: parent={parent_pid} child={child_pid} exe={child_exe}");
+                // SECURITY (audit E1 cont.): a SpawnedChild report arrives on the
+                // PARENT's own authenticated connection, so the real parent is
+                // this connection's kernel-vouched client_pid — not the
+                // self-reported parent_pid (which a hostile hook could set to any
+                // PID to make the child inherit a shallower, less-restricted
+                // depth). Inherit depth from client_pid; the claimed value is
+                // only logged. (child_pid is still parent-reported; it is
+                // reconciled when the child itself connects with its own Hello.)
+                if parent_pid != client_pid {
+                    eprintln!(
+                        "[pipe] WARN: SpawnedChild parent_pid={parent_pid} != client_pid={client_pid} \
+                         — inheriting depth from client_pid (possible spoof)",
+                    );
+                    stats.violations.fetch_add(1, Ordering::Relaxed);
+                    hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    jsonl_log::log_immediate(jsonl_log::Event::violation(
+                        client_pid,
+                        "SpawnedChildParentSpoof",
+                        &format!("claimed_parent={parent_pid} child={child_pid}"),
+                    ));
+                }
+                println!("[sandbox] child spawned: parent={client_pid} child={child_pid} exe={child_exe}");
                 hot_stats.totals.children.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                jsonl_log::log(jsonl_log::Event::child(parent_pid, child_pid, &child_exe));
+                jsonl_log::log(jsonl_log::Event::child(client_pid, child_pid, &child_exe));
                 child_pids.push(child_pid);
                 let map = crate::global_proc_info().pin();
-                let parent_depth = map.get(&parent_pid).map(|p| p.depth).unwrap_or(0);
+                let parent_depth = map.get(&client_pid).map(|p| p.depth).unwrap_or(0);
                 let exe_lower = child_exe.to_ascii_lowercase();
                 map.insert(child_pid, crate::ProcInfo {
                     depth: parent_depth + 1,

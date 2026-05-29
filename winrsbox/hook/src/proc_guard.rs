@@ -964,7 +964,9 @@ mod tests {
     #[test]
     fn pid_reuse_after_terminate_does_not_lie() {
         let fake_pid = 999_999u32;
-        crate::process_tracker::mark_spawned(fake_pid, 1, "fake_child.exe".into());
+        // create_time 0 → membership-only: this test pins the untrack contract
+        // for a non-live PID, decoupled from the live fingerprint re-query.
+        crate::process_tracker::mark_spawned(fake_pid, 1, "fake_child.exe".into(), 0);
         assert!(crate::process_tracker::is_owned_child(fake_pid));
 
         // Simulate the untrack path the NtTerminateProcess hook would take.

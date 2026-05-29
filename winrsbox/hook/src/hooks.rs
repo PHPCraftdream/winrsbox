@@ -267,6 +267,57 @@ pub(crate) fn strip_trailing_dot_space(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// Shared escape-vector denylist over an already-canonical lowercase path:
+/// ASCII-lowercased, `/` folded to `\`, per-segment trailing dot/space stripped
+/// (use `canonicalize_for_denylist`). Single source of truth so the create-side
+/// (`check_path_traversal`) and the rename/hardlink-side (`dest_is_escape`)
+/// can never drift apart on what counts as an escape.
+///
+/// Returns `(status, reason)` to deny with, or None to continue. The reason is
+/// a stable label for trace logging. NOTE: parent-dir (`..`) handling is
+/// intentionally NOT here — it is caller-specific (the create path lets the
+/// kernel/NTFS resolve it; the rename guard rejects it for its `starts_with`
+/// containment).
+pub(crate) fn canonical_denylist_status(canon: &str) -> Option<(NTSTATUS, &'static str)> {
+    // GLOBALROOT alternate namespace bypasses the DOS-form classifier.
+    if canon.contains(r"\??\globalroot") || canon.contains(r"\globalroot\") {
+        return Some((STATUS_ACCESS_DENIED, "globalroot"));
+    }
+    // ADS — a second colon after the drive-letter colon. Works on both NT
+    // (`\??\c:\..`) and bare DOS (`c:\..`) forms.
+    let after = strip_nt_dos_prefix(canon).unwrap_or(canon);
+    let bytes = after.as_bytes();
+    if bytes.len() >= 3 && bytes[1] == b':' {
+        if let Some(extra_colon) = after[2..].find(':') {
+            let stream = &after[2 + extra_colon + 1..];
+            let allowed = ["$data", "$index_allocation", "zone.identifier"];
+            if !allowed.iter().any(|a| stream == *a || stream.starts_with(&format!("{}:", a))) {
+                return Some((STATUS_ACCESS_DENIED, "ads"));
+            }
+        }
+    }
+    // 8.3 short-name (e.g. PROGRA~1) — kernel resolves to a full path, bypassing
+    // the classifier and the CoW overlay.
+    if needs_short_name_resolve(canon) {
+        return Some((STATUS_ACCESS_DENIED, "short_name"));
+    }
+    // Sandbox state directory — masked as non-existent (NAME_NOT_FOUND) so the
+    // process treats `.winrsbox` as absent rather than forbidden.
+    if canon.contains(r"\.winrsbox\") || canon.ends_with(r"\.winrsbox") {
+        return Some((STATUS_OBJECT_NAME_NOT_FOUND, "winrsbox"));
+    }
+    None
+}
+
+/// Canonical lowercase form for denylist comparison: ASCII-lowercase, `/`
+/// folded to `\` (the object manager accepts `/` as a separator), per-segment
+/// trailing dot/space stripped (mirrors NTFS). Borrows-through when nothing
+/// needs changing on the hot path.
+pub(crate) fn canonicalize_for_denylist(s: &str) -> String {
+    let lower = s.to_ascii_lowercase().replace('/', "\\");
+    strip_trailing_dot_space(&lower).into_owned()
+}
+
 /// Returns Some(STATUS_ACCESS_DENIED) if the raw NT path or create options
 /// indicate a path-traversal / escape vector. None → caller should continue.
 ///
@@ -294,61 +345,20 @@ pub(crate) unsafe fn check_path_traversal(attrs: *const OBJECT_ATTRIBUTES, creat
         return Some(STATUS_ACCESS_DENIED);
     }
 
-    // 2. GLOBALROOT namespace — \??\GLOBALROOT\Device\...
+    // 2-5. Canonicalize ONCE (ASCII-lowercase, `/`→`\`, per-segment trailing
+    //      dot/space strip — the kernel + NTFS apply these before resolving the
+    //      path), then run the shared denylist (GLOBALROOT / ADS / 8.3
+    //      short-name / .winrsbox). ASCII-only lowercase keeps non-ASCII bytes
+    //      (e.g. U+0130) from folding into or out of an ASCII denylist match.
+    //      This is the single source of truth shared with the rename/hardlink
+    //      guard (fs_metadata_guard::dest_is_escape) so the two cannot drift.
     let raw_nt = extract_raw_nt_path(attrs)?;
-    // Canonicalize ONCE: ASCII-lowercase + per-segment trailing-dot/space strip.
-    // The kernel + NTFS apply both transformations before resolving the path,
-    // so every denylist comparison below must see the same canonical form.
-    // ASCII-only lowercase ensures non-ASCII bytes (e.g. U+0130) pass through
-    // untouched and cannot accidentally fold into / out of an ASCII denylist.
-    let lower_ascii = raw_nt.to_ascii_lowercase();
-    let lower = strip_trailing_dot_space(&lower_ascii);
-    let lower: &str = lower.as_ref();
-    if lower.contains(r"\??\globalroot") || lower.contains(r"\globalroot\") {
-        if is_trace() { ipc_log(ipc::LogLevel::Trace, format!("fs_block_globalroot: {}", raw_nt)); }
-        return Some(STATUS_ACCESS_DENIED);
-    }
-
-    // 3. ADS — colon after drive-letter colon (\??\C:\path\file.txt:hidden)
-    //    Strip \??\ prefix, check for a second colon after the drive-letter colon.
-    if let Some(after_prefix) = strip_nt_dos_prefix(lower) {
-        let bytes = after_prefix.as_bytes();
-        if bytes.len() >= 3 && bytes[1] == b':' {
-            // Skip drive-letter colon at index 1, look for another colon after it
-            if let Some(extra_colon) = after_prefix[2..].find(':') {
-                let stream = &after_prefix[2 + extra_colon + 1..];
-                // Allow standard system streams
-                let allowed = ["$data", "$index_allocation", "zone.identifier"];
-                if !allowed.iter().any(|a| stream == *a || stream.starts_with(&format!("{}:", a))) {
-                    if is_trace() {
-                        ipc_log(ipc::LogLevel::Trace,
-                            format!("fs_block_ads: stream={} path={}", stream, raw_nt));
-                    }
-                    return Some(STATUS_ACCESS_DENIED);
-                }
-            }
-        }
-    }
-
-    // 4. 8.3 short-name (e.g. PROGRA~1) — kernel resolves these to full paths
-    //    transparently, bypassing both the classifier (matches on literal path)
-    //    and the CoW redirect (overlay path built from 8.3 doesn't redirect
-    //    correctly). Legit Windows code uses full long names; 8.3 in a request
-    //    is a strong escape signal.
-    if needs_short_name_resolve(lower) {
-        if is_trace() { ipc_log(ipc::LogLevel::Trace, format!("fs_block_short_name: {}", raw_nt)); }
-        return Some(STATUS_ACCESS_DENIED);
-    }
-
-    // 5. Sandbox state isolation — pretend .winrsbox doesn't exist.
-    //    Sandbox state directory contains overlay/policy/logs — must be invisible
-    //    to sandboxed processes. Return STATUS_OBJECT_NAME_NOT_FOUND (not
-    //    ACCESS_DENIED) so the process treats it as non-existent.
-    if lower.contains(r"\.winrsbox\") || lower.ends_with(r"\.winrsbox") {
+    let canon = canonicalize_for_denylist(&raw_nt);
+    if let Some((status, reason)) = canonical_denylist_status(&canon) {
         if is_trace() {
-            ipc_log(ipc::LogLevel::Trace, format!("fs_hide_winrsbox: {}", raw_nt));
+            ipc_log(ipc::LogLevel::Trace, format!("fs_block_{reason}: {}", raw_nt));
         }
-        return Some(STATUS_OBJECT_NAME_NOT_FOUND);
+        return Some(status);
     }
 
     None
@@ -616,7 +626,11 @@ unsafe extern "system" fn hook_nt_create_user_process(
         let child_exe = extract_child_exe(process_parameters);
         // Track this PID as our spawned child so memory_guard/reg_hooks can
         // distinguish legitimate injection-target operations from external attacks.
-        crate::process_tracker::mark_spawned(child_pid, parent_pid, child_exe.clone());
+        // Capture the creation-time fingerprint from the live handle we already
+        // hold (M2: source-capture makes the PID-reuse defense always engage).
+        // SAFETY: proc_h is the valid process handle returned by NtCreateUserProcess.
+        let create_time = unsafe { crate::process_tracker::create_time_from_handle(proc_h) };
+        crate::process_tracker::mark_spawned(child_pid, parent_pid, child_exe.clone(), create_time);
         ipc_spawned_child(parent_pid, child_pid, child_exe);
     }
 
