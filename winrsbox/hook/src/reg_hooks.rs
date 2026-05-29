@@ -300,6 +300,21 @@ fn log_silent_ok_downgrade(syscall: &str, friendly_key: &str, value_name: Option
     });
 }
 
+/// Log a fail-closed denial caused by inability to resolve a registry WRITE
+/// target to a friendly key path. Cheap no-op if tracing is off.
+fn log_resolve_failed(syscall: &str) {
+    if !crate::ipc_client::is_trace() {
+        return;
+    }
+    // SAFETY: GetCurrentProcessId never fails / never dereferences a pointer.
+    let pid = unsafe { winapi::um::processthreadsapi::GetCurrentProcessId() };
+    let _ = crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+        pid,
+        level: ipc::LogLevel::Warn,
+        msg: format!("reg_resolve_failed_deny: syscall={syscall}"),
+    });
+}
+
 /// Send RegDecide IPC and return the mode string.
 /// "deny"        → return STATUS_ACCESS_DENIED
 /// "silent_ok"   → currently downgraded to STATUS_ACCESS_DENIED with a
@@ -373,6 +388,17 @@ unsafe extern "system" fn hook_nt_create_key(
             }
             return STATUS_ACCESS_DENIED;
         }
+    } else {
+        // Audit CRITICAL fix: a None here previously fell through to
+        // call_original() with NO policy check (fail-open). Custom hives cannot
+        // be mounted in the sandbox (NtLoadKey is denied), so an unresolvable
+        // write target is an exotic hive or a transient NtQueryKey failure —
+        // fail CLOSED rather than letting the create/open bypass policy.
+        log_resolve_failed("NtCreateKey");
+        if !key_handle.is_null() {
+            *key_handle = std::ptr::null_mut();
+        }
+        return STATUS_ACCESS_DENIED;
     }
     call_original()
 }
@@ -415,6 +441,11 @@ unsafe extern "system" fn hook_nt_set_value_key(
             log_silent_ok_downgrade("NtSetValueKey", &friendly, v_name.as_deref());
             return STATUS_ACCESS_DENIED;
         }
+    } else {
+        // Fail CLOSED on resolution failure (audit CRITICAL): unresolvable key
+        // handle must not let a value write bypass the policy check.
+        log_resolve_failed("NtSetValueKey");
+        return STATUS_ACCESS_DENIED;
     }
     call_original()
 }
@@ -447,6 +478,10 @@ unsafe extern "system" fn hook_nt_delete_value_key(
             log_silent_ok_downgrade("NtDeleteValueKey", &friendly, v_name.as_deref());
             return STATUS_ACCESS_DENIED;
         }
+    } else {
+        // Fail CLOSED on resolution failure (audit CRITICAL).
+        log_resolve_failed("NtDeleteValueKey");
+        return STATUS_ACCESS_DENIED;
     }
     call_original()
 }
@@ -474,6 +509,10 @@ unsafe extern "system" fn hook_nt_delete_key(key_handle: HANDLE) -> NTSTATUS {
             log_silent_ok_downgrade("NtDeleteKey", &friendly, None);
             return STATUS_ACCESS_DENIED;
         }
+    } else {
+        // Fail CLOSED on resolution failure (audit CRITICAL).
+        log_resolve_failed("NtDeleteKey");
+        return STATUS_ACCESS_DENIED;
     }
     call_original()
 }

@@ -136,8 +136,13 @@ unsafe extern "system" fn hook_nt_alpc_connect_port(
         // Length must not exceed MaximumLength for a well-formed UNICODE_STRING.
         // If it does, the struct is inconsistent / hostile — treat the name as
         // unresolvable. (MaximumLength is also a byte count; /2 → WCHARs.)
+        // A well-formed UNICODE_STRING has Length <= MaximumLength, i.e.
+        // char_count <= max_chars. This already rejects the malformed
+        // MaximumLength==0 / Length>0 case (max_chars==0 ⇒ only char_count==0
+        // passes), so no special-case escape hatch is needed (an earlier
+        // `MaximumLength==0 ||` short-circuit wrongly accepted that hostile case).
         let max_chars = (ustr.MaximumLength / 2) as usize;
-        let consistent = ustr.MaximumLength == 0 || char_count <= max_chars;
+        let consistent = char_count <= max_chars;
         // Cap char_count to a sane domain maximum for ALPC port names so an
         // attacker-controlled Length pointing past a small Buffer allocation
         // can't drive an out-of-bounds read. Over the cap or inconsistent →

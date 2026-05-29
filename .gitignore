@@ -13,6 +13,11 @@
 /sandbox/target/
 /winrsbox/target/
 
+# Sandbox runtime state (CoW overlay, policy DB, logs) — must never be committed
+.winrsbox/
+# Scratch / temp working dir
+/tmp/
+
 # Go module cache
 # (go.sum files are tracked for reproducible builds)
 

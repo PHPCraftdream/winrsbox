@@ -457,8 +457,20 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Inject hook.dll into target before resuming.
-    inject::inject_dll(proc_info.hProcess, proc_info.hThread, &dll_path)?;
+    // Inject hook.dll into target before resuming. On failure the child already
+    // exists (suspended, no user code has run) but is NOT yet in the Job Object —
+    // terminate and clean up rather than leaving an orphaned, uncontained,
+    // suspended process (mirrors the pre_launch_scan refusal path above).
+    if let Err(e) = inject::inject_dll(proc_info.hProcess, proc_info.hThread, &dll_path) {
+        // SAFETY: proc_info handles are valid PROCESS/THREAD handles from CreateProcessW.
+        unsafe {
+            windows::Win32::System::Threading::TerminateProcess(proc_info.hProcess, 0xC000_0005).ok();
+            CloseHandle(proc_info.hThread).ok();
+            CloseHandle(proc_info.hProcess).ok();
+        }
+        eprintln!("hook.dll injection failed: {e}");
+        std::process::exit(0xC000_0005u32 as i32);
+    }
 
     // Assign to Job Object — kernel auto-kills all children when launcher exits.
     // Job handle must outlive the target process.
@@ -494,8 +506,12 @@ async fn main() -> Result<()> {
                 // Block SMB/NetBIOS egress (IPv4 + IPv6) — prevents DFS UNC
                 // exfiltration to remote servers.
                 for port in winrsbox::wfp::SMB_PORTS {
-                    let _ = engine.block_outbound_port(*port);
-                    let _ = engine.block_outbound_port_v6(*port);
+                    if let Err(e) = engine.block_outbound_port(*port) {
+                        eprintln!("[sandbox] WFP SMB block port {port} (v4) failed: {e}");
+                    }
+                    if let Err(e) = engine.block_outbound_port_v6(*port) {
+                        eprintln!("[sandbox] WFP SMB block port {port} (v6) failed: {e}");
+                    }
                 }
                 let fc = engine.filter_count();
                 println!("[sandbox] WFP: {fc} outbound filters registered");
@@ -552,9 +568,23 @@ async fn main() -> Result<()> {
     // spawn_blocking moves the blocking wait to tokio's thread pool — the async
     // runtime stays free to run pipe_accept_loop and other tasks.
     let event_handle_raw = init_event.0 as usize; // HANDLE → usize for Send
-    let wait_result = tokio::task::spawn_blocking(move || unsafe {
+    let wait_result = match tokio::task::spawn_blocking(move || unsafe {
         WaitForSingleObject(HANDLE(event_handle_raw as *mut _), 5000)
-    }).await?;
+    }).await {
+        Ok(wr) => wr,
+        Err(e) => {
+            // The blocking wait task panicked / the runtime is shutting down. The
+            // child was already resumed (line above) — terminate it and close the
+            // handles instead of leaking them on a `?` early-return.
+            // SAFETY: proc_info.hProcess + init_event are valid here.
+            unsafe {
+                windows::Win32::System::Threading::TerminateProcess(proc_info.hProcess, 0xC000_0005).ok();
+                CloseHandle(proc_info.hProcess).ok();
+                CloseHandle(init_event).ok();
+            }
+            anyhow::bail!("init-event wait task failed: {e}");
+        }
+    };
 
     if wait_result.0 == 0 { // WAIT_OBJECT_0
         println!("[sandbox] hook.dll init confirmed (pid {})", proc_info.dwProcessId);
@@ -585,7 +615,7 @@ async fn main() -> Result<()> {
         unsafe { WaitForSingleObject(HANDLE(target_isize as *mut _), INFINITE) };
     })
     .await
-    .ok();
+    .unwrap_or_else(|e| eprintln!("[sandbox] target-wait task failed: {e}"));
     let target_handle = proc_info.hProcess;
 
     // Give any remaining child processes a brief window to finish.
@@ -612,7 +642,7 @@ async fn main() -> Result<()> {
             unsafe { WaitForMultipleObjects(&handles, true, 5000) };
         })
         .await
-        .ok();
+        .unwrap_or_else(|e| eprintln!("[sandbox] child-wait task failed: {e}"));
         for h in &child_handles {
             // SAFETY: h is a handle we own from OpenProcess above.
             unsafe { CloseHandle(*h).ok() };

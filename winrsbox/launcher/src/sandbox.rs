@@ -1,7 +1,10 @@
 // ─── Sandbox orchestration helpers ───────────────────────────────────────────
 
 use anyhow::{Context, Result};
-use std::{os::windows::ffi::OsStrExt, path::{Path, PathBuf}};
+use std::{
+    os::windows::{ffi::OsStrExt, fs::MetadataExt},
+    path::{Path, PathBuf},
+};
 use windows::{
     core::PCWSTR,
     Win32::{
@@ -51,6 +54,13 @@ const IMAGE_FILE_MACHINE_UNKNOWN: u16 = 0x0000;
 #[allow(dead_code)]
 const IMAGE_FILE_MACHINE_I386: u16 = 0x014C;
 const STATUS_DLL_INIT_FAILED: u32 = 0xC000_0142;
+
+/// `FILE_ATTRIBUTE_REPARSE_POINT` (winnt.h). Set on any reparse point —
+/// symlinks, directory junctions, and mount points alike. Checking this bit
+/// directly (rather than only `FileType::is_symlink`) catches NTFS junctions
+/// regardless of reparse tag, which is the primary TOCTOU redirection vector
+/// on Windows when an attacker controls the parent directory.
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
 /// Default ktav policy written when auto-discovery creates a fresh state dir.
 pub(crate) const DEFAULT_CONFIG_KTAV: &str = "\
@@ -462,6 +472,57 @@ pub(crate) fn find_hook_dll() -> Result<String> {
     Ok(dll.to_string_lossy().into_owned())
 }
 
+/// Symlink/reparse-safe replacement for `create_dir_all` over an
+/// attacker-influenced path chain.
+///
+/// `base` is assumed to already exist and is treated as the trust boundary
+/// (we never create it). Each component of `relative` is then created one
+/// segment at a time. For every segment that already exists we reject it if
+/// it is a reparse point (symlink **or** NTFS junction/mount point) or not a
+/// real directory; only then do we descend. This prevents an attacker who
+/// controls `base` from pre-creating `.winrsbox` (or the `<name>` subdir) as
+/// a junction that redirects our overlay/config writes outside the sandbox.
+///
+/// `symlink_metadata` is used so we inspect the link itself, never its
+/// target. We check `FILE_ATTRIBUTE_REPARSE_POINT` in addition to
+/// `is_symlink()` because Windows junctions are reparse points that
+/// `is_symlink()` does not always report.
+fn create_dir_tree_no_reparse(base: &Path, relative: &Path) -> Result<()> {
+    let mut cur = base.to_path_buf();
+    for comp in relative.components() {
+        cur.push(comp);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(md) => {
+                let ft = md.file_type();
+                if ft.is_symlink()
+                    || (md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                {
+                    anyhow::bail!(
+                        "refusing to use sandbox state path: component {} is a \
+                         symlink/junction (reparse point) — possible TOCTOU redirection",
+                        cur.display()
+                    );
+                }
+                anyhow::ensure!(
+                    ft.is_dir(),
+                    "sandbox state path component {} exists but is not a directory",
+                    cur.display()
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&cur)
+                    .with_context(|| format!("create state dir {}", cur.display()))?;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("stat sandbox state path component {}", cur.display())
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Ensure the auto-discovered state directory exists and return the paths
 /// `(cfg_path, sandbox_root, mock_dirs_root)`.
 ///
@@ -481,9 +542,17 @@ pub(crate) fn ensure_state(project_root: &Path) -> Result<(PathBuf, PathBuf, Pat
     let mock_dirs = state_dir.join("mock-dirs");
     let cfg_path = state_dir.join("sandbox.ktav");
 
-    std::fs::create_dir_all(&workdir)
+    // Build the tree step-by-step under `parent` (the trust boundary), rejecting
+    // any existing component reached through a symlink/junction. We never blindly
+    // `create_dir_all` through this attacker-influenced chain. Creating `workdir`
+    // and `mock_dirs` re-walks (and thus re-validates) the shared
+    // `.winrsbox/<name>` prefix, tightening the TOCTOU window.
+    let state_rel = Path::new(".winrsbox").join(name);
+    create_dir_tree_no_reparse(parent, &state_rel)
+        .with_context(|| format!("create state dir {}", state_dir.display()))?;
+    create_dir_tree_no_reparse(&state_dir, Path::new("workdir"))
         .with_context(|| format!("create state dir {}", workdir.display()))?;
-    std::fs::create_dir_all(&mock_dirs)
+    create_dir_tree_no_reparse(&state_dir, Path::new("mock-dirs"))
         .with_context(|| format!("create mock-dirs {}", mock_dirs.display()))?;
 
     if !cfg_path.exists() {
@@ -519,8 +588,10 @@ pub(crate) fn setup_job_object(
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT, JOB_OBJECT_UILIMIT,
     };
 
+    // GiB → bytes, overflow-safe: a pathologically large `gb` saturates to
+    // u64::MAX (effectively "unlimited") instead of wrapping to a tiny limit.
     let limits = winrsbox::jobctl::JobLimits::default()
-        .with_memory(memory_limit.map(|gb| gb * 1024 * 1024 * 1024));
+        .with_memory(memory_limit.map(|gb| gb.saturating_mul(1024 * 1024 * 1024)));
     // SAFETY: creating a new job with no name, no security attrs.
     let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
         .context("CreateJobObjectW")?;

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build + test + clippy (windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: winrsbox
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: winrsbox
+
+      # Compile the whole workspace including benches + the escape-test bins.
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      # Library/unit tests only — the integration-tests bins are escape PoCs that
+      # require a built sandbox + Go helpers at runtime and are not cargo tests.
+      - name: Test
+        run: cargo test --workspace --lib
+
+      # Lint visibility (warnings are not denied: the tree has known, accepted
+      # style warnings). Fails only on clippy errors / compile errors.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets

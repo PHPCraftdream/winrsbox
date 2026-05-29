@@ -256,6 +256,44 @@ fn is_owned_client_pid(client_pid: u32, root_target_pid: u32) -> bool {
 /// progress even when all 128 handler slots are busy.
 pub(crate) const MAX_CONCURRENT_HANDLERS: usize = 128;
 
+/// RAII teardown guard for an accepted pipe connection's server-side handle.
+///
+/// Audit M-A3 (robustness / resource leak): the per-connection handler runs
+/// inside a `spawn_blocking` closure. If `handle_connection` panics, any
+/// teardown written as plain statements *after* the call would be skipped
+/// during unwind, leaking the pipe handle (and leaving the connection
+/// un-disconnected) for that connection. This guard moves the teardown into
+/// `Drop`, so `DisconnectNamedPipe` + `CloseHandle` run on *every* exit path —
+/// normal return, `?`/early return, or panic-unwind.
+///
+/// Stores the `isize` repr of the handle (not a `HANDLE` / raw pointer) so the
+/// value remains trivially `Send` across the `spawn_blocking` boundary, exactly
+/// as the surrounding accept loop already does; the `HANDLE` is reconstructed
+/// only inside `Drop`, on the worker thread that owns it.
+///
+/// panic=abort caveat: the workspace *release* profile uses `panic = "abort"`,
+/// under which a panic terminates the process before unwinding and Drop does not
+/// run. That is acceptable — an aborting process frees all its handles anyway.
+/// Under `panic = "unwind"` (debug/test, and any future config change) the guard
+/// is what prevents the leak. RAII is the correct pattern regardless of profile.
+struct PipeConnGuard {
+    /// `isize` repr of the connection's server-side pipe `HANDLE`.
+    raw: isize,
+}
+
+impl Drop for PipeConnGuard {
+    fn drop(&mut self) {
+        // SAFETY: `raw` is the `isize` repr of the valid server-side pipe HANDLE
+        //         for this connection, handed to us by the accept loop. It is not
+        //         closed anywhere else on this path (`handle_connection`
+        //         deliberately `mem::forget`s its `File` wrapper so teardown is
+        //         the guard's sole responsibility), so this is the unique close.
+        let h = HANDLE(self.raw as *mut _);
+        unsafe { DisconnectNamedPipe(h).ok() };
+        unsafe { CloseHandle(h).ok() };
+    }
+}
+
 /// cancel-safe: NO — individual connection handlers are detached via spawn;
 ///              this outer loop itself is not designed for clean cancellation,
 ///              it runs for the lifetime of the launcher process.
@@ -492,15 +530,18 @@ pub(crate) async fn pipe_accept_loop(
         // Intentional fire-and-forget: spawn_blocking tasks run to completion even
         // after JoinHandle is dropped — they are not cancelled.
         tokio::task::spawn_blocking(move || {
+            // RAII teardown (Audit M-A3): construct the guard BEFORE running the
+            // handler so `DisconnectNamedPipe` + `CloseHandle` run on every exit
+            // path, including a panic in `handle_connection` (under panic=unwind).
+            // Declared before `_permit` so the handle teardown spans the whole
+            // closure body; both drop when the closure returns/unwinds.
+            let _guard = PipeConnGuard { raw: ph };
             // The permit is dropped when this closure returns, releasing the
             // handler slot back to the semaphore for the next accepted connection.
             let _permit = permit;
             // SAFETY: ph is the isize repr of the valid pipe handle for this connection.
             let h = HANDLE(ph as *mut _);
             handle_connection(h, client_pid, &policy, &stats, &child_pids, &vlog, &hot_stats2, &flusher2);
-            // SAFETY: h — disconnect and close after the connection handler finishes.
-            unsafe { DisconnectNamedPipe(h).ok() };
-            unsafe { CloseHandle(h).ok() };
         });
     }
 

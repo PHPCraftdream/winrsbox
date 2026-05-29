@@ -435,12 +435,44 @@ pub(crate) fn prepare_overlay(decision: &Decision) -> Option<String> {
     }
 
     if let Some(ref src) = decision.cow_from {
-        if !overlay_path.exists() {
+        if !overlay_path.exists() && !src_is_reparse_point(src) {
+            // src_is_reparse_point() guard above closes a TOCTOU: the launcher
+            // recorded `cow_from` after an existence check in the *trusted*
+            // policy process, but this copy runs *inside the hostile target*.
+            // Between decision and copy, the adversary can swap the source for
+            // a symlink/junction pointing OUTSIDE the sandbox. std::fs::copy
+            // follows reparse points, so without this check it would copy an
+            // attacker-chosen external file into the overlay (information
+            // escape / overlay seeded from outside the boundary). We re-check
+            // immediately before the copy and refuse if the source is now a
+            // reparse point — a normal file is copied as before.
             let _ = std::fs::copy(src, overlay_path);
         }
     }
 
     Some(overlay_dos)
+}
+
+/// True if `src` is a reparse point (symlink, junction/mount point, or any
+/// other reparse tag) *right now*.
+///
+/// Uses `symlink_metadata`, which on Windows opens with no-follow semantics
+/// (it does NOT traverse the final reparse point), and tests the
+/// `FILE_ATTRIBUTE_REPARSE_POINT` (0x400) bit directly. Checking the attribute
+/// bit — rather than `FileType::is_symlink()` — is deliberate: `is_symlink()`
+/// returns false for NTFS junctions/mount points, which are exactly the
+/// reparse type an attacker can create without privilege. We must reject ALL
+/// reparse points, not just name-surrogate symlinks.
+///
+/// Fails closed: if the metadata query itself errors (e.g. the source vanished
+/// in the race), we treat the source as untrusted and skip the CoW copy.
+fn src_is_reparse_point(src: &std::path::Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    match std::fs::symlink_metadata(src) {
+        Ok(md) => md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+        Err(_) => true,
+    }
 }
 
 /// Materialize a Mock-mode overlay file exactly once.

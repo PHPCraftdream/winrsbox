@@ -131,11 +131,15 @@ pub fn verify_signature(exe_path: &Path) -> TrustLevel {
             TrustLevel::SignedUntrustedRoot
         }
         other => {
-            if is_in_trusted_path(exe_path) {
-                TrustLevel::TrustedPath
-            } else {
-                TrustLevel::Error(format!("WinVerifyTrust returned 0x{other:08x}"))
-            }
+            // Fail CLOSED. Any other WinVerifyTrust status is a *verification
+            // error* (corrupt PE, provider failure, CRYPT_E_*, file I/O, etc.) —
+            // NOT a definitive "no signature" verdict. We must not upgrade an
+            // error to TrustedPath just because the file sits under a trusted
+            // directory: an attacker who can drop/swap a file there (or trigger
+            // a transient verify failure) would otherwise be silently trusted.
+            // Only TRUST_E_NOSIGNATURE (handled above) gets the catalog/path
+            // fallback, because that is a real verdict from WinVerifyTrust.
+            TrustLevel::Error(format!("WinVerifyTrust returned 0x{other:08x}"))
         }
     }
 }
@@ -151,6 +155,38 @@ pub fn is_in_trusted_path(exe_path: &Path) -> bool {
 fn extract_publisher(exe_path: &Path) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Security::Cryptography::*;
+
+    // RAII guards so every WinTrust/Crypt resource is released on ALL exit
+    // paths (early `return None`, success, or panic). Previously the cert
+    // store and cert context were freed only on the success path, and the
+    // PKCS7 message handle was never closed at all — leaking on every call.
+    struct MsgHandle(*mut core::ffi::c_void);
+    impl Drop for MsgHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: only constructed from a CryptQueryObject success.
+                unsafe { let _ = CryptMsgClose(Some(self.0)); }
+            }
+        }
+    }
+    struct StoreHandle(HCERTSTORE);
+    impl Drop for StoreHandle {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                // SAFETY: only constructed from a CryptQueryObject success.
+                unsafe { let _ = CertCloseStore(Some(self.0), 0); }
+            }
+        }
+    }
+    struct CertCtx(*const CERT_CONTEXT);
+    impl Drop for CertCtx {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: only constructed from a CertEnumCertificatesInStore success.
+                unsafe { let _ = CertFreeCertificateContext(Some(self.0)); }
+            }
+        }
+    }
 
     let path_wide: Vec<u16> = exe_path.as_os_str()
         .encode_wide()
@@ -179,6 +215,9 @@ fn extract_publisher(exe_path: &Path) -> Option<String> {
     if ok.is_err() {
         return None;
     }
+    // Take ownership of both handles immediately so any later early return frees them.
+    let _msg = MsgHandle(msg_handle);
+    let store = StoreHandle(cert_store);
 
     // Get signer info from PKCS7 message
     let mut signer_info_size: u32 = 0;
@@ -212,10 +251,10 @@ fn extract_publisher(exe_path: &Path) -> Option<String> {
     // Parse CMSG_SIGNER_INFO to get Issuer + SerialNumber, then find cert in store
     // For simplicity: enumerate certs in store and return the first subject CN.
     // SAFETY: cert_store is valid from CryptQueryObject.
-    let cert_ctx = unsafe {
-        CertEnumCertificatesInStore(cert_store, None)
-    };
-    if cert_ctx.is_null() {
+    let cert_ctx = CertCtx(unsafe {
+        CertEnumCertificatesInStore(store.0, None)
+    });
+    if cert_ctx.0.is_null() {
         return None;
     }
 
@@ -224,7 +263,7 @@ fn extract_publisher(exe_path: &Path) -> Option<String> {
     // SAFETY: cert_ctx is valid; name_buf is sized for 512 chars.
     let name_len = unsafe {
         CertGetNameStringW(
-            cert_ctx,
+            cert_ctx.0,
             4, // CERT_NAME_SIMPLE_DISPLAY_TYPE
             0, // flags
             None,
@@ -232,12 +271,7 @@ fn extract_publisher(exe_path: &Path) -> Option<String> {
         )
     };
 
-    // Cleanup
-    unsafe {
-        let _ = CertFreeCertificateContext(Some(cert_ctx));
-        CertCloseStore(Some(cert_store), 0).ok();
-    }
-
+    // All handles (_msg, store, cert_ctx) are released by their Drop impls here.
     if name_len <= 1 {
         return None;
     }
@@ -277,7 +311,17 @@ impl TrustCache {
             }
             drop(guard);
 
-            let result = verify_signature(path);
+            // TOCTOU hardening: verify the SAME canonicalized path we keyed on
+            // (`key.0`), not the caller-supplied `path`. Previously the key was
+            // computed from the canonical path while WinVerifyTrust ran against
+            // the raw `path`, so a symlink/junction swapped after `cache_key()`
+            // could make us cache a verdict for target A but verify target B —
+            // and serve that mismatched verdict to future callers. Reusing the
+            // resolved path for both key and verify removes that discrepancy.
+            // (A fully race-free check would verify by an already-open handle;
+            // WinVerifyTrust's WTD_CHOICE_FILE re-opens by path, so consistent
+            // canonicalization is the feasible reduction here.)
+            let result = verify_signature(&key.0);
 
             let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             guard.insert(key, result.clone());

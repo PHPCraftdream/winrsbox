@@ -150,24 +150,25 @@ pub fn run_import(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     }
 
     // Import rules
+    let mut skipped = 0usize;
     if let Some(rules) = val.get("rules").and_then(|v| v.as_array()) {
         for rule in rules {
+            let prefix = match rule.get("prefix").and_then(|v| v.as_str()) {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => {
+                    eprintln!("warning: skipping rule with empty/missing prefix");
+                    skipped += 1;
+                    continue;
+                }
+            };
             let id = rule.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let prefix = rule.get("prefix").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let read = rule.get("read").and_then(|v| v.as_str())
                 .map(|s| parse_mode(s)).transpose()?
                 .unwrap_or(policy::db::RuleMode::Passthrough);
             let write = rule.get("write").and_then(|v| v.as_str())
                 .map(|s| parse_mode(s)).transpose()?
                 .unwrap_or(policy::db::RuleMode::Cow);
-            let when = rule.get("when").and_then(|w| {
-                if w.is_null() { return None; }
-                let depth = w.get("depth").and_then(|v| v.as_u64()).map(|d| d as u8);
-                let exe = w.get("exe").and_then(|v| v.as_str()).map(String::from);
-                if depth.is_none() && exe.is_none() { None } else {
-                    Some(policy::db::WhenFilter { depth, exe })
-                }
-            });
+            let when = parse_when(rule.get("when"))?;
             let row = policy::db::RuleRow { id, prefix, mode_read: read, mode_write: write, when };
             policy::db::rule_upsert(&db, &row)?;
         }
@@ -176,7 +177,14 @@ pub fn run_import(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     // Import mocks
     if let Some(mocks) = val.get("mocks").and_then(|v| v.as_array()) {
         for mock in mocks {
-            let path = mock.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path = match mock.get("path").and_then(|v| v.as_str()) {
+                Some(p) if !p.is_empty() => p,
+                _ => {
+                    eprintln!("warning: skipping mock with empty/missing path");
+                    skipped += 1;
+                    continue;
+                }
+            };
             let payload = if let Some(b64) = mock.get("content_base64").and_then(|v| v.as_str()) {
                 base64::prelude::BASE64_STANDARD.decode(b64)?
             } else if let Some(content) = mock.get("content_inline").and_then(|v| v.as_str()) {
@@ -201,18 +209,20 @@ pub fn run_import(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     if let Some(reg_rules) = val.get("reg_rules").and_then(|v| v.as_array()) {
         if replace { policy::db::reg_rule_clear(&db)?; }
         for rule in reg_rules {
+            let prefix = match rule.get("prefix").and_then(|v| v.as_str()) {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => {
+                    eprintln!("warning: skipping reg_rule with empty/missing prefix");
+                    skipped += 1;
+                    continue;
+                }
+            };
             let id = rule.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let prefix = rule.get("prefix").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let read = rule.get("read").and_then(|v| v.as_str())
                 .map(|s| parse_mode(s)).transpose()?.unwrap_or(policy::db::RuleMode::Passthrough);
             let write = rule.get("write").and_then(|v| v.as_str())
                 .map(|s| parse_mode(s)).transpose()?.unwrap_or(policy::db::RuleMode::Cow);
-            let when = rule.get("when").and_then(|w| {
-                if w.is_null() { return None; }
-                let depth = w.get("depth").and_then(|v| v.as_u64()).map(|d| d as u8);
-                let exe = w.get("exe").and_then(|v| v.as_str()).map(String::from);
-                if depth.is_none() && exe.is_none() { None } else { Some(policy::db::WhenFilter { depth, exe }) }
-            });
+            let when = parse_when(rule.get("when"))?;
             policy::db::reg_rule_upsert(&db, &policy::db::RuleRow { id, prefix, mode_read: read, mode_write: write, when })?;
         }
     }
@@ -220,10 +230,19 @@ pub fn run_import(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     // Import reg_mocks
     if let Some(reg_mocks) = val.get("reg_mocks").and_then(|v| v.as_array()) {
         for mock in reg_mocks {
-            let path = mock.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let payload = mock.get("payload_json")
-                .map(|v| serde_json::to_vec(v).unwrap_or_default())
-                .unwrap_or_default();
+            let path = match mock.get("path").and_then(|v| v.as_str()) {
+                Some(p) if !p.is_empty() => p,
+                _ => {
+                    eprintln!("warning: skipping reg_mock with empty/missing path");
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let payload = match mock.get("payload_json") {
+                Some(v) => serde_json::to_vec(v)
+                    .map_err(|e| anyhow::anyhow!("reg_mock '{}': payload_json serialize error: {}", path, e))?,
+                None => Vec::new(),
+            };
             policy::db::reg_mock_upsert(&db, &path.to_lowercase(), &payload)?;
         }
     }
@@ -232,8 +251,15 @@ pub fn run_import(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     if let Some(dev_rules) = val.get("dev_rules").and_then(|v| v.as_array()) {
         if replace { policy::db::dev_rule_clear(&db)?; }
         for rule in dev_rules {
+            let prefix = match rule.get("prefix").and_then(|v| v.as_str()) {
+                Some(p) if !p.is_empty() => p.to_string(),
+                _ => {
+                    eprintln!("warning: skipping dev_rule with empty/missing prefix");
+                    skipped += 1;
+                    continue;
+                }
+            };
             let id = rule.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let prefix = rule.get("prefix").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let read = rule.get("read").and_then(|v| v.as_str())
                 .map(|s| parse_mode(s)).transpose()?.unwrap_or(policy::db::RuleMode::Deny);
             let write = rule.get("write").and_then(|v| v.as_str())
@@ -242,7 +268,33 @@ pub fn run_import(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         }
     }
 
+    if skipped > 0 {
+        eprintln!("import: skipped {} invalid entr{}", skipped, if skipped == 1 { "y" } else { "ies" });
+    }
+
     Ok(())
+}
+
+/// Parse an optional `when` filter from JSON, rejecting out-of-range `depth`
+/// values instead of silently wrapping on the cast to u8.
+fn parse_when(when: Option<&serde_json::Value>) -> Result<Option<policy::db::WhenFilter>> {
+    let Some(w) = when else { return Ok(None) };
+    if w.is_null() {
+        return Ok(None);
+    }
+    let depth = match w.get("depth") {
+        Some(d) if !d.is_null() => {
+            let n = d.as_u64().ok_or_else(|| anyhow::anyhow!("when.depth must be a non-negative integer"))?;
+            Some(u8::try_from(n).map_err(|_| anyhow::anyhow!("when.depth {} out of range (0..=255)", n))?)
+        }
+        _ => None,
+    };
+    let exe = w.get("exe").and_then(|v| v.as_str()).map(String::from);
+    if depth.is_none() && exe.is_none() {
+        Ok(None)
+    } else {
+        Ok(Some(policy::db::WhenFilter { depth, exe }))
+    }
 }
 
 fn parse_mode(s: &str) -> Result<policy::db::RuleMode> {
