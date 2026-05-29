@@ -494,6 +494,15 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                // Block lateral movement to IPv6 private/local ranges
+                for cidr_str in winrsbox::wfp::IPV6_PRIVATE {
+                    if let Some(cidr) = winrsbox::wfp::CidrV6::parse(cidr_str) {
+                        match engine.block_outbound_cidr_v6(&cidr) {
+                            Ok(_) => {}
+                            Err(e) => eprintln!("[sandbox] WFP v6 filter {cidr_str} failed: {e}"),
+                        }
+                    }
+                }
                 // Block localhost connections (opt-in — breaks MCP/LSP).
                 if cli.block_localhost {
                     if let Some(lo) = winrsbox::wfp::CidrV4::parse("127.0.0.0/8") {

@@ -21,54 +21,7 @@ pub fn sanitize() -> usize {
 
 fn is_sensitive(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
-
-    // Always keep these
-    if is_whitelisted(&upper) {
-        return false;
-    }
-
-    // Sensitive name patterns (case-insensitive substring match)
-    const SENSITIVE_SUBSTRINGS: &[&str] = &[
-        "API_KEY", "APIKEY", "API_SECRET",
-        "SECRET_KEY", "SECRET_ACCESS", "SECRETKEY",
-        "TOKEN", // covers GITHUB_TOKEN, NPM_TOKEN, etc.
-        "PASSWORD", "PASSWD",
-        "CREDENTIAL", "CREDENTIALS",
-        "PRIVATE_KEY", "PRIVATEKEY",
-        "AUTH", // covers AUTHORIZATION, AUTH_TOKEN
-        "AWS_SECRET", "AWS_SESSION",
-        "DATABASE_URL", "DB_PASSWORD", "DB_PASS",
-        "ENCRYPTION_KEY",
-        "SIGNING_KEY",
-        "WEBHOOK_SECRET",
-        "CLIENT_SECRET",
-        "COOKIE_SECRET",
-        "SESSION_SECRET",
-        "JWT_SECRET",
-        "MASTER_KEY",
-    ];
-
-    // Exact prefixes for known secret env vars
-    const SENSITIVE_PREFIXES: &[&str] = &[
-        "ANTHROPIC_", "OPENAI_", "AZURE_", "GCP_", "GOOGLE_",
-        "GITHUB_", "GITLAB_", "BITBUCKET_",
-        "NPM_", "PYPI_", "CARGO_REGISTRY_",
-        "DOCKER_", "KUBERNETES_",
-        "SLACK_", "DISCORD_", "TELEGRAM_",
-        "SENDGRID_", "TWILIO_", "STRIPE_",
-        "SSH_AUTH_SOCK", "SSH_AGENT_PID",
-        "GPG_", "GNUPG",
-    ];
-
-    for pat in SENSITIVE_SUBSTRINGS {
-        if upper.contains(pat) { return true; }
-    }
-
-    for prefix in SENSITIVE_PREFIXES {
-        if upper.starts_with(prefix) { return true; }
-    }
-
-    false
+    !is_whitelisted(&upper)
 }
 
 fn is_whitelisted(upper: &str) -> bool {
