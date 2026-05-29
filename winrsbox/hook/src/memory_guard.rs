@@ -89,7 +89,17 @@ static HOOK_NT_UNMAP_VIEW: OnceLock<GenericDetour<FnNtUnmapViewOfSection>> = Onc
 // where we need to call the raw function without triggering our own hook.
 static NT_UNMAP_ORIG: OnceLock<FnNtUnmapViewOfSection> = OnceLock::new();
 
-// Guard mode: "scan" = content-aware (scan bytes for syscall), "full" = scan + DLL scan
+// Guard mode (mirrors the launcher GuardLevel):
+//   "scan"   = content-aware: allow executable memory, scan W^X→exec transitions
+//              for direct syscalls (NtProtect path).
+//   "full"   = scan + DLL .text scan. JIT-SAFE: self RWX-direct allocation is
+//              ALLOWED (node/V8 needs it). The residual gap — RWX-direct
+//              shellcode that never calls NtProtect, so the content-scan never
+//              sees it — is accepted in full (the real adversary is a
+//              misbehaving agent, not a hand-rolled exploit) and closed in static.
+//   "static" = hard containment: self RWX-direct allocation is TERMINATED
+//              outright (the only way to deny the content-scan-evading
+//              RWX-direct path), at the cost of breaking RWX-direct JIT.
 static GUARD_MODE: OnceLock<String> = OnceLock::new();
 static SCAN_CACHE: OnceLock<crate::scan_cache::ScanCache> = OnceLock::new();
 
@@ -99,6 +109,13 @@ fn scan_cache() -> &'static crate::scan_cache::ScanCache {
 
 fn is_full_mode() -> bool {
     GUARD_MODE.get().map(|s| s == "full").unwrap_or(true)
+}
+
+/// Hard-containment tier. Only here do we blunt-kill self RWX-direct
+/// allocations — the content-scan-evading pattern that user-mode hooking can't
+/// otherwise inspect. `full`/`scan` allow it so JIT runtimes work.
+fn is_static_mode() -> bool {
+    GUARD_MODE.get().map(|s| s == "static").unwrap_or(false)
 }
 
 fn allow_rwx() -> bool {
@@ -491,7 +508,11 @@ unsafe extern "system" fn hook_nt_allocate_virtual_memory(
 
     let result = (|| {
         if is_current_process(process_handle) {
-            if is_rwx(protect) && !allow_rwx() && is_full_mode() {
+            // Self RWX-direct allocation: the content-scan-evading JIT/shellcode
+            // pattern. Blunt-killed ONLY in static (hard containment). In
+            // full/scan it's allowed so RWX-direct JIT (node/V8) works; the
+            // W^X JIT path is still content-scanned at NtProtect→exec time.
+            if is_rwx(protect) && !allow_rwx() && is_static_mode() {
                 let size = if region_size.is_null() { 0 } else { *region_size as u64 };
                 let addr = if base_address.is_null() { 0 } else { *base_address as u64 };
                 report_and_terminate(ipc::AllocKind::Allocate, protect, size, addr);
@@ -649,8 +670,10 @@ unsafe extern "system" fn hook_nt_map_view_of_section(
                 report_and_terminate(ipc::AllocKind::MapView, win32_protect, size, mapped_base as u64);
             }
 
-            // In full mode: scan .text of user DLLs for direct syscalls
-            if is_full_mode() {
+            // Scan .text of user DLLs for direct syscalls at full level and
+            // above. static is a superset of full — it MUST also run this scan
+            // (skipping it would make the hardest tier weaker than full).
+            if is_full_mode() || is_static_mode() {
             if let Some(full_path) = get_mapped_file_path(mapped_base) {
                 if !is_system_dll_path(&full_path) {
                     // Read PE headers from the mapped image
