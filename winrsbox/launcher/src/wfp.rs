@@ -124,11 +124,20 @@ impl WfpEngine {
             ..Default::default()
         };
 
+        // Hard block: CLEAR_ACTION_RIGHT makes a BLOCK terminating so no
+        // higher-weight PERMIT (ours or any third-party filter sharing the
+        // universal sublayer) can override it. Without it, a PERMIT with a
+        // larger weight in the same sublayer wins → containment hole.
         let filter = FWPM_FILTER0 {
             displayData: display,
             layerKey: FWPM_LAYER_ALE_AUTH_CONNECT_V4,
             subLayerKey: FWPM_SUBLAYER_UNIVERSAL,
             action,
+            flags: if block {
+                FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT
+            } else {
+                FWPM_FILTER_FLAG_NONE
+            },
             filterCondition: conditions.as_mut_ptr(),
             numFilterConditions: 1,
             weight: FWP_VALUE0 {
@@ -171,11 +180,14 @@ impl WfpEngine {
             description: windows::core::PWSTR::null(),
         };
 
+        // Hard block (CLEAR_ACTION_RIGHT) so a higher-weight PERMIT cannot
+        // override the SMB egress block in the shared universal sublayer.
         let filter = FWPM_FILTER0 {
             displayData: display,
             layerKey: FWPM_LAYER_ALE_AUTH_CONNECT_V4,
             subLayerKey: FWPM_SUBLAYER_UNIVERSAL,
             action: FWPM_ACTION0 { r#type: FWP_ACTION_BLOCK, ..Default::default() },
+            flags: FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
             filterCondition: conditions.as_mut_ptr(),
             numFilterConditions: 1,
             weight: FWP_VALUE0 {
@@ -217,11 +229,14 @@ impl WfpEngine {
             description: windows::core::PWSTR::null(),
         };
 
+        // Hard block (CLEAR_ACTION_RIGHT) so a higher-weight PERMIT cannot
+        // override the SMB egress block in the shared universal sublayer.
         let filter = FWPM_FILTER0 {
             displayData: display,
             layerKey: FWPM_LAYER_ALE_AUTH_CONNECT_V6,
             subLayerKey: FWPM_SUBLAYER_UNIVERSAL,
             action: FWPM_ACTION0 { r#type: FWP_ACTION_BLOCK, ..Default::default() },
+            flags: FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
             filterCondition: conditions.as_mut_ptr(),
             numFilterConditions: 1,
             weight: FWP_VALUE0 {

@@ -81,7 +81,8 @@ impl JsonlLogger {
             Ok(s) => s,
             Err(_) => return,
         };
-        if let Ok(mut buf) = self.buffer.lock() {
+        {
+            let mut buf = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
             buf.push(line);
         }
         self.maybe_flush();
@@ -92,7 +93,8 @@ impl JsonlLogger {
             Ok(s) => s,
             Err(_) => return,
         };
-        if let Ok(mut buf) = self.buffer.lock() {
+        {
+            let mut buf = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
             buf.push(line);
         }
         self.force_flush();
@@ -101,7 +103,10 @@ impl JsonlLogger {
     fn maybe_flush(&self) {
         let mut last = match self.last_flush.try_lock() {
             Ok(l) => l,
-            Err(_) => return,
+            // Recover the guard if a previous holder panicked; only bail when the
+            // lock is genuinely contended (WouldBlock) — flushing isn't critical.
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
         };
         if last.elapsed() < FLUSH_INTERVAL {
             return;
@@ -112,7 +117,8 @@ impl JsonlLogger {
     }
 
     fn force_flush(&self) {
-        if let Ok(mut last) = self.last_flush.lock() {
+        {
+            let mut last = self.last_flush.lock().unwrap_or_else(|p| p.into_inner());
             *last = Instant::now();
         }
         self.do_flush();
@@ -120,10 +126,7 @@ impl JsonlLogger {
 
     fn do_flush(&self) {
         let lines: Vec<String> = {
-            let mut buf = match self.buffer.lock() {
-                Ok(b) => b,
-                Err(_) => return,
-            };
+            let mut buf = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
             std::mem::take(&mut *buf)
         };
         if lines.is_empty() { return; }

@@ -183,6 +183,22 @@ pub(crate) fn passthrough() -> Decision {
     Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None }
 }
 
+/// True iff `dos_path` currently names an existing file that is NOT a reparse
+/// point (no symlink / junction / mount-point / other reparse tag).
+///
+/// Uses `symlink_metadata` (no-follow on Windows) and tests the
+/// `FILE_ATTRIBUTE_REPARSE_POINT` bit, so junctions — which `is_symlink()`
+/// would miss — are rejected too. Used only as defense-in-depth when recording
+/// a CoW source; the binding TOCTOU check is re-done at copy time in the hook.
+fn path_is_plain_file(dos_path: &str) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    match std::fs::symlink_metadata(dos_path) {
+        Ok(md) => md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+        Err(_) => false,
+    }
+}
+
 /// Segment-aware path containment check: returns true iff `path_lower`
 /// equals `root_lower` or is a descendant of it. Prevents the sibling-prefix
 /// bug where naive `starts_with` matches `c:\proj` against `c:\projevil\...`.
@@ -483,7 +499,13 @@ impl Policy {
                 if let Some(ov) = existing_overlay {
                     return Decision { mode: Mode::Cow, overlay: Some(ov), cow_from: None, mock_payload: None };
                 }
-                let cow_from = if write_access && std::path::Path::new(dos_path).exists() {
+                // Defense in depth: only record a CoW source if the path is a
+                // real, non-reparse file *at decision time*. The authoritative
+                // TOCTOU fix lives at the copy site (hook::hooks::prepare_overlay,
+                // src_is_reparse_point) because decision-time is far from
+                // copy-time and the source is attacker-influenceable in between;
+                // this merely avoids ever recording a known-reparse source.
+                let cow_from = if write_access && path_is_plain_file(dos_path) {
                     Some(PathBuf::from(dos_path))
                 } else {
                     None
