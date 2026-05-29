@@ -3,7 +3,7 @@ name = "winrsbox"
 version = "0.1.0"
 edition = "2021"
 description = "Windows filesystem sandbox for AI agents (CoW overlay, ntdll-level hooks)"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/klyde13/winrsbox"
 
 [lib]
