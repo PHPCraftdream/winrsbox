@@ -24,7 +24,7 @@ winrsbox intercepts filesystem, memory, registry, and network operations at the 
 
 ```
 Pre-launch .text scan
-  Process Mitigation Policies (DynamicCode, Signature)
+  Process Mitigation Policies (JIT-safe in full; +DynamicCode/Signature in static)
     ntdll inline hooks (FS, memory, inject, registry, network)
       WFP kernel network filtering (RFC1918 + SMB block)
         Job Object (kill-on-close + memory limits)
@@ -90,8 +90,9 @@ All verified exit=0, violations=0:
 
 | Mode | Flag | Protection |
 |---|---|---|
-| Full | `-g full` (default) | All hooks + kernel mitigations (DynamicCode, Signature) + content scan + DLL scan |
-| Scan | `-g scan` | All hooks + content scan. No kernel mitigations (allows JIT/.NET) |
+| Full | `-g full` (default) | All hooks + content scan + DLL scan + **JIT-safe** kernel mitigations (ASLR, heap-terminate, strict-handle, image-load PreferSystem32/NoRemote, speculative-execution). Does NOT prohibit dynamic code or require signed DLLs, so node/V8/.NET JIT and unsigned native extensions (`.pyd`/`.node`) run. |
+| Scan | `-g scan` | All hooks + content scan. No kernel mitigations beyond image-load. Lightweight (no pre-launch/DLL `.text` scan). |
+| Static | `-g static` | Full + ProhibitDynamicCode + Microsoft-signed-only DLLs. Hard containment that closes the direct-syscall / fresh-ntdll hook-bypass surface — **breaks JIT and unsigned `.pyd`/`.node`**. For pure-static signed targets only. |
 | None | `-g none` | FS sandbox only. No memory/inject/reg/net hooks |
 
 ## Policy (KTAV config)

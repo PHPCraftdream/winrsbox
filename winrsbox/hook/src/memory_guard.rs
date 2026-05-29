@@ -694,7 +694,7 @@ unsafe extern "system" fn hook_nt_map_view_of_section(
                     }
                 }
             }
-            } // is_full_mode
+            } // full || static
         }
     } else {
         // Non-image mapping: block if executable (requested OR actual protection)
