@@ -3,7 +3,7 @@ use hook::process_tracker;
 
 fn bench_is_owned_child_hit(c: &mut Criterion) {
     let pid = 0xFF0001;
-    process_tracker::mark_spawned(pid, 0xFF0000, "c:\\a.exe".into());
+    process_tracker::mark_spawned(pid, 0xFF0000, "c:\\a.exe".into(), 0);
     c.bench_function("process_tracker/is_owned_child_hit", |b| {
         b.iter(|| process_tracker::is_owned_child(black_box(pid)))
     });
@@ -26,6 +26,7 @@ fn bench_mark_spawned(c: &mut Criterion) {
                 black_box(pid),
                 black_box(0xFE000000),
                 black_box("c:\\bench.exe".into()),
+                black_box(0),
             );
         })
     });
@@ -37,7 +38,7 @@ fn bench_mark_spawned(c: &mut Criterion) {
 
 fn bench_parent_of(c: &mut Criterion) {
     let pid = 0xFF0002;
-    process_tracker::mark_spawned(pid, 0xFF0000, "c:\\a.exe".into());
+    process_tracker::mark_spawned(pid, 0xFF0000, "c:\\a.exe".into(), 0);
     c.bench_function("process_tracker/parent_of_hit", |b| {
         b.iter(|| process_tracker::parent_of(black_box(pid)))
     });

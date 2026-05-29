@@ -139,34 +139,26 @@ unsafe fn resolve_dest_path(root: HANDLE, name: &str) -> Option<String> {
 /// `hooks::check_path_traversal` (parent-dir traversal, `.winrsbox` state dir,
 /// GLOBALROOT, 8.3 short-names), applied to the resolved lowercase DOS path.
 fn dest_is_escape(dest_lower: &str) -> bool {
-    // Parent/self traversal — check the RAW path: a segment consisting only of
-    // dots/spaces (`.`, `..`, `...`, `. `) is either traversal or an NTFS
-    // trailing-dot trick. Must run BEFORE strip_trailing_dot_space, which would
-    // collapse `..` into an empty segment and hide it.
-    if dest_lower
+    // Fold `/`→`\` first so separators match the kernel's view (and so a
+    // `/`-separated `..` is caught below). `dest_lower` is already lowercased.
+    let folded = dest_lower.replace('/', "\\");
+    // Parent/self traversal — a segment consisting only of dots/spaces (`.`,
+    // `..`, `...`, `. `) is either traversal or an NTFS trailing-dot trick. Must
+    // run BEFORE strip_trailing_dot_space, which would collapse `..` into an
+    // empty segment and hide it. (This `..` rejection is rename-specific: it
+    // protects the starts_with(sandbox_root) containment below.)
+    if folded
         .split('\\')
         .any(|seg| !seg.is_empty() && seg.bytes().all(|b| b == b'.' || b == b' '))
     {
         return true;
     }
-    // Mirror NTFS per-segment trailing dot/space stripping before substring
-    // checks so `.winrsbox.` cannot slip past `ends_with(r"\.winrsbox")`.
-    let canon = hooks::strip_trailing_dot_space(dest_lower);
-    let canon: &str = canon.as_ref();
-    // GLOBALROOT alternate namespace bypasses the DOS-form classifier.
-    if canon.contains(r"\globalroot\") || canon.contains(r"\??\globalroot") {
-        return true;
-    }
-    // 8.3 short-name (e.g. PROGRA~1) — kernel resolves to a full path, bypassing
-    // the classifier and the CoW overlay. Consistent with the create-side block.
-    if hooks::needs_short_name_resolve(canon) {
-        return true;
-    }
-    // Sandbox state directory must stay invisible and untouchable.
-    if canon.contains(r"\.winrsbox\") || canon.ends_with(r"\.winrsbox") {
-        return true;
-    }
-    false
+    // Shared escape denylist (GLOBALROOT / ADS / 8.3 short-name / .winrsbox) —
+    // single source of truth with the create-side hooks::check_path_traversal,
+    // so the two guards cannot drift. Mirror NTFS per-segment trailing dot/space
+    // stripping first.
+    let canon = hooks::strip_trailing_dot_space(&folded);
+    hooks::canonical_denylist_status(canon.as_ref()).is_some()
 }
 
 // ---------------------------------------------------------------------------

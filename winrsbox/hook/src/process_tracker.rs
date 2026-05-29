@@ -23,11 +23,14 @@ pub struct SpawnedProcess {
     /// creation time for the recycling process, so a mismatch unmasks the
     /// foreign PID.
     ///
-    /// `0` is a sentinel for "creation time unknown" — the transient query
-    /// handle could not be opened at mark time. In that case the verification
-    /// is skipped and `is_owned_child` falls back to membership-only (the PID
-    /// is still treated as owned). This is a deliberate fail-open ONLY for the
-    /// timestamp check; it never grants ownership to an *untracked* PID.
+    /// `0` is a sentinel for "creation time unknown". The fingerprint is now
+    /// captured at the SOURCE via `create_time_from_handle` on the live handle
+    /// returned by NtCreateUserProcess, so a genuinely-spawned child practically
+    /// always carries a non-zero value — and the live re-query verification in
+    /// `is_owned_child` is therefore always engaged, which is what closes the M2
+    /// PID-reuse hole. The `0` → membership-only fallback now covers only the
+    /// degenerate "even the source-handle query failed" case; it never grants
+    /// ownership to an *untracked* PID.
     pub create_time: u64,
 }
 
@@ -120,17 +123,52 @@ pub fn query_process_create_time(pid: u32) -> Option<u64> {
     Some(((create.dwHighDateTime as u64) << 32) | (create.dwLowDateTime as u64))
 }
 
-/// Mark `child_pid` as spawned by `parent_pid` with the given exe path.
+/// Read a live process's creation timestamp (FILETIME packed into u64) directly
+/// from an already-open process handle — no `OpenProcess` round-trip that could
+/// fail. Used at spawn time where we hold the genuine handle returned by
+/// `NtCreateUserProcess`, so the M2 fingerprint is captured at the SOURCE and
+/// the `0` "unknown" sentinel becomes effectively unreachable for real children
+/// (which is what closes the PID-reuse hole: a non-zero stored fingerprint means
+/// `is_owned_child` always performs the live re-query verification). Returns `0`
+/// on failure.
+///
+/// # Safety
+/// `handle` must be either null (→ returns 0) or a valid process handle with
+/// query rights for the duration of the call.
+pub unsafe fn create_time_from_handle(handle: winapi::shared::ntdef::HANDLE) -> u64 {
+    use winapi::shared::minwindef::FILETIME;
+    use winapi::um::processthreadsapi::GetProcessTimes;
+
+    if handle.is_null() {
+        return 0;
+    }
+    let mut create = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let mut exit = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let mut kernel = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let mut user = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+
+    // SAFETY: `handle` is a caller-owned valid process handle (the live handle
+    // from NtCreateUserProcess, or the current-process pseudo-handle). The four
+    // FILETIME out-params are stack-owned and fully initialized; GetProcessTimes
+    // writes only into them and returns non-zero on success.
+    let ok = unsafe {
+        GetProcessTimes(handle, &mut create, &mut exit, &mut kernel, &mut user)
+    };
+    if ok == 0 {
+        return 0;
+    }
+    ((create.dwHighDateTime as u64) << 32) | (create.dwLowDateTime as u64)
+}
+
+/// Mark `child_pid` as spawned by `parent_pid` with the given exe path and the
+/// creation-time fingerprint captured by the caller (see `create_time_from_handle`
+/// — pass the value read from the spawn handle). `0` means "unknown" and falls
+/// back to membership-only ownership in `is_owned_child`.
 /// Honors FS_SANDBOX_NO_TRACK env var (testing aid — simulates external process).
-pub fn mark_spawned(child_pid: u32, parent_pid: u32, exe_path: String) {
+pub fn mark_spawned(child_pid: u32, parent_pid: u32, exe_path: String, create_time: u64) {
     if std::env::var_os("FS_SANDBOX_NO_TRACK").is_some() {
         return;
     }
-    // Fingerprint the PID's creation time so a later PID reuse can be detected
-    // (M2). Query OUTSIDE the map lock to keep the critical section tiny and to
-    // avoid holding the lock across a syscall. `None` → 0 sentinel ("unknown",
-    // verification skipped — see SpawnedProcess::create_time docs).
-    let create_time = query_process_create_time(child_pid).unwrap_or(0);
     with_lock(|m| {
         m.insert(child_pid, SpawnedProcess {
             parent_pid,
@@ -203,7 +241,9 @@ mod tests {
 
     #[test]
     fn mark_and_lookup() {
-        mark_spawned(0x10001, 0x10000, "c:\\a.exe".into());
+        // create_time 0 → membership-only ownership (this test exercises map
+        // mechanics, not the live fingerprint).
+        mark_spawned(0x10001, 0x10000, "c:\\a.exe".into(), 0);
         assert!(is_owned_child(0x10001));
         assert_eq!(parent_of(0x10001), Some(0x10000));
         assert_eq!(info_of(0x10001).unwrap().exe_path, "c:\\a.exe");
@@ -217,7 +257,7 @@ mod tests {
 
     #[test]
     fn untrack_removes_entry() {
-        mark_spawned(0x10002, 0x10000, "c:\\b.exe".into());
+        mark_spawned(0x10002, 0x10000, "c:\\b.exe".into(), 0);
         assert!(is_owned_child(0x10002));
         untrack(0x10002);
         assert!(!is_owned_child(0x10002));
@@ -226,8 +266,8 @@ mod tests {
     #[test]
     fn count_increments() {
         let before = count();
-        mark_spawned(0x10003, 0x10000, "c:\\c.exe".into());
-        mark_spawned(0x10004, 0x10000, "c:\\d.exe".into());
+        mark_spawned(0x10003, 0x10000, "c:\\c.exe".into(), 0);
+        mark_spawned(0x10004, 0x10000, "c:\\d.exe".into(), 0);
         assert!(count() >= before + 2);
         untrack(0x10003);
         untrack(0x10004);
@@ -235,8 +275,8 @@ mod tests {
 
     #[test]
     fn re_mark_overwrites() {
-        mark_spawned(0x10005, 0x10000, "c:\\old.exe".into());
-        mark_spawned(0x10005, 0x10000, "c:\\new.exe".into());
+        mark_spawned(0x10005, 0x10000, "c:\\old.exe".into(), 0);
+        mark_spawned(0x10005, 0x10000, "c:\\new.exe".into(), 0);
         assert_eq!(info_of(0x10005).unwrap().exe_path, "c:\\new.exe");
     }
 
@@ -272,7 +312,12 @@ mod tests {
         // succeeds and stores a non-zero fingerprint, and is_owned_child re-queries
         // the same live PID and the fingerprint matches.
         let self_pid = std::process::id();
-        mark_spawned(self_pid, 0, "self.exe".into());
+        // Source-capture the fingerprint from the current-process handle, the
+        // same way the spawn hook captures it from the live child handle.
+        let ct = unsafe {
+            create_time_from_handle(winapi::um::processthreadsapi::GetCurrentProcess())
+        };
+        mark_spawned(self_pid, 0, "self.exe".into(), ct);
 
         let stored = info_of(self_pid).expect("self pid should be tracked");
         assert_ne!(
@@ -331,7 +376,7 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 let pid = 0x20000 + i;
                 b.wait();
-                mark_spawned(pid, 0x20000, format!("c:\\t{i}.exe"));
+                mark_spawned(pid, 0x20000, format!("c:\\t{i}.exe"), 0);
                 assert!(is_owned_child(pid));
             }));
         }
