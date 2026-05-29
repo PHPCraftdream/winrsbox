@@ -1249,6 +1249,59 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
+// C1/C2 regression — resolved-path denylist catches .winrsbox in joined paths
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod resolved_path_denylist_tests {
+    use super::*;
+
+    #[test]
+    fn resolved_winrsbox_relative_caught() {
+        let joined = r"c:\sandbox\.winrsbox\policy.json";
+        let canon = canonicalize_for_denylist(joined);
+        assert!(
+            canonical_denylist_status(&canon).is_some(),
+            ".winrsbox in resolved DOS path must be denied"
+        );
+    }
+
+    #[test]
+    fn resolved_winrsbox_bare_segment_caught() {
+        let joined = r"c:\sandbox\.winrsbox";
+        let canon = canonicalize_for_denylist(joined);
+        assert!(canonical_denylist_status(&canon).is_some());
+    }
+
+    #[test]
+    fn resolved_normal_path_not_blocked() {
+        let joined = r"c:\sandbox\src\main.rs";
+        let canon = canonicalize_for_denylist(joined);
+        assert!(canonical_denylist_status(&canon).is_none());
+    }
+
+    #[test]
+    fn device_volume_classified_as_harddisk() {
+        let path = r"\device\harddiskvolume3\windows\system32";
+        assert_eq!(
+            policy::dev::classify_device(path),
+            policy::dev::DeviceKind::HarddiskVolume,
+        );
+    }
+
+    #[test]
+    fn device_volume_not_unknown() {
+        let path = r"device\harddiskvolume1\users\test\file.txt";
+        assert!(
+            !matches!(
+                policy::dev::classify_device(path),
+                policy::dev::DeviceKind::Unknown
+            ),
+            "HarddiskVolume must not be Unknown (would be blocked by check_device_block already)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // status_constant_tests — pin canonical NT status codes.
 //
 // These tests catch anyone who accidentally changes the canonical value of a

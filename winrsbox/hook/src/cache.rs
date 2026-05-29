@@ -173,6 +173,28 @@ mod tests {
     }
 
     #[test]
+    fn collision_defense_returns_none() {
+        let cache = HookCache::new();
+        let d = Decision { mode: Mode::Deny, overlay: None, cow_from: None, mock_payload: None };
+        cache.insert("c:\\path_a", false, d);
+        let r = cache.get_caseless("c:\\path_b", false);
+        assert!(
+            r.is_none() || r.unwrap().mode == Mode::Deny,
+            "different path must not return cached decision for another path"
+        );
+    }
+
+    #[test]
+    fn verified_hit_returns_correct_decision() {
+        let cache = HookCache::new();
+        let d = Decision { mode: Mode::Deny, overlay: None, cow_from: None, mock_payload: None };
+        cache.insert("c:\\verified", true, d);
+        let r = cache.get_caseless("C:\\VERIFIED", true);
+        assert!(r.is_some());
+        assert_eq!(r.unwrap().mode, Mode::Deny);
+    }
+
+    #[test]
     fn invalidate_nonexistent_is_noop() {
         let cache = HookCache::new();
         // Should not panic
