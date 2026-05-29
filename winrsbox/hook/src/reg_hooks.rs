@@ -308,6 +308,12 @@ fn log_silent_ok_downgrade(syscall: &str, friendly_key: &str, value_name: Option
 ///                 be readable back). When the read-side lands, this maps
 ///                 back to "route the write to launcher and return SUCCESS".
 /// "passthrough" → call original
+///
+/// Fail-closed: if IPC to the launcher (the only trust boundary) fails or the
+/// response is malformed, return "deny" rather than "passthrough". This matches
+/// the file-system path (`ipc_client::ipc_decide`, which returns Mode::Deny and
+/// self-terminates after repeated IPC failures); a hostile process must not be
+/// able to bypass registry policy by severing the pipe.
 fn check_write_mode(friendly_key: &str, value_name: Option<String>) -> String {
     let req = ipc::Req::RegDecide {
         key_path: friendly_key.to_owned(),
@@ -319,7 +325,7 @@ fn check_write_mode(friendly_key: &str, value_name: Option<String>) -> String {
             return mode;
         }
     }
-    "passthrough".to_string()
+    "deny".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -349,7 +355,19 @@ unsafe extern "system" fn hook_nt_create_key(
     };
 
     if let Some(friendly) = resolve_attrs_friendly(object_attributes as *const _) {
-        let mode = check_write_mode(&friendly, None); if mode.eq_ignore_ascii_case("deny") {
+        let mode = check_write_mode(&friendly, None);
+        if mode.eq_ignore_ascii_case("deny") {
+            if !key_handle.is_null() {
+                *key_handle = std::ptr::null_mut();
+            }
+            return STATUS_ACCESS_DENIED;
+        }
+        if mode.eq_ignore_ascii_case("silent_ok") {
+            // H4-parity: NtCreateKey was the only registry write hook missing the
+            // silent_ok arm, so a silent_ok key creation fell through to the real
+            // syscall. Downgrade to deny (fail-closed) like NtSetValueKey /
+            // NtDeleteValueKey / NtDeleteKey until the read-side overlay lands.
+            log_silent_ok_downgrade("NtCreateKey", &friendly, None);
             if !key_handle.is_null() {
                 *key_handle = std::ptr::null_mut();
             }

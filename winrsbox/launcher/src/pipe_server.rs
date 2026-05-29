@@ -497,7 +497,7 @@ pub(crate) async fn pipe_accept_loop(
             let _permit = permit;
             // SAFETY: ph is the isize repr of the valid pipe handle for this connection.
             let h = HANDLE(ph as *mut _);
-            handle_connection(h, &policy, &stats, &child_pids, &vlog, &hot_stats2, &flusher2);
+            handle_connection(h, client_pid, &policy, &stats, &child_pids, &vlog, &hot_stats2, &flusher2);
             // SAFETY: h — disconnect and close after the connection handler finishes.
             unsafe { DisconnectNamedPipe(h).ok() };
             unsafe { CloseHandle(h).ok() };
@@ -609,8 +609,10 @@ fn is_persistence_denied(key_path: &str) -> bool {
         .any(|s| segment_contains(&lower, s))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_connection(
     handle: HANDLE,
+    client_pid: u32,
     policy: &Policy,
     stats: &Stats,
     child_pids: &crossbeam_queue::SegQueue<u32>,
@@ -641,26 +643,46 @@ fn handle_connection(
 
         let resp = match req {
             Req::Hello { pid, exe_path } => {
-                println!("[sandbox] hello from pid={pid} exe={exe_path}");
+                // SECURITY (audit E1): the `pid` in the Hello is attacker-controlled
+                // (the hook runs inside the untrusted target). Trusting it let a
+                // process claim another — or an unknown — PID, so depth-based
+                // when-filters were evaluated against the wrong context (an unknown
+                // PID resolves to depth=None, which policy treats as max-permissive).
+                // Bind this connection to the kernel-vouched client_pid from
+                // GetNamedPipeClientProcessId; the claimed pid is only logged.
+                if pid != client_pid {
+                    eprintln!(
+                        "[pipe] WARN: Hello pid={pid} != kernel client_pid={client_pid} — \
+                         using client_pid (possible spoof)",
+                    );
+                    stats.violations.fetch_add(1, Ordering::Relaxed);
+                    hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    jsonl_log::log_immediate(jsonl_log::Event::violation(
+                        client_pid,
+                        "HelloPidSpoof",
+                        &format!("claimed_pid={pid}"),
+                    ));
+                }
+                println!("[sandbox] hello from pid={client_pid} exe={exe_path}");
                 hot_stats.totals.hellos.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                jsonl_log::log(jsonl_log::Event::hello(pid, &exe_path));
+                jsonl_log::log(jsonl_log::Event::hello(client_pid, &exe_path));
                 let exe_lower = exe_path.to_ascii_lowercase();
                 let map = crate::global_proc_info().pin();
-                if let Some(existing) = map.get(&pid) {
-                    // Already have entry (e.g., root target) — keep depth, update exe
+                if let Some(existing) = map.get(&client_pid) {
+                    // Already have entry (e.g., root target or SpawnedChild) — keep depth, update exe
                     let updated = crate::ProcInfo {
                         depth: existing.depth,
                         exe_lower: Arc::from(exe_lower.as_str()),
                     };
-                    map.insert(pid, updated);
+                    map.insert(client_pid, updated);
                 } else {
-                    // New process — insert with depth 0 (will be updated by SpawnedChild if child)
-                    map.insert(pid, crate::ProcInfo {
+                    // New process — insert with depth 0 (updated by SpawnedChild if child)
+                    map.insert(client_pid, crate::ProcInfo {
                         depth: 0,
                         exe_lower: Arc::from(exe_lower.as_str()),
                     });
                 }
-                conn_pid = Some(pid);
+                conn_pid = Some(client_pid);
                 Resp::Ok
             }
             Req::SpawnedChild { parent_pid, child_pid, child_exe } => {

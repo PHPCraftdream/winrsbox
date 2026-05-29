@@ -78,6 +78,16 @@ const DANGEROUS_PORT_SUBSTRINGS: &[&str] = &[
     // in earlier audit revert).
 ];
 
+/// Domain cap for the attacker-controlled `UNICODE_STRING.Length` on the ALPC
+/// port name. ALPC port names are short object-manager paths (e.g.
+/// `\RPC Control\epmapper`), so 1024 WCHARs is well above any legitimate name.
+/// `Length` is a u16 the *target process* (the adversary) fully controls — up
+/// to 65534 bytes / 32767 chars. A large value combined with a small `Buffer`
+/// allocation would make `from_raw_parts` read out of bounds. Above this cap we
+/// treat the name as unresolvable and fall through to the original (we never
+/// deny on it — that could break legit ALPC; we only refuse the oversized read).
+const MAX_PORT_NAME_CHARS: usize = 1024;
+
 fn is_dangerous_port(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     // Get last path segment (after final \ or /) so that "ole" in
@@ -117,11 +127,30 @@ unsafe extern "system" fn hook_nt_alpc_connect_port(
     };
 
     if !port_name.is_null() {
-        // SAFETY: deref of non-null UNICODE_STRING pointer — ntdll guarantees validity on entry.
+        // SAFETY: deref of the non-null UNICODE_STRING pointer the kernel ABI
+        // hands us. The caller is the (possibly hostile) target process, so
+        // every field below is treated as adversary-controlled and validated
+        // before any read derived from it.
         let ustr = &*port_name;
         let char_count = (ustr.Length / 2) as usize;
-        if char_count > 0 && !ustr.Buffer.is_null() {
-            // SAFETY: from_raw_parts for char_count WCHARs from UNICODE_STRING.Buffer; Length bounds the region.
+        // Length must not exceed MaximumLength for a well-formed UNICODE_STRING.
+        // If it does, the struct is inconsistent / hostile — treat the name as
+        // unresolvable. (MaximumLength is also a byte count; /2 → WCHARs.)
+        let max_chars = (ustr.MaximumLength / 2) as usize;
+        let consistent = ustr.MaximumLength == 0 || char_count <= max_chars;
+        // Cap char_count to a sane domain maximum for ALPC port names so an
+        // attacker-controlled Length pointing past a small Buffer allocation
+        // can't drive an out-of-bounds read. Over the cap or inconsistent →
+        // fall through to the normal "can't classify → call original" path.
+        if char_count > 0
+            && char_count <= MAX_PORT_NAME_CHARS
+            && consistent
+            && !ustr.Buffer.is_null()
+        {
+            // SAFETY: char_count is non-zero, <= MAX_PORT_NAME_CHARS, <=
+            // MaximumLength, and Buffer is non-null. We do NOT assume ntdll
+            // guarantees Buffer spans Length bytes — the bound above caps the
+            // read to the small domain maximum for object-manager port names.
             let name_slice = std::slice::from_raw_parts(ustr.Buffer, char_count);
             let name = String::from_utf16_lossy(name_slice);
             if is_dangerous_port(&name) {

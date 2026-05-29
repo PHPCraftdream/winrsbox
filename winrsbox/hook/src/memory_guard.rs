@@ -676,20 +676,38 @@ unsafe extern "system" fn hook_nt_map_view_of_section(
             if is_full_mode() || is_static_mode() {
             if let Some(full_path) = get_mapped_file_path(mapped_base) {
                 if !is_system_dll_path(&full_path) {
-                    // Read PE headers from the mapped image
-                    let header_slice = std::slice::from_raw_parts(mapped_base as *const u8, 4096);
-                    if let Some(text) = policy::scan::pe_text_section(header_slice) {
-                        let text_addr = (mapped_base as usize + text.virtual_address as usize) as *const u8;
-                        let scan_size = (text.virtual_size as usize).min(64 * 1024 * 1024);
-                        let text_slice = std::slice::from_raw_parts(text_addr, scan_size);
-                        let hits = policy::scan::find_direct_syscalls(text_slice, text_addr as u64);
-                        if !hits.is_empty() {
-                            let unmap = unmap_section_original_pub();
-                            if let Some(unmap_fn) = unmap {
-                                unmap_fn(-1isize as HANDLE, mapped_base);
+                    // Bound every read to the actual mapped view. The PE header
+                    // fields (virtual_address / virtual_size) are attacker-
+                    // influenced for a manually-built section, so reading a flat
+                    // 4 KiB header or `mapped_base + virtual_address` for
+                    // `virtual_size` bytes could run past the mapping → OOB read /
+                    // crash. Clamp to *view_size (the kernel-reported mapped size).
+                    let view_bytes = if view_size.is_null() { 0usize } else { *view_size };
+                    let header_len = view_bytes.min(4096);
+                    if header_len >= 64 {
+                        let header_slice = std::slice::from_raw_parts(mapped_base as *const u8, header_len);
+                        if let Some(text) = policy::scan::pe_text_section(header_slice) {
+                            let va = text.virtual_address as usize;
+                            // Skip if the section claims to start at/after the view end.
+                            if va < view_bytes {
+                                let avail = view_bytes - va;
+                                let scan_size = (text.virtual_size as usize)
+                                    .min(avail)
+                                    .min(64 * 1024 * 1024);
+                                if scan_size > 0 {
+                                    let text_addr = (mapped_base as usize + va) as *const u8;
+                                    let text_slice = std::slice::from_raw_parts(text_addr, scan_size);
+                                    let hits = policy::scan::find_direct_syscalls(text_slice, text_addr as u64);
+                                    if !hits.is_empty() {
+                                        let unmap = unmap_section_original_pub();
+                                        if let Some(unmap_fn) = unmap {
+                                            unmap_fn(-1isize as HANDLE, mapped_base);
+                                        }
+                                        let size = if view_size.is_null() { 0 } else { *view_size as u64 };
+                                        report_and_terminate(ipc::AllocKind::MapView, win32_protect, size, mapped_base as u64);
+                                    }
+                                }
                             }
-                            let size = if view_size.is_null() { 0 } else { *view_size as u64 };
-                            report_and_terminate(ipc::AllocKind::MapView, win32_protect, size, mapped_base as u64);
                         }
                     }
                 }

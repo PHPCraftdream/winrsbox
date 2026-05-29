@@ -4,10 +4,10 @@ use ntapi::winapi::shared::ntdef::HANDLE;
 fn bench_is_self_process(c: &mut Criterion) {
     let mut g = c.benchmark_group("inject_guard");
     g.bench_function("is_self_process_pseudo", |b| {
-        b.iter(|| hook::inject_guard::is_self_process(black_box(-1isize as HANDLE)))
+        b.iter(|| unsafe { hook::inject_guard::is_self_process(black_box(-1isize as HANDLE)) })
     });
     g.bench_function("is_self_process_null", |b| {
-        b.iter(|| hook::inject_guard::is_self_process(black_box(std::ptr::null_mut())))
+        b.iter(|| unsafe { hook::inject_guard::is_self_process(black_box(std::ptr::null_mut())) })
     });
     g.finish();
 }
@@ -35,10 +35,10 @@ fn bench_thread_owner_pid(c: &mut Criterion) {
     let mut g = c.benchmark_group("inject_guard");
     g.bench_function("thread_owner_pid_current", |b| {
         // NtCurrentThread pseudo-handle = (HANDLE)-2
-        b.iter(|| hook::inject_guard::thread_owner_pid(black_box(-2isize as HANDLE)))
+        b.iter(|| unsafe { hook::inject_guard::thread_owner_pid(black_box(-2isize as HANDLE)) })
     });
     g.bench_function("thread_owner_pid_null", |b| {
-        b.iter(|| hook::inject_guard::thread_owner_pid(black_box(std::ptr::null_mut())))
+        b.iter(|| unsafe { hook::inject_guard::thread_owner_pid(black_box(std::ptr::null_mut())) })
     });
     g.finish();
 }

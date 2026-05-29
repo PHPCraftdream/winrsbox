@@ -265,23 +265,37 @@ pub(crate) fn shell_deny_reason(file: &str, params: &str) -> Option<&'static str
 // buffer that hits the cap.
 //
 // # SAFETY
-// `p` must either be null OR point to a valid null-terminated UTF-16 buffer
-// (the standard Win32 LPCWSTR contract). Caller is responsible for ensuring
-// the pointer is valid for at least until the null terminator or until
-// `MAX_TARGET_CHARS` code units have been read.
+// `p` originates from the (possibly hostile) target process and is therefore
+// NOT trusted to be valid: it may be null, unmapped, or point at a buffer that
+// is not null-terminated within the inspected range. This function never
+// assumes validity — it null-checks, probes readability via `VirtualQuery`
+// before any dereference, and bounds the terminator scan at `MAX_TARGET_CHARS`.
+// A wild/unmapped pointer yields `None` (caller treats it as an absent string).
+// Note: `VirtualQuery` narrows but cannot fully close the TOCTOU window (the
+// target could unmap the page after the probe); this is best-effort
+// defense-in-depth, and a hostile process can always crash its own hook.
 // ---------------------------------------------------------------------------
 
 unsafe fn read_lpcwstr(p: *const u16) -> Option<String> {
     if p.is_null() {
         return None;
     }
+    // Cheap readability pre-check: a hostile target can hand us a wild pointer.
+    // Mirror the `VirtualQuery` probe used in memory_guard — confirm the first
+    // code unit lives in a committed, non-NOACCESS, non-GUARD page before we
+    // dereference. This avoids page-faulting on an obviously-bad pointer while
+    // keeping the bounded scan below as the length guard.
+    if !is_ptr_readable(p as *const c_void) {
+        return None;
+    }
     // Locate the null terminator with a bounded scan.
     let mut len = 0usize;
     while len < MAX_TARGET_CHARS {
-        // SAFETY: `p` is non-null per check above; caller contract guarantees
-        // readability up to and including the null terminator (or, if the
-        // buffer is improperly terminated, up to the cap — at which point we
-        // bail out conservatively).
+        // SAFETY: `p` is non-null (checked above) and its first page passed the
+        // `VirtualQuery` readability probe. The target is untrusted, so this is
+        // best-effort: the scan is capped at `MAX_TARGET_CHARS` and we bail out
+        // conservatively (treating the string as absent) if no terminator is
+        // found within the cap.
         if *p.add(len) == 0 {
             break;
         }
@@ -290,10 +304,43 @@ unsafe fn read_lpcwstr(p: *const u16) -> Option<String> {
     if len == 0 {
         return None;
     }
-    // SAFETY: We have just verified `len` < MAX_TARGET_CHARS and that each of
-    // the first `len` code units is non-zero and within the readable range.
+    // SAFETY: `len` < MAX_TARGET_CHARS and each of the first `len` code units
+    // was just dereferenced (non-zero) during the scan above starting from a
+    // pointer whose first page passed the readability probe.
     let slice = std::slice::from_raw_parts(p, len);
     Some(String::from_utf16_lossy(slice))
+}
+
+/// Best-effort readability probe for an attacker-supplied pointer. Returns
+/// `true` only when `VirtualQuery` reports the address lives in a committed
+/// page that is neither `PAGE_NOACCESS` nor a `PAGE_GUARD` page (a guard-page
+/// touch would also fault). `VirtualQuery` is safe to call on any address and
+/// returns 0 on failure. This narrows — but cannot fully eliminate — the chance
+/// of faulting on a wild pointer from a hostile target (a TOCTOU unmap after
+/// the probe is still possible); it is defense-in-depth, not a guarantee.
+fn is_ptr_readable(addr: *const c_void) -> bool {
+    if addr.is_null() {
+        return false;
+    }
+    // PAGE_NOACCESS (0x01) and PAGE_GUARD (0x100) both make a read fault.
+    const PAGE_NOACCESS: u32 = 0x01;
+    const PAGE_GUARD: u32 = 0x100;
+    // SAFETY: VirtualQuery accepts any address and writes only into our
+    // stack-local MEMORY_BASIC_INFORMATION; it returns 0 on failure.
+    unsafe {
+        let mut mbi: winapi::um::winnt::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        let ret = winapi::um::memoryapi::VirtualQuery(
+            addr,
+            &mut mbi,
+            std::mem::size_of::<winapi::um::winnt::MEMORY_BASIC_INFORMATION>(),
+        );
+        if ret == 0 {
+            return false;
+        }
+        mbi.State == winapi::um::winnt::MEM_COMMIT
+            && (mbi.Protect & PAGE_NOACCESS) == 0
+            && (mbi.Protect & PAGE_GUARD) == 0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -443,16 +490,30 @@ unsafe extern "system" fn hook_shell_execute_ex_w(
         // Bytes the caller must have allocated for a write of `hInstApp` to be
         // in-bounds: through the end of the field.
         let hinstapp_end = HINSTAPP_OFFSET + core::mem::size_of::<HINSTANCE>();
+        // Bytes that must be present before we may read the prefix fields we
+        // inspect. `lpParameters` is the last field we read, so its end is the
+        // minimum struct size required for our reads to be in-bounds.
+        const LPPARAMETERS_OFFSET: usize = core::mem::offset_of!(SHELLEXECUTEINFOW, lpParameters);
+        let lpparameters_end = LPPARAMETERS_OFFSET + core::mem::size_of::<*const u16>();
         let cbsize_ok_for_full_struct = cb_size >= core::mem::size_of::<SHELLEXECUTEINFOW>();
         let cbsize_ok_for_hinstapp_write = cb_size >= hinstapp_end;
 
-        // SAFETY: `p_exec_info` is non-null and the caller contract guarantees
-        // the declared `cbSize` bytes are initialized & readable. We only read
-        // the prefix fields up to `lpParameters`; if `cbSize` is too small to
-        // even contain those, the reads below could touch uninitialized/OOB
-        // memory — but `lpParameters` lives well before `hInstApp`, so any
-        // struct large enough to be a valid ShellExecuteExW call covers them.
-        // The denylist/Unicode/params decision itself never writes the struct.
+        // The target controls `cbSize`. If it declares a struct too small to
+        // even contain the fields we inspect (`lpFile`/`lpParameters`), reading
+        // those fields would touch memory past the caller's allocation. We
+        // cannot inspect such a call, so fall through to the original — the
+        // documented "can't inspect → call original" path. (We never deny on a
+        // pointer we couldn't safely read; the real ShellExecuteExW will reject
+        // a malformed `cbSize` itself.)
+        if cb_size < lpparameters_end {
+            return call_original();
+        }
+
+        // SAFETY: `p_exec_info` is non-null (checked above) and `cb_size` is at
+        // least `lpparameters_end`, so the prefix fields up to and including
+        // `lpParameters` lie within the caller-declared (and per the ABI
+        // contract, initialized) allocation. We only read those prefix fields;
+        // the denylist/Unicode/params decision itself never writes the struct.
         let info_ref = &*p_exec_info;
         let file_str = read_lpcwstr(info_ref.lpFile).unwrap_or_default();
         let params_str = read_lpcwstr(info_ref.lpParameters).unwrap_or_default();
