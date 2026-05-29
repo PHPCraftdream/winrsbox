@@ -81,7 +81,20 @@ mod tests {
     fn edge_cases() {
         assert!(!is_sensitive("COMPUTERNAME"));
         assert!(!is_sensitive("NUMBER_OF_PROCESSORS"));
-        assert!(is_sensitive("STRIPE_SECRET_KEY"));
-        assert!(is_sensitive("JWT_SECRET"));
+    }
+
+    #[test]
+    fn allowlist_blocks_unknown_vars() {
+        assert!(is_sensitive("REDIS_URL"));
+        assert!(is_sensitive("MY_LICENSE_KEY"));
+        assert!(is_sensitive("MONGO_URI"));
+        assert!(is_sensitive("RANDOM_THING"));
+    }
+
+    #[test]
+    fn sandbox_prefixes_always_kept() {
+        assert!(!is_sensitive("FS_SANDBOX_PIPE"));
+        assert!(!is_sensitive("FS_SANDBOX_CWD"));
+        assert!(!is_sensitive("WINRSBOX_CUSTOM"));
     }
 }

@@ -581,3 +581,35 @@ pub unsafe fn uninstall() {
     if let Some(h) = HOOK_OPEN_PROC_TOKEN.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_ADJUST_PRIV.get() { let _ = h.disable(); }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_dangerous_includes_maximum_allowed() {
+        assert_ne!(TOKEN_DANGEROUS_ACCESS & 0x0200_0000, 0);
+    }
+
+    #[test]
+    fn token_dangerous_includes_generic_all() {
+        assert_ne!(TOKEN_DANGEROUS_ACCESS & 0x1000_0000, 0);
+    }
+
+    #[test]
+    fn thread_token_dangerous_includes_maximum_allowed() {
+        assert_ne!(THREAD_TOKEN_DANGEROUS & 0x0200_0000, 0);
+    }
+
+    #[test]
+    fn thread_token_dangerous_includes_generic_all() {
+        assert_ne!(THREAD_TOKEN_DANGEROUS & 0x1000_0000, 0);
+    }
+
+    #[test]
+    fn token_dangerous_includes_core_bits() {
+        assert_ne!(TOKEN_DANGEROUS_ACCESS & 0x0001, 0, "TOKEN_ASSIGN_PRIMARY");
+        assert_ne!(TOKEN_DANGEROUS_ACCESS & 0x0002, 0, "TOKEN_DUPLICATE");
+        assert_ne!(TOKEN_DANGEROUS_ACCESS & 0x0004, 0, "TOKEN_IMPERSONATE");
+    }
+}

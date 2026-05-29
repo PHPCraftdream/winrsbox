@@ -717,4 +717,46 @@ mod tests {
         // Network — handled by WFP, not here.
         assert!(!is_winrt_class_denied("Windows.Networking.Sockets.StreamSocket"));
     }
+
+    // ── CLSID denylist coverage ─────────────────────────────────────────────
+
+    #[test]
+    fn clsid_denylist_count_pinned() {
+        assert_eq!(CLSID_DENYLIST.len(), 17);
+    }
+
+    #[test]
+    fn clsid_mmc20_application_denied() {
+        let clsid = guid(0x49B2791A, 0xB1AE, 0x4C90, [0x9B,0x8E,0xE8,0x60,0xBA,0x07,0xF8,0x89]);
+        assert_eq!(check_denylist(&clsid), Some("MMC20.Application"));
+    }
+
+    #[test]
+    fn clsid_shell_browser_window_denied() {
+        let clsid = guid(0xC08AFD90, 0xF2A1, 0x11D1, [0x84,0x55,0x00,0xA0,0xC9,0x1F,0x38,0x80]);
+        assert_eq!(check_denylist(&clsid), Some("ShellBrowserWindow"));
+    }
+
+    #[test]
+    fn clsid_script_control_denied() {
+        let clsid = guid(0x0E59F1D5, 0x1FBE, 0x11D0, [0x8F,0xF2,0x00,0xA0,0xD1,0x00,0x38,0xBC]);
+        assert_eq!(check_denylist(&clsid), Some("ScriptControl"));
+    }
+
+    #[test]
+    fn clsid_internet_explorer_denied() {
+        let clsid = guid(0x0002DF01, 0x0000, 0x0000, [0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46]);
+        assert_eq!(check_denylist(&clsid), Some("InternetExplorer.Application"));
+    }
+
+    #[test]
+    fn clsid_benign_not_denied() {
+        let clsid = guid(0xDEADBEEF, 0x1234, 0x5678, [0x9A,0xBC,0xDE,0xF0,0x12,0x34,0x56,0x78]);
+        assert_eq!(check_denylist(&clsid), None);
+    }
+
+    #[test]
+    fn clsid_null_not_denied() {
+        assert_eq!(check_denylist(std::ptr::null()), None);
+    }
 }

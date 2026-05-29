@@ -1171,4 +1171,23 @@ mod tests {
             }
         }
     }
+
+    // ── M4: MAXIMUM_ALLOWED / GENERIC_ALL mask coverage ─────────────────────
+
+    #[test]
+    fn dangerous_access_includes_maximum_allowed() {
+        assert_ne!(DANGEROUS_ACCESS & 0x0200_0000, 0, "MAXIMUM_ALLOWED must be in DANGEROUS_ACCESS");
+    }
+
+    #[test]
+    fn dangerous_access_includes_generic_all() {
+        assert_ne!(DANGEROUS_ACCESS & 0x1000_0000, 0, "GENERIC_ALL must be in DANGEROUS_ACCESS");
+    }
+
+    #[test]
+    fn dangerous_access_still_includes_specific_bits() {
+        assert_ne!(DANGEROUS_ACCESS & 0x0002, 0, "PROCESS_CREATE_THREAD");
+        assert_ne!(DANGEROUS_ACCESS & 0x0020, 0, "PROCESS_VM_WRITE");
+        assert_ne!(DANGEROUS_ACCESS & 0x0040, 0, "PROCESS_DUP_HANDLE");
+    }
 }
