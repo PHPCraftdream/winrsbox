@@ -169,16 +169,46 @@ macro_rules! assert_alive {
     }};
 }
 
-#[test] #[serial] fn strict_kills_alloc_rwx()      { assert_killed!("escape_alloc_rwx", "Allocate"); }
+// escape_alloc_rwx does a RWX-DIRECT NtAllocate (no W^X transition) — the one
+// pattern that evades the NtProtect content-scan. Per the M4 tier split this is
+// blunt-killed ONLY under `static` (hard containment); `full`/`scan` allow it so
+// RWX-direct JIT (node/V8 — see real-world claude.cmd) works.
+#[test] #[serial]
+fn static_kills_alloc_rwx() {
+    let r = run_payload("escape_alloc_rwx", "static");
+    assert!(!r.status.success(),
+        "escape_alloc_rwx should be killed under static\nstderr: {}", r.stderr);
+    let v = r.read_violations();
+    assert!(v.contains("Allocate"),
+        "escape_alloc_rwx under static: violations should contain Allocate\nlog: {}\nstderr: {}", v, r.stderr);
+}
+
+#[test] #[serial]
+fn full_allows_alloc_rwx_for_jit() {
+    // M4 acceptance: full mode is JIT-safe. A bare RWX-direct allocation (as
+    // node/V8 performs) must NOT be killed under full — that was breaking
+    // claude.cmd / every node-based tool. Containment for full rests on the
+    // ntdll hooks + NtProtect content-scan, not a blunt RWX-direct kill.
+    let r = run_payload("escape_alloc_rwx", "full");
+    assert!(r.status.success() || r.status.code() == Some(0),
+        "escape_alloc_rwx should run under full (JIT-safe)\nexit={:?}\nstdout: {}\nstderr: {}",
+        r.status.code(), r.stdout, r.stderr);
+    let v = r.read_violations();
+    assert!(v.is_empty(),
+        "escape_alloc_rwx under full: no violation expected (JIT-safe)\nlog: {}", v);
+}
+
 #[test] #[serial] fn strict_kills_jit_protect()    { assert_killed!("escape_jit_protect", "Protect"); }
 #[test] #[serial] fn strict_kills_heap_to_exec()   { assert_killed!("escape_heap_to_exec", "Protect"); }
 #[test] #[serial] fn strict_kills_stack_exec()     { assert_killed!("escape_stack_exec", "Protect"); }
 #[test]
 #[serial]
 fn strict_kills_map_anon_rwx() {
-    // Under full guard, kernel's DynamicCodePolicy blocks at kernel level — no
-    // violation IPC (our hook sees the NtMapViewOfSection fail). Under scan, our
-    // user-mode hook catches it.
+    // Run under scan: our user-mode NtMapViewOfSection hook catches the
+    // anonymous RWX section map regardless of tier. (Post-M4 note: full no
+    // longer carries the kernel DynamicCodePolicy — that moved to static — so
+    // this exercises the user-mode MapView path directly, which is what we
+    // want to pin.)
     let r = run_payload("escape_map_anon_rwx", "scan");
     assert!(!r.status.success(), "escape_map_anon_rwx should have been killed\nexit={:?}\nstdout: {}\nstderr: {}", r.status.code(), r.stdout, r.stderr);
     let v = r.read_violations();
@@ -377,17 +407,20 @@ fn wfp_blocks_rfc1918() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Kernel: ProcessDynamicCodePolicy (full mode)
+// Kernel: ProcessDynamicCodePolicy (static mode only)
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
 #[serial]
-fn kernel_blocks_dynamic_code_full() {
-    let r = run_payload("escape_dynamic_code", "full");
-    // Under full: kernel returns error, payload exits non-zero with error code.
-    // Under our user-mode: terminate with 0xC0000005.
+fn static_blocks_dynamic_code() {
+    // escape_dynamic_code does a bare VirtualAlloc(PAGE_EXECUTE_READWRITE) —
+    // RWX-direct. Per the M4 tier split this is blocked ONLY under `static`
+    // (our memory_guard NtAllocate hook terminates with 0xC0000005, and the
+    // kernel's runtime ProcessDynamicCodePolicy would also refuse it). Under
+    // `full`/`scan` it's allowed so RWX-direct JIT works.
+    let r = run_payload("escape_dynamic_code", "static");
     assert!(!r.status.success(),
-        "dynamic code should be blocked under full guard\nexit={:?}\nstderr: {}", r.status.code(), r.stderr);
+        "dynamic code should be blocked under static guard\nexit={:?}\nstderr: {}", r.status.code(), r.stderr);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
