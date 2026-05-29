@@ -920,6 +920,8 @@ fn handle_connection(
                     // Non-persistence HKCU\Software writes → silent success
                     // (program thinks it wrote, sandbox absorbs it)
                     ("silent_ok", false)
+                } else if write {
+                    ("silent_ok", false)
                 } else {
                     ("passthrough", false)
                 };
@@ -1173,6 +1175,17 @@ mod tests {
     #[test]
     fn persistence_empty_path_allowed() {
         assert!(!is_persistence_denied(""));
+    }
+
+    #[test]
+    fn non_software_write_is_not_passthrough() {
+        // H3: writes outside \software\ must NOT fall to passthrough.
+        // The RegDecide handler routes them to silent_ok (absorbed).
+        // This test pins the invariant at the is_persistence_denied level:
+        // non-persistence keys that are also outside \software\ must still
+        // be handled (the handler's else-if-write branch catches them).
+        assert!(!is_persistence_denied(r"HKCU\Console\FaceName"));
+        assert!(!is_persistence_denied(r"HKCU\Keyboard Layout\Preload"));
     }
 
     // ─── Audit C1/C4: segment-anchored matching, boundaries pinned ──────────

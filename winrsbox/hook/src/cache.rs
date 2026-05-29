@@ -6,7 +6,7 @@ use policy::Decision;
 use quick_cache::sync::Cache;
 
 pub struct HookCache {
-    inner: Cache<u64, Decision>,
+    inner: Cache<u64, (String, bool, Decision)>,
 }
 
 impl HookCache {
@@ -53,7 +53,11 @@ impl HookCache {
     }
 
     pub fn insert(&self, dos_lower: &str, write: bool, decision: Decision) {
-        self.inner.insert(Self::key(dos_lower, write), decision);
+        let normalized = Self::ascii_lower(dos_lower);
+        self.inner.insert(
+            Self::key(dos_lower, write),
+            (normalized, write, decision),
+        );
     }
 
     pub fn invalidate(&self, dos_lower: &str) {
@@ -63,10 +67,21 @@ impl HookCache {
 
     /// Compute cache key from a str that may be mixed-case: lowercases per byte
     /// (ASCII only — Windows paths are ASCII in the overwhelming majority of cases)
-    /// without allocating a String.
+    /// without allocating a String. Verifies the stored key matches on hit to
+    /// defend against hash collisions (xxh3 is not collision-resistant).
     pub fn get_caseless(&self, path: &str, write: bool) -> Option<Decision> {
         let k = Self::caseless_key(path, write);
-        self.inner.get(&k)
+        let (stored_path, stored_write, decision) = self.inner.get(&k)?;
+        let path_lower = Self::ascii_lower(path);
+        if stored_path == path_lower && stored_write == write {
+            Some(decision)
+        } else {
+            None
+        }
+    }
+
+    fn ascii_lower(s: &str) -> String {
+        s.as_bytes().iter().map(|b| b.to_ascii_lowercase() as char).collect()
     }
 }
 
