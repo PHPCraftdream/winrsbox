@@ -882,7 +882,7 @@ fn apply_mitigations(guard: &str) {
     }
 
     // ImageLoadPolicy (10): PreferSystem32Images + NoRemoteImages.
-    // Applied in both scan and full mode — DLL sideloading via CWD/PATH hijack
+    // Applied in all enforcing tiers (scan/full/static) — DLL sideloading via CWD/PATH hijack
     // is a critical sandbox-escape vector that affects all profiles.
     // Safe to apply after hook installation: hook.dll is already loaded,
     // and PreferSystem32Images only affects *subsequent* LoadLibrary calls.

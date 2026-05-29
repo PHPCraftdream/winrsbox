@@ -86,9 +86,12 @@ struct Cli {
     init: bool,
 
     /// Memory protection level.
-    ///   none  — no memory protection (FS sandbox only)
-    ///   scan  — content-aware: scan executable bytes for direct syscalls
-    ///   full  — scan + pre-launch .text scan + DLL scan (default)
+    ///   none   — no memory protection (FS sandbox only)
+    ///   scan   — content-aware: scan executable bytes for direct syscalls
+    ///   full   — scan + pre-launch .text scan + DLL scan + JIT-safe kernel
+    ///            mitigations (default; node/python/JIT runtimes work)
+    ///   static — full + ProhibitDynamicCode + signed-only DLLs (hard
+    ///            containment; breaks JIT and unsigned .pyd/.node)
     #[arg(short = 'g', long = "guard", default_value = "full", value_name = "LEVEL")]
     guard: GuardLevel,
 
@@ -103,7 +106,8 @@ struct Cli {
     no_pre_scan: bool,
 
     /// Disable specific hook categories for debugging (comma-separated).
-    /// Categories: memory, inject, reg, net, link, alpc, token, mitigations, fs, ui.
+    /// Categories: fs, memory, inject, reg, net, alpc, token, ui, proc, com,
+    ///             service, shell, system, mitigations.
     /// Example: --disable-hooks inject,mitigations
     #[arg(long = "disable-hooks", value_name = "CATEGORIES")]
     disable_hooks: Option<String>,

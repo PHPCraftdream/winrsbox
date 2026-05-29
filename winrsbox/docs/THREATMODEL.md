@@ -3,7 +3,8 @@
 winrsbox sandboxes AI coding agents (Claude Code, etc.) and compilers on Windows.
 This document describes what we protect against, what we don't, and known gaps.
 
-Last updated: `8de757f` (2026-05-26).
+Last updated for the M4 four-tier guard model (`none`/`scan`/`full`/`static`);
+see "Tier model & limitations". Prior baseline: `8de757f` (2026-05-26).
 
 ## What's new since `ac0387a`
 
@@ -260,11 +261,15 @@ executable memory before they can run.
 (.text section scan for user DLLs), NtAllocateVirtualMemory (foreign-process
 exec alloc), NtWriteVirtualMemory (foreign-process write scan).
 
-**Pre-launch**: .text section of target exe scanned before resume (full mode).
+**Pre-launch**: .text section of target exe scanned before resume (full/static).
 
 ### RWX / JIT abuse
-- **Full mode**: kernel `ProcessDynamicCodePolicy` blocks all RWX allocation.
-- **Scan mode**: RWX allowed (for CLR/V8 JIT), content scanned on RX transition.
+- **Static mode**: kernel `ProcessDynamicCodePolicy` + our memory_guard blunt-kill
+  block RWX-direct allocation outright. Breaks JIT — for pure-static targets.
+- **Full / Scan mode** (default): RWX-direct allocation is ALLOWED so JIT runtimes
+  (node/V8, .NET CLR) work. The W^X JIT path (RW→RX transition) is content-scanned
+  for direct syscalls on every transition. RWX-direct (no transition) is the
+  residual gap — see "Known limitations / tier model" below.
 
 ### Registry persistence vectors
 
@@ -313,8 +318,15 @@ false-positives that plagued the old substring match are eliminated).
 - **Job Object**: `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` + optional memory limits.
 - **Job breakaway**: `BREAKAWAY_OK` and `SILENT_BREAKAWAY_OK` explicitly UNSET.
   `NtAssignProcessToJobObject` unconditionally denied by `proc_guard`.
-- **Process Mitigation Policies** (full mode): `ProcessDynamicCodePolicy`,
-  `ProcessSignaturePolicy` (MS-signed DLLs only), `ExtensionPointDisablePolicy`.
+- **Process Mitigation Policies**:
+  - full + static: `ExtensionPointDisablePolicy`, `ImageLoadPolicy`
+    (PreferSystem32 + NoRemote), ASLR/heap-terminate/strict-handle, and the v2
+    speculative-execution bits — all JIT-safe.
+  - static only: `ProcessDynamicCodePolicy` + `ProcessSignaturePolicy`
+    (MS-signed DLLs only). These break JIT/unsigned native code, so they are
+    NOT in full. hook.dll is unsigned → `BlockNonMicrosoft`+`ProhibitDynamicCode`
+    are stripped from the create-time bitmap and re-applied at runtime
+    (`hook::apply_mitigations`) after detours install.
 
 ### DLL sideloading mitigation
 
@@ -377,11 +389,14 @@ Mitigated by WFP kernel filtering below user-mode.
 |---|---|---|
 | Pre-launch .text scan | `iced-x86` disassembly before resume | Compile-time `syscall`/`sysenter`/`int 2eh` |
 | Content-aware RX scan | Disassembly on RW->RX transition | Runtime-generated shellcode |
-| Process Mitigation Policies | `PROHIBIT_DYNAMIC_CODE_ALWAYS_ON` + `BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON` | Prevents new executable memory (kernel-enforced) |
+| Process Mitigation Policies (static only) | `PROHIBIT_DYNAMIC_CODE_ALWAYS_ON` + `BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON` | Prevents new executable memory (kernel-enforced) |
 
-**Remaining gap**: Hell's Gate variant that resolves SSN at runtime into
-dynamic memory. DynamicCodePolicy blocks this (full mode); scan mode accepts
-the risk for JIT compat (content-aware RX scan still active).
+**Remaining gap**: a Hell's-Gate-style variant that resolves the SSN at runtime
+and runs from RWX-direct memory (allocated executable, never transitioned, so
+the RW→RX content scan never sees it). `static` mode blocks this
+(DynamicCodePolicy + the memory_guard RWX-direct kill). **`full` and `scan`
+accept this risk** for JIT compatibility (the RW→RX content scan still catches
+the W^X JIT path). See "Known limitations / tier model" below.
 
 **Future work**: `Microsoft-Windows-Threat-Intelligence` ETW provider subscription
 when elevated launcher infrastructure exists.
@@ -390,13 +405,43 @@ when elevated launcher infrastructure exists.
 
 | Gap | Severity | Status |
 |---|---|---|
-| Runtime SSN-resolved direct syscall in scan mode | Low | Accepted: DynamicCodePolicy off for JIT; RX content scan still active |
+| RWX-direct + runtime-SSN direct syscall in full/scan | Medium | Accepted for the default (JIT) tiers: DynamicCode/RWX-kill off so node/V8 work; RW→RX content scan still active. Closed by `-g static` (no JIT). See "Tier model & limitations". |
 | ETW TI not subscribed (requires admin) | Low | Deferred: scoring infra ready, needs elevated launcher |
 | Direct AFD IOCTL bypasses ws2_32 hook | Low | Mitigated: WFP kernel-level enforcement |
 | ALPC direct LRPC bypass (hand-crafted port name) | Low | Residual: 18 patterns cover known services; arbitrary hand-crafted port names not covered |
 | Registry CoW overlay not covering all hives | Low | Phase 2 covers HKCU\Software; HKLM uses deny-only policy |
 | cmd.exe /c doesn't work in sandbox | Low | Known limitation (DllMain injection timing) |
 | NtAllocateVirtualMemory uses manual hook | Info | detour2 trampoline bug; manual hook works correctly |
+
+### Tier model & limitations
+
+Four guard tiers (`-g`), each a strict superset of the previous in containment:
+
+| Tier | Mitigations | JIT / unsigned native | Intended for |
+|---|---|---|---|
+| `none` | none | runs | FS-sandbox-only smoke |
+| `scan` | image-load only + content-scan | runs | lightweight runs |
+| `full` (default) | JIT-safe set: ASLR, heap-terminate, strict-handle, image-load (PreferSystem32/NoRemote), spec-exec; + pre-launch & DLL `.text` content-scan | **runs** | the AI agent itself (node/python/cargo/git) |
+| `static` | full + `ProhibitDynamicCode` + MS-signed-only DLLs + memory_guard RWX-direct kill | **broken** | pure-static signed targets / untrusted native code |
+
+**Core limitation (be explicit):** `full` and `scan` enforce FS/registry/process
+containment through **user-mode ntdll interception**. Code that allocates
+RWX-direct memory and issues **direct syscalls** bypasses every user-mode hook
+for that process — it can then write the real filesystem/registry. This is
+accepted in the default tiers because (a) it is required to let JIT runtimes
+work, and (b) the modeled adversary is a *misbehaving agent* doing ordinary API
+calls (which the hooks catch), not hand-rolled direct-syscall shellcode.
+
+What still holds even against a hook-bypassed process (kernel-enforced, survive
+direct syscalls): the **Job Object** (`KILL_ON_JOB_CLOSE`, breakaway unset — the
+process tree cannot escape the job), **WFP** network filters, and create-time
+ASLR. What does NOT hold: the CoW filesystem overlay and registry/process
+guards (all user-mode).
+
+For untrusted native code that might weaponize this (e.g. a packed/obfuscated
+npm/pip native module), use `-g static` (accepts the JIT break). The only way to
+get BOTH JIT and direct-syscall-proof FS containment is a kernel minifilter —
+out of scope for this user-mode design (**future work**).
 
 ### Resolved gaps (this cycle)
 

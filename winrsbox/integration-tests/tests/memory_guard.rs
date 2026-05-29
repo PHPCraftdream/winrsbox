@@ -1,8 +1,10 @@
 // E2E tests for memory guard.
 //
-// Tests run winrsbox launcher with escape payloads and verify:
-// - Strict mode (default): escape payloads are terminated
-// - Weak mode (--weak): escape payloads run to completion
+// Tests run winrsbox launcher with escape payloads and verify per-tier behavior:
+// - full (default): user-mode hooks + content-scan terminate escape payloads;
+//   RWX-direct allocation is allowed (JIT-safe).
+// - static: full + ProhibitDynamicCode — also blunt-kills RWX-direct.
+// - none (-g none): no memory protection; escape payloads run to completion.
 //
 // All tests use #[serial] to avoid race conditions between parallel
 // sandbox instances (WFP filter collision, pipe name collision, etc.).

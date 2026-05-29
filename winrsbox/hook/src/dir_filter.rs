@@ -87,14 +87,26 @@ unsafe fn filter_dot_winrsbox(
     *only_hidden = false;
 
     while cur < end {
-        // SAFETY: deref of NextEntryOffset (offset 0) — cur is within [buf, buf+total_size).
+        // Bytes from `cur` to the buffer end. `cur < end` ⇒ avail > 0. This fn
+        // is `unsafe` over a kernel-filled buffer: the kernel never emits a
+        // record exceeding its own buffer, but we guard every field read and
+        // every advance defensively so a truncated/malformed record can neither
+        // OOB-read nor underflow the shift arithmetic into a giant ptr::copy.
+        let avail = (end as usize) - (cur as usize);
+        // Need NextEntryOffset (u32 @ 0) and FileNameLength (u32 @ name_len_off).
+        if avail < name_len_off + 4 {
+            break;
+        }
+        // SAFETY: deref of NextEntryOffset (offset 0) — guarded by avail check.
         let next_off = *(cur as *const u32) as usize;
-        // SAFETY: deref of FileNameLength at class-specific offset — cur is within bounds.
+        // SAFETY: deref of FileNameLength at class-specific offset — guarded above.
         let name_len = *(cur.add(name_len_off) as *const u32) as usize;
-        if name_len >= 2 && name_len <= 22 {
+        // Inspect the name only when the whole field provably fits in the buffer.
+        if name_len >= 2 && name_len <= 22 && name_off + name_len <= avail {
             let name_ptr = cur.add(name_off) as *const u16;
             let chars = name_len / 2;
-            // SAFETY: from_raw_parts for `chars` u16s at FileName offset; name_len ≤ 22 and cur is within the buffer.
+            // SAFETY: from_raw_parts for `chars` u16s at FileName offset; the
+            // `name_off + name_len <= avail` guard above bounds the read.
             let name_slice = std::slice::from_raw_parts(name_ptr, chars);
             let is_winrsbox = chars == 9
                 && (name_slice[0] == '.' as u16)
@@ -123,20 +135,23 @@ unsafe fn filter_dot_winrsbox(
                     *only_hidden = true;
                     return true;
                 } else {
-                    // First of multiple entries — shift the rest of the buffer left
-                    let shift = next_off;
-                    let remain = (end as usize) - (cur as usize) - shift;
-                    // SAFETY: ptr::copy shifts remaining entries left over cur; regions may overlap, which is valid for copy (memmove).
-                    std::ptr::copy(cur.add(shift), cur, remain);
+                    // First of multiple entries — shift the rest of the buffer left.
+                    // checked_sub: a malformed next_off larger than the remaining
+                    // buffer would otherwise underflow usize into a giant copy.
+                    let Some(remain) = avail.checked_sub(next_off) else { break; };
+                    // SAFETY: memmove of `remain` (≤ avail) bytes left over cur;
+                    // overlap is valid for ptr::copy.
+                    std::ptr::copy(cur.add(next_off), cur, remain);
                     continue;
                 }
-                if next_off == 0 { break; }
+                // next_off > avail ⇒ next record starts past the buffer (malformed).
+                if next_off == 0 || next_off > avail { break; }
                 cur = cur.add(next_off);
                 continue;
             }
         }
         prev = cur;
-        if next_off == 0 { break; }
+        if next_off == 0 || next_off > avail { break; }
         cur = cur.add(next_off);
     }
 
