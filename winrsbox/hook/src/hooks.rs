@@ -400,6 +400,19 @@ pub(crate) unsafe fn check_device_block(attrs: *const OBJECT_ATTRIBUTES) -> Opti
     }
 }
 
+/// Returns true if the path in `attrs` refers to a filesystem volume device
+/// (`\Device\HarddiskVolumeN\...`). Used to deny writes through device-path
+/// forms that bypass the DOS-path policy pipeline.
+///
+/// # Safety
+/// `attrs` must be valid per NT calling convention.
+pub(crate) unsafe fn is_fs_device_path(attrs: *const OBJECT_ATTRIBUTES) -> bool {
+    let Some(raw) = extract_raw_nt_path(attrs) else { return false };
+    let utf16: Vec<u16> = raw.encode_utf16().collect();
+    let Some(device) = policy::dev::nt_to_device_path(&utf16) else { return false };
+    matches!(policy::dev::classify_device(&device), policy::dev::DeviceKind::HarddiskVolume)
+}
+
 // ---------------------------------------------------------------------------
 // Post-open reparse verification + 8.3 short-name resolution
 // ---------------------------------------------------------------------------
@@ -815,9 +828,7 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if !skip("token") {
-            if let Err(e) = crate::token_guard::install() {
-                buffer_install_error(format!("token_guard install failed: {:?}", e));
-            }
+            crate::token_guard::install()?;
         }
         if !skip("ui") {
             if let Err(e) = crate::ui_guard::install() {
@@ -825,14 +836,10 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if !skip("proc") {
-            if let Err(e) = crate::proc_guard::install() {
-                buffer_install_error(format!("proc_guard install failed: {:?}", e));
-            }
+            crate::proc_guard::install()?;
         }
         if !skip("com") {
-            if let Err(e) = crate::com_guard::install() {
-                buffer_install_error(format!("com_guard install failed: {:?}", e));
-            }
+            crate::com_guard::install()?;
         }
         if !skip("service") {
             if let Err(e) = crate::service_guard::install() {

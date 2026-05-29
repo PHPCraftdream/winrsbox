@@ -215,33 +215,41 @@ unsafe extern "system" fn hook_nt_set_information_file(
             let name_slice = std::slice::from_raw_parts(name_ptr, chars);
             let dest_name = String::from_utf16_lossy(name_slice);
 
-            if let Some(dest) = resolve_dest_path(root, &dest_name) {
-                // Escape-vector denylist (traversal, .winrsbox, GLOBALROOT,
-                // 8.3 short-name) — mirrors create-side check_path_traversal.
-                // Runs regardless of SANDBOX_CWD: it rejects on path SHAPE, so a
-                // `..` traversal can't defeat the containment check below.
-                if dest_is_escape(&dest) {
+            let Some(dest) = resolve_dest_path(root, &dest_name) else {
+                if hooks::is_trace() {
+                    hooks::ipc_log(ipc::LogLevel::Trace,
+                        format!("fs_setinfo_unresolvable_dest class={class} raw={dest_name}"));
+                }
+                if !iosb.is_null() {
+                    hooks::set_io_status(iosb, STATUS_ACCESS_DENIED);
+                }
+                return STATUS_ACCESS_DENIED;
+            };
+            // Escape-vector denylist (traversal, .winrsbox, GLOBALROOT,
+            // 8.3 short-name) — mirrors create-side check_path_traversal.
+            // Runs regardless of SANDBOX_CWD: it rejects on path SHAPE, so a
+            // `..` traversal can't defeat the containment check below.
+            if dest_is_escape(&dest) {
+                if hooks::is_trace() {
+                    hooks::ipc_log(ipc::LogLevel::Trace,
+                        format!("fs_setinfo_block_escape class={} dest={}", class, dest));
+                }
+                if !iosb.is_null() {
+                    hooks::set_io_status(iosb, STATUS_ACCESS_DENIED);
+                }
+                return STATUS_ACCESS_DENIED;
+            }
+            // Check if destination is outside sandbox root
+            if let Some(sandbox_root) = hooks::SANDBOX_CWD.get() {
+                if !policy::path::pattern_matches_prefix(&sandbox_root.to_lowercase(), &dest) {
                     if hooks::is_trace() {
                         hooks::ipc_log(ipc::LogLevel::Trace,
-                            format!("fs_setinfo_block_escape class={} dest={}", class, dest));
+                            format!("fs_setinfo_block_outside class={} dest={}", class, dest));
                     }
                     if !iosb.is_null() {
                         hooks::set_io_status(iosb, STATUS_ACCESS_DENIED);
                     }
                     return STATUS_ACCESS_DENIED;
-                }
-                // Check if destination is outside sandbox root
-                if let Some(sandbox_root) = hooks::SANDBOX_CWD.get() {
-                    if !dest.starts_with(&sandbox_root.to_lowercase()) {
-                        if hooks::is_trace() {
-                            hooks::ipc_log(ipc::LogLevel::Trace,
-                                format!("fs_setinfo_block_outside class={} dest={}", class, dest));
-                        }
-                        if !iosb.is_null() {
-                            hooks::set_io_status(iosb, STATUS_ACCESS_DENIED);
-                        }
-                        return STATUS_ACCESS_DENIED;
-                    }
                 }
             }
         }
@@ -257,7 +265,7 @@ unsafe extern "system" fn hook_nt_set_information_file(
             if wants_delete {
                 if let Some(path) = query_handle_dos_path(handle) {
                     if let Some(sandbox_root) = hooks::SANDBOX_CWD.get() {
-                        if !path.starts_with(&sandbox_root.to_lowercase()) {
+                        if !policy::path::pattern_matches_prefix(&sandbox_root.to_lowercase(), &path) {
                             if hooks::is_trace() {
                                 hooks::ipc_log(ipc::LogLevel::Trace,
                                     format!("fs_setinfo_delete_block path={}", path));
