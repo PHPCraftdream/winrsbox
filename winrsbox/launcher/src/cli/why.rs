@@ -274,7 +274,7 @@ pub fn run_what_if(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     }
 
     // Apply hypothetical rule temporarily
-    policy::db::rule_upsert(policy.db(), &hypothetical)?;
+    policy.rule_upsert(&hypothetical)?;
 
     let mut results = Vec::new();
     for (path, before) in &baseline {
@@ -290,7 +290,7 @@ pub fn run_what_if(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     }
 
     // Remove hypothetical (restore state)
-    policy::db::rule_remove_by_prefix(policy.db(), &prefix_lower)?;
+    policy.rule_remove_by_prefix(&prefix_lower)?;
 
     if json {
         let out = serde_json::json!({
@@ -419,7 +419,7 @@ mod tests {
         let policy = policy::Policy::open_or_create(&db_path, sandbox.clone(), mock_dirs, project).unwrap();
 
         // Ensure defaults are set (cow for write)
-        policy::db::defaults_set(policy.db(),
+        policy.defaults_set(
             Some(policy::db::RuleMode::Passthrough),
             Some(policy::db::RuleMode::Cow)).unwrap();
 

@@ -85,7 +85,30 @@ impl Policy {
         &self.inner.project_root_lower
     }
 
-    pub fn db(&self) -> &redb::Database {
-        &self.inner.db
+    // Thin db-mutation forwarders used by `winrsbox why --what-if` to apply a
+    // hypothetical rule against this Policy's own db, then analyse. These exist
+    // so callers don't need a raw `&redb::Database` handle out of the Policy —
+    // the storage backend stays an internal detail of the policy crate.
+    // (The standalone CLI commands that operate on the on-disk db file by path
+    // still use the `policy::db::*` free functions directly; that is the public
+    // config-management API and is intentionally exposed.)
+
+    /// Upsert a filesystem rule into this policy's backing store.
+    pub fn rule_upsert(&self, row: &db::RuleRow) -> Result<(), PolicyError> {
+        db::rule_upsert(&self.inner.db, row)
+    }
+
+    /// Remove every filesystem rule whose prefix matches `prefix` (lowercased).
+    pub fn rule_remove_by_prefix(&self, prefix: &str) -> Result<bool, PolicyError> {
+        db::rule_remove_by_prefix(&self.inner.db, prefix)
+    }
+
+    /// Set the default read/write modes for unmatched paths.
+    pub fn defaults_set(
+        &self,
+        read: Option<db::RuleMode>,
+        write: Option<db::RuleMode>,
+    ) -> Result<(), PolicyError> {
+        db::defaults_set(&self.inner.db, read, write)
     }
 }

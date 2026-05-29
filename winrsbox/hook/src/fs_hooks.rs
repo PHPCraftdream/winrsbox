@@ -13,7 +13,7 @@ use policy::Mode;
 use crate::anti_rec;
 use crate::hooked_attrs::HookedAttrs;
 use crate::hooks::{
-    check_path_traversal, check_device_block, decide, extract_dos_path,
+    check_path_traversal, check_device_block, decide, resolve_for_hook,
     is_write_access, materialize_mock_overlay,
     needs_short_name_resolve, prepare_overlay, set_io_status, ipc_record_overlay,
     STATUS_ACCESS_DENIED,
@@ -151,8 +151,11 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
         return status;
     }
 
-    let Some(dos) = extract_dos_path(object_attributes as *const _) else {
-        // Not a DOS path — check if it's a device path that should be blocked.
+    // H5 resolve-once: resolve RootDirectory handle EXACTLY ONCE here. The
+    // returned `pre_resolved` (Some for relative opens) is reused verbatim in
+    // copy_passthrough_inner so the kernel opens the SAME path policy approved,
+    // closing the double-resolve window.
+    let Some((dos, pre_resolved)) = resolve_for_hook(object_attributes as *const _) else {
         if let Some(status) = check_device_block(object_attributes as *const _) {
             set_io_status(io_status_block, status);
             return status;
@@ -160,7 +163,6 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
         return call_original!();
     };
 
-    // P2-4 fix: check 8.3 short-name on the JOINED path (covers RootDirectory-relative opens)
     if needs_short_name_resolve(&dos) {
         if is_trace() {
             ipc_log(ipc::LogLevel::Trace, format!("fs_block_short_name_joined: {}", dos));
@@ -169,10 +171,6 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
         return STATUS_ACCESS_DENIED;
     }
 
-    // Audit H-S3: defense-in-depth — deny ANY caller-supplied NTFS Extended
-    // Attribute buffer BEFORE policy classification. EAs are off-band
-    // persistence and no expected workload uses them. Placed before decide()
-    // so the deny survives Passthrough/Cow/Mock alike.
     if is_ea_present(ea_buffer as *const _, ea_length) {
         crate::ipc_client::ipc_log_violation(ipc::Req::Log {
             pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
@@ -187,15 +185,8 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
     }
 
     let write = is_write_access(desired_access, create_disposition);
-    // Note: 8.3 short-name paths are blocked in check_path_traversal (raw path) and above (joined path).
     let decision = decide(&dos, write);
 
-    // Audit H-S2: deny CREATE/OVERWRITE of reparse points (block the
-    // create-side gap left by the FSCTL_SET_REPARSE_POINT hook in
-    // fs_metadata_guard). Reading an existing reparse is unaffected.
-    // Place AFTER decide() so the existing Mode::Deny / Mode::Mock paths run
-    // first when policy already rejects the path; we only veto the surviving
-    // Passthrough / Cow writes that would actually create a reparse.
     if is_reparse_create(create_options, write, create_disposition)
         && matches!(decision.mode, Mode::Passthrough | Mode::Cow)
     {
@@ -213,14 +204,13 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
 
     match decision.mode {
         Mode::Passthrough => {
-            // TOCTOU defense (audit M-S2 + H5): copy the caller's
-            // UNICODE_STRING.Buffer into hook-owned memory AND resolve any
-            // RootDirectory handle to an absolute path, then pass that to the
-            // kernel — so a concurrent attacker thread can neither mutate the
-            // path nor swap the directory anchor between our check and the
-            // kernel's read.
-            // SAFETY: object_attributes is non-null (checked above via extract_dos_path).
-            let mut copy = match HookedAttrs::copy_passthrough(&*object_attributes) {
+            // H5 resolve-once passthrough: copy_passthrough_inner reuses the
+            // pre-resolved absolute path (if relative open) so we never call
+            // resolve_handle_path a second time.
+            // SAFETY: object_attributes is non-null (checked above via resolve_for_hook).
+            let mut copy = match HookedAttrs::copy_passthrough_inner(
+                &*object_attributes, pre_resolved.as_deref()
+            ) {
                 Some(c) => c,
                 None => {
                     // Oversized / unresolvable path — fail CLOSED rather than
@@ -348,7 +338,8 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
         return status;
     }
 
-    let Some(dos) = extract_dos_path(object_attributes as *const _) else {
+    // H5 resolve-once (same pattern as NtCreateFile above).
+    let Some((dos, pre_resolved)) = resolve_for_hook(object_attributes as *const _) else {
         if let Some(status) = check_device_block(object_attributes as *const _) {
             set_io_status(io_status_block, status);
             return status;
@@ -356,7 +347,6 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
         return call_original!();
     };
 
-    // P2-4 fix: check 8.3 short-name on the JOINED path (covers RootDirectory-relative opens)
     if needs_short_name_resolve(&dos) {
         if is_trace() {
             ipc_log(ipc::LogLevel::Trace, format!("fs_block_short_name_joined: {}", dos));
@@ -369,16 +359,14 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
         crate::hooks::GENERIC_WRITE | crate::hooks::FILE_WRITE_DATA | crate::hooks::FILE_APPEND_DATA
         | crate::hooks::DELETE | crate::hooks::WRITE_DAC | crate::hooks::WRITE_OWNER;
     let write = desired_access & write_bits != 0;
-    // Note: 8.3 short-name paths are blocked in check_path_traversal (raw path) and above (joined path).
     let decision = decide(&dos, write);
 
     match decision.mode {
         Mode::Passthrough => {
-            // TOCTOU defense (audit M-S2 + H5): copy the caller's path bytes
-            // into hook-owned memory and resolve any RootDirectory handle to
-            // an absolute path before handing the syscall to the kernel.
             // SAFETY: object_attributes is non-null.
-            let mut copy = match HookedAttrs::copy_passthrough(&*object_attributes) {
+            let mut copy = match HookedAttrs::copy_passthrough_inner(
+                &*object_attributes, pre_resolved.as_deref()
+            ) {
                 Some(c) => c,
                 None => {
                     // Oversized / unresolvable path — fail CLOSED (audit H5).
@@ -469,8 +457,8 @@ pub(crate) unsafe extern "system" fn hook_nt_query_attributes_file(
             .call(object_attributes, file_information);
     };
 
-    // SAFETY: object_attributes valid per NT calling convention.
-    let Some(dos) = extract_dos_path(object_attributes as *const _) else {
+    // H5 resolve-once.
+    let Some((dos, pre_resolved)) = resolve_for_hook(object_attributes as *const _) else {
         return HOOK_NT_QUERY_ATTRIBUTES_FILE
             .get()
             .unwrap()
@@ -480,12 +468,10 @@ pub(crate) unsafe extern "system" fn hook_nt_query_attributes_file(
     let decision = decide(&dos, false);
     match decision.mode {
         Mode::Passthrough => {
-            // TOCTOU defense (audit M-S2 + H5): copy caller's path and
-            // resolve any RootDirectory handle before the kernel re-read.
-            // No io_status_block param on this syscall — just return on
-            // fail-closed.
             // SAFETY: object_attributes is non-null.
-            let mut copy = match HookedAttrs::copy_passthrough(&*object_attributes) {
+            let mut copy = match HookedAttrs::copy_passthrough_inner(
+                &*object_attributes, pre_resolved.as_deref()
+            ) {
                 Some(c) => c,
                 None => {
                     // Oversized / unresolvable path — fail CLOSED (audit H5).
@@ -579,8 +565,8 @@ pub(crate) unsafe extern "system" fn hook_nt_query_full_attributes_file(
             .call(object_attributes, file_information);
     };
 
-    // SAFETY: object_attributes valid per NT calling convention.
-    let Some(dos) = extract_dos_path(object_attributes as *const _) else {
+    // H5 resolve-once.
+    let Some((dos, pre_resolved)) = resolve_for_hook(object_attributes as *const _) else {
         return HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
             .get()
             .unwrap()
@@ -590,12 +576,10 @@ pub(crate) unsafe extern "system" fn hook_nt_query_full_attributes_file(
     let decision = decide(&dos, false);
     match decision.mode {
         Mode::Passthrough => {
-            // TOCTOU defense (audit M-S2 + H5): copy caller's path and
-            // resolve any RootDirectory handle before the kernel re-read.
-            // No io_status_block param on this syscall — just return on
-            // fail-closed.
             // SAFETY: object_attributes is non-null.
-            let mut copy = match HookedAttrs::copy_passthrough(&*object_attributes) {
+            let mut copy = match HookedAttrs::copy_passthrough_inner(
+                &*object_attributes, pre_resolved.as_deref()
+            ) {
                 Some(c) => c,
                 None => {
                     // Oversized / unresolvable path — fail CLOSED (audit H5).
