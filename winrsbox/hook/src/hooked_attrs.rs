@@ -169,6 +169,11 @@ impl HookedAttrs {
     /// `Attributes`, `SecurityDescriptor`, `SecurityQualityOfService`)
     /// verbatim. When `RootDirectory` is non-null the returned attrs carry
     /// a NULL RootDirectory and an absolute ObjectName instead.
+    // Convenience wrapper (resolves the handle internally). Production FS hooks
+    // call `copy_passthrough_inner` with the hook's pre-resolved path (H5); this
+    // no-pre-resolution form is used by the unit tests, so it reads as dead code
+    // in a non-test cdylib build.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) unsafe fn copy_passthrough(orig: &OBJECT_ATTRIBUTES) -> Option<Self> {
         Self::copy_passthrough_inner(orig, None)
     }
