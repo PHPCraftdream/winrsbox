@@ -114,12 +114,18 @@ fn run_install(args: &[String]) -> Result<()> {
     let wezterm_icon = wezterm_icon_path(&wezterm_path);
 
     // 1. Wezterm (normal)
-    let cmd_wez = compose_command(&winrsbox_exe, &wezterm_path, &["start"], false);
+    // `--always-new-process` is REQUIRED, not optional: without it wezterm-gui
+    // joins any existing wezterm mux-server in the user session and forwards
+    // all spawn requests through a named pipe. If that pre-existing mux runs
+    // OUTSIDE our Job, every cmd/shell it opens for us is NOT in our Job
+    // either — the sandbox is bypassed via IPC-spawn-proxy. The flag makes
+    // wezterm spawn a fresh in-process mux owned by THIS (sandboxed) instance.
+    let cmd_wez = compose_command(&winrsbox_exe, &wezterm_path, &["start", "--always-new-process"], false);
     install_verb(VERB_WEZTERM, LABEL_WEZTERM, &cmd_wez, &wezterm_icon, false)?;
     println!("  + {LABEL_WEZTERM}");
 
     // 2. Wezterm (admin)
-    let cmd_wez_admin = compose_command(&winrsbox_exe, &wezterm_path, &["start"], false);
+    let cmd_wez_admin = compose_command(&winrsbox_exe, &wezterm_path, &["start", "--always-new-process"], false);
     install_verb(VERB_WEZTERM_ADMIN, LABEL_WEZTERM_ADMIN, &cmd_wez_admin, &wezterm_icon, true)?;
     println!("  + {LABEL_WEZTERM_ADMIN}");
 
