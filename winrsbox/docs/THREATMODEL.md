@@ -406,6 +406,7 @@ when elevated launcher infrastructure exists.
 | Gap | Severity | Status |
 |---|---|---|
 | RWX-direct + runtime-SSN direct syscall in full/scan | Medium | Accepted for the default (JIT) tiers: DynamicCode/RWX-kill off so node/V8 work; RW→RX content scan still active. Closed by `-g static` (no JIT). See "Tier model & limitations". |
+| Direct-syscall UI injection (`NtUserSendInput`) in full | Medium | Accepted for interactive sandboxes: user-mode `ui_guard` kills `SendInput`/`keybd_event`/`mouse_event`; kernel UILIMIT_HANDLES dropped from defaults because it inseparably broke per-process keyboard layout / IME broadcasts. The interactive case is also defended by the user physically watching the screen (synthetic Win+R opens a visible Run dialog, not a stealth escape). Structural closure for *headless* runs is the separate-desktop roadmap below. |
 | ETW TI not subscribed (requires admin) | Low | Deferred: scoring infra ready, needs elevated launcher |
 | Direct AFD IOCTL bypasses ws2_32 hook | Low | Mitigated: WFP kernel-level enforcement |
 | ALPC direct LRPC bypass (hand-crafted port name) | Low | Residual: 18 patterns cover known services; arbitrary hand-crafted port names not covered |
@@ -442,6 +443,45 @@ For untrusted native code that might weaponize this (e.g. a packed/obfuscated
 npm/pip native module), use `-g static` (accepts the JIT break). The only way to
 get BOTH JIT and direct-syscall-proof FS containment is a kernel minifilter —
 out of scope for this user-mode design (**future work**).
+
+### UI isolation — two postures, not one knob
+
+UI containment splits along the same axis as the tier model — **interactivity**,
+not paranoia level. The two postures want opposite things and cannot share one
+default:
+
+- **Interactive sandbox** (wezterm, IDE, GUI workload). The user *is* the input
+  source. The process MUST receive `WM_INPUTLANGCHANGE` broadcasts from
+  Explorer/csrss, MUST touch foreign HWNDs for IME/DPI/focus coordination, MUST
+  reach into the global atom table for `RegisterWindowMessage`. Kernel UI
+  restrictions (`UILIMIT_HANDLES`, `UILIMIT_GLOBALATOMS`) sit on the HWND-
+  ownership layer where "receive `WM_INPUTLANGCHANGE` from Explorer" and
+  "synthesise `SendInput` into Explorer" are *the same operation* — the kernel
+  cannot distinguish intent at that layer, so enabling them broke layout
+  switching empirically. They are now **off by default**. Synthetic input is
+  defended at the **semantic layer** instead: `ui_guard` hooks
+  `SendInput`/`keybd_event`/`mouse_event` in user32 and terminates the process
+  on call. The residual — a direct syscall to `win32k!NtUserSendInput` bypassing
+  user32 — is the same category as the broader full-mode direct-syscall gap,
+  and is additionally bounded by the fact that the user is *watching the
+  screen* (a synthetic Win+R opens a visible Run dialog, not a stealth escape).
+
+- **Headless sandbox** (`claude -p`, `cargo build`, CI agent — roadmap). No
+  legitimate UI need at all. The right defence is **structural, not
+  behavioural**: launch the child in a separate Window Station + Desktop. A
+  process on its own desktop *cannot* `SendInput` into the real desktop — not
+  because we hooked the call, but because **there are no windows on its
+  desktop to target**. Direct syscalls don't help: `NtUserSendInput` has
+  nothing to deliver to. UILIMIT_HANDLES + UILIMIT_GLOBALATOMS can also be
+  re-enabled in headless mode at zero cost (no broadcasts to receive). This is
+  the same "make illegal states unrepresentable" move as `static` mode applied
+  to the windowing system.
+
+**Roadmap:** detect interactivity in the launcher (no controlling tty / no
+`STARTF_USESHOWWINDOW` / explicit `--headless`) and, for headless, create a
+private `winsta0`-style Window Station + Desktop and assign the suspended child
+into it before `ResumeThread`. Until that ships, headless workloads should be
+run under `-g static` and treated as still sharing the interactive desktop.
 
 ### Resolved gaps (this cycle)
 

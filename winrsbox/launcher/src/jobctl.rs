@@ -70,12 +70,25 @@ pub struct UiRestrictions {
 impl Default for UiRestrictions {
     fn default() -> Self {
         Self {
-            no_foreign_handles: true,
+            // HANDLES off by default: UILIMIT_HANDLES blocks use of HWND
+            // handles from processes outside the job, which kills inbound
+            // broadcasts like WM_INPUTLANGCHANGE (sent by Explorer/csrss when
+            // the user switches keyboard layout). Empirically required for
+            // Alt+Shift / Win+Space to work inside the sandbox. The
+            // anti-injection role is already covered (and more precisely) by
+            // user-mode ui_guard hooks (cross-PID SendInput / PostMessage are
+            // denied there). Kernel HANDLES limit is opt-in for hard isolation.
+            no_foreign_handles: false,
             no_read_clipboard: false,
             no_write_clipboard: false,
             no_system_params: true,
             no_display_settings: true,
-            no_global_atoms: true,
+            // GLOBALATOMS off by default: blocking the global atom table breaks
+            // Win32 RegisterWindowMessage / WM_INPUTLANGCHANGEREQUEST, which
+            // is how Windows broadcasts per-process keyboard-layout switches.
+            // Atom table is in-process arrangement (atoms can't escape the
+            // sandbox or modify the host).
+            no_global_atoms: false,
             no_desktop: true,
             no_exit_windows: true,
         }
@@ -167,7 +180,10 @@ mod tests {
     #[test]
     fn ui_default_all_flags_when_strict() {
         let ui = UiRestrictions::default().with_strict_clipboard();
-        assert_eq!(ui.limit_flags(), 0xFF);
+        // 0xFF would be every UI restriction; we deliberately leave HANDLES
+        // (0x01) and GLOBALATOMS (0x20) off — see Default impl.
+        // 0xDE = 0xFF & !0x01 & !0x20.
+        assert_eq!(ui.limit_flags(), 0xDE);
     }
 
     #[test]
@@ -190,8 +206,11 @@ mod tests {
     #[test]
     fn ui_default_non_clipboard_flags() {
         let ui = UiRestrictions::default();
-        // Everything except clipboard should be set
-        let expected = 0x01 | 0x08 | 0x10 | 0x20 | 0x40 | 0x80; // all except 0x02, 0x04
+        // Default = all UI restrictions EXCEPT clipboard (0x02, 0x04),
+        // HANDLES (0x01) and GLOBALATOMS (0x20) — the two that break
+        // per-process keyboard-layout switching (foreign HWND broadcasts +
+        // RegisterWindowMessage atoms). See the Default impl for rationale.
+        let expected = 0x08 | 0x10 | 0x40 | 0x80;
         assert_eq!(ui.limit_flags(), expected);
     }
 

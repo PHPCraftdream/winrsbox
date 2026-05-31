@@ -116,10 +116,18 @@ struct Cli {
     #[arg(long = "trace")]
     trace: bool,
 
-    /// JSONL log verbosity: error (violations only), warn (denies), info (default),
-    /// trace (all decides). Lower levels include higher ones.
-    #[arg(long = "log-level", default_value = "info", value_name = "LEVEL")]
-    log_level: String,
+    /// JSONL log verbosity: error (violations only), warn (denies), info
+    /// (default), trace (all decides + every hook log). Lower levels include
+    /// higher ones. Precedence: this CLI flag > `log_level: ...` in the
+    /// per-folder `sandbox.ktav` > built-in default "info". Set
+    /// `log_level: trace` in the ktav once to make verbose logging stick
+    /// across launches of that sandbox state-dir (e.g. while debugging
+    /// wezterm / claude / a flaky workload) — no need to remember `--trace`
+    /// or `--log-level` on every invocation. Hook diagnostics (spawn_attempt,
+    /// reparse_create_blocked, winrt_activation_blocked, etc.) all flow into
+    /// the JSONL too, so `trace` gives a single complete audit trail.
+    #[arg(long = "log-level", value_name = "LEVEL")]
+    log_level: Option<String>,
 
     /// Block localhost (127.0.0.0/8) connections. Prevents access to local
     /// services (databases, debug ports) but breaks MCP/LSP servers.
@@ -290,8 +298,25 @@ async fn main() -> Result<()> {
     // Violations log path
     let violations_log = cfg_path.parent().unwrap().join("violations.log");
 
-    // JSONL structured log — persistent, machine-parseable
-    jsonl_log::init(cfg_path.parent().unwrap().join("sandbox.log.jsonl"), &cli.log_level);
+    // JSONL structured log — persistent, machine-parseable.
+    // Log-level precedence: CLI `--log-level` > `log_level:` in sandbox.ktav >
+    // built-in default "info". Re-parsing the ktav here is cheap (small file)
+    // and avoids plumbing a Config getter through Policy. ktav fields that
+    // policy didn't recognise are ignored on its side; ours are ignored on
+    // its side too — both views deserialize the same file independently.
+    let ktav_log_level: Option<String> = std::fs::read_to_string(&cfg_path)
+        .ok()
+        .and_then(|src| ktav::from_str::<policy::db::Config>(&src).ok())
+        .and_then(|c| c.log_level);
+    let effective_log_level = cli
+        .log_level
+        .clone()
+        .or(ktav_log_level)
+        .unwrap_or_else(|| "info".to_string());
+    jsonl_log::init(
+        cfg_path.parent().unwrap().join("sandbox.log.jsonl"),
+        &effective_log_level,
+    );
 
     // Hot-stats: aggregates access patterns, flushed to disk at most once per 5s.
     let hot_stats = HotStats::new();
@@ -375,7 +400,14 @@ async fn main() -> Result<()> {
     if let Some(ref cats) = cli.disable_hooks {
         std::env::set_var("FS_SANDBOX_DISABLE_HOOKS", cats);
     }
-    if cli.trace {
+    // Hook-side trace gate. Triggered by EITHER the explicit `--trace` CLI
+    // flag, OR an `effective_log_level == "trace"` (from CLI `--log-level` or
+    // `log_level: trace` in sandbox.ktav). Without this, hook-side trace logs
+    // (com_blocked clsid=..., per-decide path traces, etc.) stay silent even
+    // when launcher-side JSONL filter is set to trace — they're two separate
+    // gates and the launcher-side one only catches what the hook actually
+    // sends.
+    if cli.trace || effective_log_level.eq_ignore_ascii_case("trace") {
         std::env::set_var("FS_SANDBOX_TRACE", "1");
     }
     if cli.block_localhost {
