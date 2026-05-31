@@ -64,10 +64,19 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
 /// Default ktav policy written when auto-discovery creates a fresh state dir.
 pub(crate) const DEFAULT_CONFIG_KTAV: &str = "\
-# winrsbox policy — auto-generated on first run. Edit to customize.
-#
-# Reads pass through to the real filesystem; writes are Copy-on-Write
-# into <state_dir>/workdir/. Add `rules` entries to deny or mock paths.
+## winrsbox policy — auto-generated on first run. Edit to customize.
+## (ktav 0.5.0 comments start with `##`; a single `#` is literal content.)
+##
+## Reads pass through to the real filesystem; writes are Copy-on-Write
+## into <state_dir>/workdir/. Add `rules` entries to deny or mock paths.
+##
+## Verbose JSONL logging for this sandbox folder (uncomment to enable).
+## Values: error / warn / info / trace. CLI `--log-level` overrides this
+## if explicitly set; otherwise this value wins over the built-in `info`.
+## Use `trace` while debugging a workload (every hook log + every decide
+## lands in sandbox.log.jsonl) — no need to remember CLI flags each launch.
+## To enable: copy the next line WITHOUT the `## ` prefix.
+## log_level: trace
 
 defaults: {
     read: passthrough
@@ -142,12 +151,14 @@ rules: [
     }
 ]
 
-# mock_dirs: [
-#     { prefix: C:\\Users\\Computer\\.config\\fakeapp }
-# ]
+## mock_dirs: [
+##     {
+##         prefix: C:\\Users\\Computer\\.config\\fakeapp
+##     }
+## ]
 
-# Registry persistence vectors — deny write to prevent DLL injection
-# via AppInit_DLLs, Image File Execution Options, AppCertDlls.
+## Registry persistence vectors — deny write to prevent DLL injection
+## via AppInit_DLLs, Image File Execution Options, AppCertDlls.
 regrules: [
     {
         prefix: HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows
@@ -619,7 +630,12 @@ pub(crate) fn setup_job_object(
     // Windows build (e.g. UILIMIT_HANDLES has limited effect on Win10
     // 19045 against medium-integrity foreign windows). The user32 hooks
     // in hook::ui_guard provide a second layer.
-    {
+    // Diagnostic escape hatch: set FS_SANDBOX_NO_UI_LIMITS=1 to skip Job-Object
+    // UI restrictions entirely (GLOBALATOMS / SYSTEMPARAMS / DESKTOP /
+    // EXITWINDOWS). Suspected to break per-process keyboard-layout switching
+    // because the Win32 WM_INPUTLANGCHANGEREQUEST broadcast uses global atoms
+    // via RegisterWindowMessage.
+    if std::env::var("FS_SANDBOX_NO_UI_LIMITS").is_err() {
         let mut ui = winrsbox::jobctl::UiRestrictions::default();
         if strict_clipboard {
             ui = ui.with_strict_clipboard();
@@ -659,5 +675,26 @@ mod tests {
         // STATUS_DLL_INIT_FAILED is the NTSTATUS we use as the termination
         // exit code; it must remain in the "fatal error" space (top bit set).
         assert!(STATUS_DLL_INIT_FAILED & 0xC000_0000 == 0xC000_0000);
+    }
+
+    /// The auto-generated default config must be valid ktav that round-trips
+    /// into a `policy::db::Config`. This pins the template against ktav format
+    /// drift (e.g. an inline `{ ... }` compound or a stray quote sneaking in)
+    /// and against the ktav crate's own breaking changes across versions.
+    #[test]
+    fn default_config_ktav_parses() {
+        let cfg: policy::db::Config = ktav::from_str(DEFAULT_CONFIG_KTAV)
+            .expect("DEFAULT_CONFIG_KTAV must be valid ktav");
+        // Sanity: the template ships at least the C:\Windows deny rule.
+        assert!(
+            cfg.rules.iter().any(|r| r.prefix.eq_ignore_ascii_case(r"c:\windows")),
+            "default config should contain a C:\\Windows rule",
+        );
+        // Backslashes must be single (ktav has no escape) — a path with `\\`
+        // would mean the template was written with JSON-style escaping.
+        assert!(
+            !cfg.rules.iter().any(|r| r.prefix.contains(r"\\")),
+            "default config rule prefixes must use single backslashes",
+        );
     }
 }

@@ -72,34 +72,17 @@ pub(crate) static HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE: OnceLock<GenericDetour<FnN
 // CreateOptions flag bits + dispositions (audit H-S2 / H-S3 mitigation)
 // ---------------------------------------------------------------------------
 
-/// `FILE_OPEN_REPARSE_POINT` — when set, the open does NOT traverse the
-/// reparse point; combined with a creating disposition it constructs a NEW
-/// reparse point in place. Plain `FILE_OPEN` of an existing reparse point is
-/// legitimate (git symlinks, mklink readback) and MUST stay allowed.
-const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-
-/// `FILE_OPEN` — open existing file only; never creates. Safe to combine with
-/// `FILE_OPEN_REPARSE_POINT` because the kernel will only succeed when the
-/// target reparse already exists.
-const FILE_OPEN_DISPOSITION: u32 = 1;
-
 // ---------------------------------------------------------------------------
 // Pure classifier helpers (testable, no FFI)
 // ---------------------------------------------------------------------------
-
-/// Returns true when the (CreateOptions, write-access, disposition) triple
-/// describes a CREATE/OVERWRITE that would plant a NEW reparse point.
-///
-/// Audit H-S2 — a reparse point planted inside the sandbox CWD redirects
-/// subsequent path traversal *outside* the sandbox, so we deny the create
-/// side. Reading an existing reparse (`FILE_OPEN` disposition) is left alone
-/// because git, mklink readback, and the loader all do it legitimately.
-#[inline]
-pub(crate) fn is_reparse_create(create_options: u32, is_write: bool, disposition: u32) -> bool {
-    (create_options & FILE_OPEN_REPARSE_POINT) != 0
-        && is_write
-        && disposition != FILE_OPEN_DISPOSITION
-}
+//
+// Note: a former `is_reparse_create` predicate + its `FILE_OPEN_REPARSE_POINT`
+// / `FILE_OPEN_DISPOSITION` constants used to live here. They were removed
+// after the audit found the check was overzealous (the flag controls
+// traversal, not creation — only `FSCTL_SET_REPARSE_POINT[_EX]` actually
+// plants a reparse point, and those are unconditionally denied in
+// `fs_metadata_guard`). The dead check was false-positive'ing legitimate
+// IPC primitives (wezterm's blob-lease in %TEMP%).
 
 /// Returns true when the caller supplied an NTFS Extended Attribute buffer.
 ///
@@ -199,21 +182,15 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
     let write = is_write_access(desired_access, create_disposition);
     let decision = decide(&dos, write);
 
-    if is_reparse_create(create_options, write, create_disposition)
-        && matches!(decision.mode, Mode::Passthrough | Mode::Cow)
-    {
-        crate::ipc_client::ipc_log_violation(ipc::Req::Log {
-            pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
-            level: ipc::LogLevel::Warn,
-            msg: format!("reparse_create_blocked: {dos}"),
-        });
-        if !file_handle.is_null() {
-            *file_handle = std::ptr::null_mut();
-        }
-        set_io_status(io_status_block, STATUS_ACCESS_DENIED);
-        return STATUS_ACCESS_DENIED;
-    }
-
+    // Note: the former create-side `is_reparse_create` veto here was
+    // overzealous and was removed. The `FILE_OPEN_REPARSE_POINT` flag on
+    // NtCreateFile only controls TRAVERSAL ("open the reparse point itself,
+    // don't follow") — it does NOT by itself create a reparse point. Creating
+    // a reparse point requires a subsequent `FSCTL_SET_REPARSE_POINT[_EX]`,
+    // and THAT is unconditionally denied in fs_metadata_guard. So this block
+    // added no real defence (the actual escape vector is closed elsewhere)
+    // and false-positive'd legitimate IPC primitives that pass the flag for
+    // open-self semantics (e.g. wezterm's blob-lease files in %TEMP%).
     match decision.mode {
         Mode::Passthrough => {
             // H5 resolve-once passthrough: copy_passthrough_inner reuses the
@@ -684,60 +661,10 @@ pub(crate) unsafe extern "system" fn hook_nt_query_full_attributes_file(
 mod tests {
     use super::*;
 
-    // FILE_CREATE / FILE_OPEN_IF / FILE_OVERWRITE_IF dispositions (from
-    // crate::hooks). Duplicated locally so test failures point at this file.
-    const FILE_OPEN: u32 = 1;
-    const FILE_CREATE: u32 = 2;
-    const FILE_OPEN_IF: u32 = 3;
-    const FILE_OVERWRITE_IF: u32 = 5;
-
-    /// Refactor canary: the kernel constant `FILE_OPEN_REPARSE_POINT` is
-    /// `0x00200000` and bit-mistakes (e.g. typing 0x0020_000 with three
-    /// zeros) silently break the deny path. Catch it at compile-time of the
-    /// test suite, not at exploit time.
-    #[test]
-    fn reparse_flag_constant() {
-        assert_eq!(FILE_OPEN_REPARSE_POINT, 0x0020_0000);
-        assert_eq!(FILE_OPEN_DISPOSITION, 1);
-    }
-
-    #[test]
-    fn is_reparse_create_flag_set_creating_blocks() {
-        // FILE_CREATE + write + reparse flag → CREATE a reparse point → block
-        assert!(is_reparse_create(FILE_OPEN_REPARSE_POINT, true, FILE_CREATE));
-        // FILE_OPEN_IF and FILE_OVERWRITE_IF also create when target absent
-        assert!(is_reparse_create(FILE_OPEN_REPARSE_POINT, true, FILE_OPEN_IF));
-        assert!(is_reparse_create(FILE_OPEN_REPARSE_POINT, true, FILE_OVERWRITE_IF));
-    }
-
-    #[test]
-    fn is_reparse_create_open_existing_allowed() {
-        // FILE_OPEN of an existing reparse — git symlinks, mklink readback — OK.
-        assert!(!is_reparse_create(FILE_OPEN_REPARSE_POINT, true, FILE_OPEN));
-    }
-
-    #[test]
-    fn is_reparse_create_no_flag_allowed() {
-        // Without the reparse flag, a normal create is none of this hook's business.
-        assert!(!is_reparse_create(0, true, FILE_CREATE));
-    }
-
-    #[test]
-    fn is_reparse_create_read_only_allowed() {
-        // Read-only opens (write=false) never plant new reparse points,
-        // even with the reparse flag and a creating disposition combo.
-        assert!(!is_reparse_create(FILE_OPEN_REPARSE_POINT, false, FILE_CREATE));
-    }
-
-    /// Other arbitrary bits in create_options must not flip the result —
-    /// the predicate is a flag test, not equality.
-    #[test]
-    fn is_reparse_create_extra_options_dont_mask() {
-        const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
-        const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
-        let opts = FILE_OPEN_REPARSE_POINT | FILE_DIRECTORY_FILE | FILE_NON_DIRECTORY_FILE;
-        assert!(is_reparse_create(opts, true, FILE_CREATE));
-    }
+    // Note: the former `reparse_flag_constant`, `is_reparse_create_*` tests
+    // (5 total) used to live here. They covered a now-removed predicate; the
+    // real escape vector `FSCTL_SET_REPARSE_POINT[_EX]` is tested in
+    // fs_metadata_guard. See the comment block near the top of this file.
 
     #[test]
     fn is_ea_present_empty_cases() {

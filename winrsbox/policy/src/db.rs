@@ -39,6 +39,10 @@ pub struct Config {
     pub mocks: Vec<MockEntry>,
     #[serde(default)]
     pub mock_dirs: Vec<MockDirEntry>,
+    /// Per-folder log verbosity (overridden by CLI `--log-level` if explicitly set).
+    /// Values: error / warn / info / trace. Defaults to "info" if unset.
+    #[serde(default)]
+    pub log_level: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -852,6 +856,7 @@ rules: [
             rules: vec![RuleEntry { prefix: r"c:\old".into(), read: Some("deny".into()), write: None, when: None }],
             mocks: vec![],
             mock_dirs: vec![],
+            log_level: None,
         };
         apply_config(&db, &cfg1).unwrap();
 
@@ -861,6 +866,7 @@ rules: [
             rules: vec![RuleEntry { prefix: r"c:\new".into(), read: Some("deny".into()), write: None, when: None }],
             mocks: vec![],
             mock_dirs: vec![],
+            log_level: None,
         };
         apply_config(&db, &cfg2).unwrap();
 
@@ -895,6 +901,7 @@ rules: [
             rules: vec![],
             mocks: vec![MockEntry { path: r"c:\mock.txt".into(), content_inline: Some("hello".into()) }],
             mock_dirs: vec![],
+            log_level: None,
         };
         apply_config(&db, &cfg).unwrap();
 

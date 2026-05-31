@@ -172,6 +172,11 @@ pub enum Event {
     Exit { ts: u64, code: u32, decides: u64, violations: u64 },
     #[serde(rename = "etw")]
     EtwEvent { ts: u64, pid: u32, kind: String },
+    /// Any structured log message emitted by hook.dll via `ipc::Req::Log`.
+    /// Surfaces hook-side diagnostics (spawn attempts, denials with context,
+    /// trace messages) in the JSONL instead of only on stdout.
+    #[serde(rename = "hook_log")]
+    HookLog { ts: u64, pid: u32, level: String, msg: String },
 }
 
 impl Event {
@@ -182,7 +187,17 @@ impl Event {
             Event::Hello { .. } | Event::Child { .. } | Event::Wfp { .. } | Event::Exit { .. }
             | Event::RegDecide { .. } | Event::NetDecide { .. } => LogLevel::Info,
             Event::Decide { .. } | Event::EtwEvent { .. } => LogLevel::Trace,
+            Event::HookLog { level, .. } => match level.as_str() {
+                "ERROR" => LogLevel::Error,
+                "WARN" => LogLevel::Warn,
+                "TRACE" => LogLevel::Trace,
+                _ => LogLevel::Info,
+            },
         }
+    }
+
+    pub fn hook_log(pid: u32, level: &str, msg: &str) -> Self {
+        Self::HookLog { ts: ts(), pid, level: level.to_string(), msg: msg.to_string() }
     }
 
     pub fn hello(pid: u32, exe: &str) -> Self {

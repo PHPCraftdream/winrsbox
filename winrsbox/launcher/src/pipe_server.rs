@@ -823,6 +823,10 @@ fn handle_connection(
                     LogLevel::Error => "ERROR",
                 };
                 println!("[hook/{pid}] {level_str} {msg}");
+                // Also persist to JSONL so hook-side diagnostics survive past
+                // the stdout window (which is hidden without -d). One ipc_log
+                // call per spawn / deny / warn — cheap, high diagnostic value.
+                jsonl_log::log(jsonl_log::Event::hook_log(pid, level_str.trim(), &msg));
                 Resp::Ok
             }
             Req::RegisterChild { pid } => {

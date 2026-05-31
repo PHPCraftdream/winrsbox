@@ -297,6 +297,20 @@ unsafe extern "system" fn hook_co_create_instance(
         return E_ACCESSDENIED;
     }
 
+    // Trace EVERY allowed activation too — lets us see which COM components a
+    // workload actually touches (TSF/IME for keyboard, shell, MSCTF, ...) so
+    // when something silently misbehaves we know what to look at. Gated on
+    // is_trace() so production stays quiet.
+    if is_trace() && !rclsid.is_null() {
+        let g = *rclsid;
+        ipc_log(ipc::LogLevel::Trace, format!(
+            "com_allow clsid={{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}} ctx=0x{:x}",
+            g.Data1, g.Data2, g.Data3,
+            g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3],
+            g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7],
+            dw_cls_context));
+    }
+
     call_original()
 }
 
@@ -426,6 +440,10 @@ unsafe extern "system" fn hook_ro_get_activation_factory(
             }
             return REGDB_E_CLASSNOTREG;
         }
+        if is_trace() {
+            ipc_log(ipc::LogLevel::Trace,
+                format!("winrt_factory class={class_name}"));
+        }
     }
 
     call_original()
@@ -458,6 +476,10 @@ unsafe extern "system" fn hook_ro_activate_instance(
                 *instance = std::ptr::null_mut();
             }
             return REGDB_E_CLASSNOTREG;
+        }
+        if is_trace() {
+            ipc_log(ipc::LogLevel::Trace,
+                format!("winrt_activate class={class_name}"));
         }
     }
 

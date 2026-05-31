@@ -642,6 +642,16 @@ unsafe extern "system" fn hook_nt_create_user_process(
     let forced_flags = thread_flags | THREAD_CREATE_FLAGS_CREATE_SUSPENDED;
     let originally_suspended = (thread_flags & THREAD_CREATE_FLAGS_CREATE_SUSPENDED) != 0;
 
+    // Log EVERY spawn attempt with the target exe, before the syscall. Critical
+    // diagnostic: a spawn_attempt without a matching `hello` event later means
+    // the child was created but hook.dll injection did not initialise it (e.g.
+    // cmd.exe's DllMain interferes — known limitation). Without this entry the
+    // log shows children=0 and the cause is invisible.
+    let spawn_target = extract_child_exe(process_parameters);
+    let parent_pid = GetCurrentProcessId();
+    ipc_log(ipc::LogLevel::Info,
+        format!("spawn_attempt: parent={parent_pid} target={spawn_target}"));
+
     let status = HOOK_NT_CREATE_USER_PROCESS.get().unwrap().call(
         process_handle, thread_handle,
         process_desired_access, thread_desired_access,
@@ -651,6 +661,8 @@ unsafe extern "system" fn hook_nt_create_user_process(
     );
 
     if status < 0 {
+        ipc_log(ipc::LogLevel::Warn,
+            format!("spawn_failed: parent={parent_pid} target={spawn_target} status=0x{:08x}", status as u32));
         return status;
     }
 
@@ -914,7 +926,12 @@ fn apply_mitigations(guard: &str) {
     // ExtensionPointDisablePolicy (6): blocks AppInit_DLLs, SetWindowsHookEx, IFEO.
     // Applied in full and static — this is JIT-safe hardening (it blocks
     // injection INTO us, not our own code generation).
-    if guard == "full" || guard == "static" {
+    // Diagnostic escape hatch: set FS_SANDBOX_NO_EXTPOINT_DISABLE=1 to skip
+    // this block (suspected to also break Text Services Framework / IME
+    // initialisation, including per-process keyboard layout switching).
+    if (guard == "full" || guard == "static")
+        && std::env::var("FS_SANDBOX_NO_EXTPOINT_DISABLE").is_err()
+    {
         let ext_disable_flags: u32 = 1;
         // SAFETY: ext_disable_flags is valid for PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY.
         unsafe {
@@ -962,7 +979,8 @@ fn apply_mitigations(guard: &str) {
     // is a critical sandbox-escape vector that affects all profiles.
     // Safe to apply after hook installation: hook.dll is already loaded,
     // and PreferSystem32Images only affects *subsequent* LoadLibrary calls.
-    {
+    // Diagnostic escape hatch: set FS_SANDBOX_NO_IMAGELOAD_LOCK=1 to skip.
+    if std::env::var("FS_SANDBOX_NO_IMAGELOAD_LOCK").is_err() {
         // PROCESS_MITIGATION_IMAGE_LOAD_POLICY bit layout:
         //   bit 0 = NoRemoteImages    (block UNC \\server\share\evil.dll)
         //   bit 2 = PreferSystem32Images (System32 searched before CWD/PATH)
