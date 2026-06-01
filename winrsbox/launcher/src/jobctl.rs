@@ -81,16 +81,47 @@ impl Default for UiRestrictions {
             no_foreign_handles: false,
             no_read_clipboard: false,
             no_write_clipboard: false,
-            no_system_params: true,
-            no_display_settings: true,
+            // SYSTEMPARAMS and DISPLAYSETTINGS off by default — empirically
+            // (bisected by serial elimination) they participate in the same
+            // class of clipboard-paste breakage as EXITWINDOWS/DESKTOP:
+            // any combination of two-or-more of {SYSTEMPARAMS,
+            // DISPLAYSETTINGS, EXITWINDOWS} blocks cross-process paste,
+            // while all-off restores it. Their documented effects
+            // (SystemParametersInfo SET, ChangeDisplaySettings) are mild
+            // UX nuisances rather than escape vectors — sandbox-AI doing
+            // SPI_SETCURSORS is annoying but recoverable. Strip-bits
+            // available via `--strict-clipboard` for headless mode.
+            no_system_params: false,
+            no_display_settings: false,
             // GLOBALATOMS off by default: blocking the global atom table breaks
             // Win32 RegisterWindowMessage / WM_INPUTLANGCHANGEREQUEST, which
             // is how Windows broadcasts per-process keyboard-layout switches.
             // Atom table is in-process arrangement (atoms can't escape the
             // sandbox or modify the host).
             no_global_atoms: false,
-            no_desktop: true,
-            no_exit_windows: true,
+            // DESKTOP off by default: documented as "prevents SwitchDesktop",
+            // but empirically also breaks clipboard PASTE from non-sandboxed
+            // apps into the sandboxed wezterm-gui. The clipboard manager
+            // lives on the desktop object, and reading data published by a
+            // foreign-job source seems to need the same desktop-association
+            // privileges this bit revokes. SwitchDesktop itself isn't a
+            // meaningful escape vector against the kind of agents we sandbox
+            // (interactive sessions where the user is already in front of
+            // the screen) — strip-bit available via `--strict-clipboard`
+            // for headless deployments that really want hard isolation.
+            no_desktop: false,
+            // EXITWINDOWS off by default — bisected as the empirical
+            // blocker for cross-process clipboard PASTE. Docs describe
+            // this bit as blocking ExitWindowsEx only, but empirically
+            // its set state causes GetClipboardData(CF_UNICODETEXT) to
+            // return NULL with ERROR_INVALID_HANDLE on data published
+            // by a non-sandboxed source — even though EnumClipboardFormats
+            // sees the format. The lost logoff/shutdown protection is
+            // re-added at user-mode level by `ui_guard`'s hook on
+            // user32!ExitWindowsEx (anti-Win+R-style escape from a
+            // sandboxed agent that synthesizes Alt+F4 etc.). Strip-bit
+            // available via `--strict-clipboard` for headless hardening.
+            no_exit_windows: false,
         }
     }
 }
@@ -180,10 +211,13 @@ mod tests {
     #[test]
     fn ui_default_all_flags_when_strict() {
         let ui = UiRestrictions::default().with_strict_clipboard();
-        // 0xFF would be every UI restriction; we deliberately leave HANDLES
-        // (0x01) and GLOBALATOMS (0x20) off — see Default impl.
-        // 0xDE = 0xFF & !0x01 & !0x20.
-        assert_eq!(ui.limit_flags(), 0xDE);
+        // Default sets NO bits (all five UI-restriction bits empirically
+        // participate in cross-process clipboard breakage — see Default
+        // impl). `with_strict_clipboard` adds only READ (0x02) + WRITE
+        // (0x04) on top, the two bits that are documented to actually
+        // block clipboard access (and the only ones we use for hard
+        // hardening).
+        assert_eq!(ui.limit_flags(), 0x06);
     }
 
     #[test]
@@ -206,12 +240,15 @@ mod tests {
     #[test]
     fn ui_default_non_clipboard_flags() {
         let ui = UiRestrictions::default();
-        // Default = all UI restrictions EXCEPT clipboard (0x02, 0x04),
-        // HANDLES (0x01) and GLOBALATOMS (0x20) — the two that break
-        // per-process keyboard-layout switching (foreign HWND broadcasts +
-        // RegisterWindowMessage atoms). See the Default impl for rationale.
-        let expected = 0x08 | 0x10 | 0x40 | 0x80;
-        assert_eq!(ui.limit_flags(), expected);
+        // Default = ZERO. Every kernel UI restriction bit was bisected
+        // off because the SYSTEMPARAMS/DISPLAYSETTINGS/EXITWINDOWS/
+        // DESKTOP/HANDLES/GLOBALATOMS set, in any pairing, breaks
+        // cross-process clipboard paste on Win10 19045. Protection
+        // against `ExitWindowsEx` is replaced by a user-mode hook in
+        // `ui_guard`. The other bits' documented effects are UX-only
+        // (mouse/display settings) and don't warrant the clipboard
+        // regression.
+        assert_eq!(ui.limit_flags(), 0);
     }
 
     #[test]

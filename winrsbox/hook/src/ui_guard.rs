@@ -39,6 +39,7 @@ type FnPostMessageW   = unsafe extern "system" fn(HWND, UINT, WPARAM, LPARAM) ->
 type FnPostMessageA   = unsafe extern "system" fn(HWND, UINT, WPARAM, LPARAM) -> BOOL;
 type FnSendMessageW   = unsafe extern "system" fn(HWND, UINT, WPARAM, LPARAM) -> isize;
 type FnSendMessageA   = unsafe extern "system" fn(HWND, UINT, WPARAM, LPARAM) -> isize;
+type FnExitWindowsEx  = unsafe extern "system" fn(UINT, DWORD) -> BOOL;
 
 static HOOK_SEND_INPUT:     OnceLock<GenericDetour<FnSendInput>>    = OnceLock::new();
 static HOOK_KEYBD_EVENT:    OnceLock<GenericDetour<FnKeybdEvent>>   = OnceLock::new();
@@ -52,10 +53,13 @@ static HOOK_FIND_WINDOW_EX_W:  OnceLock<GenericDetour<FnFindWindowExW>>   = Once
 static HOOK_FIND_WINDOW_EX_A:  OnceLock<GenericDetour<FnFindWindowExA>>   = OnceLock::new();
 static HOOK_OPEN_CLIPBOARD:    OnceLock<GenericDetour<FnOpenClipboard>>   = OnceLock::new();
 static HOOK_GET_CLIPBOARD:     OnceLock<GenericDetour<FnGetClipboardData>> = OnceLock::new();
+static STRICT_CLIPBOARD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 static HOOK_POST_MESSAGE_W:    OnceLock<GenericDetour<FnPostMessageW>>    = OnceLock::new();
 static HOOK_POST_MESSAGE_A:    OnceLock<GenericDetour<FnPostMessageA>>    = OnceLock::new();
 static HOOK_SEND_MESSAGE_W:    OnceLock<GenericDetour<FnSendMessageW>>    = OnceLock::new();
 static HOOK_SEND_MESSAGE_A:    OnceLock<GenericDetour<FnSendMessageA>>    = OnceLock::new();
+static HOOK_EXIT_WINDOWS_EX:   OnceLock<GenericDetour<FnExitWindowsEx>>   = OnceLock::new();
 
 /// Returns true when `hwnd` is a window owned by a process **other** than us.
 /// For cross-process HWNDs we deny PostMessage/SendMessage. Own-process
@@ -220,13 +224,32 @@ unsafe extern "system" fn hook_find_window_ex_a(
 }
 
 // SAFETY: Called by detour2 dispatcher with user32!OpenClipboard ABI.
+// Two modes:
+//   - FS_SANDBOX_STRICT_CLIPBOARD=1: deny (return 0). Used by `--strict-clipboard`.
+//   - otherwise: trace-log args + return value, then forward. Lets escape
+//     forensics see clipboard activity (and clipboard-FAILURE codepaths)
+//     without altering behaviour.
 unsafe extern "system" fn hook_open_clipboard(hwnd: HWND) -> BOOL {
     let Some(_g) = anti_rec::enter() else {
         // SAFETY: detour2 trampoline matches FnOpenClipboard ABI.
         return HOOK_OPEN_CLIPBOARD.get().unwrap().call(hwnd);
     };
-    log_soft_deny("OpenClipboard", "denied");
-    0
+    if STRICT_CLIPBOARD.load(std::sync::atomic::Ordering::Relaxed) {
+        log_soft_deny("OpenClipboard", "denied");
+        return 0;
+    }
+    // SAFETY: detour2 trampoline matches FnOpenClipboard ABI.
+    let ret = HOOK_OPEN_CLIPBOARD.get().unwrap().call(hwnd);
+    if is_trace() {
+        let err = if ret == 0 {
+            winapi::um::errhandlingapi::GetLastError()
+        } else {
+            0
+        };
+        ipc_log(ipc::LogLevel::Trace,
+            format!("OpenClipboard(hwnd={hwnd:p}) -> {ret} last_err={err}"));
+    }
+    ret
 }
 
 // SAFETY: Called by detour2 dispatcher with user32!GetClipboardData ABI.
@@ -235,8 +258,43 @@ unsafe extern "system" fn hook_get_clipboard_data(format: UINT) -> HANDLE {
         // SAFETY: detour2 trampoline matches FnGetClipboardData ABI.
         return HOOK_GET_CLIPBOARD.get().unwrap().call(format);
     };
-    log_soft_deny("GetClipboardData", "denied");
-    std::ptr::null_mut()
+    if STRICT_CLIPBOARD.load(std::sync::atomic::Ordering::Relaxed) {
+        log_soft_deny("GetClipboardData", "denied");
+        return std::ptr::null_mut();
+    }
+    // SAFETY: detour2 trampoline matches FnGetClipboardData ABI.
+    let ret = HOOK_GET_CLIPBOARD.get().unwrap().call(format);
+    if is_trace() {
+        let err = if ret.is_null() {
+            winapi::um::errhandlingapi::GetLastError()
+        } else {
+            0
+        };
+        if ret.is_null() {
+            // On failure, enumerate every format currently on the clipboard.
+            // ERROR_INVALID_HANDLE on GetClipboardData usually means the
+            // requested format isn't published — knowing what IS there tells
+            // us whether the source app uses a different format vs. nothing
+            // landing on the clipboard at all (cross-process / cross-job
+            // visibility problem).
+            let mut fmts: Vec<u32> = Vec::with_capacity(16);
+            let mut f: u32 = 0;
+            loop {
+                // SAFETY: FFI; EnumClipboardFormats with the previous format
+                // returns the next one, or 0 at end.
+                f = winapi::um::winuser::EnumClipboardFormats(f);
+                if f == 0 { break; }
+                fmts.push(f);
+                if fmts.len() >= 32 { break; }
+            }
+            ipc_log(ipc::LogLevel::Trace,
+                format!("GetClipboardData(format={format}) -> NULL last_err={err} available_formats={fmts:?}"));
+        } else {
+            ipc_log(ipc::LogLevel::Trace,
+                format!("GetClipboardData(format={format}) -> {ret:p} last_err={err}"));
+        }
+    }
+    ret
 }
 
 // SAFETY: Called by detour2 dispatcher with user32!PostMessageW ABI.
@@ -299,6 +357,29 @@ unsafe extern "system" fn hook_send_message_a(
     HOOK_SEND_MESSAGE_A.get().unwrap().call(hwnd, msg, wparam, lparam)
 }
 
+// SAFETY: Called by detour2 dispatcher with user32!ExitWindowsEx ABI.
+//
+// Hard-deny logoff/shutdown from a sandboxed process. The Job-Object
+// `JOB_OBJECT_UILIMIT_EXITWINDOWS` bit, which used to enforce this at the
+// kernel level, was dropped from the default set because it empirically
+// blocks cross-process clipboard PASTE (GetClipboardData returns NULL
+// with ERROR_INVALID_HANDLE on data published by a non-sandboxed source).
+// This user-mode hook restores the protection: a sandboxed AI agent
+// cannot ExitWindowsEx the user's session. SetLastError(ERROR_ACCESS_DENIED)
+// makes the failure observable to callers that inspect GetLastError.
+unsafe extern "system" fn hook_exit_windows_ex(flags: UINT, reason: DWORD) -> BOOL {
+    let Some(_g) = anti_rec::enter() else {
+        // SAFETY: detour2 trampoline matches FnExitWindowsEx ABI.
+        return HOOK_EXIT_WINDOWS_EX.get().unwrap().call(flags, reason);
+    };
+    if is_trace() {
+        ipc_log(ipc::LogLevel::Warn,
+            format!("ExitWindowsEx denied: flags=0x{flags:x} reason=0x{reason:x}"));
+    }
+    winapi::um::errhandlingapi::SetLastError(5); // ERROR_ACCESS_DENIED
+    0
+}
+
 /// # SAFETY
 /// Must be called from install_hooks() in DllMain context with anti_rec entered.
 pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
@@ -339,8 +420,18 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     install!(HOOK_FIND_WINDOW_EX_W, "FindWindowExW",    hook_find_window_ex_w,   FnFindWindowExW);
     install!(HOOK_FIND_WINDOW_EX_A, "FindWindowExA",    hook_find_window_ex_a,   FnFindWindowExA);
 
+    // Clipboard hooks are installed ONLY under FS_SANDBOX_STRICT_CLIPBOARD.
+    // In the default mode the system clipboard path is left fully untouched
+    // — a previous always-on-trace variant turned out to interfere with
+    // cross-process clipboard reads (LastError trampling / anti_rec
+    // contention in the hot path corrupted the caller's view of
+    // GetClipboardData's outcome), reproducibly breaking PASTE from
+    // non-sandboxed apps into sandboxed wezterm. Forensic tracing is
+    // available by setting FS_SANDBOX_STRICT_CLIPBOARD=1 (which also
+    // hard-denies) for cases that genuinely need it.
     let strict_clipboard = std::env::var("FS_SANDBOX_STRICT_CLIPBOARD")
         .as_deref() == Ok("1");
+    STRICT_CLIPBOARD.store(strict_clipboard, std::sync::atomic::Ordering::Relaxed);
     if strict_clipboard {
         install!(HOOK_OPEN_CLIPBOARD,   "OpenClipboard",    hook_open_clipboard,     FnOpenClipboard);
         install!(HOOK_GET_CLIPBOARD,    "GetClipboardData", hook_get_clipboard_data, FnGetClipboardData);
@@ -350,6 +441,7 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     install!(HOOK_POST_MESSAGE_A,   "PostMessageA",     hook_post_message_a,     FnPostMessageA);
     install!(HOOK_SEND_MESSAGE_W,   "SendMessageW",     hook_send_message_w,     FnSendMessageW);
     install!(HOOK_SEND_MESSAGE_A,   "SendMessageA",     hook_send_message_a,     FnSendMessageA);
+    install!(HOOK_EXIT_WINDOWS_EX,  "ExitWindowsEx",    hook_exit_windows_ex,    FnExitWindowsEx);
     Ok(())
 }
 
@@ -371,4 +463,5 @@ pub unsafe fn uninstall() {
     if let Some(h) = HOOK_POST_MESSAGE_A.get()   { let _ = h.disable(); }
     if let Some(h) = HOOK_SEND_MESSAGE_W.get()   { let _ = h.disable(); }
     if let Some(h) = HOOK_SEND_MESSAGE_A.get()   { let _ = h.disable(); }
+    if let Some(h) = HOOK_EXIT_WINDOWS_EX.get()  { let _ = h.disable(); }
 }
