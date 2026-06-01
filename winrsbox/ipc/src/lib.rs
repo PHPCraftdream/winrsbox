@@ -141,17 +141,40 @@ pub struct SyncClient {
     pipe: std::fs::File,
 }
 
+/// Retry budget for the hook→launcher pipe connect. 30 attempts × 100 ms ≈
+/// 3 s of patience, up from the previous 10 × 50 ms (500 ms).
+///
+/// The launcher's accept loop runs ConnectNamedPipe SERIALLY (one free pipe
+/// instance at a time), so when a parent process bursts several child spawns
+/// in a single second — observed live under MSYS2's first-run setup, which
+/// spawns 8+ helpers per bash startup — late children's `CreateFile` on
+/// the pipe returns `ERROR_PIPE_BUSY` and we fall into this retry. 500 ms
+/// was too tight: combined with the fail-closed 3-strike rule it killed
+/// processes mid-burst (cascade self-terminate). 3 s lets the accept loop
+/// drain a realistic burst before a single connect attempt gives up.
+///
+/// Pair-fix: hook::ipc_client::IPC_FAIL_THRESHOLD raised from 3 → 8 so a
+/// genuine outage still trips the kill-switch but a one-off slow connect
+/// no longer cascades.
+pub const CONNECT_RETRY_ATTEMPTS: u32 = 30;
+pub const CONNECT_RETRY_INTERVAL_MS: u64 = 100;
+
 impl SyncClient {
-    /// Открыть соединение к launcher pipe. Retry до 10 раз с 50ms паузой.
+    /// Открыть соединение к launcher pipe.
+    ///
+    /// Retry policy: `CONNECT_RETRY_ATTEMPTS` × `CONNECT_RETRY_INTERVAL_MS`.
+    /// See the doc on those constants for the budget rationale.
     pub fn connect(pipe_name: &str) -> Result<Self, IpcError> {
-        for _ in 0..10 {
+        for _ in 0..CONNECT_RETRY_ATTEMPTS {
             match std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(pipe_name)
             {
                 Ok(f) => return Ok(Self { pipe: f }),
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(_) => std::thread::sleep(
+                    std::time::Duration::from_millis(CONNECT_RETRY_INTERVAL_MS),
+                ),
             }
         }
         Err(IpcError::Io(io::Error::new(io::ErrorKind::TimedOut, "pipe connect timeout")))
@@ -161,12 +184,53 @@ impl SyncClient {
         write_msg(&mut self.pipe, req)?;
         read_msg(&mut self.pipe)
     }
+
+    /// Test-only constructor: wrap an arbitrary `std::fs::File` (typically
+    /// the write-end of an anonymous pipe whose read-end has been closed,
+    /// so `write` is guaranteed to fail) into a `SyncClient`. The `send`
+    /// method then returns `Err` on the first call, which is what we need
+    /// to drive the reconnect-on-error path in `hook::ipc_client::try_send`
+    /// from a unit test.
+    ///
+    /// Hidden from rustdoc and stable callers. Behaviour for production
+    /// callers is exactly equivalent to `connect` followed by an immediate
+    /// pipe break — nothing to gain, nothing to lose.
+    #[doc(hidden)]
+    pub fn from_file_for_test(pipe: std::fs::File) -> Self {
+        Self { pipe }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// Pin the connect-retry budget against accidental tightening. The total
+    /// budget (attempts × interval) must clear ~3 s — anything less re-opens
+    /// the MSYS2 first-run-burst cascade-self-terminate path documented at
+    /// the constants.
+    #[test]
+    fn connect_retry_budget_at_least_three_seconds() {
+        let budget_ms =
+            CONNECT_RETRY_ATTEMPTS as u64 * CONNECT_RETRY_INTERVAL_MS;
+        assert!(
+            budget_ms >= 3_000,
+            "connect retry budget {budget_ms}ms < 3000ms — MSYS2 burst regression risk",
+        );
+    }
+
+    /// Defensive: very small intervals burn CPU on every spurious failure;
+    /// very large intervals push past the hook-side fail-closed threshold
+    /// (IPC_FAIL_THRESHOLD × per-call connect budget). 50–500 ms is the
+    /// sane range; pin it.
+    #[test]
+    fn connect_retry_interval_in_sane_range() {
+        assert!(
+            (50..=500).contains(&CONNECT_RETRY_INTERVAL_MS),
+            "CONNECT_RETRY_INTERVAL_MS={CONNECT_RETRY_INTERVAL_MS} out of [50,500]ms",
+        );
+    }
 
     #[test]
     fn req_hello_roundtrip() {
