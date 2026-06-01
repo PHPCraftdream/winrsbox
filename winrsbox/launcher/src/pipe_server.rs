@@ -256,6 +256,65 @@ fn is_owned_client_pid(client_pid: u32, root_target_pid: u32) -> bool {
 /// progress even when all 128 handler slots are busy.
 pub(crate) const MAX_CONCURRENT_HANDLERS: usize = 128;
 
+/// Number of parallel `ConnectNamedPipe` acceptors that share the pipe
+/// namespace. Each acceptor owns its own pipe instance, so up to N clients
+/// can `CreateFile`-connect simultaneously without anyone seeing
+/// `ERROR_PIPE_BUSY`. Before this pool, the accept loop was single-instance:
+/// MSYS2's first-run setup (which spawns ~8 helper processes in the same
+/// second from a single bash invocation) raced for that one pipe, lost,
+/// and burned the hook-side connect/retry budget — cascading
+/// self-terminates.
+///
+/// 16 absorbs every burst we've measured live (MSYS2, npm install, cargo
+/// build, claude-code agent fan-out) with headroom; each instance costs
+/// only the 64 KiB in/out buffer (and one tokio task while idle), so the
+/// total footprint is ~1 MiB.
+pub(crate) const PIPE_ACCEPT_POOL_SIZE: usize = 16;
+
+/// Build one server-side instance of the launcher pipe. Pure FFI wrapper so
+/// the accept loop body stays focused on the connect/validate flow. The
+/// caller MUST pass `is_first = true` on exactly ONE call (the very first
+/// instance created for this pipe name) to claim the kernel namespace via
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE`; subsequent calls MUST pass `false`
+/// (the flag is illegal once an instance already exists).
+///
+/// Returns the handle as `isize` so it crosses tokio's `.await` / task
+/// boundaries (`HANDLE`'s raw pointer is `!Send`); reconstruct with
+/// `HANDLE(ph as *mut _)` on the consuming side.
+fn create_pipe_instance(
+    pipe_name_wide: &[u16],
+    pipe_sec: &PipeSecurity,
+    is_first: bool,
+) -> Result<isize, String> {
+    let dw_open_mode = if is_first {
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
+    } else {
+        PIPE_ACCESS_DUPLEX
+    };
+    let dw_pipe_mode =
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
+    // SAFETY: pipe_name_wide is a valid null-terminated UTF-16 string; pipe_sec
+    //         contains a valid SECURITY_ATTRIBUTES that lives at least until the
+    //         FFI call returns (caller owns it).
+    unsafe {
+        let h = CreateNamedPipeW(
+            PCWSTR(pipe_name_wide.as_ptr()),
+            dw_open_mode,
+            dw_pipe_mode,
+            255,    // max instances (kernel-imposed cap on this name)
+            65536,  // out buffer size
+            65536,  // in buffer size
+            0,      // default timeout
+            Some(&pipe_sec.sa as *const SECURITY_ATTRIBUTES),
+        );
+        if h.is_invalid() {
+            Err(format!("{:?}", windows::core::Error::from_win32()))
+        } else {
+            Ok(h.0 as isize)
+        }
+    }
+}
+
 /// RAII teardown guard for an accepted pipe connection's server-side handle.
 ///
 /// Audit M-A3 (robustness / resource leak): the per-connection handler runs
@@ -341,93 +400,105 @@ pub(crate) async fn pipe_accept_loop(
     // `spawn_blocking` itself.
     let handler_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS));
 
-    // C3 Part 1: the first iteration must request FILE_FLAG_FIRST_PIPE_INSTANCE
-    // so the kernel refuses our CreateNamedPipeW if another process already
-    // owns this pipe name. Subsequent iterations must NOT request that flag
-    // (it is illegal once an instance exists).
-    let mut first = true;
+    // C3 Part 1: claim the pipe namespace by creating the FIRST instance
+    // synchronously, with FILE_FLAG_FIRST_PIPE_INSTANCE. This MUST succeed
+    // before we expose any acceptors — a collision here means another
+    // process owns the pipe name (possible attack) and we fail-closed.
+    let first_ph = match create_pipe_instance(&pipe_name_wide, &pipe_sec, true) {
+        Ok(ph) => ph,
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "CreateNamedPipeW(FIRST_PIPE_INSTANCE) failed for {pipe_name}: {err} \
+                 — pipe name collision, possible attack",
+            ));
+        }
+    };
 
+    // Spawn the parallel accept pool. Worker 0 inherits the just-claimed
+    // FIRST_PIPE_INSTANCE handle as its initial pipe; the remaining workers
+    // each create their own (un-flagged) instance on entry. Each worker runs
+    // its own `Create → Connect → validate → handle` loop forever, so the
+    // pool can absorb up to PIPE_ACCEPT_POOL_SIZE simultaneous client
+    // connects without anyone hitting ERROR_PIPE_BUSY.
+    let mut workers = Vec::with_capacity(PIPE_ACCEPT_POOL_SIZE);
+    for slot in 0..PIPE_ACCEPT_POOL_SIZE {
+        let initial = if slot == 0 { Some(first_ph) } else { None };
+        let pipe_name_wide = pipe_name_wide.clone();
+        let pipe_sec = Arc::clone(&pipe_sec);
+        let handler_sem = Arc::clone(&handler_sem);
+        let policy = Arc::clone(&policy);
+        let stats = Arc::clone(&stats);
+        let child_pids = Arc::clone(&child_pids);
+        let violations_log = violations_log.clone();
+        let hot_stats = Arc::clone(&hot_stats);
+        let flusher = Arc::clone(&flusher);
+        let root_target_pid = Arc::clone(&root_target_pid);
+        workers.push(tokio::spawn(accept_worker(
+            initial,
+            pipe_name_wide,
+            pipe_sec,
+            handler_sem,
+            policy,
+            stats,
+            child_pids,
+            violations_log,
+            hot_stats,
+            flusher,
+            root_target_pid,
+        )));
+    }
+
+    // Workers are designed to run for the launcher's lifetime; if any of them
+    // returns early (Err or unexpected Ok) we surface the failure to the
+    // outer launcher rather than silently shrinking the pool.
+    for w in workers {
+        match w.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(je) => return Err(anyhow::anyhow!("accept worker task panicked: {je}")),
+        }
+    }
+    Ok(())
+}
+
+/// One slot of the parallel accept pool. Owns a single pipe instance at a
+/// time: connects a client, validates it, hands the connection off to a
+/// blocking handler task (subject to `handler_sem`), then creates a fresh
+/// instance and waits for the next client.
+///
+/// The first worker takes the launcher-owned `FIRST_PIPE_INSTANCE` handle
+/// via `initial_ph`; subsequent workers (and every subsequent iteration of
+/// every worker) call `create_pipe_instance(.., false)`.
+#[allow(clippy::too_many_arguments)]
+async fn accept_worker(
+    mut initial_ph: Option<isize>,
+    pipe_name_wide: Vec<u16>,
+    pipe_sec: Arc<PipeSecurity>,
+    handler_sem: Arc<Semaphore>,
+    policy: Arc<Policy>,
+    stats: Arc<Stats>,
+    child_pids: Arc<crossbeam_queue::SegQueue<u32>>,
+    violations_log: PathBuf,
+    hot_stats: Arc<HotStats>,
+    flusher: Arc<ThrottledFlusher>,
+    root_target_pid: Arc<AtomicU32>,
+) -> anyhow::Result<()> {
     loop {
-        // Create a new pipe instance for each incoming connection.
-        //
-        // C3 Part 1: the first CreateNamedPipeW call carries
-        //   FILE_FLAG_FIRST_PIPE_INSTANCE — fails if a competing server with
-        //   the same name already exists.
-        // C3 Part 1: ALL calls carry PIPE_REJECT_REMOTE_CLIENTS — refuses
-        //   connections that come in over SMB (remote logon sessions).
-        // C3 Part 2: ALL calls pass the launcher-user-only DACL built above
-        //   via `pipe_sec.sa`.
-        //
-        // PIPE_ACCESS_DUPLEX                              = FILE_FLAGS_AND_ATTRIBUTES(3)
-        // FILE_FLAG_FIRST_PIPE_INSTANCE                   = FILE_FLAGS_AND_ATTRIBUTES(0x00080000)
-        // PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT = NAMED_PIPE_MODE(0)
-        // PIPE_REJECT_REMOTE_CLIENTS                      = NAMED_PIPE_MODE(0x00000008)
-        let dw_open_mode = if first {
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
+        // Acquire this iteration's pipe handle: either consume the seed
+        // FIRST_PIPE_INSTANCE handle (worker-0, very first iteration), or
+        // create a fresh instance.
+        let ph: isize = if let Some(h) = initial_ph.take() {
+            h
         } else {
-            PIPE_ACCESS_DUPLEX
-        };
-        let dw_pipe_mode =
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
-
-        // SAFETY: pipe_name_wide is a valid null-terminated UTF-16 string;
-        //         pipe_sec.sa is a SECURITY_ATTRIBUTES with a valid SD that
-        //         lives for the entire loop (owned by `pipe_sec`).
-        // Convert HANDLE to isize immediately (and capture any error as a
-        // formatted String) so the Result that crosses .await is Send. The
-        // raw `windows::core::Error` wraps an HRESULT whose pointer fields
-        // make it `!Send`.
-        let create_result: Result<isize, String> = unsafe {
-            let h = CreateNamedPipeW(
-                PCWSTR(pipe_name_wide.as_ptr()),
-                dw_open_mode,
-                dw_pipe_mode,
-                255,    // max instances
-                65536,  // out buffer size
-                65536,  // in buffer size
-                0,      // default timeout
-                Some(&pipe_sec.sa as *const SECURITY_ATTRIBUTES),
-            );
-            if h.is_invalid() {
-                // CreateNamedPipeW reports failure via INVALID_HANDLE_VALUE +
-                // GetLastError. windows::core::Error::from_win32() reads the
-                // calling thread's last-error code captured by the API itself.
-                // Format to String here so the value is Send across .await.
-                Err(format!("{:?}", windows::core::Error::from_win32()))
-            } else {
-                Ok(h.0 as isize)
-            }
-        };
-
-        let ph: isize = match create_result {
-            Ok(ph) => ph,
-            Err(err) => {
-                if first {
-                    // C3 Part 1 fail-closed: if the first instance creation
-                    // fails — most commonly because another process already
-                    // owns the pipe name (ERROR_ACCESS_DENIED / ERROR_PIPE_BUSY
-                    // / ERROR_ALREADY_EXISTS) — abort the launcher. Continuing
-                    // would silently degrade to a co-tenant on a pipe controlled
-                    // by an attacker.
-                    return Err(anyhow::anyhow!(
-                        "CreateNamedPipeW(FIRST_PIPE_INSTANCE) failed for {pipe_name}: {err} \
-                         — pipe name collision, possible attack",
-                    ));
+            match create_pipe_instance(&pipe_name_wide, &pipe_sec, false) {
+                Ok(ph) => ph,
+                Err(err) => {
+                    eprintln!("[pipe] CreateNamedPipeW (instance) failed: {err} — retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
                 }
-                // Subsequent failures: transient kernel pressure (e.g. too many
-                // instances). Log and back off briefly, then retry. The pipe
-                // namespace stays owned by us because the first instance
-                // succeeded.
-                eprintln!(
-                    "[pipe] CreateNamedPipeW (instance) failed: {err} — retrying",
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                continue;
             }
         };
-        // After the first successful CreateNamedPipeW the FIRST_PIPE_INSTANCE
-        // flag MUST NOT be passed again.
-        first = false;
 
         // ConnectNamedPipe blocks until a client connects — run in spawn_blocking
         // to avoid blocking the async executor (§B11).
@@ -510,12 +581,12 @@ pub(crate) async fn pipe_accept_loop(
             Ok(p) => p,
             Err(_) => {
                 // Semaphore was closed — process is shutting down. Tear down
-                // this connection and exit the loop instead of leaking the
+                // this connection and exit the worker instead of leaking the
                 // pipe handle.
                 // SAFETY: ph is the isize repr of our pipe handle.
                 unsafe { DisconnectNamedPipe(HANDLE(ph as *mut _)).ok() };
                 unsafe { CloseHandle(HANDLE(ph as *mut _)).ok() };
-                break;
+                return Ok(());
             }
         };
 
@@ -544,8 +615,6 @@ pub(crate) async fn pipe_accept_loop(
             handle_connection(h, client_pid, &policy, &stats, &child_pids, &vlog, &hot_stats2, &flusher2);
         });
     }
-
-    Ok(())
 }
 
 /// Registry-key substrings that always deny on write — every entry here
@@ -1284,6 +1353,51 @@ mod tests {
         // task and any other launcher subsystems.
         assert!(MAX_CONCURRENT_HANDLERS >= 32);
         assert!(MAX_CONCURRENT_HANDLERS <= 256);
+    }
+
+    /// Pin the accept pool size. Must clear the empirically-observed
+    /// MSYS2 first-run burst (~8 concurrent helper spawns) with headroom,
+    /// and stay well under the kernel-imposed max-instances cap (255)
+    /// that `create_pipe_instance` passes to `CreateNamedPipeW`.
+    #[test]
+    fn accept_pool_size_in_sane_range() {
+        assert!(
+            PIPE_ACCEPT_POOL_SIZE >= 8,
+            "PIPE_ACCEPT_POOL_SIZE={PIPE_ACCEPT_POOL_SIZE} cannot absorb MSYS2's 8-process burst",
+        );
+        assert!(
+            PIPE_ACCEPT_POOL_SIZE <= 64,
+            "PIPE_ACCEPT_POOL_SIZE={PIPE_ACCEPT_POOL_SIZE} too high — \
+             each instance costs 128 KiB pipe buffers and a tokio task",
+        );
+    }
+
+    /// `create_pipe_instance` is a thin FFI wrapper; its main contract is
+    /// returning a usable handle as `isize` (Send across `.await`) and
+    /// honouring `is_first` for the FIRST_PIPE_INSTANCE flag. We can't
+    /// CreateNamedPipeW in a unit test without a unique pipe name, so this
+    /// test verifies the happy path against a one-off name and immediately
+    /// closes the returned handle.
+    #[test]
+    fn create_pipe_instance_returns_valid_handle() {
+        use windows::Win32::Foundation::HANDLE;
+        let name = format!(
+            r"\\.\pipe\winrsbox-unit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        );
+        let wide: Vec<u16> = OsStr::new(&name)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let sec = build_pipe_security().expect("pipe SD build");
+        let ph = create_pipe_instance(&wide, &sec, true)
+            .expect("first instance must create on a fresh pipe name");
+        assert_ne!(ph, 0, "handle must be non-null");
+        unsafe { CloseHandle(HANDLE(ph as *mut _)).ok() };
     }
 
     #[tokio::test(flavor = "current_thread")]

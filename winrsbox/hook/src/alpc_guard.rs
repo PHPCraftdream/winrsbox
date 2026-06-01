@@ -53,7 +53,19 @@ const DANGEROUS_PORT_SUBSTRINGS: &[&str] = &[
     "comlaunch",    // COM launch service
     "dcomlaunch",   // \RPC Control\dcomlaunch — DcomLaunch (spawns COM servers as SYSTEM)
     // Security services / privilege brokers
-    "lsarpc",       // \RPC Control\LSARPC — LSA policy queries
+    //
+    // `lsarpc` is intentionally NOT in this list. Cygwin/MSYS2 bash and
+    // most Windows runtimes call `LsaOpenPolicy(POLICY_LOOKUP_NAMES)` very
+    // early during init for SID↔name resolution; an ALPC block there
+    // doesn't stop them (they print a warning and fall through) but
+    // pollutes every shell session with `lsa_open_policy(NULL) failed`.
+    // The dangerous LSA operations (`LsaAddAccountRights`, etc.) require
+    // `POLICY_CREATE_ACCOUNT` / `POLICY_TRUST_ADMIN` on the policy object,
+    // which a medium-IL sandbox token cannot acquire from `LsaOpenPolicy`
+    // in the first place — Windows' own ACL on the LSA policy object is
+    // the real gate. The real privilege-escalation vectors (`samr` for
+    // password hashes, `seclogon` for RunAs, `appinfo` for UAC) stay
+    // blocked below.
     "samr",         // \RPC Control\samr — SAM database (account enum)
     "winreg",       // \RPC Control\winreg — remote registry
     "seclogon",     // \RPC Control\seclogon — secondary logon / RunAs (priv escalation)
@@ -258,7 +270,12 @@ mod tests {
         assert!(is_dangerous_port("ComLaunch"));
 
         // NEW — security service patterns
-        assert!(is_dangerous_port(r"\RPC Control\lsarpc"));
+        //
+        // LSARPC is intentionally NOT denied (see denylist comment): blocking
+        // it added no real defense (medium-IL ACL on the policy object
+        // already gates dangerous LSA calls) and broke Cygwin/MSYS2 bash
+        // initialization. Pin the inverted expectation.
+        assert!(!is_dangerous_port(r"\RPC Control\lsarpc"));
         assert!(is_dangerous_port(r"\RPC Control\samr"));
         assert!(is_dangerous_port(r"\RPC Control\winreg"));
         assert!(is_dangerous_port(r"\RPC Control\seclogon"));
