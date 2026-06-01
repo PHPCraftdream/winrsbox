@@ -460,8 +460,16 @@ fn resolve_process_pid(handle: HANDLE) -> u32 {
 // ---------------------------------------------------------------------------
 
 const SPAWN_DENYLIST: &[&str] = &[
-    // WSL / Linux subsystem
-    "wsl.exe", "wslhost.exe", "bash.exe",
+    // WSL / Linux subsystem.
+    //
+    // `bash.exe` intentionally LEFT OUT of the basename-deny set: that
+    // basename collides with the perfectly-fine MinGW/Git Bash binary at
+    // `C:\Program Files\Git\…\bash.exe`, which AI agents and dev tooling
+    // legitimately spawn (claude-code's git-clone path was hitting this
+    // and failing with EPERM). The legacy WSL stub at
+    // `C:\Windows\System32\bash.exe` is still denied — see
+    // `is_path_locked_wsl_bash` below.
+    "wsl.exe", "wslhost.exe",
     // WMI cmdline
     "wmic.exe",
     // Classic LOLBins — script/DLL execution from signed binaries
@@ -516,10 +524,35 @@ pub fn is_denied_by_names(basename: &str, original: Option<&str>) -> bool {
 /// (read from the VERSIONINFO resource), so a copy-renamed denylisted binary
 /// is still caught (M3). OriginalFilename is best-effort: if the version
 /// resource is missing or the file is unreadable, only the basename is used.
+///
+/// Plus the path-locked WSL-bash check (see `is_path_locked_wsl_bash`) so
+/// `\System32\bash.exe` still blocks despite the basename leaving the
+/// denylist (basename collision with Git Bash).
 pub fn is_denylisted(image_path: &str) -> bool {
     let basename = basename_of(image_path);
     let original = original_filename(image_path);
-    is_denied_by_names(&basename, original.as_deref())
+    if is_denied_by_names(&basename, original.as_deref()) {
+        return true;
+    }
+    is_path_locked_wsl_bash(image_path)
+}
+
+/// `true` when `image_path` points at the legacy WSL stub
+/// (`C:\Windows\System32\bash.exe`) or its store-app twin in
+/// `\WindowsApps\…\bash.exe`. Pure over the path string so it's
+/// unit-testable without any filesystem access.
+///
+/// The non-path-locked basename "bash.exe" was removed from
+/// `SPAWN_DENYLIST` to stop us false-positive-blocking Git Bash
+/// (`C:\Program Files\Git\…\bash.exe`); this predicate keeps WSL coverage.
+pub fn is_path_locked_wsl_bash(image_path: &str) -> bool {
+    let lower = image_path.to_lowercase().replace('/', "\\");
+    if !lower.ends_with("\\bash.exe") {
+        return false;
+    }
+    lower.contains(r"\windows\system32\")
+        || lower.contains(r"\windows\sysnative\")
+        || lower.contains(r"\windowsapps\")
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,9 +1151,88 @@ mod tests {
         // OriginalFilename still reports the denylisted name. Must be blocked.
         assert!(is_denied_by_names("foo.exe", Some("wsl.exe")));
         assert!(is_denied_by_names("totally_legit.exe", Some("WSL.EXE")));
-        assert!(is_denied_by_names("a.exe", Some("bash.exe")));
         // Neither name denylisted → allowed.
         assert!(!is_denied_by_names("a.exe", Some("b.exe")));
+        // `bash.exe` is intentionally NOT in the basename denylist — the
+        // path-locked check `is_path_locked_wsl_bash` covers the WSL stub
+        // location while leaving Git Bash alone. So a renamed-from-bash.exe
+        // is allowed by name; the path check is what catches the WSL case.
+        assert!(!is_denied_by_names("a.exe", Some("bash.exe")));
+    }
+
+    // -- is_path_locked_wsl_bash ------------------------------------------------
+    //
+    // Regression coverage for the Git-Bash false-positive: we removed
+    // `bash.exe` from the basename denylist (it collided with Git's MinGW
+    // bash at `\Program Files\Git\…`), and re-added the legacy WSL stub
+    // coverage as a PATH-locked rule. These tests pin both halves of that
+    // contract.
+
+    #[test]
+    fn wsl_bash_at_system32_is_denied() {
+        assert!(is_path_locked_wsl_bash(r"C:\Windows\System32\bash.exe"));
+        // Case + slash variants.
+        assert!(is_path_locked_wsl_bash(r"c:\windows\system32\BASH.EXE"));
+        assert!(is_path_locked_wsl_bash(r"c:/windows/system32/bash.exe"));
+    }
+
+    #[test]
+    fn wsl_bash_at_sysnative_redirector_is_denied() {
+        // 32-bit processes see the 64-bit System32 via `\Sysnative\`.
+        // Cover that path so a 32-bit attacker spawn doesn't slip through.
+        assert!(is_path_locked_wsl_bash(r"C:\Windows\Sysnative\bash.exe"));
+    }
+
+    #[test]
+    fn wsl_store_app_bash_is_denied() {
+        // Modern WSL ships as an MSIX in `\WindowsApps\…`. The exact
+        // package directory varies across builds — the predicate matches
+        // any path under WindowsApps.
+        assert!(is_path_locked_wsl_bash(
+            r"C:\Program Files\WindowsApps\MicrosoftCorporationII.WindowsSubsystemForLinux_2.2.4.0_x64__8wekyb3d8bbwe\bash.exe"
+        ));
+    }
+
+    #[test]
+    fn git_bash_is_allowed() {
+        // The whole point of the fix: Git Bash at the default install
+        // location must NOT be flagged as WSL.
+        assert!(!is_path_locked_wsl_bash(r"C:\Program Files\Git\bin\bash.exe"));
+        assert!(!is_path_locked_wsl_bash(r"C:\Program Files\Git\usr\bin\bash.exe"));
+        // 32-bit Git, or per-user install in AppData.
+        assert!(!is_path_locked_wsl_bash(r"C:\Program Files (x86)\Git\bin\bash.exe"));
+        assert!(!is_path_locked_wsl_bash(
+            r"C:\Users\alice\AppData\Local\Programs\Git\bin\bash.exe"
+        ));
+    }
+
+    #[test]
+    fn msys_and_cygwin_bash_are_allowed() {
+        assert!(!is_path_locked_wsl_bash(r"C:\msys64\usr\bin\bash.exe"));
+        assert!(!is_path_locked_wsl_bash(r"C:\cygwin64\bin\bash.exe"));
+    }
+
+    #[test]
+    fn non_bash_exe_is_not_flagged() {
+        // Predicate is for `bash.exe` only; other executables anywhere on
+        // the system are out of its scope.
+        assert!(!is_path_locked_wsl_bash(r"C:\Windows\System32\notepad.exe"));
+        assert!(!is_path_locked_wsl_bash(r"C:\Windows\System32\bashlike.exe"));
+        // Bare bash without the .exe extension — kernel never opens the
+        // image like this on Windows, but defensively reject.
+        assert!(!is_path_locked_wsl_bash(r"C:\Windows\System32\bash"));
+    }
+
+    #[test]
+    fn is_denylisted_combines_name_and_path_checks() {
+        // The umbrella entrypoint MUST catch both:
+        // (a) the basename-deny set (e.g. wsl.exe anywhere)
+        assert!(is_denylisted(r"C:\Windows\System32\wsl.exe"));
+        // (b) the path-locked WSL-bash stub
+        assert!(is_denylisted(r"C:\Windows\System32\bash.exe"));
+        // …without dragging Git Bash into either.
+        assert!(!is_denylisted(r"C:\Program Files\Git\bin\bash.exe"));
+        assert!(!is_denylisted(r"C:\Program Files\Git\usr\bin\bash.exe"));
     }
 
     #[test]

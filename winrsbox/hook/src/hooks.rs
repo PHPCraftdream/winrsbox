@@ -341,17 +341,35 @@ pub(crate) unsafe fn resolve_for_hook(
     }
     let cwd = &cwd_buf[..cwd_len];
 
-    let need_sep = !cwd.is_empty() && cwd[cwd.len() - 1] != b'\\' as u16;
-    let mut abs: Vec<u16> = Vec::with_capacity(4 + cwd.len() + 1 + name_slice.len());
-    abs.extend_from_slice(&[b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16]);
-    abs.extend_from_slice(cwd);
-    if need_sep {
-        abs.push(b'\\' as u16);
-    }
-    abs.extend_from_slice(name_slice);
-
+    let abs = join_bare_relative_to_nt(cwd, name_slice);
     let dos = policy::path::nt_to_dos_lower(&abs)?;
     Some((dos, Some(abs)))
+}
+
+/// Build the absolute NT-form path `\??\<cwd>\<relative>` for a bare-relative
+/// `name` given the process's current working directory `cwd`. Pure over its
+/// inputs so the join discipline can be unit-tested without a real
+/// `GetCurrentDirectoryW`.
+///
+/// Inputs are UTF-16 slices (the form the kernel ABI hands us):
+///   - `cwd`     must be the lowercased absolute DOS path of the process CWD
+///               (e.g. `c:\users\alice\desktop`). NUL terminator NOT included.
+///   - `name`    is the bare relative ObjectName from `OBJECT_ATTRIBUTES`
+///               (e.g. `qwe.txt`). NUL terminator NOT included.
+///
+/// Returns a freshly-built UTF-16 vector `\??\<cwd>[\]<name>` (no NUL).
+/// A trailing path separator on `cwd` is honoured (no double `\\`);
+/// otherwise one is inserted.
+pub(crate) fn join_bare_relative_to_nt(cwd: &[u16], name: &[u16]) -> Vec<u16> {
+    let need_sep = !cwd.is_empty() && cwd[cwd.len() - 1] != b'\\' as u16;
+    let mut out: Vec<u16> = Vec::with_capacity(4 + cwd.len() + 1 + name.len());
+    out.extend_from_slice(&[b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16]);
+    out.extend_from_slice(cwd);
+    if need_sep {
+        out.push(b'\\' as u16);
+    }
+    out.extend_from_slice(name);
+    out
 }
 
 pub(crate) unsafe fn extract_raw_nt_path(attrs: *const OBJECT_ATTRIBUTES) -> Option<String> {
@@ -1505,6 +1523,78 @@ mod tests {
         assert!(s.starts_with(r"\??\c:\"),
             "expected `\\??\\c:\\…`, got {s}");
         assert!(s.ends_with(r"\probe"), "tail lost in rewrite: {s}");
+    }
+
+    // -- join_bare_relative_to_nt ----------------------------------------------
+    //
+    // Regression coverage for the cmd.exe `>filename` escape's bare-relative
+    // branch in resolve_for_hook. The OS-backed half of that fix
+    // (GetCurrentDirectoryW) can't be unit-tested without launching a child
+    // process, so the join discipline is split into this pure helper that
+    // takes CWD as an input slice.
+
+    fn u(s: &str) -> Vec<u16> { s.encode_utf16().collect() }
+    fn s_of(v: &[u16]) -> String { String::from_utf16_lossy(v) }
+
+    #[test]
+    fn join_typical_cwd_and_bare_name() {
+        let abs = join_bare_relative_to_nt(&u(r"C:\Users\alice\Desktop"), &u("qwe.txt"));
+        assert_eq!(s_of(&abs), r"\??\C:\Users\alice\Desktop\qwe.txt");
+    }
+
+    #[test]
+    fn join_inserts_separator_when_cwd_missing_trailing_slash() {
+        // The realistic case — GetCurrentDirectoryW typically returns
+        // `C:\some\path` without a trailing slash.
+        let abs = join_bare_relative_to_nt(&u(r"C:\some\path"), &u("file"));
+        assert_eq!(s_of(&abs), r"\??\C:\some\path\file");
+    }
+
+    #[test]
+    fn join_no_double_slash_when_cwd_has_trailing_slash() {
+        // Drive root case (`C:\`) — CWD already ends with `\`. We must NOT
+        // insert a second one, or the kernel parses `\\file` as a UNC root.
+        let abs = join_bare_relative_to_nt(&u(r"C:\"), &u("file.txt"));
+        assert_eq!(s_of(&abs), r"\??\C:\file.txt");
+    }
+
+    #[test]
+    fn join_prefix_is_dos_device_form() {
+        // The first four code units MUST be `\??\` (the DOS-device prefix
+        // policy::path::nt_to_dos_lower recognises). A `\\?\` variant would
+        // also be accepted by the path normalizer, but mixing the two would
+        // fail the join contract test below.
+        let abs = join_bare_relative_to_nt(&u(r"C:\x"), &u("y"));
+        assert_eq!(&abs[..4], &[
+            b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16,
+        ]);
+    }
+
+    #[test]
+    fn join_passes_through_nt_to_dos_lower() {
+        // The combined contract: anything the join produces from a valid
+        // DOS CWD + a bare relative name must be classifiable by
+        // `policy::path::nt_to_dos_lower` — that's the gate that turns
+        // the kernel-form path back into our policy-form DOS path. If this
+        // ever breaks, the cmd.exe escape returns.
+        let abs = join_bare_relative_to_nt(
+            &u(r"C:\Users\Computer\Desktop"),
+            &u("qwe.txt"),
+        );
+        let dos = policy::path::nt_to_dos_lower(&abs)
+            .expect("synthesized \\??\\<cwd>\\<name> must be DOS-classifiable");
+        assert_eq!(dos, r"c:\users\computer\desktop\qwe.txt");
+    }
+
+    #[test]
+    fn join_preserves_subdirectory_in_name() {
+        // Caller can pass a multi-component bare relative path (e.g.
+        // `subdir\file.txt`). The join logic must not flatten or split it.
+        let abs = join_bare_relative_to_nt(
+            &u(r"C:\base"),
+            &u(r"sub\file.txt"),
+        );
+        assert_eq!(s_of(&abs), r"\??\C:\base\sub\file.txt");
     }
 }
 
