@@ -155,6 +155,13 @@ unsafe extern "system" fn hook_nt_alpc_connect_port(
                     }
                     return STATUS_ACCESS_DENIED;
                 }
+                // Diagnostic: log every ALLOWED connect under trace. Pure
+                // visibility — needed to spot DNS / SChannel / proxy
+                // resolvers that travel through unfamiliar port names.
+                if crate::hooks::is_trace() {
+                    crate::hooks::ipc_log(ipc::LogLevel::Trace,
+                        format!("alpc_connect: {name}"));
+                }
             }
             PortNameStatus::Malformed(reason) => {
                 // Fail closed: an oversized / inconsistent / null-Buffer

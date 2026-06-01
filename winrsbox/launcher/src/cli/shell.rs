@@ -398,6 +398,44 @@ mod tests {
         assert_eq!(extract_target_from_command(cmd), r"C:\wezterm\wezterm-gui.exe");
     }
 
+    /// Regression pin for the IPC-spawn-proxy + mux-discovery fix:
+    /// the wezterm context-menu command MUST carry
+    /// `start --always-new-process --no-auto-connect` (in that order).
+    ///
+    ///   - `start` is the subcommand both flags belong to (`wezterm-gui
+    ///     start --help` lists them as `start`-specific). Putting either
+    ///     flag before `start` makes wezterm reject it as an unknown
+    ///     global option.
+    ///   - `--always-new-process` blocks the CLI handoff to a pre-existing
+    ///     wezterm GUI (which would parent the resulting shell outside
+    ///     our Job).
+    ///   - `--no-auto-connect` blocks auto-attach to unix_domains /
+    ///     ssh_domains from the user's wezterm.lua (which would route
+    ///     spawn requests through an out-of-Job mux-server).
+    ///
+    /// Anyone touching this command line in shell.rs must update the test
+    /// — silently dropping a flag broke escape containment in earlier
+    /// sessions.
+    #[test]
+    fn wezterm_install_command_has_both_isolation_flags() {
+        let cmd = compose_command(
+            r"C:\bin\winrsbox.exe",
+            r"C:\Program Files\WezTerm\wezterm-gui.exe",
+            &["start", "--always-new-process", "--no-auto-connect"],
+            false,
+        );
+        let start_pos = cmd.find(" start ").or_else(|| cmd.find(" start"))
+            .expect("`start` subcommand must appear in the composed command");
+        let anp_pos = cmd.find("--always-new-process")
+            .expect("--always-new-process must appear");
+        let nac_pos = cmd.find("--no-auto-connect")
+            .expect("--no-auto-connect must appear");
+        assert!(start_pos < anp_pos,
+            "--always-new-process must come AFTER `start` (it's a subcommand flag)");
+        assert!(start_pos < nac_pos,
+            "--no-auto-connect must come AFTER `start` (it's a subcommand flag)");
+    }
+
     #[test]
     fn find_in_path_finds_cmd() {
         let found = find_in_path("cmd.exe");

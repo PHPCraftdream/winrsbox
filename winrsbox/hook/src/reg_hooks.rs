@@ -343,6 +343,40 @@ fn check_write_mode(friendly_key: &str, value_name: Option<String>) -> policy::M
     policy::Mode::Deny
 }
 
+/// Registry access-mask bits whose presence in `DesiredAccess` means the
+/// caller can mutate the key (set values, create subkeys, delete it,
+/// change owner / DACL, or — via the generic / maximum aliases — the kernel
+/// could grant any of the above). When NONE of these bits is set, an
+/// `NtCreateKey` is effectively just an open and never lets the caller
+/// mutate state, so it's safe to bypass our Cow-downgrade fail-closed.
+///
+/// Public for tests; not exported beyond the crate.
+pub(crate) const NT_CREATE_KEY_WRITE_BITS: u32 = {
+    // Per Microsoft `ntddk.h` / `winnt.h` registry access rights.
+    const KEY_SET_VALUE:      u32 = 0x0002;
+    const KEY_CREATE_SUB_KEY: u32 = 0x0004;
+    const KEY_CREATE_LINK:    u32 = 0x0020;
+    const DELETE:             u32 = 0x0001_0000;
+    const WRITE_DAC:          u32 = 0x0004_0000;
+    const WRITE_OWNER:        u32 = 0x0008_0000;
+    const GENERIC_ALL:        u32 = 0x1000_0000;
+    const GENERIC_WRITE:      u32 = 0x4000_0000;
+    // MAXIMUM_ALLOWED asks the kernel for "everything you'd allow me to
+    // have"; on a key the sandboxed process can write to, that includes
+    // write rights. Treat it as a write-intent so the Cow-downgrade still
+    // fires on the dangerous case.
+    const MAXIMUM_ALLOWED:    u32 = 0x0200_0000;
+    KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK
+        | DELETE | WRITE_DAC | WRITE_OWNER
+        | GENERIC_ALL | GENERIC_WRITE | MAXIMUM_ALLOWED
+};
+
+/// `true` when `desired_access` carries any bit that could let the caller
+/// mutate the key — see [`NT_CREATE_KEY_WRITE_BITS`] for the bit set.
+pub(crate) fn nt_create_key_is_write_access(desired_access: u32) -> bool {
+    (desired_access & NT_CREATE_KEY_WRITE_BITS) != 0
+}
+
 // ---------------------------------------------------------------------------
 // Hook handlers
 // ---------------------------------------------------------------------------
@@ -369,6 +403,16 @@ unsafe extern "system" fn hook_nt_create_key(
         return call_original();
     };
 
+    // Bypass the policy / Cow-downgrade path when the caller is asking for a
+    // read-only handle: NtCreateKey is the create-OR-open primitive, and a
+    // read-only desired access can't mutate the key even if NtCreateKey ends
+    // up creating it. dnsapi's `RegCreateKeyEx(KEY_READ)` on `HKLM\System\…`
+    // tripped the previous unconditional deny and cascaded into
+    // "Could not resolve host" inside the sandbox.
+    if !nt_create_key_is_write_access(desired_access) {
+        return call_original();
+    }
+
     if let Some(friendly) = resolve_attrs_friendly(object_attributes as *const _) {
         let mode = check_write_mode(&friendly, None);
         if matches!(mode, policy::Mode::Deny) {
@@ -382,7 +426,11 @@ unsafe extern "system" fn hook_nt_create_key(
             // silent_ok arm, so a silent_ok key creation fell through to the real
             // syscall. Downgrade to deny (fail-closed) like NtSetValueKey /
             // NtDeleteValueKey / NtDeleteKey until the read-side overlay lands.
-            log_silent_ok_downgrade("NtCreateKey", &friendly, None);
+            log_silent_ok_downgrade(
+                &format!("NtCreateKey(da=0x{desired_access:x})"),
+                &friendly,
+                None,
+            );
             if !key_handle.is_null() {
                 *key_handle = std::ptr::null_mut();
             }
@@ -1117,5 +1165,120 @@ mod tests {
     #[test]
     fn status_not_supported_value() {
         assert_eq!(crate::hooks::STATUS_NOT_SUPPORTED, 0xC000_00BB_u32 as i32);
+    }
+
+    // -- nt_create_key_is_write_access ----------------------------------------
+    //
+    // Regression coverage for the DNS-from-sandbox fix. NtCreateKey is the
+    // create-OR-open primitive, and dnsapi's `RegCreateKeyEx(KEY_READ)` on
+    // `HKLM\System\…` previously hit the Cow-downgrade-to-Deny path and
+    // cascaded into "Could not resolve host". The fix is to bypass that
+    // path when DesiredAccess carries no write-intent bits.
+
+    /// Microsoft `winnt.h` definitions reproduced here so the tests pin the
+    /// real-world access masks against our private write-bit set.
+    mod access_masks {
+        pub const KEY_QUERY_VALUE:        u32 = 0x0001;
+        pub const KEY_SET_VALUE:          u32 = 0x0002;
+        pub const KEY_CREATE_SUB_KEY:     u32 = 0x0004;
+        pub const KEY_ENUMERATE_SUB_KEYS: u32 = 0x0008;
+        pub const KEY_NOTIFY:             u32 = 0x0010;
+        pub const KEY_CREATE_LINK:        u32 = 0x0020;
+        pub const READ_CONTROL:           u32 = 0x0002_0000;
+        pub const DELETE:                 u32 = 0x0001_0000;
+        pub const WRITE_DAC:              u32 = 0x0004_0000;
+        pub const WRITE_OWNER:            u32 = 0x0008_0000;
+        pub const MAXIMUM_ALLOWED:        u32 = 0x0200_0000;
+        pub const GENERIC_ALL:            u32 = 0x1000_0000;
+        pub const GENERIC_WRITE:          u32 = 0x4000_0000;
+        pub const GENERIC_READ:           u32 = 0x8000_0000;
+
+        // Compound aliases (winnt.h):
+        // KEY_READ  = STANDARD_RIGHTS_READ  | QUERY_VALUE | ENUMERATE | NOTIFY
+        // KEY_WRITE = STANDARD_RIGHTS_WRITE | SET_VALUE   | CREATE_SUB_KEY
+        // KEY_ALL_ACCESS = STANDARD_RIGHTS_ALL | KEY_*
+        pub const KEY_READ:               u32 = READ_CONTROL | KEY_QUERY_VALUE
+                                              | KEY_ENUMERATE_SUB_KEYS | KEY_NOTIFY;
+        pub const KEY_WRITE:              u32 = READ_CONTROL | KEY_SET_VALUE
+                                              | KEY_CREATE_SUB_KEY;
+        pub const KEY_ALL_ACCESS:         u32 = 0x000F_003F;
+    }
+
+    #[test]
+    fn read_only_masks_are_not_writes() {
+        use access_masks::*;
+        // The single bit that broke DNS — KEY_READ on its own.
+        assert!(!nt_create_key_is_write_access(KEY_READ),
+            "KEY_READ (=0x{KEY_READ:x}) must NOT be classified as write");
+        // Each individual read bit, plus all-reads combined.
+        assert!(!nt_create_key_is_write_access(KEY_QUERY_VALUE));
+        assert!(!nt_create_key_is_write_access(KEY_ENUMERATE_SUB_KEYS));
+        assert!(!nt_create_key_is_write_access(KEY_NOTIFY));
+        assert!(!nt_create_key_is_write_access(READ_CONTROL));
+        assert!(!nt_create_key_is_write_access(GENERIC_READ));
+        let all_reads = KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS
+                      | KEY_NOTIFY | READ_CONTROL | GENERIC_READ;
+        assert!(!nt_create_key_is_write_access(all_reads),
+            "OR of every read-only bit must still be a non-write");
+    }
+
+    #[test]
+    fn write_masks_are_writes() {
+        use access_masks::*;
+        assert!(nt_create_key_is_write_access(KEY_WRITE));
+        assert!(nt_create_key_is_write_access(KEY_SET_VALUE));
+        assert!(nt_create_key_is_write_access(KEY_CREATE_SUB_KEY));
+        assert!(nt_create_key_is_write_access(KEY_CREATE_LINK));
+        assert!(nt_create_key_is_write_access(DELETE));
+        assert!(nt_create_key_is_write_access(WRITE_DAC));
+        assert!(nt_create_key_is_write_access(WRITE_OWNER));
+        assert!(nt_create_key_is_write_access(GENERIC_WRITE));
+        assert!(nt_create_key_is_write_access(GENERIC_ALL));
+        assert!(nt_create_key_is_write_access(KEY_ALL_ACCESS));
+    }
+
+    #[test]
+    fn read_plus_write_bit_is_still_write() {
+        use access_masks::*;
+        // The realistic mixed case: caller asks for read + one write bit.
+        // Must still be classified as a write (the read bits don't sanitise
+        // the request).
+        assert!(nt_create_key_is_write_access(KEY_READ | KEY_SET_VALUE));
+        assert!(nt_create_key_is_write_access(KEY_QUERY_VALUE | DELETE));
+    }
+
+    #[test]
+    fn maximum_allowed_treated_as_write() {
+        use access_masks::*;
+        // MAXIMUM_ALLOWED asks the kernel for "everything you'd grant me".
+        // On a key the caller has write access to, that includes mutate
+        // rights — we MUST route through the policy path, otherwise an
+        // adversarial process could use it to bypass our Cow-downgrade
+        // fail-closed on dangerous keys.
+        assert!(nt_create_key_is_write_access(MAXIMUM_ALLOWED));
+        assert!(nt_create_key_is_write_access(MAXIMUM_ALLOWED | KEY_READ));
+    }
+
+    #[test]
+    fn empty_access_is_not_write() {
+        // Pathological caller passing 0 — kernel rejects this anyway,
+        // but our classifier must not flag it as a write.
+        assert!(!nt_create_key_is_write_access(0));
+    }
+
+    #[test]
+    fn write_bits_set_is_well_formed() {
+        // Every bit in NT_CREATE_KEY_WRITE_BITS, taken individually, must
+        // be classified as a write. This guards against a future refactor
+        // accidentally clearing one of them from the constant.
+        let mut bit: u32 = 1;
+        while bit != 0 {
+            if (NT_CREATE_KEY_WRITE_BITS & bit) != 0 {
+                assert!(nt_create_key_is_write_access(bit),
+                    "isolated write bit 0x{bit:x} must classify as write");
+            }
+            // Step to next bit; explicit overflow wrap exits the loop.
+            bit = bit.checked_shl(1).unwrap_or(0);
+        }
     }
 }
