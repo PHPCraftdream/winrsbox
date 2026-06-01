@@ -27,7 +27,10 @@ use windows::{
                 GetNamedPipeClientProcessId,
                 PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
             },
-            Threading::{GetCurrentProcess, OpenProcessToken},
+            Threading::{
+                GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
+                PROCESS_ACCESS_RIGHTS,
+            },
         },
     },
 };
@@ -265,11 +268,11 @@ pub(crate) const MAX_CONCURRENT_HANDLERS: usize = 128;
 /// and burned the hook-side connect/retry budget — cascading
 /// self-terminates.
 ///
-/// 16 absorbs every burst we've measured live (MSYS2, npm install, cargo
-/// build, claude-code agent fan-out) with headroom; each instance costs
-/// only the 64 KiB in/out buffer (and one tokio task while idle), so the
-/// total footprint is ~1 MiB.
-pub(crate) const PIPE_ACCEPT_POOL_SIZE: usize = 16;
+/// 32 absorbs every burst we've measured live (MSYS2 first-run spawns 27+
+/// bash helpers in 1 s, npm install, cargo build, claude-code agent fan-out)
+/// with generous headroom; each instance costs only the 64 KiB in/out buffer
+/// (and one tokio task while idle), so the total footprint is ~2 MiB.
+pub(crate) const PIPE_ACCEPT_POOL_SIZE: usize = 32;
 
 /// Build one server-side instance of the launcher pipe. Pure FFI wrapper so
 /// the accept loop body stays focused on the connect/validate flow. The
@@ -753,10 +756,30 @@ fn handle_connection(
     let raw: RawHandle = handle.0 as *mut _;
     let mut file = unsafe { std::fs::File::from_raw_handle(raw) };
 
+    // Defense-in-depth: open a handle to the client process so we can
+    // check liveness before each blocking read_msg. If the client died
+    // between reads (pipe not yet broken by the kernel), we break early
+    // instead of holding the semaphore permit indefinitely.
+    // PROCESS_QUERY_LIMITED_INFORMATION (0x1000) is the minimum right
+    // for GetExitCodeProcess.
+    let proc_handle = unsafe {
+        OpenProcess(PROCESS_ACCESS_RIGHTS(0x1000), false, client_pid).ok()
+    };
+    const STILL_ACTIVE: u32 = 259;
+
     // Track the PID associated with this pipe connection
     let mut conn_pid: Option<u32> = None;
 
     loop {
+        if let Some(ref ph) = proc_handle {
+            let mut exit_code = 0u32;
+            // SAFETY: ph is a valid process handle obtained above.
+            let ok = unsafe { GetExitCodeProcess(*ph, &mut exit_code).is_ok() };
+            if ok && exit_code != STILL_ACTIVE {
+                break;
+            }
+        }
+
         let req: Req = match read_msg(&mut file) {
             Ok(r) => r,
             Err(_) => break,
@@ -1048,6 +1071,11 @@ fn handle_connection(
         if write_msg(&mut file, &resp).is_err() {
             break;
         }
+    }
+
+    if let Some(ph) = proc_handle {
+        // SAFETY: ph was opened by us above; close it now that the loop is done.
+        unsafe { CloseHandle(ph).ok() };
     }
 
     // Do NOT let `file` run its Drop (which would call CloseHandle on the underlying HANDLE).
@@ -1362,8 +1390,8 @@ mod tests {
     #[test]
     fn accept_pool_size_in_sane_range() {
         assert!(
-            PIPE_ACCEPT_POOL_SIZE >= 8,
-            "PIPE_ACCEPT_POOL_SIZE={PIPE_ACCEPT_POOL_SIZE} cannot absorb MSYS2's 8-process burst",
+            PIPE_ACCEPT_POOL_SIZE >= 16,
+            "PIPE_ACCEPT_POOL_SIZE={PIPE_ACCEPT_POOL_SIZE} cannot absorb MSYS2's 27-process burst",
         );
         assert!(
             PIPE_ACCEPT_POOL_SIZE <= 64,

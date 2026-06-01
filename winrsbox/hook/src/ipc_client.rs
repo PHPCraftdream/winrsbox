@@ -87,17 +87,23 @@ pub(crate) fn cache() -> &'static HookCache {
 }
 
 pub(crate) fn ensure_ipc_and<R>(f: impl FnOnce(&mut Option<ipc::SyncClient>) -> R) -> Option<R> {
-    let mut sent = false;
+    let mut first_hello = false;
     let result = IPC_CLIENT.with_borrow_mut(|opt| {
         if opt.is_none() {
             if let Some(name) = PIPE_NAME.get() {
-                *opt = ipc::SyncClient::connect(name).ok();
-                // Send Hello on first connection. If the very first send
-                // already fails — pipe was accepted but the launcher's
-                // handler thread died before we could write — clear the
-                // client so the next ensure_ipc_and reconnects rather
-                // than burning the fail-closed counter on a dead handle.
-                if opt.is_some() && !HELLO_SENT.get() {
+                match ipc::SyncClient::connect(name) {
+                    Ok(c) => *opt = Some(c),
+                    Err(e) => {
+                        let pid = unsafe { GetCurrentProcessId() };
+                        eprintln!("[hook/{pid}] IPC connect failed: {e}");
+                    }
+                }
+                // Always re-send Hello on every new connection — the
+                // server handler for any previous connection is gone
+                // (pipe broke → handle_connection returned → PipeConnGuard
+                // disconnected). Without Hello the new handler has
+                // conn_pid=None and cannot resolve depth/exe context.
+                if opt.is_some() {
                     let pid = unsafe { GetCurrentProcessId() };
                     let exe = get_own_exe_path();
                     let send_res = opt.as_mut().unwrap().send(&ipc::Req::Hello {
@@ -106,8 +112,8 @@ pub(crate) fn ensure_ipc_and<R>(f: impl FnOnce(&mut Option<ipc::SyncClient>) -> 
                     });
                     if send_res.is_err() {
                         *opt = None;
-                    } else {
-                        sent = true;
+                    } else if !HELLO_SENT.get() {
+                        first_hello = true;
                     }
                 }
             }
@@ -118,7 +124,7 @@ pub(crate) fn ensure_ipc_and<R>(f: impl FnOnce(&mut Option<ipc::SyncClient>) -> 
             None
         }
     });
-    if sent {
+    if first_hello {
         HELLO_SENT.set(true);
         flush_install_errors();
         crate::inject_guard::arm();
@@ -137,8 +143,9 @@ pub(crate) fn try_send(opt: &mut Option<ipc::SyncClient>, req: &ipc::Req) -> Opt
     let client = opt.as_mut()?;
     match client.send(req) {
         Ok(resp) => Some(resp),
-        Err(_) => {
-            // Mark client for reconnect on the next ensure_ipc_and call.
+        Err(e) => {
+            let pid = unsafe { GetCurrentProcessId() };
+            eprintln!("[hook/{pid}] IPC send error: {e}");
             *opt = None;
             None
         }
@@ -163,8 +170,8 @@ pub(crate) fn ipc_decide(dos_lower: &str, write: bool) -> Decision {
             d
         }
         _ => {
-            // IPC failure — increment counter, possibly self-terminate (fail-closed).
             let n = IPC_CONSECUTIVE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            eprintln!("[hook] IPC decide failure #{n}/{IPC_FAIL_THRESHOLD}");
             if n >= IPC_FAIL_THRESHOLD {
                 eprintln!(
                     "[hook] CRITICAL: {} consecutive IPC failures — \
