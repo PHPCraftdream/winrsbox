@@ -134,44 +134,87 @@ unsafe extern "system" fn hook_nt_alpc_connect_port(
         let ustr = &*port_name;
         let char_count = (ustr.Length / 2) as usize;
         // Length must not exceed MaximumLength for a well-formed UNICODE_STRING.
-        // If it does, the struct is inconsistent / hostile — treat the name as
-        // unresolvable. (MaximumLength is also a byte count; /2 → WCHARs.)
-        // A well-formed UNICODE_STRING has Length <= MaximumLength, i.e.
-        // char_count <= max_chars. This already rejects the malformed
-        // MaximumLength==0 / Length>0 case (max_chars==0 ⇒ only char_count==0
-        // passes), so no special-case escape hatch is needed (an earlier
-        // `MaximumLength==0 ||` short-circuit wrongly accepted that hostile case).
         let max_chars = (ustr.MaximumLength / 2) as usize;
-        let consistent = char_count <= max_chars;
-        // Cap char_count to a sane domain maximum for ALPC port names so an
-        // attacker-controlled Length pointing past a small Buffer allocation
-        // can't drive an out-of-bounds read. Over the cap or inconsistent →
-        // fall through to the normal "can't classify → call original" path.
-        if char_count > 0
-            && char_count <= MAX_PORT_NAME_CHARS
-            && consistent
-            && !ustr.Buffer.is_null()
-        {
-            // SAFETY: char_count is non-zero, <= MAX_PORT_NAME_CHARS, <=
-            // MaximumLength, and Buffer is non-null. We do NOT assume ntdll
-            // guarantees Buffer spans Length bytes — the bound above caps the
-            // read to the small domain maximum for object-manager port names.
-            let name_slice = std::slice::from_raw_parts(ustr.Buffer, char_count);
-            let name = String::from_utf16_lossy(name_slice);
-            if is_dangerous_port(&name) {
-                if crate::hooks::is_trace() {
-                    crate::hooks::ipc_log_violation(ipc::Req::Log {
-                        pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
-                        level: ipc::LogLevel::Warn,
-                        msg: format!("ALPC DENY: {name}"),
-                    });
+        match classify_port_name(char_count, max_chars, ustr.Buffer.is_null()) {
+            PortNameStatus::Empty => {
+                // Legitimate (caller is using ObjectAttributes instead).
+                // Passthrough.
+            }
+            PortNameStatus::Valid => {
+                // SAFETY: classifier verified char_count > 0,
+                // <= MAX_PORT_NAME_CHARS, <= max_chars, and Buffer non-null.
+                let name_slice = std::slice::from_raw_parts(ustr.Buffer, char_count);
+                let name = String::from_utf16_lossy(name_slice);
+                if is_dangerous_port(&name) {
+                    if crate::hooks::is_trace() {
+                        crate::hooks::ipc_log_violation(ipc::Req::Log {
+                            pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                            level: ipc::LogLevel::Warn,
+                            msg: format!("ALPC DENY: {name}"),
+                        });
+                    }
+                    return STATUS_ACCESS_DENIED;
                 }
+            }
+            PortNameStatus::Malformed(reason) => {
+                // Fail closed: an oversized / inconsistent / null-Buffer
+                // UNICODE_STRING is either a hostile probe trying to slip
+                // past our denylist by tripping the classifier, or genuinely
+                // broken caller code. Either way, refusing the connect is
+                // the safe posture (mirrors fs_metadata_guard's
+                // unresolvable-rename-dest -> ACCESS_DENIED).
+                crate::hooks::ipc_log_violation(ipc::Req::Log {
+                    pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                    level: ipc::LogLevel::Warn,
+                    msg: format!(
+                        "ALPC DENY (malformed port_name): {reason} len={} max={} buf_null={}",
+                        ustr.Length, ustr.MaximumLength, ustr.Buffer.is_null()
+                    ),
+                });
                 return STATUS_ACCESS_DENIED;
             }
         }
     }
 
     call_original()
+}
+
+/// Outcome of classifying a port-name `UNICODE_STRING` against ALPC's
+/// real-world domain. Pure over its inputs so the malformed-detection logic
+/// can be unit-tested without fabricating a `UNICODE_STRING` + a hostile
+/// kernel ABI surface.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PortNameStatus {
+    /// Length == 0 — caller is using ObjectAttributes for the name. Let it
+    /// pass through; this is the legitimate `NtAlpcConnectPort(...)` shape
+    /// when the name lives in `ObjectAttributes->ObjectName`.
+    Empty,
+    /// Well-formed and within the domain cap; safe to read `char_count`
+    /// WCHARs from `Buffer`.
+    Valid,
+    /// Hostile or buggy struct. Caller must fail closed (ACCESS_DENIED) so
+    /// the unparseable name cannot bypass `is_dangerous_port`.
+    Malformed(&'static str),
+}
+
+pub(crate) fn classify_port_name(
+    char_count: usize,
+    max_chars: usize,
+    buffer_is_null: bool,
+) -> PortNameStatus {
+    if char_count == 0 {
+        return PortNameStatus::Empty;
+    }
+    if char_count > max_chars {
+        return PortNameStatus::Malformed("length>maximum_length");
+    }
+    if char_count > MAX_PORT_NAME_CHARS {
+        return PortNameStatus::Malformed("oversized_port_name");
+    }
+    if buffer_is_null {
+        return PortNameStatus::Malformed("null_buffer_nonzero_length");
+    }
+    PortNameStatus::Valid
 }
 
 /// # SAFETY
@@ -252,5 +295,64 @@ mod tests {
         assert!(!is_dangerous_port(r"\RPC Control\Console"));
         assert!(!is_dangerous_port(r"\RPC Control\ConsoleNotificationPort"));
         assert!(!is_dangerous_port(r"\BaseNamedObjects\GoogleChromeServiceSocket"));
+    }
+
+    // -- classify_port_name -----------------------------------------------------
+    //
+    // Pure inputs reproduce every shape `hook_nt_alpc_connect_port` cares about
+    // — including the previously fail-open "hostile UNICODE_STRING" shapes the
+    // connect hook now refuses with STATUS_ACCESS_DENIED.
+
+    #[test]
+    fn classify_empty_passthrough() {
+        // ObjectAttributes-only caller — Length=0 must NOT trigger a deny;
+        // the legitimate code path here is to keep going and let the kernel
+        // honour ObjectAttributes->ObjectName.
+        assert_eq!(classify_port_name(0, 0,  true),  PortNameStatus::Empty);
+        assert_eq!(classify_port_name(0, 64, false), PortNameStatus::Empty);
+    }
+
+    #[test]
+    fn classify_valid_normal_name() {
+        // Realistic ALPC port name length range.
+        assert_eq!(classify_port_name(16,  16, false), PortNameStatus::Valid);
+        assert_eq!(classify_port_name(128, 256, false), PortNameStatus::Valid);
+        assert_eq!(classify_port_name(MAX_PORT_NAME_CHARS, MAX_PORT_NAME_CHARS, false),
+                   PortNameStatus::Valid);
+    }
+
+    #[test]
+    fn classify_inconsistent_length_exceeds_maxlength() {
+        // Hostile: Length > MaximumLength advertises a longer string than
+        // Buffer was allocated for. Refuse — was a fail-open path pre-#55.
+        let got = classify_port_name(64, 32, false);
+        assert!(matches!(got, PortNameStatus::Malformed(_)),
+            "expected Malformed for length>maximum, got {got:?}");
+    }
+
+    #[test]
+    fn classify_oversized_port_name_denied() {
+        // Hostile: char_count > MAX_PORT_NAME_CHARS would drive an OOB read
+        // if we read all of it. Refuse instead of clamping or skipping.
+        let got = classify_port_name(MAX_PORT_NAME_CHARS + 1,
+                                     MAX_PORT_NAME_CHARS + 1, false);
+        assert!(matches!(got, PortNameStatus::Malformed(_)),
+            "oversized name must be malformed (got {got:?})");
+    }
+
+    #[test]
+    fn classify_null_buffer_with_nonzero_length() {
+        // Hostile: Length>0 but Buffer is null. Old code skipped the deny
+        // check; we now refuse.
+        let got = classify_port_name(8, 16, true);
+        assert!(matches!(got, PortNameStatus::Malformed(_)),
+            "null Buffer + nonzero Length must be malformed (got {got:?})");
+    }
+
+    #[test]
+    fn classify_zero_length_with_null_buffer_is_empty_not_malformed() {
+        // Both zero is the "no name, see ObjectAttributes" legitimate case —
+        // a null Buffer is fine when Length is 0 (caller didn't allocate).
+        assert_eq!(classify_port_name(0, 0, true), PortNameStatus::Empty);
     }
 }
