@@ -823,10 +823,16 @@ fn handle_connection(
                     LogLevel::Error => "ERROR",
                 };
                 println!("[hook/{pid}] {level_str} {msg}");
-                // Also persist to JSONL so hook-side diagnostics survive past
-                // the stdout window (which is hidden without -d). One ipc_log
-                // call per spawn / deny / warn — cheap, high diagnostic value.
-                jsonl_log::log(jsonl_log::Event::hook_log(pid, level_str.trim(), &msg));
+                // Persist to JSONL. INFO/WARN/ERROR are rare and load-bearing
+                // for forensics (spawn_attempt, fs_decide on writes, denials):
+                // flush them to disk immediately so a hung or idle sandbox
+                // doesn't leave critical events stranded in the 5 s buffer.
+                // TRACE stays on the throttled path — it can be high volume.
+                let event = jsonl_log::Event::hook_log(pid, level_str.trim(), &msg);
+                match level {
+                    LogLevel::Trace => jsonl_log::log(event),
+                    _ => jsonl_log::log_immediate(event),
+                }
                 Resp::Ok
             }
             Req::RegisterChild { pid } => {

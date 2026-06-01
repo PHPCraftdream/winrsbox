@@ -139,6 +139,20 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
     // copy_passthrough_inner so the kernel opens the SAME path policy approved,
     // closing the double-resolve window.
     let Some((dos, pre_resolved)) = resolve_for_hook(object_attributes as *const _) else {
+        // Forensic: a WRITE we couldn't resolve is exactly the class of bug
+        // that the cmd.exe `>filename` escape lived in (device-namespace
+        // RootDirectory + bare ObjectName). Keep this one on TRACE — it
+        // produces no event under default log_level, but with `log_level:
+        // trace` in sandbox.ktav an escape investigator sees every unresolved
+        // write and the raw path that caused it.
+        if is_trace() && is_write_access(desired_access, create_disposition) {
+            let raw = crate::hooks::extract_raw_nt_path(object_attributes as *const _)
+                .unwrap_or_else(|| "<unresolved>".to_string());
+            ipc_log(
+                ipc::LogLevel::Trace,
+                format!("fs_resolve_failed: NtCreateFile raw={raw} write=true"),
+            );
+        }
         if let Some(status) = check_device_block(object_attributes as *const _) {
             set_io_status(io_status_block, status);
             return status;
@@ -181,6 +195,13 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
 
     let write = is_write_access(desired_access, create_disposition);
     let decision = decide(&dos, write);
+
+    if is_trace() {
+        ipc_log(
+            ipc::LogLevel::Trace,
+            format!("fs_decide NtCreateFile: {dos} write={write} mode={:?}", decision.mode),
+        );
+    }
 
     // Note: the former create-side `is_reparse_create` veto here was
     // overzealous and was removed. The `FILE_OPEN_REPARSE_POINT` flag on
@@ -361,6 +382,13 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
         | crate::hooks::DELETE | crate::hooks::WRITE_DAC | crate::hooks::WRITE_OWNER;
     let write = desired_access & write_bits != 0;
     let decision = decide(&dos, write);
+
+    if is_trace() {
+        ipc_log(
+            ipc::LogLevel::Trace,
+            format!("fs_decide NtOpenFile: {dos} write={write} mode={:?}", decision.mode),
+        );
+    }
 
     match decision.mode {
         Mode::Passthrough => {

@@ -114,18 +114,31 @@ fn run_install(args: &[String]) -> Result<()> {
     let wezterm_icon = wezterm_icon_path(&wezterm_path);
 
     // 1. Wezterm (normal)
-    // `--always-new-process` is REQUIRED, not optional: without it wezterm-gui
-    // joins any existing wezterm mux-server in the user session and forwards
-    // all spawn requests through a named pipe. If that pre-existing mux runs
-    // OUTSIDE our Job, every cmd/shell it opens for us is NOT in our Job
-    // either — the sandbox is bypassed via IPC-spawn-proxy. The flag makes
-    // wezterm spawn a fresh in-process mux owned by THIS (sandboxed) instance.
-    let cmd_wez = compose_command(&winrsbox_exe, &wezterm_path, &["start", "--always-new-process"], false);
+    // Two `start`-subcommand flags are REQUIRED, not optional, to keep the
+    // shell tree inside our Job — both close different halves of the
+    // IPC-spawn-proxy escape:
+    //
+    //   --always-new-process : prevents the CLI invocation from handing the
+    //       command off to an already-running wezterm GUI instance and
+    //       exiting. Without it, the actual cmd/shell ends up parented by
+    //       the pre-existing (unsandboxed) GUI — never enters our Job.
+    //
+    //   --no-auto-connect : prevents the GUI from auto-connecting to any
+    //       mux-server domain (unix_domains / ssh_domains marked
+    //       `connect_automatically = true`) declared in the user's
+    //       wezterm.lua. Without it, the GUI can run inside our Job, but
+    //       new tabs route their spawn requests via named pipe / SSH to a
+    //       mux-server process living OUTSIDE the Job, and the resulting
+    //       shell is parented by THAT broker.
+    //
+    // Both flags are options of the `start` subcommand (see
+    // `wezterm-gui start --help`); they must appear AFTER `start`, not before.
+    let cmd_wez = compose_command(&winrsbox_exe, &wezterm_path, &["start", "--always-new-process", "--no-auto-connect"], false);
     install_verb(VERB_WEZTERM, LABEL_WEZTERM, &cmd_wez, &wezterm_icon, false)?;
     println!("  + {LABEL_WEZTERM}");
 
     // 2. Wezterm (admin)
-    let cmd_wez_admin = compose_command(&winrsbox_exe, &wezterm_path, &["start", "--always-new-process"], false);
+    let cmd_wez_admin = compose_command(&winrsbox_exe, &wezterm_path, &["start", "--always-new-process", "--no-auto-connect"], false);
     install_verb(VERB_WEZTERM_ADMIN, LABEL_WEZTERM_ADMIN, &cmd_wez_admin, &wezterm_icon, true)?;
     println!("  + {LABEL_WEZTERM_ADMIN}");
 
