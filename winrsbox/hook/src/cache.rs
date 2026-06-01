@@ -72,12 +72,32 @@ impl HookCache {
     pub fn get_caseless(&self, path: &str, write: bool) -> Option<Decision> {
         let k = Self::caseless_key(path, write);
         let (stored_path, stored_write, decision) = self.inner.get(&k)?;
-        let path_lower = Self::ascii_lower(path);
-        if stored_path == path_lower && stored_write == write {
+        if Self::eq_ascii_lower(&stored_path, path) && stored_write == write {
             Some(decision)
         } else {
             None
         }
+    }
+
+    /// Compare a stored path (produced by `ascii_lower`) against a raw candidate
+    /// without heap allocation. `ascii_lower` maps each *byte* through
+    /// `b.to_ascii_lowercase() as char`, which for bytes >= 0x80 produces a
+    /// 2-byte UTF-8 char. We replicate that logic on the candidate side via an
+    /// iterator so the comparison is allocation-free.
+    fn eq_ascii_lower(stored_lower: &str, candidate: &str) -> bool {
+        let mut si = stored_lower.as_bytes().iter();
+        for &b in candidate.as_bytes() {
+            let ch = b.to_ascii_lowercase() as char;
+            let mut buf = [0u8; 4];
+            let encoded = ch.encode_utf8(&mut buf);
+            for &eb in encoded.as_bytes() {
+                match si.next() {
+                    Some(&sb) if sb == eb => {}
+                    _ => return false,
+                }
+            }
+        }
+        si.next().is_none()
     }
 
     fn ascii_lower(s: &str) -> String {
@@ -223,5 +243,29 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn mixed_case_lookup_hits_lowercase_entry() {
+        let cache = HookCache::new();
+        let d = Decision { mode: Mode::Deny, overlay: None, cow_from: None, mock_payload: None };
+        cache.insert("c:\\windows\\system32\\ntdll.dll", false, d);
+        let r = cache.get_caseless("C:\\Windows\\System32\\NTDLL.DLL", false);
+        assert!(r.is_some());
+        assert_eq!(r.unwrap().mode, Mode::Deny);
+    }
+
+    #[test]
+    fn eq_ascii_lower_edge_cases() {
+        // Different lengths → false
+        assert!(!HookCache::eq_ascii_lower("abc", "ab"));
+        assert!(!HookCache::eq_ascii_lower("ab", "abc"));
+        // Case-only difference → true
+        assert!(HookCache::eq_ascii_lower("hello", "HELLO"));
+        assert!(HookCache::eq_ascii_lower("c:\\foo", "C:\\FOO"));
+        // Exact match → true
+        assert!(HookCache::eq_ascii_lower("same", "same"));
+        // Actual content difference → false
+        assert!(!HookCache::eq_ascii_lower("abc", "abd"));
     }
 }

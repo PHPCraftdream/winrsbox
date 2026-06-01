@@ -458,9 +458,35 @@ pub(crate) fn canonical_denylist_status(canon: &str) -> Option<(NTSTATUS, &'stat
 /// folded to `\` (the object manager accepts `/` as a separator), per-segment
 /// trailing dot/space stripped (mirrors NTFS). Borrows-through when nothing
 /// needs changing on the hot path.
-pub(crate) fn canonicalize_for_denylist(s: &str) -> String {
-    let lower = s.to_ascii_lowercase().replace('/', "\\");
-    strip_trailing_dot_space(&lower).into_owned()
+pub(crate) fn canonicalize_for_denylist(s: &str) -> Cow<'_, str> {
+    let needs_case = s.bytes().any(|b| b.is_ascii_uppercase());
+    let needs_slash = s.contains('/');
+    let needs_strip = s.split('\\').any(|seg| seg.ends_with('.') || seg.ends_with(' '));
+
+    if !needs_case && !needs_slash && !needs_strip {
+        return Cow::Borrowed(s);
+    }
+
+    // Single-pass: ASCII-lowercase + fold '/' → '\'. Iterate over CHARS (not
+    // bytes) so multibyte non-ASCII sequences are preserved verbatim, exactly
+    // as the original `s.to_ascii_lowercase()` did — `char::to_ascii_lowercase`
+    // maps only A–Z and leaves every non-ASCII char untouched. (A per-byte
+    // `b as char` fold would mojibake bytes >= 0x80 into U+0080..U+00FF and
+    // diverge from the old output for non-ASCII paths.)
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch == '/' {
+            out.push('\\');
+        } else {
+            out.push(ch.to_ascii_lowercase());
+        }
+    }
+
+    // Apply per-segment trailing-dot/space strip (reuse existing helper).
+    match strip_trailing_dot_space(&out) {
+        Cow::Borrowed(_) => Cow::Owned(out),
+        Cow::Owned(stripped) => Cow::Owned(stripped),
+    }
 }
 
 /// Returns Some(STATUS_ACCESS_DENIED) if the raw NT path or create options
@@ -1627,6 +1653,77 @@ mod resolved_path_denylist_tests {
         let joined = r"c:\sandbox\src\main.rs";
         let canon = canonicalize_for_denylist(joined);
         assert!(canonical_denylist_status(&canon).is_none());
+    }
+
+    #[test]
+    fn canonicalize_already_canonical_borrows() {
+        let p = r"c:\sandbox\src\main.rs";
+        assert!(
+            matches!(canonicalize_for_denylist(p), Cow::Borrowed(_)),
+            "already-canonical path must return Cow::Borrowed (zero alloc)"
+        );
+    }
+
+    #[test]
+    fn canonicalize_folds_forward_slash() {
+        let p = r"c:/sandbox/src/main.rs";
+        let canon = canonicalize_for_denylist(p);
+        assert!(matches!(canon, Cow::Owned(_)));
+        assert_eq!(&*canon, r"c:\sandbox\src\main.rs");
+    }
+
+    #[test]
+    fn canonicalize_lowercases_uppercase() {
+        let p = r"C:\Sandbox\SRC\Main.RS";
+        let canon = canonicalize_for_denylist(p);
+        assert!(matches!(canon, Cow::Owned(_)));
+        assert_eq!(&*canon, r"c:\sandbox\src\main.rs");
+    }
+
+    #[test]
+    fn canonicalize_strips_trailing_dot() {
+        let p = r"c:\sandbox\src.\main.rs";
+        let canon = canonicalize_for_denylist(p);
+        assert!(matches!(canon, Cow::Owned(_)));
+        // Reference: old algorithm
+        let lowered = p.to_ascii_lowercase().replace('/', "\\");
+        let reference = strip_trailing_dot_space(&lowered);
+        assert_eq!(&*canon, &*reference);
+    }
+
+    /// The Owned (needs-change) branch MUST produce byte-for-byte the same
+    /// output as the original `s.to_ascii_lowercase().replace('/', "\\")`
+    /// then `strip_trailing_dot_space`. Non-ASCII chars must be preserved
+    /// verbatim (NOT per-byte mojibake'd into U+0080..U+00FF). This path has
+    /// an uppercase ASCII letter (forcing the Owned branch) AND a non-ASCII
+    /// segment, which is exactly where a per-byte fold would diverge.
+    #[test]
+    fn canonicalize_preserves_non_ascii_on_owned_branch() {
+        let p = "C:\\Users\\Ω\\Naïve/Файл.TXT";
+        let canon = canonicalize_for_denylist(p);
+        assert!(matches!(canon, Cow::Owned(_)));
+        // Reference: exactly the pre-optimization algorithm.
+        let lowered = p.to_ascii_lowercase().replace('/', "\\");
+        let reference = strip_trailing_dot_space(&lowered).into_owned();
+        assert_eq!(&*canon, reference,
+            "Owned branch must match the original transform byte-for-byte, \
+             preserving non-ASCII UTF-8");
+        // And the non-ASCII chars survive as real chars (not mojibake).
+        assert!(canon.contains('ω') || canon.contains('Ω'),
+            "Greek omega must survive the fold as a real char");
+        assert!(canon.contains('ф') || canon.contains('Ф'),
+            "Cyrillic char must survive the fold");
+    }
+
+    /// A path that is already canonical EXCEPT it contains a non-ASCII char
+    /// must still borrow (the non-ASCII char itself triggers no transform).
+    #[test]
+    fn canonicalize_non_ascii_already_canonical_borrows() {
+        let p = "c:\\users\\наvöl\\file.txt"; // lowercase, no slash, no trailing dot/space
+        assert!(
+            matches!(canonicalize_for_denylist(p), Cow::Borrowed(_)),
+            "lowercase non-ASCII path with no '/' or trailing dot/space must borrow"
+        );
     }
 
     #[test]
