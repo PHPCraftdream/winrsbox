@@ -141,23 +141,18 @@ pub struct SyncClient {
     pipe: std::fs::File,
 }
 
-/// Retry budget for the hook→launcher pipe connect. 30 attempts × 100 ms ≈
-/// 3 s of patience, up from the previous 10 × 50 ms (500 ms).
+/// Retry budget for the hook→launcher pipe connect. 60 attempts × 150 ms ≈
+/// 9 s of patience.
 ///
-/// The launcher's accept loop runs ConnectNamedPipe SERIALLY (one free pipe
-/// instance at a time), so when a parent process bursts several child spawns
-/// in a single second — observed live under MSYS2's first-run setup, which
-/// spawns 8+ helpers per bash startup — late children's `CreateFile` on
-/// the pipe returns `ERROR_PIPE_BUSY` and we fall into this retry. 500 ms
-/// was too tight: combined with the fail-closed 3-strike rule it killed
-/// processes mid-burst (cascade self-terminate). 3 s lets the accept loop
-/// drain a realistic burst before a single connect attempt gives up.
-///
-/// Pair-fix: hook::ipc_client::IPC_FAIL_THRESHOLD raised from 3 → 8 so a
-/// genuine outage still trips the kill-switch but a one-off slow connect
-/// no longer cascades.
-pub const CONNECT_RETRY_ATTEMPTS: u32 = 30;
-pub const CONNECT_RETRY_INTERVAL_MS: u64 = 100;
+/// History: started at 10×50 ms (500 ms), raised to 30×100 ms (3 s), now
+/// 60×150 ms (9 s). Under MSYS2 first-run 27+ bash helpers spawn in 1 s;
+/// even with a 32-instance accept pool, late children may see transient
+/// `ERROR_PIPE_BUSY` while the pool drains the burst. 9 s gives generous
+/// headroom without meaningfully delaying a genuine "launcher dead" detect
+/// (the hook-side IPC_FAIL_THRESHOLD × per-call connect budget still trips
+/// the kill-switch within ~72 s).
+pub const CONNECT_RETRY_ATTEMPTS: u32 = 60;
+pub const CONNECT_RETRY_INTERVAL_MS: u64 = 150;
 
 impl SyncClient {
     /// Открыть соединение к launcher pipe.
@@ -165,6 +160,7 @@ impl SyncClient {
     /// Retry policy: `CONNECT_RETRY_ATTEMPTS` × `CONNECT_RETRY_INTERVAL_MS`.
     /// See the doc on those constants for the budget rationale.
     pub fn connect(pipe_name: &str) -> Result<Self, IpcError> {
+        let mut last_err = None;
         for _ in 0..CONNECT_RETRY_ATTEMPTS {
             match std::fs::OpenOptions::new()
                 .read(true)
@@ -172,12 +168,18 @@ impl SyncClient {
                 .open(pipe_name)
             {
                 Ok(f) => return Ok(Self { pipe: f }),
-                Err(_) => std::thread::sleep(
-                    std::time::Duration::from_millis(CONNECT_RETRY_INTERVAL_MS),
-                ),
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(
+                        std::time::Duration::from_millis(CONNECT_RETRY_INTERVAL_MS),
+                    );
+                }
             }
         }
-        Err(IpcError::Io(io::Error::new(io::ErrorKind::TimedOut, "pipe connect timeout")))
+        let detail = last_err
+            .map(|e| format!("{} attempts, last os error: {e}", CONNECT_RETRY_ATTEMPTS))
+            .unwrap_or_else(|| "no attempts".into());
+        Err(IpcError::Io(io::Error::new(io::ErrorKind::TimedOut, detail)))
     }
 
     pub fn send(&mut self, req: &Req) -> Result<Resp, IpcError> {
@@ -211,12 +213,12 @@ mod tests {
     /// the MSYS2 first-run-burst cascade-self-terminate path documented at
     /// the constants.
     #[test]
-    fn connect_retry_budget_at_least_three_seconds() {
+    fn connect_retry_budget_at_least_nine_seconds() {
         let budget_ms =
             CONNECT_RETRY_ATTEMPTS as u64 * CONNECT_RETRY_INTERVAL_MS;
         assert!(
-            budget_ms >= 3_000,
-            "connect retry budget {budget_ms}ms < 3000ms — MSYS2 burst regression risk",
+            budget_ms >= 9_000,
+            "connect retry budget {budget_ms}ms < 9000ms — MSYS2 burst regression risk",
         );
     }
 
@@ -227,8 +229,8 @@ mod tests {
     #[test]
     fn connect_retry_interval_in_sane_range() {
         assert!(
-            (50..=500).contains(&CONNECT_RETRY_INTERVAL_MS),
-            "CONNECT_RETRY_INTERVAL_MS={CONNECT_RETRY_INTERVAL_MS} out of [50,500]ms",
+            (100..=500).contains(&CONNECT_RETRY_INTERVAL_MS),
+            "CONNECT_RETRY_INTERVAL_MS={CONNECT_RETRY_INTERVAL_MS} out of [100,500]ms",
         );
     }
 
