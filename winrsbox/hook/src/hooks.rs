@@ -312,6 +312,12 @@ pub(crate) unsafe fn resolve_for_hook(
         full.push(b'\\' as u16);
         full.extend_from_slice(name_slice);
         let dos = policy::path::nt_to_dos_lower(&full)?;
+        // Relative-open whose directory handle was itself a CoW'd overlay file:
+        // see `unmirror_overlay_handle_relative` for the rationale. Returns the
+        // original `dos` unchanged when the handle does not resolve into the
+        // overlay storage (the common non-sandbox case, zero overhead).
+        let sb_root = SANDBOX_ROOT.get().map(|s| s.as_str());
+        let dos = unmirror_overlay_handle_relative(&dos, sb_root).unwrap_or(dos);
         return Some((dos, Some(full)));
     }
 
@@ -374,6 +380,58 @@ pub(crate) fn join_bare_relative_to_nt(cwd: &[u16], name: &[u16]) -> Vec<u16> {
     }
     out.extend_from_slice(name);
     out
+}
+
+/// Translate a policy path that resolved INTO the sandbox overlay storage back
+/// to the virtual DOS path the sandboxed process believes it owns.
+///
+/// When a relative-open's `RootDirectory` handle points to a CoW'd overlay file
+/// (e.g. `.git` opened by git.exe → CoW'd into `<sandbox_root>\d\…\.git`),
+/// `inject::resolve_handle_path` returns the REAL kernel-namespace path of that
+/// handle, which lives under `SANDBOX_ROOT`. Glueing the relative `ObjectName`
+/// onto it yields an overlay path like
+/// `d:\…\.winrsbox\<name>\workdir\d\…\.git\config`. Feeding that to
+/// `decide`/`canonical_denylist` verbatim would trip our own sandbox-internals
+/// denylist (the `.winrsbox` segment → `STATUS_OBJECT_NAME_NOT_FOUND`) and
+/// silently break legitimate relative opens against the process's OWN CoW
+/// copies. That self-block is what makes `git add`/`git commit` fail with
+/// "unknown error reading configuration files".
+///
+/// Such a handle-relative open is a legitimate self-access, NOT an attempt by
+/// the agent to poke sandbox internals by virtual path. This fn translates the
+/// overlay path back to the virtual DOS path; subsequent `decide` re-mirrors it
+/// into the overlay (Cow) and the kernel passthrough still uses the original
+/// overlay `full` path, so the actual file touched is unchanged. The denylist
+/// then sees the VIRTUAL path, so a genuine `D:\…\.winrsbox` attack by virtual
+/// path stays blocked.
+///
+/// Returns `None` (no rewrite) when `SANDBOX_ROOT` is unset, when the path is
+/// not under it, or when `unmirror_from_overlay` cannot recover a virtual path.
+/// Pure over its inputs — callers pass `Some(sb_root)` from `SANDBOX_ROOT.get()`
+/// in production and a literal string in tests (avoids contending with the
+/// process-global `OnceLock`).
+fn unmirror_overlay_handle_relative(
+    overlay_dos: &str,
+    sandbox_root: Option<&str>,
+) -> Option<String> {
+    let sb = sandbox_root?;
+    let sb_lower = sb.to_lowercase();
+    let sb_trimmed = sb_lower.trim_end_matches('\\');
+    if sb_trimmed.is_empty() {
+        return None;
+    }
+    if !policy::path::pattern_matches_prefix(sb_trimmed, overlay_dos) {
+        return None;
+    }
+    let overlay_pbuf = std::path::PathBuf::from(overlay_dos);
+    let virtual_dos = policy::path::unmirror_from_overlay(
+        &overlay_pbuf,
+        std::path::Path::new(sb_trimmed),
+    )?;
+    // `unmirror_from_overlay` rebuilds `<letter>:\<rest>` from path components
+    // but does not lowercase; lowercase to match the canonical form used by the
+    // overlay mirror keys, denylist, and decide path comparison.
+    Some(virtual_dos.to_ascii_lowercase())
 }
 
 pub(crate) unsafe fn extract_raw_nt_path(attrs: *const OBJECT_ATTRIBUTES) -> Option<String> {
@@ -1788,5 +1846,46 @@ mod status_constant_tests {
     #[test]
     fn status_not_supported_is_canonical() {
         assert_eq!(STATUS_NOT_SUPPORTED, 0xC000_00BB_u32 as i32);
+    }
+
+    #[test]
+    fn unmirror_overlay_handle_relative_recovers_virtual_path() {
+        // Real-world layout: handle resolved into overlay storage under
+        // `.winrsbox\<name>\workdir\d\…`. The transform must recover the
+        // virtual DOS path the agent thinks it owns, so decide/denylist see
+        // `d:\diag_git\.git\config` instead of the `.winrsbox`-laden overlay
+        // path (which would self-block via the sandbox-internals denylist).
+        let sb = r"d:\dev\rust\fs-sandbox\repro\.winrsbox\diag_git\workdir";
+        let overlay_dos = r"d:\dev\rust\fs-sandbox\repro\.winrsbox\diag_git\workdir\d\diag_git\.git\config";
+        let got = unmirror_overlay_handle_relative(overlay_dos, Some(sb)).expect("should unmirror");
+        assert_eq!(got, r"d:\diag_git\.git\config");
+    }
+
+    #[test]
+    fn unmirror_overlay_handle_relative_passthrough_when_not_under_root() {
+        // Common non-sandbox case: handle outside overlay storage → no rewrite.
+        let sb = r"d:\dev\rust\fs-sandbox\repro\.winrsbox\diag_git\workdir";
+        let external = r"c:\windows\system32\drivers\etc\hosts";
+        assert_eq!(unmirror_overlay_handle_relative(external, Some(sb)), None);
+    }
+
+    #[test]
+    fn unmirror_overlay_handle_relative_none_when_sandbox_root_unset() {
+        // During very early DLL load (before the launcher publishes the root),
+        // a relative open must NOT be rewritten — fall through verbatim.
+        let overlay_dos = r"d:\sb\.winrsbox\n\workdir\d\sb\.git\config";
+        assert_eq!(unmirror_overlay_handle_relative(overlay_dos, None), None);
+    }
+
+    #[test]
+    fn unmirror_overlay_handle_relative_virtual_winrsbox_untouched_by_fn() {
+        // The denylist guard runs downstream of this fn, on the returned path.
+        // A path phrased as an overlay path under SANDBOX_ROOT that unmirrors
+        // to a virtual path containing `.winrsbox` is unmirrored unchanged by
+        // THIS fn; the denylist then independently decides to mask it.
+        let sb = r"d:\sb\.winrsbox\n\workdir";
+        let overlay_dos = r"d:\sb\.winrsbox\n\workdir\d\sb\.winrsbox\secret";
+        let got = unmirror_overlay_handle_relative(overlay_dos, Some(sb)).expect("should unmirror");
+        assert_eq!(got, r"d:\sb\.winrsbox\secret");
     }
 }
