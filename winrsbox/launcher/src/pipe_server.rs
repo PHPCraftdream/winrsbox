@@ -1009,6 +1009,11 @@ fn handle_connection(
                         stats.mock_.fetch_add(1, Ordering::Relaxed);
                         hot_stats.totals.fs_mocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
+                    policy::Mode::Hidden => {
+                        // Whiteout hit — path is hidden from the sandbox view.
+                        // No dedicated stat counter; trace it for diagnostics.
+                        hot_stats.totals.fs_decides.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     policy::Mode::Passthrough => {}
                 }
                 hot_stats.record_fs(&dos_path, write, denied);
@@ -1018,6 +1023,29 @@ fn handle_connection(
             Req::RecordOverlay { orig, overlay } => {
                 let _ = policy.record_overlay(&orig, &overlay);
                 Resp::Ok
+            }
+            Req::ClearOverlay { path } => {
+                match policy.clear_overlay(&path) {
+                    Ok(()) => Resp::Ok,
+                    Err(e) => Resp::Err(format!("clear_overlay: {e}")),
+                }
+            }
+            Req::RecordWhiteout { path } => {
+                match policy.record_whiteout(&path) {
+                    Ok(()) => Resp::Ok,
+                    Err(e) => Resp::Err(format!("record_whiteout: {e}")),
+                }
+            }
+            Req::ClearWhiteout { path } => {
+                if let Err(e) = policy.clear_whiteout(&path) {
+                    Resp::Err(format!("clear_whiteout: {e}"))
+                } else {
+                    Resp::Ok
+                }
+            }
+            Req::WhiteoutsUnder { dir } => {
+                let names = policy.whiteouts_under(&dir);
+                Resp::Whiteouts(names)
             }
             Req::Log { pid, level, msg } => {
                 let level_str = match level {

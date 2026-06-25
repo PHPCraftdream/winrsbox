@@ -210,6 +210,48 @@ pub(crate) fn build_random_event_name(pid: u32) -> String {
     format!("Local\\fs-sandbox-init-{}-{}", pid, suffix)
 }
 
+/// Detect whether THIS launcher was spawned inside an existing sandbox.
+///
+/// The outer launcher exports `FS_SANDBOX_PIPE` (its named-pipe path) into
+/// the environment of every descendant — `CreateProcessW` inherits env
+/// verbatim, so any nested `winrsbox.exe -- <target>` invocation inside the
+/// sandbox will see the variable. Its presence is a reliable signal that we
+/// are a descendant of an outer launcher, not the outer launcher itself.
+///
+/// Returning `true` here tells `main()` to skip the entire sandbox setup
+/// (no state dir, no pipe, no overlay, no hook injection) and delegate the
+/// target directly to the outer sandbox's process hook.
+/// (issue C, #63)
+fn is_nested_invocation() -> bool {
+    std::env::var_os("FS_SANDBOX_PIPE").is_some()
+}
+
+/// Build the transparent-delegation `Command` used when this launcher is
+/// itself running inside an outer sandbox (issue C, #63).
+///
+/// `target` is the full `cli.target` vector — `target[0]` is the executable
+/// and `target[1..]` are its arguments, all forwarded verbatim. No sandbox
+/// plumbing (pipe / overlay / hook / mitigations) is attached: the outer
+/// sandbox's process hook in our parent observes the spawn and applies its
+/// own containment, so a second nested layer would only duplicate work.
+///
+/// Extracted as a pure builder (no `.spawn()`/`.status()`) so a unit test can
+/// assert every argument survives the handoff — a regression where only the
+/// executable reached the child (e.g. dropping `target[1..]`) would otherwise
+/// silently turn `cmd.exe /c "echo X"` into an interactive `cmd.exe`.
+fn build_delegation_command(target: &[String]) -> std::process::Command {
+    // clap's `target` field has `required_unless_present = "init"`, and we
+    // only enter the nested branch when `!cli.target.is_empty()`, so
+    // `target[0]` is always safe here.
+    let mut cmd = std::process::Command::new(&target[0]);
+    if target.len() > 1 {
+        cmd.args(&target[1..]);
+    }
+    // stdio is inherited by default — the outer sandbox captures the spawn
+    // via its NtCreateUserProcess hook, so no FS_SANDBOX_* env is needed.
+    cmd
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 /// cancel-safe: NO — top-level main is not meant to be cancelled
@@ -260,6 +302,33 @@ async fn main() -> Result<()> {
     if let Some(ref cwd) = cli.cwd {
         std::env::set_current_dir(cwd)
             .with_context(|| format!("failed to set working directory to '{cwd}'"))?;
+    }
+
+    // ── Nested-sandbox guard (issue C, #63) ─────────────────────────────────
+    // The outer (first) launcher exports FS_SANDBOX_PIPE into the environment
+    // of every descendant process. If WE see it, we are already inside a
+    // sandbox: spawning a second pipe + overlay here would duplicate the
+    // containment and waste resources. Instead, transparently delegate the
+    // target to the outer sandbox by launching it directly (no mitigations,
+    // no pipe, no overlay, no hook injection) and propagating its exit code.
+    // The outer sandbox's NtCreateUserProcess hook in our parent process
+    // captures this target exactly like any other child, so isolation is
+    // preserved without a nested layer.
+    //
+    // CLI subcommands (rule/why/export/...) are routed earlier in main() and
+    // never reach here, so they keep working inside a sandbox for policy
+    // inspection. `--init` / `--help` are also exempt.
+    if !cli.init && !cli.target.is_empty() && is_nested_invocation() {
+        eprintln!(
+            "[sandbox] nested invocation detected — delegating <{}> to the outer sandbox",
+            cli.target[0]
+        );
+        // stdio is inherited by default; the outer sandbox observes the spawn
+        // via its own process hook, so no FS_SANDBOX_* plumbing is needed.
+        let status = build_delegation_command(&cli.target)
+            .status()
+            .with_context(|| format!("nested delegation failed to spawn '{}'", cli.target[0]))?;
+        std::process::exit(status.code().unwrap_or(1));
     }
 
     let project_root: PathBuf = std::env::current_dir()
@@ -387,6 +456,9 @@ async fn main() -> Result<()> {
     let cwd_str = project_root.to_string_lossy().into_owned();
     std::env::set_var("WEZTERM_EXECUTABLE_ARGS_CWD", &cwd_str);
     std::env::set_var("FS_SANDBOX_CWD", &cwd_str);
+    // Publish the sandbox overlay storage dir so the hook can recognise
+    // overlay files on delete and convert them back to virtual DOS paths.
+    std::env::set_var("FS_SANDBOX_ROOT", sandbox_root.to_string_lossy().as_ref());
     // Pass guard configuration to hook DLL via env vars
     std::env::set_var("FS_SANDBOX_GUARD", match cli.guard {
         GuardLevel::None => "none",
@@ -426,6 +498,7 @@ async fn main() -> Result<()> {
         pipe_name: pipe_name.clone(),
         dll_path: dll_path.clone(),
         cwd: cwd_str.clone(),
+        sandbox_root: sandbox_root.to_string_lossy().into_owned(),
         trace: cli.trace || effective_log_level.eq_ignore_ascii_case("trace"),
         guard: match cli.guard {
             GuardLevel::None => "none".into(),
@@ -921,5 +994,246 @@ mod hello_event_name_tests {
             let name = build_random_event_name(7);
             assert!(seen.insert(name.clone()), "duplicate random name: {name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod nested_detection_tests {
+    //! Issue C (#63): nested-sandbox detection must fire exactly when
+    //! `FS_SANDBOX_PIPE` is present in the environment, and never otherwise.
+    //!
+    //! These tests mutate the process environment, so they must not run in
+    //! parallel with anything else that reads `FS_SANDBOX_PIPE`. Each test
+    //! saves and restores the variable to avoid leaking state.
+
+    use super::is_nested_invocation;
+
+    /// RAII guard that restores `FS_SANDBOX_PIPE` to its prior state on drop.
+    struct PipeGuard(Option<std::ffi::OsString>);
+    impl PipeGuard {
+        fn capture() -> Self {
+            PipeGuard(std::env::var_os("FS_SANDBOX_PIPE"))
+        }
+    }
+    impl Drop for PipeGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("FS_SANDBOX_PIPE", v),
+                None => std::env::remove_var("FS_SANDBOX_PIPE"),
+            }
+        }
+    }
+
+    #[test]
+    fn detects_nested_when_pipe_set() {
+        let _g = PipeGuard::capture();
+        std::env::set_var("FS_SANDBOX_PIPE", r"\\.\pipe\fs-sandbox-99999");
+        assert!(is_nested_invocation(), "FS_SANDBOX_PIPE set ⇒ nested");
+    }
+
+    #[test]
+    fn not_nested_when_pipe_unset() {
+        let _g = PipeGuard::capture();
+        std::env::remove_var("FS_SANDBOX_PIPE");
+        assert!(!is_nested_invocation(), "FS_SANDBOX_PIPE unset ⇒ not nested");
+    }
+
+    /// The detector must trigger on any non-empty value — including a
+    /// pathological empty string. The outer launcher always sets a
+    /// well-formed pipe name, but the contract is "presence ⇒ nested",
+    /// not "non-empty ⇒ nested", so an empty string still counts.
+    #[test]
+    fn empty_string_still_counts_as_nested() {
+        let _g = PipeGuard::capture();
+        std::env::set_var("FS_SANDBOX_PIPE", "");
+        assert!(is_nested_invocation(), "presence (not value) ⇒ nested");
+    }
+}
+
+#[cfg(test)]
+mod nested_delegation_tests {
+    //! Issue C (#63): the nested-delegation builder must forward EVERY
+    //! target argument to the child, not just the executable. A regression
+    //! that drops `target[1..]` would silently turn
+    //! `cmd.exe /c "echo X"` into an interactive `cmd.exe`.
+    //!
+    //! These tests inspect the built `Command`'s argv directly — no process
+    //! is spawned — so they are deterministic and platform-independent.
+
+    use super::build_delegation_command;
+
+    /// `cmd.exe /c "echo DELEGATED_ARG_OK"` (3 target elements) must reach
+    /// the child with both `/c` and the quoted echo intact.
+    #[test]
+    fn preserves_full_target_argv() {
+        let target: Vec<String> = vec![
+            "cmd.exe".into(),
+            "/c".into(),
+            "echo DELEGATED_ARG_OK".into(),
+        ];
+        let cmd = build_delegation_command(&target);
+        assert_eq!(cmd.get_program(), std::ffi::OsStr::new("cmd.exe"));
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            ["/c", "echo DELEGATED_ARG_OK"],
+            "all target arguments after [0] must be forwarded verbatim",
+        );
+    }
+
+    /// Pathological case: a target that is only the executable (no args).
+    /// The builder must not panic on `target[1..]` and must produce zero
+    /// child arguments.
+    #[test]
+    fn handles_executable_only_target() {
+        let target: Vec<String> = vec!["cmd.exe".into()];
+        let cmd = build_delegation_command(&target);
+        assert_eq!(cmd.get_program(), std::ffi::OsStr::new("cmd.exe"));
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert!(args.is_empty(), "no args expected, got {args:?}");
+    }
+
+    /// Arguments that look like launcher flags (`-c`, `--flag`) must survive
+    /// verbatim — clap already consumed the real launcher opts via `--`, so
+    /// everything in `cli.target` is the child's argv, not ours.
+    #[test]
+    fn preserves_flag_like_arguments() {
+        let target: Vec<String> = vec![
+            "node".into(),
+            "-e".into(),
+            "console.log('hi')".into(),
+            "--unhandled-rejections=strict".into(),
+        ];
+        let cmd = build_delegation_command(&target);
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "-e",
+                "console.log('hi')",
+                "--unhandled-rejections=strict",
+            ],
+        );
+    }
+
+    /// Empty-string arguments (rare but legal) must round-trip — they must
+    /// not be silently dropped, since the child's argv indexing depends on
+    /// positional presence.
+    #[test]
+    fn preserves_empty_string_argument() {
+        let target: Vec<String> = vec!["git".into(), "commit".into(), "".into(), "-m".into()];
+        let cmd = build_delegation_command(&target);
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args, ["commit", "", "-m"], "empty-string arg preserved");
+    }
+}
+
+#[cfg(test)]
+mod cli_target_parsing_tests {
+    //! Issue C (#63), iteration 3: regression test for the FULL argv→target
+    //! chain that feeds `build_delegation_command`. The orchestrator reported
+    //! that the nested launcher received only the bare executable (`cmd.exe`)
+    //! without `/c "echo ..."`, which would mean clap's `trailing_var_arg`
+    //! collection dropped everything after the inner `--`.
+    //!
+    //! These tests invoke the clap parser directly (`Cli::try_parse_from`)
+    //! against the exact argv shape produced when an outer launcher spawns a
+    //! nested launcher — `winrsbox.exe --cwd X -- <target...>` — and assert
+    //! `cli.target` carries every trailing token verbatim. They do NOT start
+    //! the sandbox, so they run anywhere without hook.dll / admin rights.
+
+    use clap::Parser;
+    use super::Cli;
+
+    /// The exact nested-delegation shape from the acceptance test:
+    ///     winrsbox.exe --cwd X -- cmd.exe /c "echo DELEGATED_ARG_OK"
+    /// clap must collect THREE entries into `target`.
+    #[test]
+    fn nested_argv_preserves_full_target_after_inner_dashdash() {
+        let argv = [
+            "winrsbox.exe",
+            "--cwd", r"D:\nest_sbx",
+            "--",
+            "cmd.exe", "/c", "echo DELEGATED_ARG_OK",
+        ];
+        let cli = Cli::try_parse_from(argv).expect("parse nested argv");
+        assert_eq!(
+            cli.target,
+            vec![
+                "cmd.exe".to_string(),
+                "/c".to_string(),
+                "echo DELEGATED_ARG_OK".to_string(),
+            ],
+            "clap must forward every token after `--` into cli.target",
+        );
+        assert!(!cli.init, "init flag must not be set by trailing tokens");
+    }
+
+    /// A nested launcher may itself be invoked with its own `--` plus a
+    /// complex target (e.g. multi-word echo with spaces). The trailing
+    /// collection must NOT split quoted arguments on whitespace.
+    #[test]
+    fn nested_argv_preserves_quoted_multiword_target() {
+        let argv = [
+            "winrsbox.exe",
+            "--cwd", r"D:\nest_sbx",
+            "--",
+            "cmd.exe", "/c", "echo hello world from nested",
+        ];
+        let cli = Cli::try_parse_from(argv).expect("parse multiword argv");
+        assert_eq!(
+            cli.target,
+            vec![
+                "cmd.exe".to_string(),
+                "/c".to_string(),
+                "echo hello world from nested".to_string(),
+            ],
+        );
+    }
+
+    /// Hyphen-prefixed tokens after `--` (e.g. `-c`, `--flag`) must land in
+    /// `target`, not be re-interpreted as launcher options. With
+    /// `allow_hyphen_values=true` + `trailing_var_arg=true` on the `target`
+    /// field, the first `--` terminates option parsing and everything
+    /// afterwards is positional — this test pins that behaviour.
+    #[test]
+    fn nested_argv_treats_hyphen_tokens_as_target() {
+        let argv = [
+            "winrsbox.exe",
+            "--",
+            "node", "-e", "console.log(1)", "--unhandled-rejections=strict",
+        ];
+        let cli = Cli::try_parse_from(argv).expect("parse hyphen argv");
+        assert_eq!(
+            cli.target,
+            vec![
+                "node".to_string(),
+                "-e".to_string(),
+                "console.log(1)".to_string(),
+                "--unhandled-rejections=strict".to_string(),
+            ],
+        );
+        // sanity: launcher's own --debug was NOT set by the trailing `-e`
+        assert!(!cli.debug);
+    }
+
+    /// End-to-end glue check: feed the parsed `cli.target` straight into
+    /// `build_delegation_command` and confirm the `Command` argv matches the
+    /// original input byte-for-byte. This catches any silent dropping or
+    /// re-quoting between clap collection and the delegation builder.
+    #[test]
+    fn parse_then_build_command_roundtrip() {
+        use super::build_delegation_command;
+        let argv = [
+            "winrsbox.exe",
+            "--cwd", r"D:\nest_sbx",
+            "--",
+            "cmd.exe", "/c", "echo DELEGATED_ARG_OK",
+        ];
+        let cli = Cli::try_parse_from(argv).expect("parse");
+        let cmd = build_delegation_command(&cli.target);
+        assert_eq!(cmd.get_program(), std::ffi::OsStr::new("cmd.exe"));
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert_eq!(args, ["/c", "echo DELEGATED_ARG_OK"]);
     }
 }

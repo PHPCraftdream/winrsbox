@@ -106,6 +106,7 @@ mod tests {
             pipe_name: format!(r"\\.\pipe\winrsbox-test-{}", std::process::id()),
             dll_path: r"D:\bin\hook.dll".into(),
             cwd: r"D:\sandbox".into(),
+            sandbox_root: r"D:\sandbox_root".into(),
             trace: true,
             guard: "scan".into(),
             allow_rwx: false,
