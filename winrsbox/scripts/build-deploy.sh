@@ -38,16 +38,43 @@ for arg in "$@"; do
     esac
 done
 
-# Respect a caller-provided / environment-set CARGO_TARGET_DIR (cargo itself
-# honors it, so we must look in the same place for artifacts). Fall back to the
-# workspace-local target/ dir when unset. Without this, a globally set
-# CARGO_TARGET_DIR makes the artifacts land elsewhere and deploy silently fails
-# with "! missing artifact".
-if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
-    TARGET_DIR="$CARGO_TARGET_DIR/$PROFILE"
-else
-    TARGET_DIR="$WORKSPACE_DIR/target/$PROFILE"
+# Resolve the artifact directory the SAME WAY cargo does — by asking cargo.
+# The previous logic only honoured the CARGO_TARGET_DIR env var and fell back
+# to <workspace>/target/ otherwise, but cargo ALSO honours:
+#   - build.target-dir in .cargo/config.toml (workspace or $CARGO_HOME)
+#   - CARGO_BUILD_TARGET_DIR (prefixed form)
+#   - a globally-exported CARGO_TARGET_DIR that the script's shell didn't inherit
+# Any of those caused the script to look in the wrong place: if the wrong
+# dir happened to hold a stale winrsbox.exe byte-identical to bin/, `cmp -s`
+# correctly reported "unchanged" and a freshly-built binary was silently
+# skipped — leaving tests running against a stale deploy.
+#
+# `cargo metadata` is cargo's own authoritative source for target_directory;
+# it accounts for every config layer. We strip a trailing release/debug so we
+# can re-append the active profile consistently.
+echo "==> resolving target dir via cargo metadata"
+TARGET_ROOT="$(
+    cd "$WORKSPACE_DIR" && cargo metadata --no-deps --format-version=1 2>/dev/null \
+        | python -c "import json,sys; print(json.load(sys.stdin)['target_directory'])" 2>/dev/null \
+        || true
+)"
+if [[ -z "$TARGET_ROOT" ]]; then
+    # Fallback: legacy env-then-workspace logic if cargo metadata is unavailable
+    # (e.g. python missing). Better than hard-failing, but emits a warning.
+    echo "  ! cargo metadata unavailable — falling back to CARGO_TARGET_DIR/workspace" >&2
+    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+        TARGET_ROOT="$CARGO_TARGET_DIR"
+    else
+        TARGET_ROOT="$WORKSPACE_DIR/target"
+    fi
 fi
+# Normalise Windows-style "C:\..." to a bash-friendly "/c/..." so the path
+# composes cleanly with $PROFILE below. cygpath -m gives a mixed-mode path
+# that both bash and cmp/cp accept.
+if command -v cygpath >/dev/null 2>&1; then
+    TARGET_ROOT="$(cygpath -m "$TARGET_ROOT" 2>/dev/null || echo "$TARGET_ROOT")"
+fi
+TARGET_DIR="$TARGET_ROOT/$PROFILE"
 
 mkdir -p "$BIN_DIR"
 
