@@ -16,9 +16,13 @@ use crate::hooks::{
     check_path_traversal, check_device_block, decide, resolve_for_hook,
     is_write_access, materialize_mock_overlay,
     prepare_overlay, set_io_status, ipc_record_overlay,
-    STATUS_ACCESS_DENIED,
+    FILE_CREATE, FILE_OPEN_IF, FILE_OVERWRITE_IF, FILE_SUPERSEDE,
+    STATUS_ACCESS_DENIED, STATUS_OBJECT_NAME_NOT_FOUND,
 };
-use crate::ipc_client::{cache, ipc_log, is_trace};
+use crate::ipc_client::{
+    cache, ipc_log, is_trace,
+    ipc_clear_whiteout,
+};
 
 // ---------------------------------------------------------------------------
 // Nt* function type aliases
@@ -93,6 +97,24 @@ pub(crate) static HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE: OnceLock<GenericDetour<FnN
 #[inline]
 pub(crate) fn is_ea_present(ea_buffer: *const c_void, ea_length: u32) -> bool {
     !ea_buffer.is_null() && ea_length > 0
+}
+
+/// True iff `create_disposition` (NtCreateFile) requests that a file be
+/// CREATED rather than merely opened. Such a disposition against a
+/// whiteouted path is a REVIVE: the caller wants to (re)create the file, so
+/// we must clear the whiteout marker and let the create proceed into the
+/// overlay, rather than returning not-found.
+///
+/// FILE_OPEN (1) and FILE_OVERWRITE (4) are NOT creates:
+///  - FILE_OPEN fails if the file does not exist — it's a pure open.
+///  - FILE_OVERWRITE opens-then-truncates an EXISTING file; for a hidden
+///    path it must surface not-found (the file is gone from the view).
+#[inline]
+pub(crate) fn is_create_disposition(create_disposition: u32) -> bool {
+    matches!(
+        create_disposition,
+        FILE_CREATE | FILE_OPEN_IF | FILE_OVERWRITE_IF | FILE_SUPERSEDE
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +216,30 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
     }
 
     let write = is_write_access(desired_access, create_disposition);
-    let decision = decide(&dos, write);
+    let mut decision = decide(&dos, write);
+
+    // ── Revive: a create/supersede/open-if against a Hidden (whiteouted) path
+    // means the caller wants to (re)create the file. We clear the whiteout
+    // marker and re-decide so the second decision returns Cow (overlay),
+    // materialising the file in the sandbox instead of surfacing not-found.
+    //
+    // We do NOT recurse into hook_nt_create_file because the outer call holds
+    // an anti_rec guard; the re-entry would see enter()==None and bypass the
+    // decision logic entirely (calling the original on the REAL path — an
+    // escape). Instead we clear + re-decide inline and fall through to the
+    // normal match below.
+    if decision.mode == Mode::Hidden && is_create_disposition(create_disposition) {
+        let lower = dos.to_lowercase();
+        ipc_clear_whiteout(&lower);
+        cache().invalidate(&lower);
+        if is_trace() {
+            ipc_log(
+                ipc::LogLevel::Trace,
+                format!("fs_whiteout_revive NtCreateFile: {dos}"),
+            );
+        }
+        decision = decide(&dos, write);
+    }
 
     if is_trace() {
         ipc_log(
@@ -213,6 +258,22 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
     // and false-positive'd legitimate IPC primitives that pass the flag for
     // open-self semantics (e.g. wezterm's blob-lease files in %TEMP%).
     match decision.mode {
+        Mode::Hidden => {
+            // Pure open / read / overwrite-of-existing against a hidden path:
+            // the file is gone from the sandbox view → not-found. The revive
+            // case (create disposition) is handled above before this match.
+            if is_trace() {
+                ipc_log(
+                    ipc::LogLevel::Trace,
+                    format!("fs_whiteout_hidden NtCreateFile: {dos} disposition={create_disposition}"),
+                );
+            }
+            if !file_handle.is_null() {
+                *file_handle = std::ptr::null_mut();
+            }
+            set_io_status(io_status_block, STATUS_OBJECT_NAME_NOT_FOUND);
+            STATUS_OBJECT_NAME_NOT_FOUND
+        }
         Mode::Passthrough => {
             // H5 resolve-once passthrough: copy_passthrough_inner reuses the
             // pre-resolved absolute path (if relative open) so we never call
@@ -391,6 +452,23 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
     }
 
     match decision.mode {
+        Mode::Hidden => {
+            // NtOpenFile is always a pure open (CreateDisposition = FILE_OPEN
+            // semantically — it cannot create). A hidden path is therefore
+            // not-found. The revive path is handled by NtCreateFile, which is
+            // what every "create-if-not-exists" call routes through.
+            if is_trace() {
+                ipc_log(
+                    ipc::LogLevel::Trace,
+                    format!("fs_whiteout_hidden NtOpenFile: {dos}"),
+                );
+            }
+            if !file_handle.is_null() {
+                *file_handle = std::ptr::null_mut();
+            }
+            set_io_status(io_status_block, STATUS_OBJECT_NAME_NOT_FOUND);
+            STATUS_OBJECT_NAME_NOT_FOUND
+        }
         Mode::Passthrough => {
             // SAFETY: object_attributes is non-null.
             let mut copy = match HookedAttrs::copy_passthrough_inner(
@@ -496,6 +574,7 @@ pub(crate) unsafe extern "system" fn hook_nt_query_attributes_file(
 
     let decision = decide(&dos, false);
     match decision.mode {
+        Mode::Hidden => STATUS_OBJECT_NAME_NOT_FOUND,
         Mode::Passthrough => {
             // SAFETY: object_attributes is non-null.
             let mut copy = match HookedAttrs::copy_passthrough_inner(
@@ -604,6 +683,7 @@ pub(crate) unsafe extern "system" fn hook_nt_query_full_attributes_file(
 
     let decision = decide(&dos, false);
     match decision.mode {
+        Mode::Hidden => STATUS_OBJECT_NAME_NOT_FOUND,
         Mode::Passthrough => {
             // SAFETY: object_attributes is non-null.
             let mut copy = match HookedAttrs::copy_passthrough_inner(
@@ -711,5 +791,24 @@ mod tests {
         let dummy = 0u8;
         assert!(is_ea_present(&dummy as *const u8 as *const c_void, 1));
         assert!(is_ea_present(&dummy as *const u8 as *const c_void, u32::MAX));
+    }
+
+    #[test]
+    fn is_create_disposition_classifies_revive() {
+        // Dispositions that (re)create the file → revive path on whiteout.
+        assert!(is_create_disposition(FILE_SUPERSEDE)); // 0
+        assert!(is_create_disposition(FILE_CREATE));     // 2
+        assert!(is_create_disposition(FILE_OPEN_IF));    // 3
+        assert!(is_create_disposition(FILE_OVERWRITE_IF)); // 5
+    }
+
+    #[test]
+    fn is_create_disposition_rejects_pure_open() {
+        // FILE_OPEN (1) and FILE_OVERWRITE (4) are NOT creates:
+        // a hidden path must surface not-found for these, not revive.
+        assert!(!is_create_disposition(1)); // FILE_OPEN
+        assert!(!is_create_disposition(4)); // FILE_OVERWRITE
+        // Unknown dispositions are also not revives.
+        assert!(!is_create_disposition(99));
     }
 }

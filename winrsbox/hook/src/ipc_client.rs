@@ -27,6 +27,10 @@ thread_local! {
 pub(crate) static PIPE_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 pub(crate) static DLL_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 pub(crate) static SANDBOX_CWD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// Absolute path of the sandbox overlay storage dir (populated from the
+/// session section's `sandbox_root` field). Used by the delete hook to
+/// recognise overlay files and convert them back to virtual DOS paths.
+pub(crate) static SANDBOX_ROOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Install-error buffer (P2-5)
@@ -132,6 +136,9 @@ fn try_load_session_config_from_section() -> Option<()> {
     }
     if !cfg.cwd.is_empty() {
         let _ = SANDBOX_CWD.set(cfg.cwd);
+    }
+    if !cfg.sandbox_root.is_empty() {
+        let _ = SANDBOX_ROOT.set(cfg.sandbox_root);
     }
     if cfg.trace {
         TRACE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -315,6 +322,48 @@ pub(crate) fn ipc_record_overlay(orig: &str, overlay: &str) {
             overlay: overlay.to_owned(),
         });
     });
+}
+
+/// Remove an OVERLAY_IDX entry (used after physically deleting an overlay
+/// copy so the index doesn't point at a missing file).
+pub(crate) fn ipc_clear_overlay(orig: &str) {
+    let _ = ensure_ipc_and(|opt| {
+        let _ = try_send(opt, &ipc::Req::ClearOverlay {
+            path: orig.to_owned(),
+        });
+    });
+}
+
+/// Record a whiteout (tombstone) for a virtual path. Hides the real lower
+/// file from the sandbox view. The real disk is never touched.
+pub(crate) fn ipc_record_whiteout(path: &str) {
+    let _ = ensure_ipc_and(|opt| {
+        let _ = try_send(opt, &ipc::Req::RecordWhiteout {
+            path: path.to_owned(),
+        });
+    });
+}
+
+/// Clear a whiteout marker (revive) for a virtual path. Called when a create
+/// re-materialises a previously-deleted path in the overlay.
+pub(crate) fn ipc_clear_whiteout(path: &str) {
+    let _ = ensure_ipc_and(|opt| {
+        let _ = try_send(opt, &ipc::Req::ClearWhiteout {
+            path: path.to_owned(),
+        });
+    });
+}
+
+/// Return the filenames of whiteouted direct children of `dir`. Used by the
+/// NtQueryDirectoryFile hook to hide tombstoned entries from listings.
+/// Returns None on IPC failure (caller treats as empty set — no filtering).
+pub(crate) fn ipc_whiteouts_under(dir: &str) -> Option<Vec<String>> {
+    ensure_ipc_and(|opt| {
+        match try_send(opt, &ipc::Req::WhiteoutsUnder { dir: dir.to_owned() }) {
+            Some(ipc::Resp::Whiteouts(names)) => Some(names),
+            _ => None,
+        }
+    }).flatten()
 }
 
 pub(crate) fn ipc_register_child(pid: u32) {

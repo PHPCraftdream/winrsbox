@@ -973,13 +973,24 @@ mod tests {
 
     #[test]
     fn mode_enum_is_exhaustive_fail_closed() {
-        for mode in [policy::Mode::Deny, policy::Mode::Cow, policy::Mode::Mock, policy::Mode::Passthrough] {
+        for mode in [
+            policy::Mode::Deny,
+            policy::Mode::Cow,
+            policy::Mode::Mock,
+            policy::Mode::Passthrough,
+            policy::Mode::Hidden,
+        ] {
             match mode {
                 policy::Mode::Deny | policy::Mode::Cow | policy::Mode::Mock => {
                     // These all deny in hook handlers (H4 downgrade)
                 }
                 policy::Mode::Passthrough => {
                     // Only passthrough calls original
+                }
+                policy::Mode::Hidden => {
+                    // Hidden is a whiteout marker; reg hooks never see it
+                    // (it only applies to filesystem paths). Treating it as
+                    // deny is the fail-closed stance for any future use.
                 }
             }
         }

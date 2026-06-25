@@ -239,12 +239,104 @@ unsafe extern "system" fn hook_nt_set_information_file(
                 }
                 return STATUS_ACCESS_DENIED;
             }
-            // Check if destination is outside sandbox root
-            if let Some(sandbox_root) = hooks::SANDBOX_CWD.get() {
-                if !policy::path::pattern_matches_prefix(&sandbox_root.to_lowercase(), &dest) {
+            // Allow the rename/hardlink destination if policy would allow a
+            // write there. This mirrors the create-side decision so an external
+            // path that policy isolates via CoW (e.g. d:\e2e_external — outside
+            // project_root but recorded as Cow) stays writable. Without this,
+            // git's atomic `create config.lock` → `rename → config` workflow
+            // fails inside a CoW-managed external dir: the .lock write is
+            // allowed (Cow) but the rename to the bare name is denied because
+            // the destination isn't under SANDBOX_CWD, leaving the repo half-
+            // initialized (no HEAD/config/objects).
+            //
+            // Passthrough → inside project_root (real write) — call original.
+            // Cow/Mock    → external path CoW-managed into the overlay. The
+            //               caller's source handle points at the overlay copy
+            //               (create/open redirected it there), but the rename
+            //               buffer still names the VIRTUAL destination, so we
+            //               must rewrite the FileName to the overlay path and
+            //               null RootDirectory so the kernel targets the same
+            //               layer the source handle lives on.
+            // Deny       → block.
+            // Hidden     → revive (same as NtCreateFile's revive path in
+            //              fs_hooks.rs): a rename/hardlink onto a whiteouted
+            //              path is a re-creation of that path. The source will
+            //              be moved/linked into the overlay, superseding the
+            //              tombstone, so we clear the whiteout and re-decide.
+            //              Without this, `git config` (which on a fresh repo
+            //              renames `config.lock` over a `.git/config` path that
+            //              `git init` never populated because it too was
+            //              whiteouted by a prior `rm -rf .git`) is denied, every
+            //              subsequent git command fails to read config, and the
+            //              repo is unusable.
+            let mut decision = hooks::decide(&dest, true);
+            if decision.mode == policy::Mode::Hidden {
+                let lower = dest.to_ascii_lowercase();
+                hooks::ipc_clear_whiteout(&lower);
+                hooks::cache().invalidate(&lower);
+                if hooks::is_trace() {
+                    hooks::ipc_log(ipc::LogLevel::Trace,
+                        format!("fs_whiteout_revive setinfo_rename: {dest}"));
+                }
+                decision = hooks::decide(&dest, true);
+            }
+            match decision.mode {
+                policy::Mode::Passthrough => {
+                    return call_original();
+                }
+                policy::Mode::Cow | policy::Mode::Mock => {
+                    if decision.overlay.is_none() {
+                        if !iosb.is_null() {
+                            hooks::set_io_status(iosb, STATUS_ACCESS_DENIED);
+                        }
+                        return STATUS_ACCESS_DENIED;
+                    }
+                    // Mirror into overlay (records the index entry and creates
+                    // parent dirs) so subsequent opens at the virtual path
+                    // resolve here. prepare_overlay also returns the canonical
+                    // overlay DOS path to splice into the rename buffer.
+                    let overlay_dos = match hooks::prepare_overlay(&decision) {
+                        Some(p) => p,
+                        None => {
+                            if !iosb.is_null() {
+                                hooks::set_io_status(iosb, STATUS_ACCESS_DENIED);
+                            }
+                            return STATUS_ACCESS_DENIED;
+                        }
+                    };
+                    let dest_lower = dest.to_ascii_lowercase();
+                    // Source-side bookkeeping. For a *rename* (not hardlink),
+                    // the kernel moves the source file to the destination, so
+                    // the source overlay copy disappears and its OVERLAY_IDX
+                    // entry must not keep pointing at the now-missing path
+                    // (otherwise a later `compute` would treat the source as
+                    // revived-into-overlay when it is in fact gone). For a
+                    // *hardlink* (FileLinkInfo) the source stays, so we skip
+                    // the cleanup. We also record a whiteout for the source
+                    // virtual path on rename so the sandbox view reflects that
+                    // the source name no longer exists (mirrors a real delete).
+                    let is_link = class == FILE_LINK_INFO_CLASS
+                        || class == FILE_LINK_EX_INFO_CLASS;
+                    if !is_link {
+                        if let Some(src) = query_handle_dos_path(handle) {
+                            let src_lower = src.to_ascii_lowercase();
+                            hooks::ipc_clear_overlay(&src_lower);
+                            hooks::ipc_record_whiteout(&src_lower);
+                            hooks::cache().invalidate(&src_lower);
+                        }
+                    }
+                    hooks::ipc_record_overlay(&dest_lower, &overlay_dos);
+                    hooks::cache().invalidate(&dest_lower);
+
+                    return setinfo_rename_to_overlay(
+                        handle, iosb, info, len, class, &overlay_dos,
+                    );
+                }
+                policy::Mode::Deny | policy::Mode::Hidden => {
                     if hooks::is_trace() {
                         hooks::ipc_log(ipc::LogLevel::Trace,
-                            format!("fs_setinfo_block_outside class={} dest={}", class, dest));
+                            format!("fs_setinfo_block_outside class={} dest={} mode={:?}",
+                                class, dest, decision.mode));
                     }
                     if !iosb.is_null() {
                         hooks::set_io_status(iosb, STATUS_ACCESS_DENIED);
@@ -264,18 +356,80 @@ unsafe extern "system" fn hook_nt_set_information_file(
             };
             if wants_delete {
                 if let Some(path) = query_handle_dos_path(handle) {
-                    if let Some(sandbox_root) = hooks::SANDBOX_CWD.get() {
-                        if !policy::path::pattern_matches_prefix(&sandbox_root.to_lowercase(), &path) {
-                            if hooks::is_trace() {
-                                hooks::ipc_log(ipc::LogLevel::Trace,
-                                    format!("fs_setinfo_delete_block path={}", path));
+                    let in_project = hooks::SANDBOX_CWD.get().map_or(false, |cwd| {
+                        policy::path::pattern_matches_prefix(&cwd.to_lowercase(), &path)
+                    });
+                    if in_project {
+                        // Inside the agent's own project_root: real delete as
+                        // usual (passthrough). project_root is the only place
+                        // the agent may mutate the real disk.
+                        return call_original();
+                    }
+
+                    // Outside project_root: whiteout. The real lower file is
+                    // NEVER touched (invariant #1). Two sub-cases:
+                    //
+                    // (a) The handle resolves INTO the sandbox overlay storage
+                    //     (path is under sandbox_root). This is a CoW'd copy the
+                    //     agent previously created; it lives inside the sandbox
+                    //     so we may really delete it, then record a whiteout for
+                    //     the VIRTUAL path so the lower layer (if any) stays hidden.
+                    //
+                    // (b) The handle resolves to a real external file. We must
+                    //     NOT call the original (that would delete the real file).
+                    //     Record a whiteout for the path and return SUCCESS so the
+                    //     caller believes the delete succeeded.
+                    if let Some(sb_root) = hooks::SANDBOX_ROOT.get() {
+                        let sb_lower = sb_root.to_lowercase();
+                        let sb_trimmed = sb_lower.trim_end_matches('\\');
+                        if !sb_trimmed.is_empty()
+                            && policy::path::pattern_matches_prefix(sb_trimmed, &path)
+                        {
+                            // (a) overlay copy: really delete it (the path is
+                            // inside the sandbox, safe to mutate), then whiteout
+                            // the virtual path so the lower layer stays hidden.
+                            let overlay_pbuf = std::path::PathBuf::from(&path);
+                            let virtual_dos = policy::path::unmirror_from_overlay(
+                                &overlay_pbuf,
+                                std::path::Path::new(sb_trimmed),
+                            ).unwrap_or_else(|| path.clone());
+                            let status = call_original();
+                            if status == 0 {
+                                let lower = virtual_dos.to_lowercase();
+                                // The overlay file is gone — drop the index
+                                // entry too, otherwise `compute` would still
+                                // see has_overlay=true and treat the path as
+                                // revived (surfacing the real lower file
+                                // instead of Hidden).
+                                hooks::ipc_clear_overlay(&lower);
+                                hooks::ipc_record_whiteout(&lower);
+                                hooks::cache().invalidate(&lower);
+                                if hooks::is_trace() {
+                                    hooks::ipc_log(ipc::LogLevel::Trace,
+                                        format!("fs_whiteout_overlay_delete virtual={virtual_dos} overlay={path}"));
+                                }
                             }
-                            if !iosb.is_null() {
-                                hooks::set_io_status(iosb, STATUS_ACCESS_DENIED);
-                            }
-                            return STATUS_ACCESS_DENIED;
+                            return status;
                         }
                     }
+
+                    // (b) real external file: do NOT delete it. Record the
+                    // whiteout and return SUCCESS so the caller sees a
+                    // successful virtual delete. The real disk is untouched.
+                    let lower = path.to_lowercase();
+                    hooks::ipc_record_whiteout(&lower);
+                    hooks::cache().invalidate(&lower);
+                    if hooks::is_trace() {
+                        hooks::ipc_log(ipc::LogLevel::Trace,
+                            format!("fs_whiteout_external_delete path={path}"));
+                    }
+                    // STATUS_SUCCESS with a clean iosb.Status. The caller may
+                    // then NtClose the handle; that is fine (the real file is
+                    // still on disk, NtClose just drops the handle).
+                    if !iosb.is_null() {
+                        hooks::set_io_status(iosb, 0); // STATUS_SUCCESS
+                    }
+                    return 0; // STATUS_SUCCESS
                 }
             }
         }
@@ -283,6 +437,76 @@ unsafe extern "system" fn hook_nt_set_information_file(
     }
 
     call_original()
+}
+
+/// Rewrite a FileRenameInfo(Ex)/FileLinkInfo(Ex) buffer to name the overlay
+/// path instead of the caller's virtual destination, then call the original
+/// `NtSetInformationFile` with RootDirectory=NULL (absolute overlay path).
+///
+/// Both the non-Ex (ReplaceIfExists at 0x00, BOOLEAN) and Ex (Flags at 0x00,
+/// ULONG) variants keep RootDirectory at 0x08, FileNameLength at 0x10, and the
+/// WCHAR FileName[] at 0x14. We preserve the leading header word so
+/// ReplaceIfExists / Flags semantics are unchanged, set RootDirectory=NULL,
+/// and append the UTF-16 overlay path.
+///
+/// # SAFETY
+/// `info`/`len` are the original NtSetInformationFile buffer; `iosb` may be
+/// null. Caller holds the anti_rec guard (we are mid-hook).
+unsafe fn setinfo_rename_to_overlay(
+    handle: HANDLE,
+    iosb: *mut IO_STATUS_BLOCK,
+    info: *const c_void,
+    len: u32,
+    class: u32,
+    overlay_dos: &str,
+) -> NTSTATUS {
+    let off_root = 0x08usize;
+    let off_name = 0x14usize;
+
+    // Build a replacement info buffer. The first 0x08 bytes carry either
+    // ReplaceIfExists (non-Ex) or Flags (Ex); copy verbatim so the caller's
+    // replace/replace-if-exists behavior is preserved. Zero RootDirectory,
+    // set FileNameLength, and write the UTF-16 NT-form overlay path
+    // (`\??\<overlay_dos>`). The kernel's FileRenameInfo FileName expects an
+    // NT object name, not a bare DOS path; passing the DOS form yields
+    // STATUS_INVALID_PARAMETER.
+    let overlay_nt = hooks::make_overlay_nt_buf(overlay_dos);
+    // make_overlay_nt_buf returns `\??\<path>\0` (WITH trailing NUL).
+    // FileNameLength counts bytes EXCLUDING the trailing NUL (matches the
+    // UNICODE_STRING.Length discipline used by HookedAttrs::redirect).
+    let chars_excluding_nul = overlay_nt.len().saturating_sub(1);
+    let file_name_bytes = chars_excluding_nul * 2;
+    let new_len = off_name + file_name_bytes;
+    let mut buf: Vec<u8> = Vec::with_capacity(new_len);
+    // Header [0x00, 0x08): preserve ReplaceIfExists/Flags verbatim.
+    let header = if (len as usize) >= off_root {
+        std::slice::from_raw_parts(info as *const u8, off_root)
+    } else {
+        // Defensive: caller already validated len >= off_name (0x14) before
+        // invoking us, but do not assume a malformed buffer.
+        if !iosb.is_null() {
+            hooks::set_io_status(iosb, STATUS_ACCESS_DENIED);
+        }
+        return STATUS_ACCESS_DENIED;
+    };
+    buf.extend_from_slice(header);
+    // RootDirectory (HANDLE, 8 bytes) = NULL — we pass an absolute overlay path.
+    buf.extend_from_slice(&[0u8; 8]);
+    // FileNameLength (ULONG, 4 bytes, little-endian).
+    buf.extend_from_slice(&(file_name_bytes as u32).to_le_bytes());
+    // FileName[] (WCHAR) — the NT path bytes (excluding the trailing NUL).
+    for w in overlay_nt.iter().take(chars_excluding_nul) {
+        buf.extend_from_slice(&w.to_le_bytes());
+    }
+
+    let new_info = buf.as_mut_ptr() as *mut c_void;
+    if hooks::is_trace() {
+        hooks::ipc_log(ipc::LogLevel::Trace,
+            format!("fs_setinfo_rename_overlay class={class} overlay={overlay_dos}"));
+    }
+    HOOK_NT_SET_INFO_FILE.get().unwrap().call(
+        handle, iosb, new_info, new_len as u32, class,
+    )
 }
 
 unsafe extern "system" fn hook_nt_fs_control_file(
