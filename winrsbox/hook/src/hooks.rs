@@ -39,6 +39,9 @@ pub(crate) use crate::ipc_client::{
     ipc_log,
     ipc_log_violation,
     ipc_record_overlay,
+    ipc_clear_overlay,
+    ipc_clear_whiteout,
+    ipc_record_whiteout,
     ipc_register_child,
     ipc_send_and_recv,
     ipc_spawned_child,
@@ -46,6 +49,7 @@ pub(crate) use crate::ipc_client::{
     DLL_PATH,
     PIPE_NAME,
     SANDBOX_CWD,
+    SANDBOX_ROOT,
     TRACE_ENABLED,
 };
 
@@ -938,14 +942,18 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         TRACE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     if let Ok(cwd) = std::env::var("FS_SANDBOX_CWD") {
-        let _ = SANDBOX_CWD.set(cwd.clone());
-        // Override the process CWD to the sandbox root. This runs before any
-        // user-mode entry point code, so the process sees the right directory
-        // from the first os.Getwd() / GetCurrentDirectory call.
-        // SetCurrentDirectoryW is safe to call from DllMain (pure RtlSetCurrentDirectory_U).
-        let wide: Vec<u16> = cwd.encode_utf16().chain(Some(0)).collect();
-        // SAFETY: wide is a valid null-terminated UTF-16 path string.
-        unsafe { winapi::um::processenv::SetCurrentDirectoryW(wide.as_ptr()) };
+        // Store project_root for the boundary checks (delete-hook, decide).
+        // Do NOT call SetCurrentDirectoryW here: install_hooks runs in DllMain
+        // of EVERY hooked process, including children. Forcing CWD to
+        // project_root would clobber the CWD a parent shell established via
+        // `cd` (e.g. `cd /d/e2e_external && git init`), so git would discover
+        // project_root as the worktree and create .git in the wrong place.
+        // The root process's CWD is already set by the launcher via
+        // CreateProcessW(lpCurrentDirectory); children inherit it normally.
+        let _ = SANDBOX_CWD.set(cwd);
+    }
+    if let Ok(sb_root) = std::env::var("FS_SANDBOX_ROOT") {
+        let _ = crate::ipc_client::SANDBOX_ROOT.set(sb_root);
     }
 
     macro_rules! install {
@@ -981,6 +989,7 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         install!(HOOK_NT_CREATE_USER_PROCESS,      "NtCreateUserProcess\0",       hook_nt_create_user_process,      FnNtCreateUserProcess);
         crate::dir_filter::install()?;
         crate::fs_metadata_guard::install()?;
+        crate::path_info_guard::install()?;
     }
 
     if guard != "none" {
@@ -1192,6 +1201,7 @@ pub unsafe fn uninstall_hooks() {
     if let Some(h) = HOOK_NT_CREATE_USER_PROCESS.get() { let _ = h.disable(); }
     crate::fs_metadata_guard::uninstall();
     crate::dir_filter::uninstall();
+    crate::path_info_guard::uninstall();
 }
 
 #[cfg(test)]
