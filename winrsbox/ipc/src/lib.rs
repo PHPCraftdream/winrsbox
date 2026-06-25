@@ -29,6 +29,12 @@ pub struct SessionConfig {
     pub pipe_name: String,
     pub dll_path: String,
     pub cwd: String,
+    /// Absolute path of the sandbox overlay storage dir (where CoW files and
+    /// policy.redb live). Published so the hook can recognise overlay paths
+    /// on delete and convert them back to virtual DOS paths via
+    /// `policy::path::unmirror_from_overlay`.
+    #[serde(default)]
+    pub sandbox_root: String,
     pub trace: bool,
     pub guard: String,
     pub allow_rwx: bool,
@@ -128,6 +134,18 @@ pub enum Req {
     SpawnedChild { parent_pid: u32, child_pid: u32, child_exe: String },
     Decide { dos_path: String, write: bool },
     RecordOverlay { orig: String, overlay: String },
+    /// Remove an OVERLAY_IDX entry. Called when an overlay copy is physically
+    /// deleted so the index doesn't keep pointing at a missing file (which
+    /// would defeat a concurrent whiteout).
+    ClearOverlay { path: String },
+    /// Record a whiteout (tombstone) for a virtual path. Hides the real lower
+    /// file from the sandbox view without touching the real disk.
+    RecordWhiteout { path: String },
+    /// Clear a whiteout marker (revive) — called when a create re-materialises
+    /// a previously-deleted path in the overlay.
+    ClearWhiteout { path: String },
+    /// Return the filenames of whiteouted direct children of `dir`.
+    WhiteoutsUnder { dir: String },
     Log { pid: u32, level: LogLevel, msg: String },
     RegisterChild { pid: u32 },
     InjectionViolation {
@@ -172,6 +190,8 @@ pub enum Resp {
     RegDecision { mode: policy::Mode, value_json: Option<Vec<u8>> },
     NetDecision { allow: bool },
     MemDecision { allow: bool },
+    /// Filenames of whiteouted direct children of a directory (for enumerate hiding).
+    Whiteouts(Vec<String>),
 }
 
 #[derive(Error, Debug)]
@@ -594,6 +614,7 @@ mod tests {
             pipe_name: r"\\.\pipe\fs-sandbox-12345".into(),
             dll_path: r"D:\bin\hook.dll".into(),
             cwd: r"D:\sandbox\workdir".into(),
+            sandbox_root: r"D:\sandbox".into(),
             trace: true,
             guard: "scan".into(),
             allow_rwx: false,
@@ -604,6 +625,7 @@ mod tests {
         assert_eq!(dec.pipe_name, cfg.pipe_name);
         assert_eq!(dec.dll_path, cfg.dll_path);
         assert_eq!(dec.cwd, cfg.cwd);
+        assert_eq!(dec.sandbox_root, r"D:\sandbox");
         assert!(dec.trace);
         assert_eq!(dec.guard, "scan");
     }
@@ -644,5 +666,83 @@ mod tests {
         buf.set_position(0);
         let dec: Resp = read_msg(&mut buf).unwrap();
         match dec { Resp::NetDecision { allow } => assert!(allow), _ => panic!() }
+    }
+
+    #[test]
+    fn req_clear_overlay_roundtrip() {
+        let msg = Req::ClearOverlay { path: r"d:\ext\file.txt".into() };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Req = read_msg(&mut buf).unwrap();
+        match dec {
+            Req::ClearOverlay { path } => assert_eq!(path, r"d:\ext\file.txt"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn req_record_whiteout_roundtrip() {
+        let msg = Req::RecordWhiteout { path: r"d:\ext\file.txt".into() };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Req = read_msg(&mut buf).unwrap();
+        match dec {
+            Req::RecordWhiteout { path } => assert_eq!(path, r"d:\ext\file.txt"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn req_clear_whiteout_roundtrip() {
+        let msg = Req::ClearWhiteout { path: r"d:\revive.txt".into() };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Req = read_msg(&mut buf).unwrap();
+        match dec {
+            Req::ClearWhiteout { path } => assert_eq!(path, r"d:\revive.txt"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn req_whiteouts_under_roundtrip() {
+        let msg = Req::WhiteoutsUnder { dir: r"d:\foo".into() };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Req = read_msg(&mut buf).unwrap();
+        match dec {
+            Req::WhiteoutsUnder { dir } => assert_eq!(dir, r"d:\foo"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn resp_whiteouts_roundtrip() {
+        let msg = Resp::Whiteouts(vec!["a.txt".into(), "b.log".into()]);
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Resp = read_msg(&mut buf).unwrap();
+        match dec {
+            Resp::Whiteouts(names) => assert_eq!(names, vec!["a.txt".to_string(), "b.log".to_string()]),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn resp_whiteouts_empty_roundtrip() {
+        let msg = Resp::Whiteouts(vec![]);
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Resp = read_msg(&mut buf).unwrap();
+        match dec {
+            Resp::Whiteouts(names) => assert!(names.is_empty()),
+            _ => panic!("wrong variant"),
+        }
     }
 }
