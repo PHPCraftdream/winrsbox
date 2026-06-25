@@ -7,6 +7,82 @@ pub const PIPE_PREFIX: &str = r"\\.\pipe\fs-sandbox-";
 
 pub const MAX_MSG_LEN: usize = 16 * 1024 * 1024;
 
+// ─── Session-config shared section ────────────────────────────────────────────
+//
+// Some hosted processes lose `FS_SANDBOX_*` environment variables — most
+// reliably reproducible under MSYS2 first-run setup, where helper child
+// processes inherit a scrubbed environment. The hook needs PIPE_NAME and
+// friends regardless. We publish them via a small named shared section so
+// every hooked process in the same Windows session can read them without
+// depending on inherited env vars.
+//
+// `Local\` namespace = session-scoped (per Windows logon session). No
+// SeCreateGlobalPrivilege required, no cross-session leakage.
+
+pub const SESSION_CONFIG_SECTION_NAME: &str = "Local\\WinRsBoxSession";
+pub const SESSION_CONFIG_SECTION_SIZE: usize = 4096;
+/// "WRSB" little-endian.
+pub const SESSION_CONFIG_MAGIC: u32 = 0x42535257;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionConfig {
+    pub pipe_name: String,
+    pub dll_path: String,
+    pub cwd: String,
+    pub trace: bool,
+    pub guard: String,
+    pub allow_rwx: bool,
+    pub disable_hooks: String,
+}
+
+impl SessionConfig {
+    /// Encode for writing to the shared section: 4-byte magic, 4-byte body
+    /// length, then bincode body. Fails if the encoded size would exceed the
+    /// shared section reserve.
+    pub fn to_section_bytes(&self) -> Result<Vec<u8>, IpcError> {
+        let body = bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .map_err(|e| IpcError::Encode(e.to_string()))?;
+        if 8 + body.len() > SESSION_CONFIG_SECTION_SIZE {
+            return Err(IpcError::Encode(format!(
+                "session config encodes to {} bytes, max {}",
+                8 + body.len(),
+                SESSION_CONFIG_SECTION_SIZE,
+            )));
+        }
+        let mut out = Vec::with_capacity(8 + body.len());
+        out.extend_from_slice(&SESSION_CONFIG_MAGIC.to_le_bytes());
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    /// Decode from raw section bytes. Validates magic + body length so a
+    /// torn / uninitialised section yields a `Decode` error rather than UB.
+    pub fn from_section_bytes(buf: &[u8]) -> Result<Self, IpcError> {
+        if buf.len() < 8 {
+            return Err(IpcError::Decode("session section too short".into()));
+        }
+        let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if magic != SESSION_CONFIG_MAGIC {
+            return Err(IpcError::Decode(format!(
+                "session section magic mismatch: 0x{magic:08x}",
+            )));
+        }
+        let len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+        if len == 0 || 8 + len > buf.len() {
+            return Err(IpcError::Decode(format!(
+                "session section body length {len} invalid",
+            )));
+        }
+        let (cfg, _) = bincode::serde::decode_from_slice(
+            &buf[8..8 + len],
+            bincode::config::standard(),
+        )
+        .map_err(|e| IpcError::Decode(e.to_string()))?;
+        Ok(cfg)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum LogLevel { Trace, Info, Warn, Error }
 
@@ -510,6 +586,54 @@ mod tests {
         buf.set_position(0);
         let dec: Resp = read_msg(&mut buf).unwrap();
         match dec { Resp::RegDecision { mode, value_json } => { assert_eq!(mode, policy::Mode::Cow); assert_eq!(value_json, Some(vec![42])); }, _ => panic!() }
+    }
+
+    #[test]
+    fn session_config_roundtrip_minimal() {
+        let cfg = SessionConfig {
+            pipe_name: r"\\.\pipe\fs-sandbox-12345".into(),
+            dll_path: r"D:\bin\hook.dll".into(),
+            cwd: r"D:\sandbox\workdir".into(),
+            trace: true,
+            guard: "scan".into(),
+            allow_rwx: false,
+            disable_hooks: String::new(),
+        };
+        let bytes = cfg.to_section_bytes().unwrap();
+        let dec = SessionConfig::from_section_bytes(&bytes).unwrap();
+        assert_eq!(dec.pipe_name, cfg.pipe_name);
+        assert_eq!(dec.dll_path, cfg.dll_path);
+        assert_eq!(dec.cwd, cfg.cwd);
+        assert!(dec.trace);
+        assert_eq!(dec.guard, "scan");
+    }
+
+    #[test]
+    fn session_config_section_size_bound() {
+        let huge = "x".repeat(SESSION_CONFIG_SECTION_SIZE + 1);
+        let cfg = SessionConfig {
+            pipe_name: huge,
+            ..Default::default()
+        };
+        assert!(cfg.to_section_bytes().is_err(),
+            "oversized config must be rejected, not silently truncated");
+    }
+
+    #[test]
+    fn session_config_rejects_bad_magic() {
+        let mut buf = vec![0u8; 64];
+        buf[0..4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        let err = SessionConfig::from_section_bytes(&buf).unwrap_err();
+        match err {
+            IpcError::Decode(msg) => assert!(msg.contains("magic"), "got: {msg}"),
+            other => panic!("expected Decode, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_config_rejects_short_buffer() {
+        let buf = [0u8; 4];
+        assert!(SessionConfig::from_section_bytes(&buf).is_err());
     }
 
     #[test]

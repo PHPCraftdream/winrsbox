@@ -244,7 +244,119 @@ fn is_owned_client_pid(client_pid: u32, root_target_pid: u32) -> bool {
         return true;
     }
     // Map populated by the Hello / SpawnedChild handlers below.
-    crate::global_proc_info().pin().contains_key(&client_pid)
+    if crate::global_proc_info().pin().contains_key(&client_pid) {
+        return true;
+    }
+    // Race-resilience: a child can reach this point BEFORE its parent's
+    // SpawnedChild message has been processed by the launcher (the parent
+    // hook sends SpawnedChild on its own pipe connection; under burst that
+    // send may be queued behind the new child's connection attempt). Walk
+    // the kernel-vouched parent chain via NtQueryInformationProcess; if any
+    // ancestor is in the owned map or matches `root_target_pid`, accept.
+    walk_parents_to_owned(client_pid, root_target_pid)
+}
+
+/// Open the process with `PROCESS_QUERY_LIMITED_INFORMATION` and query
+/// `PROCESS_BASIC_INFORMATION` to read `InheritedFromUniqueProcessId`.
+/// Returns `None` on any failure (process gone, access denied, etc.).
+fn get_parent_pid(pid: u32) -> Option<u32> {
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessBasicInformation {
+        exit_status: i32,
+        _pad0: u32,
+        peb_base_address: usize,
+        affinity_mask: usize,
+        base_priority: i32,
+        _pad1: u32,
+        unique_process_id: usize,
+        inherited_from_unique_process_id: usize,
+    }
+    type FnNtQueryInformationProcess = unsafe extern "system" fn(
+        HANDLE, u32, *mut core::ffi::c_void, u32, *mut u32,
+    ) -> i32;
+    static QIP: std::sync::OnceLock<Option<FnNtQueryInformationProcess>> =
+        std::sync::OnceLock::new();
+    let qip = (*QIP.get_or_init(|| {
+        use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        let ntdll: Vec<u16> = OsStr::new("ntdll.dll")
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        // SAFETY: ntdll.dll is always loaded; literal name.
+        let hmod = match unsafe { GetModuleHandleW(PCWSTR(ntdll.as_ptr())) } {
+            Ok(h) => h,
+            Err(_) => return None,
+        };
+        // SAFETY: hmod is valid; export name is null-terminated ASCII.
+        let addr = match unsafe {
+            GetProcAddress(hmod, windows::core::s!("NtQueryInformationProcess"))
+        } {
+            Some(a) => a,
+            None => return None,
+        };
+        // SAFETY: addr is the real NtQueryInformationProcess export.
+        Some(unsafe { std::mem::transmute::<_, FnNtQueryInformationProcess>(addr) })
+    }))?;
+
+    // SAFETY: pid is from kernel-vouched GetNamedPipeClientProcessId.
+    let h = unsafe {
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?
+    };
+    let mut info = ProcessBasicInformation::default();
+    let mut ret_len = 0u32;
+    // SAFETY: h is valid; info sized correctly.
+    let status = unsafe {
+        qip(
+            h,
+            0,
+            &mut info as *mut _ as *mut _,
+            std::mem::size_of::<ProcessBasicInformation>() as u32,
+            &mut ret_len,
+        )
+    };
+    // SAFETY: h was opened by us.
+    unsafe { CloseHandle(h).ok() };
+    if status < 0 {
+        return None;
+    }
+    Some(info.inherited_from_unique_process_id as u32)
+}
+
+/// Walk `pid`'s parent chain (up to `MAX_DEPTH` ancestors) looking for any
+/// PID that's either `root_target_pid` or present in `global_proc_info`.
+/// Returns true on first match; false if the chain runs out, loops, or
+/// reaches a non-sandbox process.
+fn walk_parents_to_owned(pid: u32, root_target_pid: u32) -> bool {
+    const MAX_DEPTH: u32 = 16;
+    let map = crate::global_proc_info();
+    let mut current = pid;
+    let mut seen = std::collections::HashSet::with_capacity(MAX_DEPTH as usize);
+    for _ in 0..MAX_DEPTH {
+        if !seen.insert(current) {
+            return false; // cycle detected
+        }
+        let parent = match get_parent_pid(current) {
+            Some(0) => return false,
+            Some(p) => p,
+            None => return false,
+        };
+        if parent == 0 {
+            return false;
+        }
+        if root_target_pid != 0 && parent == root_target_pid {
+            return true;
+        }
+        if map.pin().contains_key(&parent) {
+            return true;
+        }
+        current = parent;
+    }
+    false
 }
 
 // ─── Pipe accept loop ─────────────────────────────────────────────────────────

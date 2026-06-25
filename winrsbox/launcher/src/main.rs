@@ -417,6 +417,28 @@ async fn main() -> Result<()> {
         std::env::set_var("FS_SANDBOX_STRICT_CLIPBOARD", "1");
     }
 
+    // Publish a `SessionConfig` snapshot via `Local\WinRsBoxSession` so
+    // hooked descendants whose environment was scrubbed (MSYS2 first-run
+    // helpers in particular) can still discover the pipe name etc. The
+    // returned handle is held for the launcher's whole lifetime — dropping
+    // it would destroy the section and break late-arriving readers.
+    let session_cfg = ipc::SessionConfig {
+        pipe_name: pipe_name.clone(),
+        dll_path: dll_path.clone(),
+        cwd: cwd_str.clone(),
+        trace: cli.trace || effective_log_level.eq_ignore_ascii_case("trace"),
+        guard: match cli.guard {
+            GuardLevel::None => "none".into(),
+            GuardLevel::Scan => "scan".into(),
+            GuardLevel::Full => "full".into(),
+            GuardLevel::Static => "static".into(),
+        },
+        allow_rwx: cli.allow_rwx,
+        disable_hooks: cli.disable_hooks.clone().unwrap_or_default(),
+    };
+    let _session_section = winrsbox::session_section::publish(&session_cfg)
+        .context("publish session config to Local\\WinRsBoxSession")?;
+
     // Create kernel Event for hook.dll init signaling.
     //
     // H1 fix: the event name embeds a 128-bit random suffix so a same-session

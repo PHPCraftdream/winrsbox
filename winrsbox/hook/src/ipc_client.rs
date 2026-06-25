@@ -57,6 +57,100 @@ pub(crate) fn flush_install_errors() {
 pub(crate) static TRACE_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Whether we have already attempted to load `SessionConfig` from the named
+/// shared section. We try at most once per process to avoid hammering
+/// `OpenFileMappingW` on every IPC call when the launcher is genuinely gone.
+static SESSION_FALLBACK_TRIED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Read `SessionConfig` from `Local\WinRsBoxSession` (the launcher publishes
+/// it at startup). Used as a fallback when env vars were scrubbed by the
+/// hosted process (e.g. MSYS2 first-run helpers inheriting an empty env).
+/// Returns `Some(())` if at least the pipe name was loaded.
+fn try_load_session_config_from_section() -> Option<()> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use winapi::shared::minwindef::FALSE;
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::memoryapi::{
+        MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ,
+    };
+
+    let name_wide: Vec<u16> = OsStr::new(ipc::SESSION_CONFIG_SECTION_NAME)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: name_wide is null-terminated UTF-16; we pass FALSE for inherit.
+    let h = unsafe { OpenFileMappingW(FILE_MAP_READ, FALSE, name_wide.as_ptr()) };
+    if h.is_null() {
+        let pid = unsafe { GetCurrentProcessId() };
+        eprintln!(
+            "[hook/{pid}] session section open failed (launcher not running?)",
+        );
+        return None;
+    }
+    // SAFETY: h is a valid mapping handle from OpenFileMappingW.
+    let view = unsafe {
+        MapViewOfFile(h, FILE_MAP_READ, 0, 0, ipc::SESSION_CONFIG_SECTION_SIZE)
+    };
+    if view.is_null() {
+        unsafe { CloseHandle(h) };
+        return None;
+    }
+    // SAFETY: view points to a readable mapping of at least
+    //         SESSION_CONFIG_SECTION_SIZE bytes.
+    let slice = unsafe {
+        std::slice::from_raw_parts(
+            view as *const u8,
+            ipc::SESSION_CONFIG_SECTION_SIZE,
+        )
+    };
+    let parsed = ipc::SessionConfig::from_section_bytes(slice);
+    // SAFETY: view came from MapViewOfFile above; h is the mapping handle.
+    unsafe {
+        UnmapViewOfFile(view);
+        CloseHandle(h);
+    }
+    let cfg = match parsed {
+        Ok(c) => c,
+        Err(e) => {
+            let pid = unsafe { GetCurrentProcessId() };
+            eprintln!("[hook/{pid}] session section parse failed: {e}");
+            return None;
+        }
+    };
+    let pid = unsafe { GetCurrentProcessId() };
+    eprintln!(
+        "[hook/{pid}] loaded session config from Local\\WinRsBoxSession (pipe={})",
+        cfg.pipe_name,
+    );
+    if !cfg.pipe_name.is_empty() {
+        let _ = PIPE_NAME.set(cfg.pipe_name);
+    }
+    if !cfg.dll_path.is_empty() {
+        let _ = DLL_PATH.set(cfg.dll_path);
+    }
+    if !cfg.cwd.is_empty() {
+        let _ = SANDBOX_CWD.set(cfg.cwd);
+    }
+    if cfg.trace {
+        TRACE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Some(())
+}
+
+/// Ensure `PIPE_NAME` is populated, attempting a one-shot fallback to the
+/// shared session section if env vars were scrubbed in this process.
+fn ensure_pipe_name_loaded() {
+    if PIPE_NAME.get().is_some() {
+        return;
+    }
+    if SESSION_FALLBACK_TRIED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let _ = try_load_session_config_from_section();
+}
+
 /// Consecutive IPC failures counter for fail-closed self-termination (P1-3 audit fix).
 pub(crate) static IPC_CONSECUTIVE_FAILURES: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
@@ -88,32 +182,48 @@ pub(crate) fn cache() -> &'static HookCache {
 
 pub(crate) fn ensure_ipc_and<R>(f: impl FnOnce(&mut Option<ipc::SyncClient>) -> R) -> Option<R> {
     let mut first_hello = false;
+    // Recover PIPE_NAME from the session section if env vars are missing
+    // (MSYS2 first-run helpers scrub their inherited environment). One-shot;
+    // a missing section means the launcher really is gone.
+    ensure_pipe_name_loaded();
     let result = IPC_CLIENT.with_borrow_mut(|opt| {
         if opt.is_none() {
-            if let Some(name) = PIPE_NAME.get() {
-                match ipc::SyncClient::connect(name) {
-                    Ok(c) => *opt = Some(c),
-                    Err(e) => {
-                        let pid = unsafe { GetCurrentProcessId() };
-                        eprintln!("[hook/{pid}] IPC connect failed: {e}");
-                    }
-                }
-                // Always re-send Hello on every new connection — the
-                // server handler for any previous connection is gone
-                // (pipe broke → handle_connection returned → PipeConnGuard
-                // disconnected). Without Hello the new handler has
-                // conn_pid=None and cannot resolve depth/exe context.
-                if opt.is_some() {
+            match PIPE_NAME.get() {
+                None => {
                     let pid = unsafe { GetCurrentProcessId() };
-                    let exe = get_own_exe_path();
-                    let send_res = opt.as_mut().unwrap().send(&ipc::Req::Hello {
-                        pid,
-                        exe_path: exe,
-                    });
-                    if send_res.is_err() {
-                        *opt = None;
-                    } else if !HELLO_SENT.get() {
-                        first_hello = true;
+                    eprintln!("[hook/{pid}] IPC unavailable: PIPE_NAME not set");
+                }
+                Some(name) => {
+                    match ipc::SyncClient::connect(name) {
+                        Ok(c) => *opt = Some(c),
+                        Err(e) => {
+                            let pid = unsafe { GetCurrentProcessId() };
+                            eprintln!("[hook/{pid}] IPC connect failed: {e}");
+                        }
+                    }
+                    // Always re-send Hello on every new connection — the
+                    // server handler for any previous connection is gone
+                    // (pipe broke → handle_connection returned → PipeConnGuard
+                    // disconnected). Without Hello the new handler has
+                    // conn_pid=None and cannot resolve depth/exe context.
+                    if opt.is_some() {
+                        let pid = unsafe { GetCurrentProcessId() };
+                        let exe = get_own_exe_path();
+                        let send_res = opt.as_mut().unwrap().send(&ipc::Req::Hello {
+                            pid,
+                            exe_path: exe,
+                        });
+                        match send_res {
+                            Ok(_) => {
+                                if !HELLO_SENT.get() {
+                                    first_hello = true;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[hook/{pid}] IPC hello send failed: {e}");
+                                *opt = None;
+                            }
+                        }
                     }
                 }
             }
@@ -158,10 +268,15 @@ pub(crate) fn ipc_decide(dos_lower: &str, write: bool) -> Decision {
             dos_path: dos_lower.to_owned(),
             write,
         };
-        if let Some(ipc::Resp::Decision(d)) = try_send(opt, &req) {
-            return Some(d);
+        match try_send(opt, &req) {
+            Some(ipc::Resp::Decision(d)) => Some(d),
+            Some(other) => {
+                let pid = unsafe { GetCurrentProcessId() };
+                eprintln!("[hook/{pid}] IPC decide: wrong response variant: {other:?}");
+                None
+            }
+            None => None,
         }
-        None
     });
 
     match result {
