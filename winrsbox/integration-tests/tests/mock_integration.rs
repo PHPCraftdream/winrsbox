@@ -61,9 +61,10 @@ fn depth_ge_1_rule_restricts_children_not_root() {
         \x20       }\n\
         \x20   }\n");
 
-    // Root (depth=0): depth filter skips (0 < 1) → default cow
+    // Root (depth=0): depth filter skips (0 < 1) → no explicit rule applies,
+    // so the merged-view default kicks in: external write → Cow (isolated).
     let d = policy.decide_with_context(r"c:\restricted\root-file", true, Some(0), None);
-    assert_eq!(d.mode, policy::Mode::Cow, "depth=0 should be cow (default)");
+    assert_eq!(d.mode, policy::Mode::Cow, "depth=0 should be cow (default isolation)");
 
     // Child (depth=1): depth filter passes → deny
     let d = policy.decide_with_context(r"c:\restricted\child-file", true, Some(1), None);
@@ -89,11 +90,11 @@ fn depth_ge_2_rule_applies_only_to_deep_processes() {
         \x20       }\n\
         \x20   }\n");
 
-    // Root (depth=0): skip
+    // Root (depth=0): depth filter skips → no explicit rule → default Cow
     let d = policy.decide_with_context(r"c:\deep\at-root", true, Some(0), None);
     assert_eq!(d.mode, policy::Mode::Cow);
 
-    // Child (depth=1): skip
+    // Child (depth=1): depth filter skips → no explicit rule → default Cow
     let d = policy.decide_with_context(r"c:\deep\at-child", true, Some(1), None);
     assert_eq!(d.mode, policy::Mode::Cow);
 
@@ -127,13 +128,13 @@ fn exe_filter_applies_only_to_matching_process() {
     );
     assert_eq!(d.mode, policy::Mode::Deny, "matching exe should deny");
 
-    // Different exe: default (cow for writes)
+    // Different exe: exe filter skips → no explicit rule → default Cow
     let d = policy.decide_with_context(
         r"c:\appdata\config-other", true, Some(0), Some(r"c:\bin\other.exe"),
     );
     assert_eq!(d.mode, policy::Mode::Cow, "non-matching exe should get default cow");
 
-    // No exe info: default (cow for writes)
+    // No exe info: exe filter skips → no explicit rule → default Cow
     let d = policy.decide_with_context(r"c:\appdata\config-legacy", true, Some(0), None);
     assert_eq!(d.mode, policy::Mode::Cow, "no exe info should get default cow");
 }
@@ -186,7 +187,7 @@ fn double_star_glob_in_prefix() {
     let d = policy.decide_with_context(r"c:\users\alice\subdir\.ssh\known_hosts", true, None, None);
     assert_eq!(d.mode, policy::Mode::Deny);
 
-    // No match
+    // No match: outside project_root, no explicit rule → default Cow
     let d = policy.decide_with_context(r"c:\users\alice\docs\resume.pdf", true, None, None);
     assert_eq!(d.mode, policy::Mode::Cow);
 }
@@ -213,13 +214,13 @@ fn combined_depth_and_exe_filter() {
     );
     assert_eq!(d.mode, policy::Mode::Deny);
 
-    // Depth ok but exe wrong → default cow
+    // Depth ok but exe wrong → rule skipped → no explicit rule → default Cow
     let d = policy.decide_with_context(
         r"c:\secure\depth-ok-exe-bad", true, Some(1), Some(r"c:\bin\other.exe"),
     );
     assert_eq!(d.mode, policy::Mode::Cow);
 
-    // Exe ok but depth wrong → default cow
+    // Exe ok but depth wrong → rule skipped → no explicit rule → default Cow
     let d = policy.decide_with_context(
         r"c:\secure\depth-bad-exe-ok", true, Some(0), Some(r"c:\bin\target-app.exe"),
     );

@@ -113,6 +113,23 @@ impl Snapshot {
     }
 
     pub(crate) fn best_rule_match(&self, lower_path: &str, depth: Option<u8>, exe_lower: Option<&str>) -> Option<&db::RuleRow> {
+        self.best_explicit_rule_match(lower_path, depth, exe_lower)
+            .or(self.default_rule.as_ref())
+    }
+
+    /// Like `best_rule_match` but only considers explicit (non-empty-prefix)
+    /// rules — never falls back to the default catch-all rule. Returns `None`
+    /// when no explicit rule's prefix matches `lower_path`.
+    ///
+    /// Used to distinguish "matched an explicit rule" from "fell through to the
+    /// default rule": a path outside `project_root` that hits only the default
+    /// must NOT be CoW-redirected into the overlay (see `compute`).
+    pub(crate) fn best_explicit_rule_match(
+        &self,
+        lower_path: &str,
+        depth: Option<u8>,
+        exe_lower: Option<&str>,
+    ) -> Option<&db::RuleRow> {
         let mut best: Option<(usize, &db::RuleRow)> = None;
         for sr in &self.rules {
             if !path::pattern_matches_prefix(&sr.pattern, lower_path) { continue; }
@@ -144,7 +161,7 @@ impl Snapshot {
                 _ => {}
             }
         }
-        best.map(|(_, r)| r).or(self.default_rule.as_ref())
+        best.map(|(_, r)| r)
     }
 }
 
@@ -409,6 +426,12 @@ impl Policy {
             }
         }
 
+        // Mirror `compute`: fold in the configured default catch-all rule so
+        // `why` / `what-if` report the same decision the live path takes. With
+        // no explicit match, the default rule drives the outcome (read=pass,
+        // write=cow under the merged-view isolation model), and when even the
+        // default is absent the fallback is the hard-coded (Passthrough, Cow)
+        // pair from `compute`.
         let matched = best.map(|(_, r)| r).or(default_row);
         let (decision, rule_id, rule_prefix) = match &matched {
             Some(row) => {
@@ -437,6 +460,36 @@ impl Policy {
         }
     }
 
+    /// Decide the fate of a DOS path under the **merged-view overlay** model.
+    ///
+    /// This is the core isolation policy, conceptually identical to OverlayFS
+    /// or Sandboxie's sandbox: there is exactly one place an agent may mutate
+    /// the real disk (its own `project_root`); every other write is isolated
+    /// inside the sandbox overlay and never reaches the real disk.
+    ///
+    /// | Operation            | inside `project_root`            | outside `project_root`                 |
+    /// |----------------------|----------------------------------|----------------------------------------|
+    /// | Read                 | passthrough (real disk)          | overlay if recorded, else real disk    |
+    /// | Write / create       | passthrough (real disk)          | **CoW → overlay** (isolated)           |
+    /// | Delete / rename      | passthrough (real disk)          | blocked (`ACCESS_DENIED`) in the hook  |
+    ///
+    /// Resolution order:
+    /// 1. **`project_root` short-circuit** — the agent's own dir is always real
+    ///    (passthrough), regardless of any rule. This is the only path that may
+    ///    hit the real disk for writes.
+    /// 2. **Mock payload / mock dir** — synthesized content, never real disk.
+    /// 3. **Rule lookup** via `best_rule_match` (explicit prefix rule, else the
+    ///    configured default catch-all rule). An explicit rule may force
+    ///    `Deny` (block) or `Passthrough` (override the default and touch the
+    ///    real disk — use sparingly).
+    /// 4. **Default** when nothing matched: read = `Passthrough` (read-through
+    ///    will still consult `OVERLAY_IDX` so a previously-isolated file is
+    ///    seen), write = `Cow` (isolate into the overlay). This is what makes
+    ///    external writes land in the sandbox instead of on the real disk.
+    ///
+    /// The read-through branch inside the `Passthrough` arm consults
+    /// `OVERLAY_IDX` so that a file previously CoW'd into the overlay is
+    /// returned from there on read — the agent sees its own isolated view.
     pub(crate) fn compute(&self, dos_path: &str, write_access: bool, depth: Option<u8>, exe_lower: Option<&str>) -> Decision {
         let lower = ensure_lower(dos_path);
 
@@ -468,6 +521,12 @@ impl Policy {
 
         let rule = snap.best_rule_match(&lower, depth, exe_lower);
 
+        // Merged-view default: a path outside project_root that matched no
+        // explicit rule (and no configured default) is isolated — reads
+        // passthrough (the read-through arm below still consults OVERLAY_IDX),
+        // writes go CoW into the overlay so the real disk is never touched.
+        // `best_rule_match` already folds in the configured default catch-all
+        // rule, so an operator-supplied default overrides this fallback.
         let (mode_read, mode_write) = rule
             .map(|r| (r.mode_read, r.mode_write))
             .unwrap_or((db::RuleMode::Passthrough, db::RuleMode::Cow));
