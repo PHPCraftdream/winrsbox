@@ -2,7 +2,7 @@
 //   windows = "0.61"  (windows-0.61.3 in registry)
 //   tokio   = "1"     (full features)
 //   anyhow  = "1"
-//   ktav    = "0.3.1"
+//   ktav    = "0.6.1"
 //   serde   = "1"
 
 mod inject;

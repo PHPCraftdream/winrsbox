@@ -100,14 +100,22 @@ All verified exit=0, violations=0:
 State directory: `<parent>/.winrsbox/<cwd-name>/`
 
 ```
-# sandbox.ktav
+## sandbox.ktav — comments start with `##` (a single `#` is literal content).
 defaults: {
     read: passthrough
     write: cow
 }
 rules: [
-    { prefix: C:\Windows, read: passthrough, write: deny }
-    { prefix: C:\Users\**\.cargo, read: passthrough, write: passthrough }
+    {
+        prefix: C:\Windows
+        read: passthrough
+        write: deny
+    }
+    {
+        prefix: C:\Users\**\.cargo
+        read: passthrough
+        write: passthrough
+    }
 ]
 ```
 
