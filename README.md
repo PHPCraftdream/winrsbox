@@ -84,6 +84,23 @@ All JSON output includes `"schema_version": 1`. Import merges by default; use `-
 
 The sandbox config is automatically created at `<parent>/.winrsbox/<project-name>/sandbox.ktav`.
 
+### Config format (`.ktav`, format v0.6.1)
+
+The policy file uses the [ktav](https://crates.io/crates/ktav) text format. A few rules to keep in mind when editing `sandbox.ktav` by hand:
+
+- **Comments** are whole lines starting with `##` (two hashes). A single `#` is *literal content*, not a comment — `key: # value` puts `# value` into the value.
+- **Backslashes are literal.** Windows paths use a single `\`: `C:\Windows`, never `C:\\Windows` (the latter would store two backslashes in the value, since ktav 0.6.1 has no `\` escape sequence).
+- **No type hints.** Values are bare words: `read: passthrough`, `depth: 1`. Don't write `depth: u8 1`.
+- **Scalars** are a bare token after `key:`: `write: deny`, `content_inline: FAKE_SECRET`.
+- **Multi-line / literal strings** use parenthesised blocks `( ... )` — the common leading indent is stripped, so embedded `[app]` / `key=value` lines survive verbatim even though they look like ktav compounds:
+  ```ktav
+  content_inline: (
+      [app]
+      key=value
+  )
+  ```
+- **Objects** use `{ ... }` and **arrays** use `[ ... ]`. An inline compound `{ ... }` must open and close on the same line if it starts inline; for readability put each field on its own line (see examples below).
+
 ### Pattern matching
 
 Rules use glob patterns with `*` (zero or more chars) and `?` (one char) per path segment:
@@ -107,6 +124,7 @@ Matches are prefix-based by default (rules don't require full path), unless used
 ### Example config
 
 ```ktav
+## Comments start with two hashes. A single '#' would be literal content.
 defaults: {
     read: passthrough
     write: cow
@@ -139,9 +157,9 @@ rules: [
 mocks: [
     {
         path: C:\config.ini
-        ## multi-line string: ( ... ) strips the common leading indent.
-        ## A plain `content_inline: [app]` would be parsed as an array —
-        ## the multi-line form (like `::`) keeps it a literal string.
+        ## multi-line literal string: ( ... ) strips the common leading indent.
+        ## A bare `content_inline: [app]` would be parsed as an array — the
+        ## parenthesised form keeps it a verbatim string.
         content_inline: (
             [app]
             key=value
@@ -178,12 +196,11 @@ when: {
 }
 ```
 
-> ktav has no inline comments — a `#` after a value becomes part of the value.
-> Comments are whole lines starting with `##`.
-
 - `depth`: rule applies only when the process is at this depth or deeper in the sandbox tree. The root target is depth 0, its children are depth 1, etc.
 - `exe`: glob pattern matched against the lowercase executable path. Supports `*`, `?`, and `**`.
 - Legacy callers (without depth/exe context) are treated as max-permissive: they pass through depth filters.
+
+> See *Config format* above for ktav syntax rules (comments, paths, strings).
 
 ## How it works
 

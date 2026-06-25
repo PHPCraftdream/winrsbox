@@ -65,7 +65,7 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 /// Default ktav policy written when auto-discovery creates a fresh state dir.
 pub(crate) const DEFAULT_CONFIG_KTAV: &str = "\
 ## winrsbox policy — auto-generated on first run. Edit to customize.
-## (ktav 0.5.0 comments start with `##`; a single `#` is literal content.)
+## (ktav 0.6.1 comments start with `##`; a single `#` is literal content.)
 ##
 ## Reads pass through to the real filesystem; writes are Copy-on-Write
 ## into <state_dir>/workdir/. Add `rules` entries to deny or mock paths.
