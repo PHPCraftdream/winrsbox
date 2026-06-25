@@ -1,26 +1,12 @@
 # winrsbox — Windows filesystem sandbox for AI agents
 
 <p align="center">
-  <a href="#"><img src="https://img.shields.io/badge/platform-Windows%20x64-0078D6?style=flat-square&logo=windows&logoColor=white" alt="Platform"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Rust-MSVC-000000?style=flat-square&logo=rust&logoColor=white" alt="Rust"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Go-%E2%89%A5%201.21-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue?style=flat-square" alt="License"></a>
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/built%20for-AI%20agents-8A2BE2?style=flat-square&logo=openai&logoColor=white" alt="Built for AI agents">
-  <img src="https://img.shields.io/badge/isolation-copy--on--write%20overlay-success?style=flat-square" alt="CoW overlay">
-  <img src="https://img.shields.io/badge/hooks-ntdll%20syscall-orange?style=flat-square" alt="ntdll hooks">
-  <img src="https://img.shields.io/badge/deletes-whiteout%20tombstones-9cf?style=flat-square" alt="Whiteout deletes">
-  <img src="https://img.shields.io/badge/nested%20sandbox-blocked-critical?style=flat-square" alt="Nested blocked">
-</p>
-
-<p align="center">
+  <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue?style=flat-square" alt="License">
+  <img src="https://img.shields.io/badge/platform-Windows%20x64-0078D6?style=flat-square&logo=windows&logoColor=white" alt="Platform">
+  <img src="https://img.shields.io/badge/rust-MSVC-orange?style=flat-square&logo=rust&logoColor=white" alt="Rust">
   <img src="https://img.shields.io/github/stars/PHPCraftdream/winrsbox?style=flat-square&logo=github" alt="Stars">
   <img src="https://img.shields.io/github/last-commit/PHPCraftdream/winrsbox?style=flat-square" alt="Last commit">
-  <img src="https://img.shields.io/github/repo-size/PHPCraftdream/winrsbox?style=flat-square" alt="Repo size">
-  <img src="https://img.shields.io/github/languages/top/PHPCraftdream/winrsbox?style=flat-square" alt="Top language">
-  <img src="https://img.shields.io/github/commit-activity/m/PHPCraftdream/winrsbox?style=flat-square" alt="Commit activity">
+  <img src="https://img.shields.io/github/issues/PHPCraftdream/winrsbox?style=flat-square" alt="Issues">
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square" alt="PRs welcome">
 </p>
 
