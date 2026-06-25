@@ -117,6 +117,53 @@ pub fn mirror_into_overlay(dos_lower: &str, root: &Path) -> PathBuf {
     out
 }
 
+/// Inverse of `mirror_into_overlay`: given an overlay path that lives under
+/// `root` in the layout `<root>\<drive>\<rest>`, recover the virtual DOS path
+/// `<drive>:\<rest>`. Returns None when `overlay_path` is not under `root`,
+/// or when the first component after `root` is not a single ASCII letter (the
+/// only legal drive-letter form produced by `mirror_into_overlay`).
+///
+/// Used by the delete hook to turn a sandbox-internal overlay file path back
+/// into the virtual path the agent sees, so a whiteout marker can be recorded
+/// against the correct key.
+pub fn unmirror_from_overlay(overlay_path: &Path, root: &Path) -> Option<String> {
+    let rest = overlay_path.strip_prefix(root).ok()?;
+    let mut comps = rest.components();
+    // First component must be a single drive letter (Normal), e.g. "c".
+    let drive = comps.next()?.as_os_str().to_str()?;
+    if drive.len() != 1 || !drive.as_bytes()[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let mut virtual_dos = format!("{}:", drive);
+    for c in comps {
+        match c {
+            std::path::Component::Normal(s) => {
+                virtual_dos.push('\\');
+                virtual_dos.push_str(s.to_str()?);
+            }
+            _ => return None,
+        }
+    }
+    Some(virtual_dos)
+}
+
+/// Strip the leading `<letter>:` drive-letter prefix from a DOS path, returning
+/// the volume-relative form (`\rest\of\path`). This is the inverse of gluing a
+/// drive letter back on, and matches the semantics of `FILE_NAME_INFORMATION`.
+/// `FileName` field: a path relative to the volume, beginning with `\`, with
+/// NO drive letter.
+///
+/// Returns the input unchanged when no ASCII `<letter>:` prefix is present
+/// (defensive — callers that already hold a volume-relative path pass through).
+pub fn dos_to_volume_relative(dos: &str) -> &str {
+    let b = dos.as_bytes();
+    if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+        &dos[2..]
+    } else {
+        dos
+    }
+}
+
 // ─── Glob matching ───────────────────────────────────────────────────────────
 //
 // pattern_matches_prefix returns true if `pattern` matches `path` treating
@@ -266,6 +313,81 @@ fn exact_match(pat: &[&str], path: &[&str]) -> bool {
         } else {
             return false;
         }
+    }
+}
+
+#[cfg(test)]
+mod unmirror_tests {
+    use super::*;
+
+    #[test]
+    fn unmirror_roundtrip_file() {
+        let root = PathBuf::from(r"D:\sb");
+        let virtual_dos = r"c:\users\alice\file.txt";
+        let overlay = mirror_into_overlay(virtual_dos, &root);
+        assert_eq!(overlay, PathBuf::from(r"D:\sb\c\users\alice\file.txt"));
+        let back = unmirror_from_overlay(&overlay, &root).unwrap();
+        assert_eq!(back, virtual_dos);
+    }
+
+    #[test]
+    fn unmirror_drive_root_only() {
+        let root = PathBuf::from(r"D:\sb");
+        let overlay = mirror_into_overlay(r"d:\", &root);
+        let back = unmirror_from_overlay(&overlay, &root).unwrap();
+        assert_eq!(back, r"d:");
+    }
+
+    #[test]
+    fn unmirror_not_under_root_returns_none() {
+        let root = PathBuf::from(r"D:\sb");
+        let alien = PathBuf::from(r"D:\elsewhere\c\file.txt");
+        assert!(unmirror_from_overlay(&alien, &root).is_none());
+    }
+
+    #[test]
+    fn unmirror_first_component_not_drive_letter() {
+        let root = PathBuf::from(r"D:\sb");
+        // "cd" is two chars — not a drive letter.
+        let overlay = PathBuf::from(r"D:\sb\cd\file.txt");
+        assert!(unmirror_from_overlay(&overlay, &root).is_none());
+    }
+
+    #[test]
+    fn mirror_unmirror_case_preserved() {
+        // mirror_into_overlay preserves case of the components (only strips ':');
+        // unmirror_from_overlay does not lowercase. The virtual DOS path roundtrips.
+        let root = PathBuf::from(r"D:\sb");
+        let virtual_dos = r"D:\Users\Alice";
+        let overlay = mirror_into_overlay(virtual_dos, &root);
+        let back = unmirror_from_overlay(&overlay, &root).unwrap();
+        assert_eq!(back, virtual_dos);
+    }
+
+    #[test]
+    fn dos_to_volume_relative_strips_drive_letter() {
+        assert_eq!(dos_to_volume_relative(r"d:\proj\.git\HEAD"), r"\proj\.git\HEAD");
+        assert_eq!(dos_to_volume_relative(r"D:\proj"), r"\proj");
+        assert_eq!(dos_to_volume_relative(r"c:\"), r"\");
+    }
+
+    #[test]
+    fn dos_to_volume_relative_passthrough_without_drive() {
+        assert_eq!(dos_to_volume_relative(r"\already\relative"), r"\already\relative");
+        assert_eq!(dos_to_volume_relative(r"bare"), r"bare");
+        assert_eq!(dos_to_volume_relative(""), "");
+    }
+
+    #[test]
+    fn unmirror_then_volume_relative_roundtrip() {
+        // Full round-trip: virtual DOS → overlay → unmirror → strip drive.
+        // The volume-relative form is what FileNameInformation must return.
+        let root = PathBuf::from(r"C:\Users\me\.winrsbox\sbx\workdir");
+        let virtual_dos = r"d:\proj\.git\HEAD";
+        let overlay = mirror_into_overlay(virtual_dos, &root);
+        let back = unmirror_from_overlay(&overlay, &root).unwrap();
+        let vol_rel = dos_to_volume_relative(&back);
+        assert_eq!(vol_rel, r"\proj\.git\HEAD");
     }
 }
 

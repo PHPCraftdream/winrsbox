@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
-use crate::{db, path, ensure_lower, Mode, Decision, PolicyError};
+use crate::{db, path, ensure_lower, trim_trailing_sep, Mode, Decision, PolicyError};
 
 // ── Traced decision types for `why` / `what-if` ──────────────────────────
 
@@ -266,7 +266,13 @@ impl Policy {
         let txn = self.inner.db.begin_write()?;
         {
             let mut t = txn.open_table(db::OVERLAY_IDX)?;
-            t.insert(orig.to_lowercase().as_str(), overlay)?;
+            // Normalize trailing separators (create-at-`d:\foo\` vs open-at-
+            // `d:\foo`) so the index key matches the lookup path used in
+            // `compute`. Without this, a directory created with a trailing
+            // separator disappears from later readers.
+            let lower = orig.to_lowercase();
+            let key = trim_trailing_sep(&lower);
+            t.insert(key, overlay)?;
         }
         txn.commit()?;
         // Invalidate cache entries for all possible (depth, exe) combos for this path.
@@ -278,6 +284,120 @@ impl Policy {
         Ok(())
     }
 
+    /// Record a whiteout (delete-marker / tombstone) for `path`. The real
+    /// lower file is never touched; the marker only hides the path from the
+    /// sandbox's merged view. Keyed on the ASCII-lowercased virtual DOS path.
+    /// Clears the entire decide-cache (same conservative approach as
+    /// `record_overlay`) so subsequent `decide` calls observe the marker.
+    pub fn record_whiteout(&self, path: &str) -> Result<(), PolicyError> {
+        let lower_raw = ensure_lower(path);
+        let lower = trim_trailing_sep(&lower_raw);
+        let txn = self.inner.db.begin_write()?;
+        {
+            let mut t = txn.open_table(db::WHITEOUTS)?;
+            t.insert(lower, ())?;
+        }
+        txn.commit()?;
+        self.inner.cache.clear();
+        Ok(())
+    }
+
+    /// Remove a whiteout marker for `path` (revive). Called when a create at a
+    /// whiteouted path re-materialises the file in the overlay.
+    pub fn clear_whiteout(&self, path: &str) -> Result<(), PolicyError> {
+        let lower_raw = ensure_lower(path);
+        let lower = trim_trailing_sep(&lower_raw);
+        let txn = self.inner.db.begin_write()?;
+        {
+            let mut t = txn.open_table(db::WHITEOUTS)?;
+            t.remove(lower)?;
+        }
+        txn.commit()?;
+        self.inner.cache.clear();
+        Ok(())
+    }
+
+    /// Remove an OVERLAY_IDX entry for `path`. Called by the delete hook when
+    /// it physically deletes an overlay copy: the overlay file is gone, so the
+    /// index must not keep pointing at it (otherwise `compute` would treat a
+    /// whiteouted path as "revived" and fall through to the now-missing
+    /// overlay, surfacing the real lower file instead of Hidden).
+    pub fn clear_overlay(&self, path: &str) -> Result<(), PolicyError> {
+        let lower_raw = ensure_lower(path);
+        let lower = trim_trailing_sep(&lower_raw);
+        let txn = self.inner.db.begin_write()?;
+        {
+            let mut t = txn.open_table(db::OVERLAY_IDX)?;
+            t.remove(lower)?;
+        }
+        txn.commit()?;
+        self.inner.cache.clear();
+        Ok(())
+    }
+
+    /// True iff a whiteout marker currently exists for `path`.
+    pub fn is_whiteouted(&self, path: &str) -> bool {
+        let lower_raw = ensure_lower(path);
+        let lower = trim_trailing_sep(&lower_raw);
+        let Ok(txn) = self.inner.db.begin_read() else { return false };
+        let Ok(t) = txn.open_table(db::WHITEOUTS) else { return false };
+        t.get(lower).ok().flatten().is_some()
+    }
+
+    /// True iff an overlay entry exists for the (already lowercased) `lower`.
+    /// Used internally to distinguish a pure whiteout (Hidden) from a revived
+    /// whiteout (overlay present → Cow).
+    fn has_overlay(&self, lower: &str) -> bool {
+        let Ok(txn) = self.inner.db.begin_read() else { return false };
+        let Ok(t) = txn.open_table(db::OVERLAY_IDX) else { return false };
+        t.get(lower).ok().flatten().is_some()
+    }
+
+    /// Return the set of whiteouted paths that are direct children of `dir`
+    /// (i.e. `dir\<single-segment>`). Returns only the trailing segment
+    /// (filename), not the full path, so the enumerate hook can match it
+    /// against directory entry names. Used to hide whiteouted entries from
+    /// directory listings.
+    ///
+    /// `dir` is matched case-insensitively and with a trailing-backslash
+    /// boundary so a whiteout for `c:\foo\bar` is reported under `c:\foo`
+    /// but NOT under `c:\foobar`.
+    pub fn whiteouts_under(&self, dir: &str) -> Vec<String> {
+        let dir_lower = ensure_lower(dir);
+        let dir_trimmed = dir_lower.trim_end_matches('\\');
+        if dir_trimmed.is_empty() {
+            return Vec::new();
+        }
+        let prefix_with_sep = format!("{}\\", dir_trimmed);
+        let Ok(txn) = self.inner.db.begin_read() else { return Vec::new() };
+        let Ok(t) = txn.open_table(db::WHITEOUTS) else { return Vec::new() };
+        let mut out = Vec::new();
+        // range over keys >= prefix_with_sep; stop once we pass the dir's scope.
+        let iter = if let Ok(iter) = t.range(prefix_with_sep.as_str()..) {
+            iter
+        } else {
+            return Vec::new();
+        };
+        for entry in iter.flatten() {
+            let key = entry.0.value();
+            // Must start with `dir\` — otherwise it's a different directory.
+            let Some(rest) = key.strip_prefix(&prefix_with_sep) else { break };
+            // A direct child has no further backslash. Descendants of a
+            // subdirectory (e.g. `dir\sub\file`) are not direct children of
+            // `dir` and must not be reported here — enumeration of `dir`
+            // would list `sub`, not `file`.
+            if rest.contains('\\') {
+                continue;
+            }
+            // Also stop if this key is a sibling-prefix miss (e.g. dir=`c:\foo`
+            // and key=`c:\foobar\baz`): the range lower bound placed it
+            // lexicographically after `c:\foo\`, but `c:\foobar` lacks the
+            // separator so strip_prefix already broke above. Still, guard.
+            out.push(rest.to_owned());
+        }
+        out
+    }
+
     /// Traced decision for `why` / `what-if` — no caching, full chain info.
     pub fn decide_traced(
         &self,
@@ -286,14 +406,33 @@ impl Policy {
         depth: Option<u8>,
         exe_lower: Option<&str>,
     ) -> TracedDecision {
-        let lower = ensure_lower(dos_path);
+        let lower_raw = ensure_lower(dos_path);
+        let lower_owned: String = trim_trailing_sep(&lower_raw).to_string();
+        let lower: &str = &lower_owned;
 
         // project_root always passthrough
-        if path_contained_in(&lower, &self.inner.project_root_lower) {
+        if path_contained_in(lower, &self.inner.project_root_lower) {
             return TracedDecision {
                 decision: db::RuleMode::Passthrough,
                 target_path: None,
                 rule_id: None,
+                rule_prefix: None,
+                mock_match: None,
+                mockdir_match: None,
+                chain: vec![],
+            };
+        }
+
+        // Whiteout check mirrors `compute`: a hidden external path is reported
+        // as Passthrough in the trace's RuleMode field (there is no RuleMode::Hidden
+        // — Hidden is a policy::Mode only the hook layer consumes), but with an
+        // empty chain and no rule so `why` shows no rule drove the decision.
+        // The authoritative Mode::Hidden outcome is produced by `compute`.
+        if self.is_whiteouted(dos_path) && !self.has_overlay(&lower) {
+            return TracedDecision {
+                decision: db::RuleMode::Passthrough,
+                target_path: None,
+                rule_id: Some("whiteout".into()),
                 rule_prefix: None,
                 mock_match: None,
                 mockdir_match: None,
@@ -491,10 +630,59 @@ impl Policy {
     /// `OVERLAY_IDX` so that a file previously CoW'd into the overlay is
     /// returned from there on read — the agent sees its own isolated view.
     pub(crate) fn compute(&self, dos_path: &str, write_access: bool, depth: Option<u8>, exe_lower: Option<&str>) -> Decision {
-        let lower = ensure_lower(dos_path);
+        let lower_raw = ensure_lower(dos_path);
+        // Normalize trailing separators so OVERLAY_IDX / WHITEOUTS key lookups
+        // agree across create-at-`d:\foo\` and open-at-`d:\foo` callers.
+        let lower_owned: std::borrow::Cow<'_, str> = match lower_raw {
+            std::borrow::Cow::Borrowed(b) => {
+                let t = trim_trailing_sep(b);
+                if std::ptr::eq(t.as_ptr(), b.as_ptr()) && t.len() == b.len() {
+                    std::borrow::Cow::Borrowed(b)
+                } else {
+                    std::borrow::Cow::Owned(t.to_string())
+                }
+            }
+            other => {
+                let t = trim_trailing_sep(&other);
+                if t.len() == other.len() { other } else { std::borrow::Cow::Owned(t.to_string()) }
+            }
+        };
+        let lower: &str = lower_owned.as_ref();
 
-        if path_contained_in(&lower, &self.inner.project_root_lower) {
+        if path_contained_in(lower, &self.inner.project_root_lower) {
             return Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None };
+        }
+
+        // ── Whiteout (OverlayFS tombstone) check ────────────────────────────
+        //
+        // A path outside project_root may carry a whiteout marker recorded by a
+        // previous delete. If it does, and there is no overlay entry for it
+        // (i.e. it was not revived by a subsequent create), the merged view
+        // hides it: open → not-found, absent from enumeration. We model that
+        // with Mode::Hidden.
+        //
+        // If an overlay entry EXISTS (the agent re-created the file in the
+        // overlay after deleting it), the whiteout is effectively superseded
+        // — the file is alive in the overlay and reads resolve there. In that
+        // case we fall through to the normal flow, which returns Mode::Cow
+        // pointing at the overlay.
+        //
+        // Both tables are consulted in one read txn to keep this cheap.
+        if let Ok(txn) = self.inner.db.begin_read() {
+            let is_whiteouted = txn.open_table(db::WHITEOUTS)
+                .ok()
+                .and_then(|t| t.get(&*lower).ok().flatten().is_some().then_some(()))
+                .is_some();
+            if is_whiteouted {
+                let has_overlay = txn.open_table(db::OVERLAY_IDX)
+                    .ok()
+                    .and_then(|t| t.get(&*lower).ok().flatten().map(|_| ()))
+                    .is_some();
+                if !has_overlay {
+                    return Decision { mode: Mode::Hidden, overlay: None, cow_from: None, mock_payload: None };
+                }
+                // has_overlay: fall through (revive) — normal flow returns Cow below.
+            }
         }
 
         let snap = self.inner.snapshot.load();

@@ -42,6 +42,7 @@ impl Policy {
             txn.open_table(db::MOCKS)?;
             txn.open_table(db::MOCK_DIRS)?;
             txn.open_table(db::OVERLAY_IDX)?;
+            txn.open_table(db::WHITEOUTS)?;
             txn.open_table(db::REG_RULES)?;
             txn.open_table(db::REG_MOCKS)?;
             txn.open_table(db::DEV_RULES)?;

@@ -7,6 +7,14 @@ pub const MOCKS: TableDefinition<&str, &[u8]> = TableDefinition::new("mocks");
 pub const MOCK_DIRS: TableDefinition<&str, ()> = TableDefinition::new("mock_dirs");
 pub const OVERLAY_IDX: TableDefinition<&str, &str> = TableDefinition::new("overlay_idx");
 
+/// Whiteout markers (OverlayFS-style tombstones). Key = lowercase virtual DOS
+/// path that has been "deleted" from the sandbox's merged view. The real lower
+/// file is untouched; the presence of the key here makes the path appear
+/// not-found to open/create and hides it from directory enumeration. A
+/// subsequent create at the same path clears the marker (revive) and re-enters
+/// the CoW overlay.
+pub const WHITEOUTS: TableDefinition<&str, ()> = TableDefinition::new("whiteouts");
+
 pub const REG_RULES: TableDefinition<&str, &[u8]> = TableDefinition::new("reg_rules");
 pub const REG_MOCKS: TableDefinition<&str, &[u8]> = TableDefinition::new("reg_mocks");
 pub const DEV_RULES: TableDefinition<&str, &[u8]> = TableDefinition::new("dev_rules");
