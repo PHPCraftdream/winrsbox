@@ -38,7 +38,16 @@ for arg in "$@"; do
     esac
 done
 
-TARGET_DIR="$WORKSPACE_DIR/target/$PROFILE"
+# Respect a caller-provided / environment-set CARGO_TARGET_DIR (cargo itself
+# honors it, so we must look in the same place for artifacts). Fall back to the
+# workspace-local target/ dir when unset. Without this, a globally set
+# CARGO_TARGET_DIR makes the artifacts land elsewhere and deploy silently fails
+# with "! missing artifact".
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+    TARGET_DIR="$CARGO_TARGET_DIR/$PROFILE"
+else
+    TARGET_DIR="$WORKSPACE_DIR/target/$PROFILE"
+fi
 
 mkdir -p "$BIN_DIR"
 
