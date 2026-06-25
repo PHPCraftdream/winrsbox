@@ -9,5 +9,6 @@ pub mod hot_stats;
 pub mod jobctl;
 pub mod jsonl_log;
 pub mod mitigations;
+pub mod session_section;
 pub mod trust;
 pub mod wfp;
