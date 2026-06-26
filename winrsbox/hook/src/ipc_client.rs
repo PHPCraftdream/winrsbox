@@ -13,15 +13,71 @@ use crate::cache::HookCache;
 
 pub(crate) static CACHE: std::sync::OnceLock<HookCache> = std::sync::OnceLock::new();
 
-// Per-thread IPC connection. Each thread gets its own SyncClient so file-system
-// calls don't serialize on a global mutex. The launcher pipe server handles
-// each connection concurrently via spawn_blocking, giving real parallelism on
-// multithreaded targets.
-thread_local! {
-    pub(crate) static IPC_CLIENT: std::cell::RefCell<Option<ipc::SyncClient>> =
-        const { std::cell::RefCell::new(None) };
-    pub(crate) static HELLO_SENT: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
+// Per-thread IPC connection + hello-sent flag.
+//
+// WHY TlsAlloc AND NOT Rust `thread_local!`: this crate is injected late via
+// APC `LoadLibraryW`. Rust `thread_local!` on MSVC compiles to native
+// `__declspec(thread)` TLS, whose slot read (`gs:[0x58]` → indexed deref)
+// intermittently faults on threads that existed before the load
+// (Schannel/WinHTTP thread-pool workers) — the same data race that crashed
+// `iwr`/`irm` ~1/3 of the time and that we fixed in `anti_rec.rs`. `IPC_CLIENT`
+// is on the cache-miss IPC path and uses the exact same native-TLS mechanism;
+// leaving it as `thread_local!` is a residual instance of the same bug class.
+// `TlsAlloc` stores the slot in `TEB.TlsSlots` (`gs:0x1480`), which the loader
+// initializes for EVERY thread (including pre-existing ones), so it is safe for
+// a late-injected DLL. Precedent: `memory_guard.rs` and `anti_rec.rs` already
+// use `TlsAlloc` for this reason.
+//
+// Lifetime: the `Box<PerThread>` is leaked on thread exit (no cleanup callback,
+// unlike FlsAlloc). This is acceptable: `SyncClient` has no custom `Drop`
+// (it just holds a `std::fs::File`, whose handle the OS reclaims at process
+// exit), Schannel reuses thread-pool workers rather than spawning/tearing them
+// down, and the launcher detects broken pipes via `try_send` clearing dead
+// clients. Handle leak is bounded by the (small) thread count.
+use std::cell::{Cell, RefCell};
+
+#[derive(Default)]
+struct PerThread {
+    /// Per-thread IPC connection so FS calls don't serialize on a global
+    /// mutex; the launcher handles each connection concurrently.
+    ipc: RefCell<Option<ipc::SyncClient>>,
+    /// Whether Hello has been sent on this thread's connection (one-shot side
+    /// effects: arm inject_guard, flush install errors).
+    hello_sent: Cell<bool>,
+}
+
+static PT_TLS_SLOT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+const TLS_OUT_OF_INDEXES: u32 = 0xFFFFFFFF;
+
+/// Resolve the runtime TLS slot for the per-thread struct (allocating once).
+fn pt_slot() -> u32 {
+    *PT_TLS_SLOT.get_or_init(|| unsafe { winapi::um::processthreadsapi::TlsAlloc() })
+}
+
+/// Lazily initialize (once per thread) and return the thread's `PerThread`.
+///
+/// Returns `None` only if `TlsAlloc` failed (`TLS_OUT_OF_INDEXES` — essentially
+/// impossible; ~1000 slots available) or `TlsSetValue` failed. Callers treat
+/// `None` as "IPC unavailable" → fail-closed (self-terminate), which is the
+/// safe disposition for an unrecoverable TLS failure.
+fn per_thread() -> Option<&'static PerThread> {
+    let s = pt_slot();
+    if s == TLS_OUT_OF_INDEXES {
+        return None;
+    }
+    unsafe {
+        let p = winapi::um::processthreadsapi::TlsGetValue(s);
+        if !p.is_null() {
+            return Some(&*(p as *const PerThread));
+        }
+        let raw = Box::into_raw(Box::<PerThread>::default());
+        if winapi::um::processthreadsapi::TlsSetValue(s, raw as *mut _) == 0 {
+            // TlsSetValue failed — reclaim the box (don't leak) and fail-closed.
+            let _ = Box::from_raw(raw);
+            return None;
+        }
+        Some(&*raw)
+    }
 }
 
 pub(crate) static PIPE_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -193,7 +249,13 @@ pub(crate) fn ensure_ipc_and<R>(f: impl FnOnce(&mut Option<ipc::SyncClient>) -> 
     // (MSYS2 first-run helpers scrub their inherited environment). One-shot;
     // a missing section means the launcher really is gone.
     ensure_pipe_name_loaded();
-    let result = IPC_CLIENT.with_borrow_mut(|opt| {
+    let Some(pt) = per_thread() else {
+        // TlsAlloc/TlsSetValue failure (degenerate) — IPC unavailable, fail-closed.
+        return None;
+    };
+    let result = {
+        let mut opt_guard = pt.ipc.borrow_mut();
+        let opt: &mut Option<ipc::SyncClient> = &mut *opt_guard;
         if opt.is_none() {
             match PIPE_NAME.get() {
                 None => {
@@ -222,7 +284,7 @@ pub(crate) fn ensure_ipc_and<R>(f: impl FnOnce(&mut Option<ipc::SyncClient>) -> 
                         });
                         match send_res {
                             Ok(_) => {
-                                if !HELLO_SENT.get() {
+                                if !pt.hello_sent.get() {
                                     first_hello = true;
                                 }
                             }
@@ -240,9 +302,9 @@ pub(crate) fn ensure_ipc_and<R>(f: impl FnOnce(&mut Option<ipc::SyncClient>) -> 
         } else {
             None
         }
-    });
+    };
     if first_hello {
-        HELLO_SENT.set(true);
+        pt.hello_sent.set(true);
         flush_install_errors();
         crate::inject_guard::arm();
     }

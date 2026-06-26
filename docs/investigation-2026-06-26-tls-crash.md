@@ -261,18 +261,38 @@ documented-safe механизм для DLL, которая не может пр
 через `TlsGetValue`/`TlsSetValue`. +4 unit-теста (9/9 pass), включая
 `threads_independent` (параллельные потоки не интерферируют).
 
-### Решение по `IPC_CLIENT`/`HELLO_SENT`
+### Решение по `IPC_CLIENT`/`HELLO_SENT` — ПОЛНАЯ КОНВЕРСИЯ (review follow-up)
 
-Оставлены как `thread_local!` — это редко-используемые пути (только на cache-miss/
-connect), их доступ к TLS не на hot-path и не воспроизводил краш. Конверсия
- risque-на (деликатная reconnect-логика). Принципиальный фикс hot-path (`IN_HOOK`)
- достаточно устранил класс крашей.
+**Первоначально** оставлены как `thread_local!` (cache-miss пути, не
+воспроизводили краш). **Code-review** (2026-06-26) указал, что это тот же
+класс native-TLS и тайминг-аргумент («`anti_rec` ловит гонку первым») — не
+гарантия: под другой нагрузкой фолт может всплыть на `IPC_CLIENT`. Прецедент в
+кодовой базе: `memory_guard.rs` уже использует `TlsAlloc` именно по этой
+причине.
+
+**Принято:** конвертированы тоже. `IPC_CLIENT` + `HELLO_SENT` объединены в
+одну `PerThread`-структуру (`RefCell<Option<SyncClient>>` + `Cell<bool>`),
+хранящуюся как `Box<PerThread>` в одном `TlsAlloc`-слоте. Ленивая инициализация
+на поток (`TlsGetValue`→NULL→alloc→`TlsSetValue`); fail-closed если `TlsAlloc`/
+`TlsSetValue` не сработали.
+
+**Подтверждение:** `gs:0x58`-счётчик **51 → 18** (33 native-TLS сайта убраны;
+оставшиеся 18 — std-внутренние, неизбежные). iwr stress после конверсии: **0/12**.
+net_installer E2E: 3/3 (IPC работает end-to-end).
+
+**Lifetime tradeoff** (задокументирован): `Box<PerThread` утечёт при выходе
+потока (нет cleanup-callback, в отличие от `FlsAlloc`). Приемлемо: `SyncClient`
+не имеет своего `Drop` (только `std::fs::File`, handle освобождается ОС при
+process exit), Schannel переиспользует thread-pool, а launcher детектит
+сломанные pipe через `try_send`. Утечка bounded числом потоков.
 
 ### Итог
 
 - Clean baseline: **7/12** крашей (54 `gs:0x58`).
 - После фикса `anti_rec`: **0/25** (51 `gs:0x58`), биномиальная p ≈ 10⁻⁹.
-- Workspace-тесты: **948/0**.
+- После конверсии `IPC_CLIENT`/`HELLO_SENT` (review follow-up): **18 `gs:0x58`**,
+  класс native-TLS в hook-коде закрыт полностью (остались только std-сайты).
+- Workspace-тесты: **952/0**.
 - Корень назван, механизм объяснён, фикс принципиальный (не маскировка).
 
 ### Что осталось как документированное ограничение

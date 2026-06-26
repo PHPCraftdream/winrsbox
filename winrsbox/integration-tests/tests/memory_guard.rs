@@ -567,7 +567,7 @@ fn strict_blocks_token_duplicate_primary() {
 
 #[test]
 #[serial]
-fn strict_blocks_token_impersonation() {
+fn allows_self_token_impersonation() {
     // NtSetInformationThread(ThreadImpersonationToken) on the CURRENT thread
     // with the process's OWN token (OpenProcessToken(GetCurrentProcess())).
     //
@@ -580,11 +580,123 @@ fn strict_blocks_token_impersonation() {
     // token — is blocked upstream at NtOpenProcessTokenEx (escape_token_open)
     // and NtImpersonateThread on foreign threads (escape_impersonate_thread).
     //
-    // So this payload (own token + own thread) must now be ALLOWED.
+    // So this payload (own token + own thread) must be ALLOWED: exit 0.
+    // (exit 5 would be a regression — self-impersonation blocked again.)
     let r = run_payload("escape_token_impersonate", "scan");
-    assert_ne!(r.status.code(), Some(5),
-        "self-impersonation with own process token must be ALLOWED (not blocked) \
-         under the new token_guard policy; got exit 5\nstderr: {}", r.stderr);
+    assert_eq!(r.status.code(), Some(0),
+        "self-impersonation with own process token must be ALLOWED \
+         (exit 0); got {:?} — if exit 5, the allow-self token_guard policy \
+         regressed.\nstderr: {}", r.status.code(), r.stderr);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NTFS Extended-Attributes defence (audit H-S3) — pinned with a REAL EA payload.
+//
+// The EA block fires AFTER the policy decision so it only denies on the
+// real-disk path (Mode::Passthrough); a CoW destination keeps the EA trapped
+// in the overlay (harmless). This test exercises both branches with a payload
+// that supplies an actual FILE_FULL_EA_INFORMATION buffer via NtCreateFile.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[serial]
+fn ntfs_ea_blocked_on_passthrough_allowed_on_cow() {
+    let launcher = find_launcher();
+    let hook_dll = find_hook_dll();
+    let payload = find_binary("escape_ntfs_ea");
+    let env = TestEnv::setup("ntfs_ea");
+
+    // --- Passthrough case: project_root is the agent's own dir (Mode::Passthrough,
+    //     real disk). An EA-bearing create MUST be DENIED (EA = covert storage). ---
+    let pt_target = env.project_root.join("ea_pt.txt");
+    let _ = std::fs::remove_file(&pt_target);
+    let out = Command::new(&launcher)
+        .arg("-d")
+        .args(["--guard", "scan"])
+        .arg("--")
+        .arg(payload.to_str().unwrap())
+        .arg(pt_target.to_str().unwrap())
+        .current_dir(&env.project_root)
+        .env("FS_SANDBOX_DLL", hook_dll.to_str().unwrap())
+        .output()
+        .expect("failed to run launcher");
+    let code = out.status.code();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(
+        code,
+        Some(5),
+        "EA create on Passthrough (project_root) must be DENIED (exit 5); \
+         got {code:?}. If 0, the EA block stopped firing on the real-disk path.\n{combined}",
+    );
+    // The file must NOT exist on the real disk (denied → never created).
+    assert!(
+        !pt_target.exists(),
+        "EA create on passthrough leaked a file to the real disk: {}",
+        pt_target.display(),
+    );
+
+    // --- CoW case: %TEMP% (outside project_root) is Mode::Cow. An EA-bearing
+    //     create MUST succeed (EA trapped in overlay, harmless). This is the
+    //     behaviour that unblocks extraction of binaries like uv.exe. ---
+    let cow_target = std::env::temp_dir()
+        .join(format!("winrsbox-ea-cow-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&cow_target);
+    let out = Command::new(&launcher)
+        .arg("-d")
+        .args(["--guard", "scan"])
+        .arg("--")
+        .arg(payload.to_str().unwrap())
+        .arg(cow_target.to_str().unwrap())
+        .current_dir(&env.project_root)
+        .env("FS_SANDBOX_DLL", hook_dll.to_str().unwrap())
+        .output()
+        .expect("failed to run launcher");
+    let code = out.status.code();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "EA create on CoW (%TEMP%) must SUCCEED (exit 0); got {code:?}. \
+         If 5, the EA block is over-firing on the CoW path.\n{combined}",
+    );
+    // Real disk must NOT have it (CoW isolation).
+    assert!(
+        !cow_target.exists(),
+        "EA create on CoW leaked to the real disk: {}",
+        cow_target.display(),
+    );
+    // The overlay MUST hold it (single-layer CoW write worked).
+    let overlay_root = env.state_dir.join("workdir");
+    let needle = cow_target.file_name().unwrap().to_string_lossy().into_owned();
+    let mut found = false;
+    let mut stack = vec![overlay_root.clone()];
+    while let Some(d) = stack.pop() {
+        if let Ok(rd) = std::fs::read_dir(&d) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.file_name().map(|f| f == &*needle).unwrap_or(false) {
+                    found = true;
+                }
+            }
+        }
+    }
+    assert!(
+        found,
+        "EA CoW file missing from overlay {} — write did not land in CoW",
+        overlay_root.display(),
+    );
+
+    let _ = std::fs::remove_file(&cow_target);
 }
 
 #[test]
