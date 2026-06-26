@@ -117,6 +117,146 @@ pub fn mirror_into_overlay(dos_lower: &str, root: &Path) -> PathBuf {
     out
 }
 
+// ─── Same-volume overlay layout (fixes drive-letter identity leak) ──────────
+//
+// Background: the kernel's GetFinalPathNameByHandleW (class
+// FileNormalizedNameInformation) reports a path as <volume-letter> + <volume-
+// relative tail>, where the letter is taken from the PHYSICAL volume of the
+// handle. When an overlay for a C:\... virtual path lived on a different
+// volume (D:), the handle's volume was D:, so the reported path got D:
+// glued on — a drive-letter identity leak (Bug A). user-mode masking of the
+// class-48 tail can recover the path tail but NOT change the drive letter.
+//
+// Fix (Path 1, "same-volume overlay"): store the overlay for each virtual
+// drive on that SAME drive. Then handle volume == virtual volume, and the
+// kernel glues the correct letter. The existing class-48 masking becomes
+// fully correct.
+//
+// `OverlayLayout` resolves, for a given virtual DOS path, the overlay root
+// that lives on the same volume. `primary_root` is the project drive's root
+// (kept as the default/fallback for backward compatibility and for drives
+// with no explicit root); `per_drive` overrides roots for specific drives
+// (e.g. C: → %LOCALAPPDATA%\.winrsbox\… so installers writing to
+// C:\Users\…\AppData land on C:).
+
+/// Overlay root layout: maps a virtual drive letter to the overlay root that
+/// lives on that same volume. `primary_root` is the fallback (typically the
+/// project drive's root).
+#[derive(Debug, Clone)]
+pub struct OverlayLayout {
+    /// Fallback root, used for any drive without an explicit override. Always
+    /// the project drive's overlay root for backward compatibility.
+    primary_root: PathBuf,
+    /// Per-drive overrides: drive letter (lowercase) → root on that volume.
+    /// E.g. 'c' → C:\Users\…\AppData\Local\.winrsbox\<session>\workdir.
+    per_drive: std::collections::BTreeMap<char, PathBuf>,
+}
+
+impl OverlayLayout {
+    /// Create a layout with just a primary (fallback) root — equivalent to
+    /// the legacy single-root behaviour.
+    pub fn single(primary_root: PathBuf) -> Self {
+        Self { primary_root, per_drive: Default::default() }
+    }
+
+    /// Create a layout with a primary fallback and a set of per-drive roots.
+    pub fn new(
+        primary_root: PathBuf,
+        per_drive: impl IntoIterator<Item = (char, PathBuf)>,
+    ) -> Self {
+        let per_drive = per_drive
+            .into_iter()
+            .map(|(c, p)| (c.to_ascii_lowercase(), p))
+            .collect();
+        Self { primary_root, per_drive }
+    }
+
+    /// Add (or replace) the overlay root for a given drive letter.
+    pub fn set_drive_root(&mut self, drive: char, root: PathBuf) {
+        self.per_drive.insert(drive.to_ascii_lowercase(), root);
+    }
+
+    /// The primary/fallback root (project drive).
+    pub fn primary(&self) -> &Path { &self.primary_root }
+
+    /// Resolve the overlay root for a virtual DOS path's drive. If the path's
+    /// drive has an explicit same-volume root, use it; otherwise fall back to
+    /// `primary_root`. Returns the chosen root.
+    pub fn root_for(&self, dos_lower: &str) -> &Path {
+        let drive = dos_lower.chars().next().unwrap_or('\0').to_ascii_lowercase();
+        if drive.is_ascii_alphabetic() {
+            if let Some(r) = self.per_drive.get(&drive) {
+                return r;
+            }
+        }
+        &self.primary_root
+    }
+
+    /// Iterate (drive, root) for every same-volume root, including primary.
+    /// Used by `unmirror` to find which root a given overlay path belongs to.
+    pub fn all_roots(&self) -> impl Iterator<Item = (Option<char>, PathBuf)> + '_ {
+        let primary = std::iter::once((None, self.primary_root.clone()));
+        let per = self.per_drive.iter().map(|(&c, p)| (Some(c), p.clone()));
+        primary.chain(per)
+    }
+}
+
+/// Mirror a virtual DOS path into the overlay, choosing the overlay root by
+/// the virtual path's drive (same-volume layout). The resulting path lives on
+/// the same volume as the virtual path, so kernel-reported drive letters are
+/// correct. Layout is `<root>\<rest>` (NO drive component — the drive is
+/// implicit in the chosen root's volume).
+pub fn mirror_into_overlay_layout(dos_lower: &str, layout: &OverlayLayout) -> PathBuf {
+    let root = layout.root_for(dos_lower);
+    // Strip the drive letter from the virtual path so it isn't doubled into
+    // the layout (the drive is encoded by WHICH root was chosen).
+    let rest = dos_to_volume_relative(dos_lower);
+    let sanitized = rest.replace('/', "\\").trim_start_matches('\\').to_string();
+    let mut out = root.to_path_buf();
+    for component in Path::new(&sanitized).components() {
+        match component {
+            std::path::Component::Normal(c) => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Inverse of `mirror_into_overlay_layout`: given an overlay path and the
+/// same-volume layout, recover the virtual DOS path `<drive>:\<rest>`. Finds
+/// which root the overlay path lives under, takes that root's drive, and
+/// prepends it. Returns None when the path matches no root.
+pub fn unmirror_from_overlay_layout(overlay_path: &Path, layout: &OverlayLayout) -> Option<String> {
+    for (drive_opt, root) in layout.all_roots() {
+        if let Ok(rest) = overlay_path.strip_prefix(&root) {
+            let drive_letter = drive_opt.unwrap_or_else(|| {
+                // Primary root with no explicit drive: derive from the root path
+                // and lowercase it (virtual paths are conventionally lowercase).
+                root.to_string_lossy()
+                    .chars()
+                    .next()
+                    .filter(|c| c.is_ascii_alphabetic())
+                    .map(|c| c.to_ascii_lowercase())
+                    .unwrap_or('c')
+            });
+            let mut virtual_dos = format!("{}:", drive_letter);
+            for c in rest.components() {
+                match c {
+                    std::path::Component::Normal(s) => {
+                        virtual_dos.push('\\');
+                        virtual_dos.push_str(s.to_str()?);
+                    }
+                    _ => return None,
+                }
+            }
+            return Some(virtual_dos);
+        }
+    }
+    None
+}
+
+
+
 /// Inverse of `mirror_into_overlay`: given an overlay path that lives under
 /// `root` in the layout `<root>\<drive>\<rest>`, recover the virtual DOS path
 /// `<drive>:\<rest>`. Returns None when `overlay_path` is not under `root`,
@@ -388,6 +528,74 @@ mod unmirror_tests {
         let back = unmirror_from_overlay(&overlay, &root).unwrap();
         let vol_rel = dos_to_volume_relative(&back);
         assert_eq!(vol_rel, r"\proj\.git\HEAD");
+    }
+
+    // ── OverlayLayout (same-volume) tests ──────────────────────────────────
+
+    #[test]
+    fn layout_single_uses_primary_root() {
+        // No per-drive overrides → every drive uses primary_root.
+        let layout = OverlayLayout::single(PathBuf::from(r"D:\proj\.winrsbox\sbx\workdir"));
+        assert_eq!(layout.root_for(r"c:\users\me"), Path::new(r"D:\proj\.winrsbox\sbx\workdir"));
+        assert_eq!(layout.root_for(r"d:\foo"), Path::new(r"D:\proj\.winrsbox\sbx\workdir"));
+    }
+
+    #[test]
+    fn layout_per_drive_override_for_c() {
+        // C: has an explicit same-volume root (on C:); D: falls back to primary.
+        let layout = OverlayLayout::new(
+            PathBuf::from(r"D:\proj\.winrsbox\sbx\workdir"),
+            [('c', PathBuf::from(r"C:\Users\me\AppData\Local\.winrsbox\sbx\workdir"))],
+        );
+        assert_eq!(layout.root_for(r"c:\users\me\appdata"), Path::new(r"C:\Users\me\AppData\Local\.winrsbox\sbx\workdir"));
+        assert_eq!(layout.root_for(r"d:\proj"), Path::new(r"D:\proj\.winrsbox\sbx\workdir"));
+        // case-insensitive drive match
+        assert_eq!(layout.root_for(r"C:\Users"), Path::new(r"C:\Users\me\AppData\Local\.winrsbox\sbx\workdir"));
+    }
+
+    #[test]
+    fn layout_mirror_roundtrip_c_drive() {
+        // mirror c:\... → C:-root overlay (same volume); unmirror recovers c:\...
+        let layout = OverlayLayout::new(
+            PathBuf::from(r"D:\proj\.winrsbox\sbx\workdir"),
+            [('c', PathBuf::from(r"C:\Users\me\AppData\Local\.winrsbox\sbx\workdir"))],
+        );
+        let virtual_dos = r"c:\users\me\appdata\local\clonebug";
+        let overlay = mirror_into_overlay_layout(virtual_dos, &layout);
+        // Must live on C: (same volume as virtual) — NOT on D:.
+        assert!(overlay.starts_with(r"C:\Users\me\AppData\Local\.winrsbox\sbx\workdir"),
+            "C: overlay must be on C: volume, got {}", overlay.display());
+        assert_eq!(overlay, Path::new(r"C:\Users\me\AppData\Local\.winrsbox\sbx\workdir\users\me\appdata\local\clonebug"));
+        let back = unmirror_from_overlay_layout(&overlay, &layout).unwrap();
+        assert_eq!(back, r"c:\users\me\appdata\local\clonebug");
+    }
+
+    #[test]
+    fn layout_mirror_roundtrip_d_drive_uses_primary() {
+        // d:\... has no override → uses primary_root (which is on D:).
+        let layout = OverlayLayout::new(
+            PathBuf::from(r"D:\proj\.winrsbox\sbx\workdir"),
+            [('c', PathBuf::from(r"C:\Users\me\AppData\Local\.winrsbox\sbx\workdir"))],
+        );
+        let virtual_dos = r"d:\proj\repo\.git\HEAD";
+        let overlay = mirror_into_overlay_layout(virtual_dos, &layout);
+        assert!(overlay.starts_with(r"D:\proj\.winrsbox\sbx\workdir"));
+        let back = unmirror_from_overlay_layout(&overlay, &layout).unwrap();
+        assert_eq!(back, r"d:\proj\repo\.git\HEAD");
+    }
+
+    #[test]
+    fn layout_unmirror_unknown_path_returns_none() {
+        let layout = OverlayLayout::single(PathBuf::from(r"D:\proj\.winrsbox\sbx\workdir"));
+        let alien = Path::new(r"E:\unrelated\path");
+        assert!(unmirror_from_overlay_layout(alien, &layout).is_none());
+    }
+
+    #[test]
+    fn layout_no_drive_letter_uses_primary() {
+        // A path with no leading drive letter falls back to primary_root.
+        let layout = OverlayLayout::single(PathBuf::from(r"D:\proj\.winrsbox\sbx\workdir"));
+        assert_eq!(layout.root_for(r"\relative\path"), Path::new(r"D:\proj\.winrsbox\sbx\workdir"));
     }
 }
 

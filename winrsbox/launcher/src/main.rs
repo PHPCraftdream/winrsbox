@@ -345,10 +345,44 @@ async fn main() -> Result<()> {
 
     // Open / create policy DB
     let db_path = sandbox_root.join("policy.redb");
+
+    // Same-volume overlay layout (fixes the drive-letter identity leak — Bug A):
+    // the overlay for each virtual drive must live on THAT SAME drive, so the
+    // kernel's GetFinalPathNameByHandleW reports the correct drive letter
+    // (taken from the handle's physical volume). Primary root = sandbox_root
+    // (project drive). Add an explicit C: root at %LOCALAPPDATA%\.winrsbox so
+    // installers writing to C:\Users\…\AppData land on C:, not the project
+    // drive. The session sub-dir matches the project's .winrsbox layout.
+    let mut overlay_layout = policy::path::OverlayLayout::single(sandbox_root.clone());
+    {
+        let session_name = project_root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "session".to_string());
+        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+            let c_root = PathBuf::from(local_appdata)
+                .join(".winrsbox")
+                .join(&session_name)
+                .join("workdir");
+            // Only register a C: root if C: is NOT already the project drive
+            // (avoids a redundant/duplicate root).
+            let project_drive = project_root
+                .to_string_lossy()
+                .chars()
+                .next()
+                .map(|c| c.to_ascii_lowercase());
+            if project_drive != Some('c') {
+                std::fs::create_dir_all(&c_root).with_context(|| {
+                    format!("create C: overlay root {}", c_root.display())
+                })?;
+                overlay_layout.set_drive_root('c', c_root);
+            }
+        }
+    }
     let policy = Arc::new(
-        Policy::open_or_create(
+        Policy::open_or_create_with_layout(
             &db_path,
-            sandbox_root.clone(),
+            overlay_layout,
             mock_dirs_root.clone(),
             project_root.clone(),
         )?,

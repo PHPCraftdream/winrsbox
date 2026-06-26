@@ -233,8 +233,8 @@ fn path_is_plain_file(dos_path: &str) -> bool {
 /// exists there, else `None`. Uses `symlink_metadata` (no-follow) so a
 /// reparse point planted in the overlay is not falsely reported as a live
 /// regular node.
-fn physical_overlay_path(lower: &str, sandbox_root: &Path) -> Option<PathBuf> {
-    let mirror = path::mirror_into_overlay(lower, sandbox_root);
+fn physical_overlay_path(lower: &str, layout: &path::OverlayLayout) -> Option<PathBuf> {
+    let mirror = path::mirror_into_overlay_layout(lower, layout);
     match std::fs::symlink_metadata(&mirror) {
         Ok(_) => Some(mirror),
         Err(_) => None,
@@ -481,7 +481,7 @@ impl Policy {
         // Check mocks
         if let Some(payload) = db::find_mock_payload(&txn, &lower) {
             let _ = payload; // we know it matched
-            let overlay = path::mirror_into_overlay(&lower, &self.inner.sandbox_root);
+            let overlay = path::mirror_into_overlay_layout(&lower, &self.inner.overlay_layout);
             return TracedDecision {
                 decision: db::RuleMode::Cow, // mocks use Cow overlay path
                 target_path: Some(overlay),
@@ -609,7 +609,7 @@ impl Policy {
             db::RuleMode::Deny => None,
             db::RuleMode::Passthrough => None,
             db::RuleMode::Cow | db::RuleMode::Redirect => {
-                Some(path::mirror_into_overlay(&lower, &self.inner.sandbox_root))
+                Some(path::mirror_into_overlay_layout(&lower, &self.inner.overlay_layout))
             }
         };
 
@@ -707,7 +707,7 @@ impl Policy {
                     .and_then(|t| t.get(&*lower).ok().flatten().map(|_| ()))
                     .is_some();
                 let phys_hit = !idx_hit
-                    && physical_overlay_path(&lower, &self.inner.sandbox_root).is_some();
+                    && physical_overlay_path(&lower, &self.inner.overlay_layout).is_some();
                 if !(idx_hit || phys_hit) {
                     return Decision { mode: Mode::Hidden, overlay: None, cow_from: None, mock_payload: None };
                 }
@@ -718,7 +718,7 @@ impl Policy {
         let snap = self.inner.snapshot.load();
 
         if let Some(payload) = snap.find_mock_payload(&lower) {
-            let overlay = path::mirror_into_overlay(&lower, &self.inner.sandbox_root);
+            let overlay = path::mirror_into_overlay_layout(&lower, &self.inner.overlay_layout);
             return Decision {
                 mode: Mode::Mock,
                 overlay: Some(overlay),
@@ -772,14 +772,14 @@ impl Policy {
                     // the read passthroughs to the real disk and fails with
                     // STATUS_OBJECT_NAME_NOT_FOUND. The mirror check is a single
                     // local stat; HookCache amortizes it across repeated reads.
-                    if let Some(ov) = physical_overlay_path(&lower, &self.inner.sandbox_root) {
+                    if let Some(ov) = physical_overlay_path(&lower, &self.inner.overlay_layout) {
                         return Decision { mode: Mode::Cow, overlay: Some(ov), cow_from: None, mock_payload: None };
                     }
                 }
                 passthrough()
             }
             db::RuleMode::Cow | db::RuleMode::Redirect => {
-                let overlay = path::mirror_into_overlay(&lower, &self.inner.sandbox_root);
+                let overlay = path::mirror_into_overlay_layout(&lower, &self.inner.overlay_layout);
                 let existing_overlay = if let Ok(txn) = self.inner.db.begin_read() {
                     if let Ok(t) = txn.open_table(db::OVERLAY_IDX) {
                         t.get(&*lower).ok().flatten().map(|v| PathBuf::from(v.value()))
