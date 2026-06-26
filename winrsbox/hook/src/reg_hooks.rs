@@ -478,16 +478,38 @@ unsafe extern "system" fn hook_nt_set_value_key(
             return STATUS_ACCESS_DENIED;
         }
         if matches!(mode, policy::Mode::Cow) {
-            // H4 fix: downgrade silent_ok → deny while the read-side overlay
-            // is missing. The launcher overlay would happily absorb this
-            // write, but a follow-up NtQueryValueKey on the same key still
-            // hits the real hive and reads the OLD value — confusing the
-            // child *and* leaking host state. Fail-closed is the safer
-            // regression. The previously-routed RegWrite IPC payload (4 LE
-            // bytes of REG_* type followed by raw value bytes) is no longer
-            // produced; restore it once the read-side hooks land.
-            log_silent_ok_downgrade("NtSetValueKey", &friendly, v_name.as_deref());
-            return STATUS_ACCESS_DENIED;
+            // CoW registry write: decode the raw value into a typed RegValue
+            // and ship it to the launcher, which records it in the CoW overlay
+            // (host registry untouched). The read-side merge happens via
+            // RegDecision's overlay_value (NtQueryValueKey hook — see below).
+            // Return STATUS_SUCCESS so the caller (RegSetValueEx /
+            // SetEnvironmentVariable) sees a successful write.
+            let raw = if data.is_null() || data_size == 0 {
+                &[][..]
+            } else {
+                // SAFETY: data is valid for data_size bytes per NtSetValueKey contract.
+                std::slice::from_raw_parts(data as *const u8, data_size as usize)
+            };
+            let value = policy::reg::reg_value_from_raw(value_type, raw);
+            let req = ipc::Req::RegWrite {
+                key_path: friendly.clone(),
+                value_name: v_name.clone().unwrap_or_default(),
+                value,
+            };
+            match crate::ipc_client::ipc_send_and_recv(req) {
+                Some(ipc::Resp::Ok) => {
+                    if crate::ipc_client::is_trace() {
+                        crate::hooks::ipc_log(ipc::LogLevel::Trace,
+                            format!("reg_setvalue_overlay key={friendly} value={:?}", v_name));
+                    }
+                    return 0; // STATUS_SUCCESS
+                }
+                _ => {
+                    // IPC failure or launcher refused → fail-closed.
+                    log_silent_ok_downgrade("NtSetValueKey", &friendly, v_name.as_deref());
+                    return STATUS_ACCESS_DENIED;
+                }
+            }
         }
     } else {
         // Fail CLOSED on resolution failure (audit CRITICAL): unresolvable key

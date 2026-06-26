@@ -19,7 +19,7 @@ pub struct Policy {
 }
 
 pub(crate) struct PolicyInner {
-    pub(crate) db: redb::Database,
+    pub(crate) db: Arc<redb::Database>,
     pub(crate) cache: Cache<u128, Arc<Decision>>,
     pub(crate) snapshot: arc_swap::ArcSwap<decide::Snapshot>,
     pub(crate) sandbox_root: PathBuf,
@@ -34,7 +34,7 @@ impl Policy {
         mock_dirs_root: PathBuf,
         project_root: PathBuf,
     ) -> Result<Self, PolicyError> {
-        let db = redb::Database::create(db_path)?;
+        let db: Arc<redb::Database> = Arc::new(redb::Database::create(db_path)?);
         // Ensure tables exist
         {
             let txn = db.begin_write()?;
@@ -61,6 +61,13 @@ impl Policy {
                 project_root_lower,
             }),
         })
+    }
+
+    /// Share the underlying policy DB with another policy subsystem (e.g.
+    /// `RegistryPolicy`) so both FS and registry decisions read/write the
+    /// same on-disk store without a second file handle.
+    pub fn db(&self) -> Arc<redb::Database> {
+        Arc::clone(&self.inner.db)
     }
 
     pub fn load_config(&self, path: &Path) -> Result<(), PolicyError> {

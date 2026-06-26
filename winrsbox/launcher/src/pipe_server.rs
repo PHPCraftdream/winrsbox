@@ -474,6 +474,7 @@ impl Drop for PipeConnGuard {
 pub(crate) async fn pipe_accept_loop(
     pipe_name: &str,
     policy: Arc<Policy>,
+    reg_policy: Arc<policy::RegistryPolicy>,
     stats: Arc<Stats>,
     child_pids: Arc<crossbeam_queue::SegQueue<u32>>,
     violations_log: PathBuf,
@@ -542,6 +543,7 @@ pub(crate) async fn pipe_accept_loop(
         let pipe_sec = Arc::clone(&pipe_sec);
         let handler_sem = Arc::clone(&handler_sem);
         let policy = Arc::clone(&policy);
+        let reg_policy = Arc::clone(&reg_policy);
         let stats = Arc::clone(&stats);
         let child_pids = Arc::clone(&child_pids);
         let violations_log = violations_log.clone();
@@ -554,6 +556,7 @@ pub(crate) async fn pipe_accept_loop(
             pipe_sec,
             handler_sem,
             policy,
+            reg_policy,
             stats,
             child_pids,
             violations_log,
@@ -591,6 +594,7 @@ async fn accept_worker(
     pipe_sec: Arc<PipeSecurity>,
     handler_sem: Arc<Semaphore>,
     policy: Arc<Policy>,
+    reg_policy: Arc<policy::RegistryPolicy>,
     stats: Arc<Stats>,
     child_pids: Arc<crossbeam_queue::SegQueue<u32>>,
     violations_log: PathBuf,
@@ -707,6 +711,7 @@ async fn accept_worker(
 
         // Handle this connection in a separate blocking task.
         let policy = Arc::clone(&policy);
+        let reg_policy = Arc::clone(&reg_policy);
         let stats = Arc::clone(&stats);
         let child_pids = Arc::clone(&child_pids);
         let vlog = violations_log.clone();
@@ -727,7 +732,7 @@ async fn accept_worker(
             let _permit = permit;
             // SAFETY: ph is the isize repr of the valid pipe handle for this connection.
             let h = HANDLE(ph as *mut _);
-            handle_connection(h, client_pid, &policy, &stats, &child_pids, &vlog, &hot_stats2, &flusher2);
+            handle_connection(h, client_pid, &policy, &reg_policy, &stats, &child_pids, &vlog, &hot_stats2, &flusher2);
         });
     }
 }
@@ -897,6 +902,7 @@ fn handle_connection(
     handle: HANDLE,
     client_pid: u32,
     policy: &Policy,
+    reg_policy: &policy::RegistryPolicy,
     stats: &Stats,
     child_pids: &crossbeam_queue::SegQueue<u32>,
     violations_log: &Path,
@@ -1192,35 +1198,32 @@ fn handle_connection(
                 Resp::Ok
             }
             Req::RegDecide { key_path, value_name, write } => {
-                // P8 default-deny: block writes to known DLL-injection persistence
-                // vectors. Until full RegistryPolicy wiring, hardcode the most
-                // critical paths from DEFAULT_CONFIG_KTAV.
-                // Match by `contains` (substring) to cover HKU\<SID>\... per-user
-                // hive paths and HKLM/HKCU/HKCR/HKU forms uniformly.
+                // Layer 1 (security, hardcoded): persistence/DLL-injection
+                // deny-suffixes always deny on write, EXCEPT a benign value-name
+                // in ENV_VALUE_NAME_ALLOWLIST for HKCU\Environment. This layer
+                // is intentionally NOT in the DB-backed RegistryPolicy — it is a
+                // non-bypassable safety floor that survives any user rule config.
                 let key_lower = key_path.to_ascii_lowercase();
-                // is_persistence_denied lowercases internally, but key_lower
-                // is needed for the silent-ok branch below; pass it through
-                // to avoid a second allocation.
                 let is_persistence = is_persistence_denied(&key_lower);
-                // PERSISTENCE-DENY exception: a persistence-denied key (e.g.
-                // HKCU\Environment) still admits a value-name from
-                // ENV_VALUE_NAME_ALLOWLIST into the CoW overlay — benign
-                // installer env-vars (HERMES_*, PATH, CARGO_HOME, ...). The
-                // genuinely dangerous value-names (UserInitMprLogonScript etc.)
-                // are absent from the allowlist, so they stay hard-DENIED.
                 let env_allowed = is_persistence
                     && key_lower.ends_with(r"\environment")
                     && is_env_value_allowed(value_name.as_deref());
-                let (mode, denied) = if write && is_persistence && !env_allowed {
+
+                let (mode, value_json) = if write && is_persistence && !env_allowed {
                     eprintln!("[reg] DENY {key_path} value={value_name:?}");
-                    (policy::Mode::Deny, true)
-                } else if write && (key_lower.contains(r"\software\") || key_lower.ends_with(r"\software")) {
-                    (policy::Mode::Cow, false)
-                } else if write {
-                    (policy::Mode::Cow, false)
+                    (policy::Mode::Deny, None)
                 } else {
-                    (policy::Mode::Passthrough, false)
+                    // Layer 2 (DB-backed + overlay merge): RegistryPolicy consults
+                    // REG_RULES / REG_MOCKS and returns the recorded overlay value
+                    // (if any) for the read-side merge.
+                    let d = reg_policy.decide(&key_path, value_name.as_deref(), write);
+                    let vj = d.overlay_value.or(d.mock_value).map(|v| {
+                        serde_json::to_vec(&v.to_json_value()).unwrap_or_default()
+                    });
+                    (d.mode, vj)
                 };
+
+                let denied = matches!(mode, policy::Mode::Deny);
                 hot_stats.totals.reg_decides.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if denied { hot_stats.totals.reg_denies.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                 hot_stats.record_reg(&key_path, write, denied);
@@ -1228,19 +1231,39 @@ fn handle_connection(
                     jsonl_log::log(jsonl_log::Event::reg_decide(&key_path, write, &format!("{mode:?}")));
                 }
                 flusher.maybe_flush();
-                Resp::RegDecision { mode, value_json: None }
+                Resp::RegDecision { mode, value_json }
             }
-            Req::RegWrite { key_path, value_name, .. } => {
-                println!("[reg] write: {key_path}\\{value_name}");
-                Resp::Ok
+            Req::RegWrite { key_path, value_name, value } => {
+                // Record the value into the CoW overlay (read-back merge happens
+                // via RegDecision's overlay_value). The hook builds the RegValue
+                // from the raw NtSetValueKey bytes; bincode carries it here.
+                let resp = match reg_policy.write_to_overlay(&key_path, &value_name, value) {
+                    Ok(()) => {
+                        if is_persistence_denied(&key_path.to_ascii_lowercase()) {
+                            eprintln!("[reg] overlay write (persistence-allowed): {key_path}\\{value_name}");
+                        }
+                        Resp::Ok
+                    }
+                    Err(e) => {
+                        eprintln!("[reg] overlay write FAILED {key_path}\\{value_name}: {e}");
+                        Resp::Err(e)
+                    }
+                };
+                resp
             }
             Req::RegDeleteValue { key_path, value_name } => {
-                println!("[reg] delete_value: {key_path}\\{value_name}");
-                Resp::Ok
+                let resp = match reg_policy.delete_value_in_overlay(&key_path, &value_name) {
+                    Ok(()) => Resp::Ok,
+                    Err(e) => Resp::Err(e),
+                };
+                resp
             }
             Req::RegDeleteKey { key_path } => {
-                println!("[reg] delete_key: {key_path}");
-                Resp::Ok
+                let resp = match reg_policy.delete_key_in_overlay(&key_path) {
+                    Ok(()) => Resp::Ok,
+                    Err(e) => Resp::Err(e),
+                };
+                resp
             }
             Req::NetDecide { host, port } => {
                 // Net enforcement happens in the WFP filter set up at

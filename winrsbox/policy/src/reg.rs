@@ -154,6 +154,78 @@ impl RegValue {
     }
 }
 
+/// Build a `RegValue` from the raw `(type, data, data_size)` triple handed to
+/// `NtSetValueKey` / `RegSetValueEx`. This is the hook-side codec: the hook
+/// intercepts a registry write, decodes the raw bytes into a typed `RegValue`,
+/// and ships it over IPC to the launcher, which records it in the CoW overlay.
+///
+/// Decoding rules (Windows registry value encodings):
+///  - REG_SZ / REG_EXPAND_SZ: UTF-16LE, may or may not be NUL-terminated;
+///    trailing NULs are trimmed.
+///  - REG_MULTI_SZ: UTF-16LE, NUL-separated, double-NUL-terminated list.
+///  - REG_DWORD: 4 bytes little-endian.
+///  - REG_DWORD_BIG_ENDIAN: 4 bytes big-endian.
+///  - REG_QWORD: 8 bytes little-endian.
+///  - REG_BINARY / unknown: raw bytes.
+///  - REG_NONE / REG_LINK: `RegData::None`.
+///
+/// Defensive: malformed lengths (e.g. a REG_DWORD with != 4 bytes) fall back to
+/// `RegData::Bytes(raw)` rather than panicking — the value is still recorded.
+pub fn reg_value_from_raw(value_type: u32, data: &[u8]) -> RegValue {
+    let typ = RegType::from_u32(value_type);
+    let data_val = match typ {
+        RegType::Sz | RegType::ExpandSz => {
+            let s = utf16le_to_string(data);
+            RegData::String(s.trim_end_matches('\0').to_owned())
+        }
+        RegType::MultiSz => {
+            let mut strs = Vec::new();
+            // Split on UTF-16 NUL (0x0000); ignore a trailing empty segment.
+            let chars = data.chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect::<Vec<u16>>();
+            let mut cur = String::new();
+            for &w in &chars {
+                if w == 0 {
+                    if cur.is_empty() {
+                        // double-NUL terminator → end of list
+                        break;
+                    }
+                    strs.push(std::mem::take(&mut cur));
+                } else {
+                    cur.push(char::from_u32(w as u32).unwrap_or('\u{FFFD}'));
+                }
+            }
+            RegData::Strings(strs)
+        }
+        RegType::Dword if data.len() >= 4 => {
+            RegData::U32(u32::from_le_bytes([data[0], data[1], data[2], data[3]]))
+        }
+        RegType::DwordBe if data.len() >= 4 => {
+            RegData::U32(u32::from_be_bytes([data[0], data[1], data[2], data[3]]))
+        }
+        RegType::Qword if data.len() >= 8 => {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&data[..8]);
+            RegData::U64(u64::from_le_bytes(a))
+        }
+        RegType::None | RegType::Link => RegData::None,
+        // Defensive fallback for malformed lengths or unknown types: keep raw.
+        _ => RegData::Bytes(data.to_vec()),
+    };
+    RegValue { typ, data: data_val }
+}
+
+/// Decode a UTF-16LE byte slice to a Rust `String`, replacing invalid surrogates.
+fn utf16le_to_string(data: &[u8]) -> String {
+    data.chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect::<Vec<u16>>()
+        .iter()
+        .map(|&w| char::from_u32(w as u32).unwrap_or('\u{FFFD}'))
+        .collect()
+}
+
 pub fn parse_values_json(raw: &str) -> Result<rustc_hash::FxHashMap<String, RegEntry>, String> {
     let obj: serde_json::Value = serde_json::from_str(raw)
         .map_err(|e| format!("JSON parse error: {e}"))?;
