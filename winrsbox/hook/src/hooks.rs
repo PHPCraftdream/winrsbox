@@ -892,41 +892,25 @@ impl ImagePathOverlayGuard {
             None => return g,
         };
 
-        // ── Materialize the overlay EXE onto the REAL (virtual) path ──────────
-        // The kernel image loader (`NtCreateProcessEx` → `MmCreateSection`) opens
-        // the EXE by the path in `PS_CREATE_INFO.ImageFileName`, whose layout is
-        // undocumented and cannot be safely patched from user mode (a heuristic
-        // scan over it crashed reliably). The robust workaround: copy the EXE
-        // bytes from the CoW overlay to the REAL virtual path the loader will
-        // open. The materialized file is a pure byte copy of what the agent
-        // already chose to execute — it grants no new capability (process
-        // creation was already requested), only persistence (the EXE can be
-        // re-run outside the sandbox). For an agent toolchain binary (uv, a
-        // downloaded installer) that is an acceptable, bounded tradeoff that
-        // unblocks end-to-end installs.
-        //
-        // Best-effort: on any I/O failure we fall through to the (insufficient)
-        // ImagePathName patch below; the spawn simply fails with the usual
-        // STATUS_PATH_NOT_FOUND and no crash occurs.
-        let src = std::path::Path::new(&overlay_path);
-        let dst = std::path::Path::new(&virt);
-        if src.exists() {
-            if let Some(parent) = dst.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::copy(src, dst);
-            if is_trace() {
-                ipc_log(ipc::LogLevel::Trace,
-                    format!("proc_spawn_overlay_materialize src={overlay_path} dst={virt}"));
-            }
-        }
-
         // New image path in NT form `\??\<overlay>` WITH a trailing NUL.
         let overlay_nt = make_overlay_nt_buf(&overlay_path);
 
-        // RTL_USER_PROCESS_PARAMETERS.ImagePathName (offset 0x60). Informational
-        // only now that the real path is materialized, but patched for
-        // consistency with the overlay file the loader will resolve.
+        // RTL_USER_PROCESS_PARAMETERS.ImagePathName (offset 0x60). The kernel
+        // image loader (`NtCreateProcessEx` → `MmCreateSection`) opens the EXE
+        // by the path in `PS_CREATE_INFO.ImageFileName`, whose layout is
+        // undocumented and cannot be safely patched from user mode (a heuristic
+        // scan over it crashed reliably). We patch `ImagePathName` — the one
+        // field we can address safely — but this is informational only and does
+        // NOT make spawning an overlay-only EXE succeed: the loader still
+        // resolves via CreateInfo and fails with STATUS_PATH_NOT_FOUND.
+        //
+        // This is a tracked, fundamental limitation of a user-mode CoW overlay
+        // without a kernel driver (bindflt + Server Silo would remove the whole
+        // class by design). The only "fixes" that would make spawn succeed
+        // (materialize the EXE onto the real disk; patch CreateInfo) either
+        // break the isolation invariant or risk UB — both rejected. We keep the
+        // harmless ImagePathName patch for consistency and as a diagnostic
+        // signal, and surface the limitation via this comment + the trace log.
         let params_ptr = params as *mut u8;
         let img_ustr = params_ptr.add(0x60) as *mut UNICODE_STRING;
         g.patch_one(img_ustr, &overlay_nt);
@@ -1028,10 +1012,11 @@ unsafe extern "system" fn hook_nt_create_user_process(
     ipc_log(ipc::LogLevel::Info,
         format!("spawn_attempt: parent={parent_pid} target={spawn_target}"));
 
-    // If the EXE only exists in the CoW overlay, the kernel image loader would
-    // fail with STATUS_PATH_NOT_FOUND. Patch ImagePathName (and the
-    // PS_CREATE_INFO image name) to the real overlay file for the duration of
-    // the syscall; restored on drop.
+    // If the EXE only exists in the CoW overlay, the kernel image loader fails
+    // with STATUS_PATH_NOT_FOUND (a fundamental limitation of a user-mode CoW
+    // overlay — see ImagePathOverlayGuard::new for the full rationale). We
+    // patch the one field we can address safely (ImagePathName); it does not
+    // make the spawn succeed, but it is harmless and serves as a diagnostic.
     let _img_guard = unsafe { ImagePathOverlayGuard::new(process_parameters, create_info) };
 
     let status = HOOK_NT_CREATE_USER_PROCESS.get().unwrap().call(
