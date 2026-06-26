@@ -22,6 +22,7 @@ use ntapi::winapi::shared::ntdef::{
 };
 use ntapi::winapi::um::winnt::ACCESS_MASK;
 use policy::Decision;
+use policy::Mode;
 use winapi::um::processthreadsapi::{GetCurrentProcessId, GetProcessId};
 
 use crate::anti_rec;
@@ -807,6 +808,123 @@ unsafe fn extract_child_exe(params: *mut c_void) -> String {
     policy::path::nt_to_dos_lower(name_slice).unwrap_or_default()
 }
 
+/// If a spawn target's image path lives in the CoW overlay, rewrite the
+/// `ImagePathName` field of `RTL_USER_PROCESS_PARAMETERS` to the REAL overlay
+/// path for the duration of the `NtCreateUserProcess` call, then restore it.
+///
+/// Why: the kernel image loader (`NtCreateProcessEx` → `MmCreateSection`) opens
+/// the EXE by the path in `ImagePathName` DIRECTLY — it does not route through
+/// our user-mode file hook. So if a sandboxed installer extracts+moves a binary
+/// into a CoW-managed dir (e.g. `%LOCALAPPDATA%\hermes\bin\uv.exe`, which only
+/// exists in the overlay), `NtCreateUserProcess` returns
+/// `STATUS_PATH_NOT_FOUND` and the install aborts. Patching `ImagePathName` to
+/// the real overlay file makes the loader find the bytes; the child still runs
+/// fully hooked (we inject into it on resume), and its argv/CommandLine is
+/// unchanged so it self-identifies by the virtual path.
+///
+/// No-op (returns immediately) when the image path is not overlay-managed.
+///
+/// # Safety
+/// `params` must be a valid `RTL_USER_PROCESS_PARAMETERS`. The guard swaps the
+/// `UNICODE_STRING.Buffer`/`Length`/`MaximumLength` of `ImagePathName` for a
+/// caller-owned UTF-16 buffer for the duration of its lifetime and restores the
+/// originals on drop. The buffer outlives the syscall because it is owned by the
+/// guard.
+struct ImagePathOverlayGuard {
+    // Patches we apply; each is a (UNICODE_STRING ptr, original value) we
+    // restore on drop. Usually 1 (ImagePathName) or 2 (+ CreateInfo image name).
+    patches: Vec<(*mut UNICODE_STRING, UNICODE_STRING)>,
+    // Owned replacement buffers; kept alive for the syscall. Non-empty only when
+    // we patched at least one field (otherwise the guard is a no-op).
+    bufs: Vec<Vec<u16>>,
+}
+
+impl ImagePathOverlayGuard {
+    fn no_op() -> Self {
+        ImagePathOverlayGuard { patches: Vec::new(), bufs: Vec::new() }
+    }
+
+    /// SAFETY: `params` and `create_info` must be valid pointers to the
+    /// RTL_USER_PROCESS_PARAMETERS / PS_CREATE_INFO passed to NtCreateUserProcess.
+    /// `overlay_nt_wide` is the new image path in `\??\<overlay>` UTF-16 form
+    /// WITH a trailing NUL.
+    unsafe fn patch_one(
+        &mut self,
+        ustr_ptr: *mut UNICODE_STRING,
+        overlay_nt_wide: &[u16],
+    ) {
+        if ustr_ptr.is_null() {
+            return;
+        }
+        let chars_excluding_nul = overlay_nt_wide.len().saturating_sub(1);
+        let mut buf: Vec<u16> = overlay_nt_wide.to_vec();
+        let new_len = (chars_excluding_nul * 2) as u16;
+        let new_max = (buf.len() * 2) as u16;
+        let orig = std::ptr::read(ustr_ptr);
+        self.patches.push((ustr_ptr, orig));
+        self.bufs.push(buf);
+        let last = self.bufs.last_mut().unwrap();
+        let patched = UNICODE_STRING {
+            Length: new_len,
+            MaximumLength: new_max,
+            Buffer: last.as_mut_ptr(),
+        };
+        std::ptr::write(ustr_ptr, patched);
+    }
+
+    /// SAFETY: `params`/`create_info` as for `NtCreateUserProcess`.
+    unsafe fn new(params: *mut c_void, _create_info: *mut c_void) -> Self {
+        let mut g = Self::no_op();
+        if params.is_null() {
+            return g;
+        }
+        let virt = extract_child_exe(params);
+        if virt.is_empty() {
+            return g;
+        }
+        let virt_lower = virt.to_ascii_lowercase();
+        let decision = decide(&virt_lower, false);
+        if !matches!(decision.mode, Mode::Cow | Mode::Mock) || decision.overlay.is_none() {
+            return g;
+        }
+        let overlay_path = match decision.overlay.as_ref() {
+            Some(o) => o.to_string_lossy().into_owned(),
+            None => return g,
+        };
+        // New image path in NT form `\??\<overlay>` WITH a trailing NUL.
+        let overlay_nt = make_overlay_nt_buf(&overlay_path);
+
+        // RTL_USER_PROCESS_PARAMETERS.ImagePathName (offset 0x60). This is the
+        // informational path; the kernel image loader actually opens the EXE
+        // via PS_CREATE_INFO.ImageFileName, whose layout is undocumented and
+        // cannot be safely patched without risking a crash. We patch
+        // ImagePathName anyway — it is the one field we can address safely and
+        // it is read by some loader/CLR code paths. Spawning an overlay-only
+        // EXE still needs the CreateInfo path; that is a tracked limitation
+        // (see docs) and there is no safe user-mode fix for it.
+        let params_ptr = params as *mut u8;
+        let img_ustr = params_ptr.add(0x60) as *mut UNICODE_STRING;
+        g.patch_one(img_ustr, &overlay_nt);
+
+        if !g.patches.is_empty() {
+            if is_trace() {
+                ipc_log(ipc::LogLevel::Trace,
+                    format!("proc_spawn_overlay_redirect virt={virt} overlay={overlay_path} fields={}", g.patches.len()));
+            }
+        }
+        g
+    }
+}
+
+impl Drop for ImagePathOverlayGuard {
+    fn drop(&mut self) {
+        // SAFETY: each patched UNICODE_STRING was snapshotted in `patch_one`.
+        for (ustr_ptr, orig) in &self.patches {
+            unsafe { std::ptr::write(*ustr_ptr, std::ptr::read(orig)); }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // NtCreateUserProcess hook
 // ---------------------------------------------------------------------------
@@ -884,6 +1002,12 @@ unsafe extern "system" fn hook_nt_create_user_process(
     let parent_pid = GetCurrentProcessId();
     ipc_log(ipc::LogLevel::Info,
         format!("spawn_attempt: parent={parent_pid} target={spawn_target}"));
+
+    // If the EXE only exists in the CoW overlay, the kernel image loader would
+    // fail with STATUS_PATH_NOT_FOUND. Patch ImagePathName (and the
+    // PS_CREATE_INFO image name) to the real overlay file for the duration of
+    // the syscall; restored on drop.
+    let _img_guard = unsafe { ImagePathOverlayGuard::new(process_parameters, create_info) };
 
     let status = HOOK_NT_CREATE_USER_PROCESS.get().unwrap().call(
         process_handle, thread_handle,

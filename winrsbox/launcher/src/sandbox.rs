@@ -83,6 +83,14 @@ defaults: {
     write: cow
 }
 
+## rules: toolchain caches stay on the real disk (shared/persistent across
+## runs). NOTE: %LOCALAPPDATA%\\Temp is deliberately NOT whitelisted here —
+## it falls through to the defaults (read passthrough via the overlay merge,
+## write cow). Whitelisting Temp as passthrough leaked scratch files to the
+## real disk AND broke network installers that download to Temp then move
+## into a CoW destination (cross-layer extract fails). Keeping Temp in the
+## CoW layer makes download->extract->install a single-layer operation and
+## restores the out-of-project isolation invariant.
 rules: [
     {
         prefix: C:\\Windows
@@ -106,11 +114,6 @@ rules: [
     }
     {
         prefix: C:\\Users\\**\\AppData\\Roaming\\npm
-        read: passthrough
-        write: passthrough
-    }
-    {
-        prefix: C:\\Users\\**\\AppData\\Local\\Temp
         read: passthrough
         write: passthrough
     }

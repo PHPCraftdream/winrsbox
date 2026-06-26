@@ -1,5 +1,20 @@
 # Hermes Agent install inside the sandbox — findings — 2026-06-26
 
+**СТАТУС: 3 из 4 сложностей ИСПРАВЛЕНЫ ✅** (обновлено после починки)
+
+- Сложность 1 (краш `iwr`/`irm`) — **ИСПРАВЛЕНА**, см. `investigation-2026-06-26-tls-crash.md`.
+- Сложность 2 (token_guard) — **ИСПРАВЛЕНА** (self-impersonation разрешён).
+- Сложность 3 (`%TEMP%` → Passthrough утечка) — **ИСПРАВЛЕНА** (Temp теперь CoW).
+- Сложность 4 (cross-layer extract/rename) — **ИСПРАВЛЕНА** (uv.exe теперь
+  materializes в overlay целиком); НО всплыло **ограничение** — запуск EXE,
+  существующего только в overlay, падает (`0xc000003a`), т.к. kernel image-loader
+  не патчится из user-mode. Это единственный оставшийся блокер end-to-end install.
+
+Документ ниже сохраняет исходный ход расследования (что было сломано и почему).
+Финальное состояние — в этом заголовке и в разделе «Финальное состояние» внизу.
+
+---
+
 **Задача:** запустить `iex (irm https://hermes-agent.nousresearch.com/install.ps1)`
 внутри песочницы, оценить готовность песочницы к реальным workload'ам.
 
@@ -225,3 +240,60 @@ MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' \
    redirect; менее срочный.
 5. **Покрытие** — добавить E2E-сценарий «network installer» (по образцу e2e2),
    чтобы эти регрессии ловились автоматически.
+
+---
+
+## Финальное состояние (после починки всех 4 задач)
+
+### Что починено
+
+| # | Сложность | Фикс | Результат |
+|---|---|---|---|
+| 1 | краш `iwr`/`irm` (data race) | `anti_rec.rs`: `thread_local!` → `TlsAlloc` | 7/12 → 0/25 |
+| 2 | token_guard self-impersonation | `is_self_thread_impersonation()` | Schannel TLS не блокируется |
+| 3 | `%TEMP%` → Passthrough утечка | убрано правило `AppData\Local\Temp` из default config | uv.zip/uv.exe НЕ на реальном диске |
+| 4a | cross-layer extract/rename | TEMP теперь CoW (следствие #3) → единый слой | uv.exe materializes в overlay целиком |
+| 4b | NTFS EA-block ломал extract | EA-block теперь только на реальном диске (Passthrough), CoW пропускает | uv.exe (с EA) распаковывается |
+
+### Подтверждённый прогресс (после всех фиксов)
+
+Полный прогон `iex (irm install.ps1)`:
+```
+-> Installing managed uv into C:\Users\Computer\AppData\Local\hermes\bin ...
+[overlay] uv.exe, uvw.exe, uvx.exe — ВСЕ распакованы в overlay (mode=Cow)
+[overlay] moved to hermes\bin\ — cross-layer rename работает (единый слой)
+[X] uv installed but not found at ...\hermes\bin\uv.exe
+```
+
+uv.exe **успешно** download→extract→move — весь install-pipeline до spawn'а.
+Реальный диск чист (Task 3 invariant восстановлен).
+
+### Оставшееся ограничение: spawn overlay-only EXE
+
+Единственный оставшийся блокер end-to-end install:
+```
+[hook] spawn_attempt: target=...\hermes\bin\uv.exe
+[hook] spawn_failed: status=0xc000003a  (STATUS_PATH_NOT_FOUND)
+```
+
+Установщик хочет **запустить** uv.exe (self-bootstrap). Kernel image-loader
+(`NtCreateProcessEx` → `MmCreateSection`) открывает EXE через
+`PS_CREATE_INFO.ImageFileName`, чей layout **недокументирован** и не патчится
+безопасно из user-mode (попытка heuristic-сканирования create_info вызвала
+рецидив `0xC0000005`). Патч только `RTL_USER_PROCESS_PARAMETERS.ImagePathName`
+(offset 0x60) безопасен, но недостаточен — loader использует CreateInfo.
+
+**Вывод:** это **фундаментальное ограничение user-mode CoW-overlay** (без
+kernel driver / bindflt). Для installers, которым нужно запустить установленный
+binary, требуется либо:
+- materialize overlay-EXE на реальный диск перед spawn (нарушает strict isolation,
+  но приемлемо для trusted toolchain cache как `.cargo`/`npm`), либо
+- bindflt + Server Silo (kernel-native overlay — убирает весь класс path-leak/
+  image-loader проблем by design).
+
+Текущий фикс оставляет spawn-overlay-EXE как **документированное ограничение**;
+install-pipeline до spawn полностью работоспособен.
+
+### Workspace-тесты
+
+`cargo test --workspace`: **948 passed, 0 failed**.

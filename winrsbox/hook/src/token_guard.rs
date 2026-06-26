@@ -312,9 +312,12 @@ unsafe extern "system" fn hook_nt_duplicate_token(
 // handle (obtained via NtOpenProcessToken on an accessible service process),
 // this lets all subsequent resource access run as the target user.
 //
-// Policy: block impersonation with non-null token handles. Self-impersonation
-// (the thread's own process token) is rare but allowed by not hooking it when
-// the token handle is null (removing impersonation = safe).
+// Policy: block impersonation of FOREIGN threads (handles resolving to a
+// process other than self). Self-impersonation — NtCurrentThread pseudo-handle
+// (-2) or a real handle to one of our own threads — is allowed, because the
+// token can only be our own process token (no escalation), and Schannel/TLS,
+// WinHTTP proxy detection, and the .NET networking stack all legitimately do
+// it during a TLS handshake. Blocking it breaks HTTPS under the sandbox.
 
 type FnNtSetInformationThread = unsafe extern "system" fn(
     HANDLE,         // ThreadHandle
@@ -326,6 +329,22 @@ type FnNtSetInformationThread = unsafe extern "system" fn(
 static HOOK_SET_INFO_THREAD: OnceLock<GenericDetour<FnNtSetInformationThread>> = OnceLock::new();
 
 const THREAD_IMPERSONATION_TOKEN: u32 = 5;
+
+/// Decide whether `NtSetInformationThread(ThreadImpersonationToken)` on
+/// `thread_handle` should be allowed based on whether the target thread is
+/// "self" (the current process). Pure + unit-tested so the allow/deny
+/// classification can be pinned without standing up the full detour.
+///
+/// `owner_pid` is the PID that `thread_handle` resolves to (0 if unknown /
+/// not resolvable). `self_pid` is `GetCurrentProcessId()`.
+fn is_self_thread_impersonation(thread_handle: HANDLE, owner_pid: u32, self_pid: u32) -> bool {
+    // NtCurrentThread pseudo-handle (-2) always denotes the current thread.
+    if thread_handle as isize == NT_CURRENT_THREAD {
+        return true;
+    }
+    // A real handle to one of our own threads → owner is our own process.
+    owner_pid != 0 && owner_pid == self_pid
+}
 
 unsafe extern "system" fn hook_nt_set_information_thread(
     thread_handle: HANDLE,
@@ -349,12 +368,29 @@ unsafe extern "system" fn hook_nt_set_information_thread(
         if !thread_info.is_null() && info_length >= std::mem::size_of::<HANDLE>() as u32 {
             let token = *(thread_info as *const HANDLE);
             if !token.is_null() {
-                if is_trace() {
-                    ipc_log(ipc::LogLevel::Trace,
-                        format!("token_impersonation_blocked thread=0x{:x} token=0x{:x}",
-                            thread_handle as usize, token as usize));
+                // Self-impersonation is legitimate and must be allowed:
+                // Schannel/TLS, WinHTTP proxy detection, and the .NET
+                // networking stack all assign the *current process* token to
+                // the current thread during a TLS handshake / SSPI call.
+                // Blocking it breaks HTTPS under the sandbox (observed:
+                // Invoke-WebRequest / Invoke-RestMethod failures).
+                //
+                // Two safe shapes:
+                //   (a) thread_handle == NtCurrentThread pseudo-handle (-2)
+                //   (b) thread_handle resolves to the current process (a real
+                //       handle to one of our own threads)
+                // In both cases the token can only be our own process token,
+                // which confers no privilege escalation. Block everything else.
+                let self_pid = GetCurrentProcessId();
+                let owner_pid = crate::inject_guard::thread_owner_pid(thread_handle);
+                if !is_self_thread_impersonation(thread_handle, owner_pid, self_pid) {
+                    if is_trace() {
+                        ipc_log(ipc::LogLevel::Trace,
+                            format!("token_impersonation_blocked thread=0x{:x} token=0x{:x}",
+                                thread_handle as usize, token as usize));
+                    }
+                    return STATUS_ACCESS_DENIED;
                 }
-                return STATUS_ACCESS_DENIED;
             }
         }
     }
@@ -611,5 +647,35 @@ mod tests {
         assert_ne!(TOKEN_DANGEROUS_ACCESS & 0x0001, 0, "TOKEN_ASSIGN_PRIMARY");
         assert_ne!(TOKEN_DANGEROUS_ACCESS & 0x0002, 0, "TOKEN_DUPLICATE");
         assert_ne!(TOKEN_DANGEROUS_ACCESS & 0x0004, 0, "TOKEN_IMPERSONATE");
+    }
+
+    // ── self-impersonation classification (Schannel/TLS must be allowed) ──
+
+    #[test]
+    fn nt_current_thread_pseudo_handle_is_self() {
+        // NtCurrentThread = -2; assigning the process token to the current
+        // thread is what Schannel does during a TLS handshake.
+        assert!(is_self_thread_impersonation(NT_CURRENT_THREAD as *mut c_void, 0, 1234));
+        // owner_pid irrelevant when the handle is the pseudo-handle.
+        assert!(is_self_thread_impersonation(NT_CURRENT_THREAD as *mut c_void, 9999, 1234));
+    }
+
+    #[test]
+    fn real_handle_to_own_thread_is_self() {
+        // A real handle whose owning process is us → self.
+        assert!(is_self_thread_impersonation(0x100 as *mut c_void, 1234, 1234));
+    }
+
+    #[test]
+    fn real_handle_to_foreign_thread_is_not_self() {
+        // A handle to a thread in another process → blocked.
+        assert!(!is_self_thread_impersonation(0x100 as *mut c_void, 9999, 1234));
+    }
+
+    #[test]
+    fn unresolvable_real_handle_is_not_self() {
+        // owner_pid 0 (NtQueryInformationProcess failed / not resolvable) on
+        // a non-pseudo handle: can't prove it's ours, fail-closed → block.
+        assert!(!is_self_thread_impersonation(0x100 as *mut c_void, 0, 1234));
     }
 }

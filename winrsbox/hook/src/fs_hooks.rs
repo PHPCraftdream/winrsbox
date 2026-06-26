@@ -202,20 +202,25 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
         }
     }
 
-    if is_ea_present(ea_buffer as *const _, ea_length) {
-        crate::ipc_client::ipc_log_violation(ipc::Req::Log {
-            pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
-            level: ipc::LogLevel::Warn,
-            msg: format!("ntfs_ea_blocked: {dos} (ea_len={ea_length})"),
-        });
-        if !file_handle.is_null() {
-            *file_handle = std::ptr::null_mut();
-        }
-        set_io_status(io_status_block, STATUS_ACCESS_DENIED);
-        return STATUS_ACCESS_DENIED;
-    }
-
     let write = is_write_access(desired_access, create_disposition);
+
+    // ── NTFS Extended-Attributes (EA) defence-in-depth (audit H-S3) ─────────
+    //
+    // EA are not listed by directory enumeration, persist across reboots, and
+    // recent BlackLotus-class loaders stash payloads in them. So we treat any
+    // non-empty EA buffer as hostile — BUT only when it would land on the REAL
+    // disk. When the destination is policy-redirected into the CoW overlay
+    // (Mode::Cow/Mock), the EA is trapped inside the sandbox and can neither
+    // persist on the host nor be read by an out-of-sandbox process, so it is
+    // harmless. Blocking EA on a CoW path instead breaks network installers
+    // (e.g. uv.exe, which carries a download-attribution EA) whose extract
+    // step writes the file with its EA buffer into %TEMP% (now CoW).
+    //
+    // We must `decide` first to know the mode, so the unconditional block moved
+    // below the decision. The EA buffer is preserved verbatim for the CoW
+    // kernel open (the overlay copy legitimately keeps whatever EA the caller
+    // intended).
+    let ea_present = is_ea_present(ea_buffer as *const _, ea_length);
     let mut decision = decide(&dos, write);
 
     // ── Revive: a create/supersede/open-if against a Hidden (whiteouted) path
@@ -275,6 +280,24 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
             STATUS_OBJECT_NAME_NOT_FOUND
         }
         Mode::Passthrough => {
+            // EA-defence (audit H-S3) applies ONLY on the real-disk path. A
+            // write carrying an Extended-Attribute buffer would persist on the
+            // host and is the covert-storage vector BlackLotus uses. Block it
+            // here (after the CoW branches were already handled above, where EA
+            // are safe because they land in the overlay). See the comment near
+            // `ea_present` for the full rationale.
+            if write && ea_present {
+                crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+                    pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                    level: ipc::LogLevel::Warn,
+                    msg: format!("ntfs_ea_blocked: {dos} (ea_len={ea_length})"),
+                });
+                if !file_handle.is_null() {
+                    *file_handle = std::ptr::null_mut();
+                }
+                set_io_status(io_status_block, STATUS_ACCESS_DENIED);
+                return STATUS_ACCESS_DENIED;
+            }
             // H5 resolve-once passthrough: copy_passthrough_inner reuses the
             // pre-resolved absolute path (if relative open) so we never call
             // resolve_handle_path a second time.

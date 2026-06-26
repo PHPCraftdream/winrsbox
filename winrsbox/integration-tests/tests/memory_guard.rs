@@ -568,10 +568,23 @@ fn strict_blocks_token_duplicate_primary() {
 #[test]
 #[serial]
 fn strict_blocks_token_impersonation() {
-    // NtSetInformationThread(ThreadImpersonationToken) with non-null token
+    // NtSetInformationThread(ThreadImpersonationToken) on the CURRENT thread
+    // with the process's OWN token (OpenProcessToken(GetCurrentProcess())).
+    //
+    // token_guard policy (see hook/src/token_guard.rs): self-impersonation —
+    // NtCurrentThread pseudo-handle or a handle to one of our own threads —
+    // is ALLOWED, because the token can only be our own process token (no
+    // privilege escalation) and Schannel/TLS + the .NET networking stack
+    // legitimately do it during a TLS handshake. Blocking it broke HTTPS
+    // under the sandbox. The real escalation vector — impersonating a FOREIGN
+    // token — is blocked upstream at NtOpenProcessTokenEx (escape_token_open)
+    // and NtImpersonateThread on foreign threads (escape_impersonate_thread).
+    //
+    // So this payload (own token + own thread) must now be ALLOWED.
     let r = run_payload("escape_token_impersonate", "scan");
-    assert_eq!(r.status.code(), Some(5),
-        "escape_token_impersonate should exit 5 (blocked)\nstderr: {}", r.stderr);
+    assert_ne!(r.status.code(), Some(5),
+        "self-impersonation with own process token must be ALLOWED (not blocked) \
+         under the new token_guard policy; got exit 5\nstderr: {}", r.stderr);
 }
 
 #[test]
