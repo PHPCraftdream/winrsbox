@@ -803,6 +803,38 @@ const PERSISTENCE_DENY_SUFFIXES: &[&str] = &[
     r"\environment",
 ];
 
+/// Value-name allowlist for persistence-denied keys. The key itself is a
+/// persistence/dll-injection surface (so unknown value-names stay DENIED),
+/// but a short, explicit list of benign env-var names is allowed through into
+/// the CoW overlay so legitimate installers that write e.g. `HERMES_*` or
+/// `PATH` don't break.
+///
+/// This is the PERSISTENCE-DENY exception: anything NOT in this list that
+/// targets a deny-suffix key stays hard-DENIED. The dangerous names — the
+/// actual logon/DLL-search-order vectors — are deliberately absent.
+///
+/// Naming convention:
+///   - exact match (case-insensitive): `path`, `hermes_git_bash_path`
+///   - `vendor_*` prefix: matches `hermes_*` (any value starting with the prefix)
+#[allow(dead_code)]
+const ENV_VALUE_NAME_ALLOWLIST: &[&str] = &[
+    // PATH-like env vars that installers legitimately extend.
+    "path",
+    "pathext",
+    // Toolchain homes / version env-vars written by installers. These are pure
+    // data values read back by the toolchain itself — they are not consulted by
+    // winlogon / the DLL loader, so they confer no persistence.
+    "hermes_*",        // Hermes Agent installer (HERMES_HOME, HERMES_GIT_BASH_PATH, ...)
+    "npm_config_*",    // npm global config
+    "cargo_home",
+    "rustup_home",
+    "python*",
+    "pip_*",
+    "uv_*",
+    "node_path",
+    "node_options",
+];
+
 /// Return `true` if `fragment` occurs in `key_lower` aligned to path-segment
 /// boundaries: the fragment starts with `\` (left-anchored to a segment edge)
 /// and the character immediately after the match is either end-of-string or
@@ -843,6 +875,21 @@ fn is_persistence_denied(key_path: &str) -> bool {
     PERSISTENCE_DENY_SUFFIXES
         .iter()
         .any(|s| segment_contains(&lower, s))
+}
+
+/// True if `value_name` matches the `ENV_VALUE_NAME_ALLOWLIST`. Matches are
+/// case-insensitive. An entry ending in `_*` is a prefix match; otherwise an
+/// exact match.
+fn is_env_value_allowed(value_name: Option<&str>) -> bool {
+    let Some(name) = value_name else { return false; };
+    let lower = name.to_ascii_lowercase();
+    ENV_VALUE_NAME_ALLOWLIST.iter().any(|pat| {
+        if let Some(prefix) = pat.strip_suffix("*") {
+            lower.starts_with(prefix)
+        } else {
+            lower == *pat
+        }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1155,7 +1202,16 @@ fn handle_connection(
                 // is needed for the silent-ok branch below; pass it through
                 // to avoid a second allocation.
                 let is_persistence = is_persistence_denied(&key_lower);
-                let (mode, denied) = if write && is_persistence {
+                // PERSISTENCE-DENY exception: a persistence-denied key (e.g.
+                // HKCU\Environment) still admits a value-name from
+                // ENV_VALUE_NAME_ALLOWLIST into the CoW overlay — benign
+                // installer env-vars (HERMES_*, PATH, CARGO_HOME, ...). The
+                // genuinely dangerous value-names (UserInitMprLogonScript etc.)
+                // are absent from the allowlist, so they stay hard-DENIED.
+                let env_allowed = is_persistence
+                    && key_lower.ends_with(r"\environment")
+                    && is_env_value_allowed(value_name.as_deref());
+                let (mode, denied) = if write && is_persistence && !env_allowed {
                     eprintln!("[reg] DENY {key_path} value={value_name:?}");
                     (policy::Mode::Deny, true)
                 } else if write && (key_lower.contains(r"\software\") || key_lower.ends_with(r"\software")) {
@@ -1498,6 +1554,44 @@ mod tests {
         assert!(!segment_contains(r"a\runtime", r"\run")); // followed by other char
         assert!(!segment_contains(r"arun", r"\run")); // no left boundary
         assert!(segment_contains(r"x\run\run", r"\run")); // second occurrence anchored
+    }
+
+    // ─── ENV_VALUE_NAME_ALLOWLIST (PERSISTENCE-DENY exception) ──────────────
+
+    #[test]
+    fn env_allowlist_exact_match_path() {
+        assert!(is_env_value_allowed(Some("Path")));
+        assert!(is_env_value_allowed(Some("PATH")));
+        assert!(is_env_value_allowed(Some("PATHEXT")));
+    }
+
+    #[test]
+    fn env_allowlist_vendor_prefix_hermes() {
+        assert!(is_env_value_allowed(Some("HERMES_HOME")));
+        assert!(is_env_value_allowed(Some("HERMES_GIT_BASH_PATH")));
+        assert!(is_env_value_allowed(Some("hermes_anything")));
+    }
+
+    #[test]
+    fn env_allowlist_python_prefix() {
+        assert!(is_env_value_allowed(Some("PYTHONPATH")));
+        assert!(is_env_value_allowed(Some("PYTHONHOME")));
+    }
+
+    #[test]
+    fn env_allowlist_none_value_name_denied() {
+        // No value name → can't prove benign → fail-closed (not allowed).
+        assert!(!is_env_value_allowed(None));
+    }
+
+    #[test]
+    fn env_allowlist_dangerous_name_denied() {
+        // The actual logon-script persistence vector must NOT match the
+        // allowlist — it stays hard-DENIED even under HKCU\Environment.
+        assert!(!is_env_value_allowed(Some("UserInitMprLogonScript")));
+        // Unknown / arbitrary attacker value-name → denied.
+        assert!(!is_env_value_allowed(Some("evil_persistence")));
+        assert!(!is_env_value_allowed(Some("TEMP")));
     }
 
     #[test]
