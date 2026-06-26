@@ -1,18 +1,21 @@
-// escape_token_impersonate — tries NtSetInformationThread(ThreadImpersonationToken)
-// to assign a token handle to the current thread. This is the primitive behind
-// SetThreadToken / ImpersonateLoggedOnUser — all subsequent resource access goes
-// under the impersonated token's security context.
-// Without token_guard: impersonation succeeds → resource access under foreign context.
-// With token_guard: NtSetInformationThread returns STATUS_ACCESS_DENIED → exit 5.
+// escape_token_impersonate — NtSetInformationThread(ThreadImpersonationToken)
+// on the CURRENT thread with the process's OWN token (GetCurrentThread() +
+// OpenProcessToken(GetCurrentProcess())). This is the primitive behind
+// SetThreadToken / ImpersonateLoggedOnUser.
+//
+// token_guard policy: self-impersonation (own token on own thread) is ALLOWED
+// — it confers no privilege escalation (the token is already ours) and is what
+// Schannel/TLS and the .NET networking stack do during a handshake. The
+// foreign-token escalation vector is blocked upstream (NtOpenProcessTokenEx,
+// NtImpersonateThread). So this payload must NOT be blocked (exit != 5).
 
 fn main() {
     eprintln!("[escape_token_impersonate] starting");
 
     unsafe {
-        // Get any token handle (our own process token is sufficient to demonstrate
-        // the impersonation primitive — the hook blocks ANY non-null token assignment
-        // via ThreadImpersonationToken since we can't determine token ownership at
-        // the thread level).
+        // Get our OWN process token — self-impersonation with it must be
+        // allowed (no escalation; Schannel does this for TLS). The foreign-
+        // token vector is tested elsewhere and blocked upstream.
         let mut token: *mut winapi::ctypes::c_void = std::ptr::null_mut();
         let process = winapi::um::processthreadsapi::GetCurrentProcess();
         let ok = winapi::um::processthreadsapi::OpenProcessToken(
