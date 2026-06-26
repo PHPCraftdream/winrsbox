@@ -114,16 +114,17 @@ type FnNtCreateProcessEx = unsafe extern "system" fn(
 
 // PS_ATTRIBUTE for parent-spoof detection in NtCreateUserProcess attribute list.
 #[repr(C)]
-struct PS_ATTRIBUTE {
-    Attribute: usize,
-    Size: usize,
-    Value: usize,
+pub(crate) struct PS_ATTRIBUTE {
+    pub(crate) Attribute: usize,
+    pub(crate) Size: usize,
+    pub(crate) Value: usize,
+    #[allow(dead_code)]
     ReturnLength: *mut usize,
 }
 
 #[repr(C)]
-struct PS_ATTRIBUTE_LIST {
-    TotalLength: usize,
+pub(crate) struct PS_ATTRIBUTE_LIST {
+    pub(crate) TotalLength: usize,
     Attributes: [PS_ATTRIBUTE; 1],
 }
 
@@ -773,6 +774,107 @@ pub fn attribute_list_contains_handle_list(attr_list: *const c_void) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// PS_ATTRIBUTE_LIST introspection (C0/C1: spawn-overlay-redirect support)
+// ---------------------------------------------------------------------------
+
+/// Bounds-checked walk returning a mutable pointer to the
+/// `PsAttributeImageName` record (attribute number 5) in `attr_list`, or
+/// `None` if the list is null/malformed or has no such record.
+///
+/// The record's `Value` is a raw `PWSTR` and `Size` is its byte length
+/// excluding the trailing NUL — confirmed empirically by the C0 diagnostic
+/// dump (`dump_attr_list_for_overlay_spawn`). Callers (C2 guard) swap Value
+/// and Size to point the kernel image loader at the CoW overlay copy.
+///
+/// # Safety
+/// `attr_list` must be a valid `PS_ATTRIBUTE_LIST` pointer for the duration of
+/// the borrow (the caller owns it across the NtCreateUserProcess call). The
+/// returned pointer aliases `attr_list` and must not outlive it.
+pub(crate) unsafe fn image_name_attr_mut(attr_list: *mut c_void) -> Option<*mut PS_ATTRIBUTE> {
+    let count = attr_count(attr_list)?;
+    let list = attr_list as *mut PS_ATTRIBUTE_LIST;
+    // SAFETY: attr_list is valid per caller contract; Attributes[0] begins a
+    // contiguous run of `count` records after TotalLength.
+    let attrs = unsafe { (*list).Attributes.as_mut_ptr() };
+    for i in 0..count {
+        // SAFETY: i < count, validated by attr_count against TotalLength.
+        let attr = unsafe { &mut *attrs.add(i) };
+        if (attr.Attribute & 0xFFFF) == 5 {
+            return Some(attrs.add(i));
+        }
+    }
+    None
+}
+
+/// Bounds-checked walk of the attribute list, returning the count of attribute
+/// records (excluding the leading `TotalLength` field). Returns `None` if the
+/// list is null or malformed (TotalLength too small).
+///
+/// Pure + shared between the C0 diagnostic dump and the C1 mutator.
+fn attr_count(attr_list: *const c_void) -> Option<usize> {
+    if attr_list.is_null() {
+        return None;
+    }
+    // SAFETY: attr_list is a valid PS_ATTRIBUTE_LIST pointer per the
+    // NtCreateUserProcess contract. We only read TotalLength here.
+    let list = attr_list as *const PS_ATTRIBUTE_LIST;
+    let total = unsafe { (*list).TotalLength };
+    if total < std::mem::size_of::<usize>() {
+        return None;
+    }
+    let count = (total - std::mem::size_of::<usize>()) / std::mem::size_of::<PS_ATTRIBUTE>();
+    if count == 0 {
+        return None;
+    }
+    Some(count)
+}
+
+/// C0 diagnostic: dump every attribute record in `attr_list` to the trace log,
+/// with extra detail for the PsAttributeImageName record (number 5). Used to
+/// confirm the presence and the Value-convention (raw PWSTR + byte Size vs a
+/// UNICODE_STRING pointer) BEFORE the C2 patch decides how to mutate it.
+///
+/// `target` is the virtual exe path (for correlation with spawn_attempt).
+pub(crate) fn dump_attr_list_for_overlay_spawn(attr_list: *const c_void, target: &str) {
+    let Some(count) = attr_count(attr_list) else {
+        ipc_log(ipc::LogLevel::Trace,
+            format!("attr_list_dump: target={target} EMPTY_OR_MALFORMED"));
+        return;
+    };
+    // SAFETY: attr_list is valid; Attributes[0] is the first of `count` records
+    // laid out contiguously after TotalLength.
+    let list = attr_list as *const PS_ATTRIBUTE_LIST;
+    let attrs = unsafe { (*list).Attributes.as_ptr() };
+    ipc_log(ipc::LogLevel::Trace,
+        format!("attr_list_dump: target={target} attr_count={count}"));
+    for i in 0..count {
+        // SAFETY: i < count, validated above against the declared TotalLength.
+        let attr = unsafe { &*attrs.add(i) };
+        let num = attr.Attribute & 0xFFFF;
+        let is_image_name = num == 5; // PsAttributeImageName
+        // For the image-name record, Value is a raw PWSTR (per the standard
+        // CreateProcessInternalW path) and Size is the byte length excluding
+        // the trailing NUL. Read it defensively to confirm.
+        let value_desc = if is_image_name {
+            let ptr = attr.Value as *const u16;
+            if !ptr.is_null() && attr.Size > 0 && attr.Size <= 0x10000 {
+                let chars = attr.Size / 2;
+                let slice = unsafe { std::slice::from_raw_parts(ptr, chars) };
+                let s = String::from_utf16_lossy(slice);
+                format!(" value=PWSTR \"{s}\" size_bytes={} (chars={})", attr.Size, chars)
+            } else {
+                format!(" value=0x{:x} size={} (unreadable)", attr.Value, attr.Size)
+            }
+        } else {
+            String::new()
+        };
+        ipc_log(ipc::LogLevel::Trace,
+            format!("attr_list_dump:   [{i}] num={num} encoded=0x{:x} size={} value_ptr=0x{:x}{}",
+                attr.Attribute, attr.Size, attr.Value, value_desc));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Extract image path from RTL_USER_PROCESS_PARAMETERS
 // ---------------------------------------------------------------------------
 
@@ -1119,6 +1221,105 @@ mod tests {
         }
         assert!(attribute_list_contains_parent_process(buf.as_ptr() as _));
         assert!(attribute_list_contains_handle_list(buf.as_ptr() as _));
+    }
+
+    // -----------------------------------------------------------------------
+    // C1 — image_name_attr_mut (PsAttributeImageName record = number 5)
+    // -----------------------------------------------------------------------
+
+    /// Build a synthetic PS_ATTRIBUTE_LIST with the given records (Attribute,
+    /// Size, Value) and return its backing buffer. Records are laid out after
+    /// the TotalLength header, and TotalLength is set to header + N*attr_size.
+    fn make_attr_list_with(records: &[(usize, usize, usize)]) -> Vec<u8> {
+        let header_size = std::mem::size_of::<usize>();
+        let attr_size = std::mem::size_of::<PS_ATTRIBUTE>();
+        let total = header_size + attr_size * records.len();
+        let mut buf = vec![0u8; total];
+        buf[..header_size].copy_from_slice(&total.to_ne_bytes());
+        let attrs_ptr = unsafe { buf.as_mut_ptr().add(header_size) } as *mut PS_ATTRIBUTE;
+        unsafe {
+            for (i, &(attr, size, value)) in records.iter().enumerate() {
+                (*attrs_ptr.add(i)).Attribute = attr;
+                (*attrs_ptr.add(i)).Size = size;
+                (*attrs_ptr.add(i)).Value = value;
+                (*attrs_ptr.add(i)).ReturnLength = std::ptr::null_mut();
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn image_name_attr_finds_record_5() {
+        // [0] IMAGE_NAME (number=5), Value points at a fake NT path.
+        let buf = make_attr_list_with(&[(0x0002_0005, 10, 0xAAAA_BBBB)]);
+        let ptr = buf.as_ptr() as *mut c_void;
+        // SAFETY: buf is a valid, correctly-sized PS_ATTRIBUTE_LIST.
+        let found = unsafe { image_name_attr_mut(ptr) };
+        let found = found.expect("record 5 must be found");
+        unsafe {
+            assert_eq!((*found).Attribute & 0xFFFF, 5);
+            assert_eq!((*found).Value, 0xAAAA_BBBB);
+        }
+    }
+
+    #[test]
+    fn image_name_attr_skips_other_records() {
+        // PARENT (0) + HANDLE_LIST (2), no IMAGE_NAME (5) → None.
+        let buf = make_attr_list_with(&[
+            (0x0002_0000, std::mem::size_of::<usize>(), 0x1000),
+            (0x0002_0002, std::mem::size_of::<usize>(), 0x2000),
+        ]);
+        let ptr = buf.as_ptr() as *mut c_void;
+        let found = unsafe { image_name_attr_mut(ptr) };
+        assert!(found.is_none(), "no record 5 → None");
+    }
+
+    #[test]
+    fn image_name_attr_finds_record_5_among_many() {
+        // IMAGE_NAME (5) is the 3rd entry; must skip the first two.
+        let buf = make_attr_list_with(&[
+            (0x0002_0000, 8, 0x1),
+            (0x0002_0002, 8, 0x2),
+            (0x0002_0005, 12, 0x3),
+            (0x0002_0006, 8, 0x4),
+        ]);
+        let ptr = buf.as_ptr() as *mut c_void;
+        let found = unsafe { image_name_attr_mut(ptr) }.expect("record 5 present");
+        unsafe { assert_eq!((*found).Value, 0x3); }
+    }
+
+    #[test]
+    fn image_name_attr_null_safe() {
+        assert!(unsafe { image_name_attr_mut(std::ptr::null_mut()) }.is_none());
+    }
+
+    #[test]
+    fn image_name_attr_malformed_total_safe() {
+        // total below header → None, no underflow.
+        let buf = make_attr_buf(4);
+        assert!(unsafe { image_name_attr_mut(buf.as_ptr() as *mut c_void) }.is_none());
+    }
+
+    #[test]
+    fn image_name_attr_is_mutable_and_restorable() {
+        // Mutate Value/Size through the returned pointer, then restore — this
+        // is exactly the C2 guard's patch_attr flow.
+        let mut buf = make_attr_list_with(&[(0x0002_0005, 10, 0x1111)]);
+        let ptr = buf.as_mut_ptr() as *mut c_void;
+        let attr = unsafe { image_name_attr_mut(ptr) }.unwrap();
+        unsafe {
+            let orig_value = (*attr).Value;
+            let orig_size = (*attr).Size;
+            (*attr).Value = 0x2222;
+            (*attr).Size = 99;
+            assert_eq!((*attr).Value, 0x2222);
+            assert_eq!((*attr).Size, 99);
+            // restore
+            (*attr).Value = orig_value;
+            (*attr).Size = orig_size;
+            assert_eq!((*attr).Value, 0x1111);
+            assert_eq!((*attr).Size, 10);
+        }
     }
 
     // -----------------------------------------------------------------------

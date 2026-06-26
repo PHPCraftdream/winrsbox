@@ -830,12 +830,22 @@ unsafe fn extract_child_exe(params: *mut c_void) -> String {
 /// caller-owned UTF-16 buffer for the duration of its lifetime and restores the
 /// originals on drop. The buffer outlives the syscall because it is owned by the
 /// guard.
+/// One in-place patch applied by `ImagePathOverlayGuard`, restored on drop.
+enum Patch {
+    /// A `UNICODE_STRING` field (e.g. RTL_USER_PROCESS_PARAMETERS.ImagePathName).
+    /// Snapshot the whole struct, restore on drop.
+    UnicodeString { ptr: *mut UNICODE_STRING, orig: UNICODE_STRING },
+    /// A raw PS_ATTRIBUTE record (PsAttributeImageName). `Value` is a raw
+    /// PWSTR and `Size` is its byte length excluding the trailing NUL (per
+    /// the C0 diagnostic dump convention). Snapshot (Value, Size), restore.
+    Attr { ptr: *mut crate::proc_guard::PS_ATTRIBUTE, orig_value: usize, orig_size: usize },
+}
+
 struct ImagePathOverlayGuard {
-    // Patches we apply; each is a (UNICODE_STRING ptr, original value) we
-    // restore on drop. Usually 1 (ImagePathName) or 2 (+ CreateInfo image name).
-    patches: Vec<(*mut UNICODE_STRING, UNICODE_STRING)>,
-    // Owned replacement buffers; kept alive for the syscall. Non-empty only when
-    // we patched at least one field (otherwise the guard is a no-op).
+    patches: Vec<Patch>,
+    // Owned replacement buffers; kept alive for the syscall. Each patch owns
+    // exactly one buffer (the overlay NT path, possibly reused for both the
+    // UNICODE_STRING and the attr pointing at the same overlay copy).
     bufs: Vec<Vec<u16>>,
 }
 
@@ -844,10 +854,12 @@ impl ImagePathOverlayGuard {
         ImagePathOverlayGuard { patches: Vec::new(), bufs: Vec::new() }
     }
 
-    /// SAFETY: `params` and `create_info` must be valid pointers to the
-    /// RTL_USER_PROCESS_PARAMETERS / PS_CREATE_INFO passed to NtCreateUserProcess.
-    /// `overlay_nt_wide` is the new image path in `\??\<overlay>` UTF-16 form
-    /// WITH a trailing NUL.
+    /// Patch a `UNICODE_STRING` field to point at the owned overlay NT buffer.
+    ///
+    /// # Safety
+    /// `ustr_ptr` must be a valid, writeable `UNICODE_STRING` for the syscall
+    /// duration; the guard owns the replacement buffer and restores the original
+    /// on drop.
     unsafe fn patch_one(
         &mut self,
         ustr_ptr: *mut UNICODE_STRING,
@@ -861,7 +873,7 @@ impl ImagePathOverlayGuard {
         let new_len = (chars_excluding_nul * 2) as u16;
         let new_max = (buf.len() * 2) as u16;
         let orig = std::ptr::read(ustr_ptr);
-        self.patches.push((ustr_ptr, orig));
+        self.patches.push(Patch::UnicodeString { ptr: ustr_ptr, orig });
         self.bufs.push(buf);
         let last = self.bufs.last_mut().unwrap();
         let patched = UNICODE_STRING {
@@ -872,8 +884,40 @@ impl ImagePathOverlayGuard {
         std::ptr::write(ustr_ptr, patched);
     }
 
-    /// SAFETY: `params`/`create_info` as for `NtCreateUserProcess`.
-    unsafe fn new(params: *mut c_void, _create_info: *mut c_void) -> Self {
+    /// Patch a raw `PS_ATTRIBUTE` (PsAttributeImageName) to point its `Value`
+    /// (raw PWSTR) and `Size` (bytes, no NUL) at the owned overlay NT buffer.
+    ///
+    /// # Safety
+    /// `attr_ptr` must be a valid, writeable `PS_ATTRIBUTE` for the syscall
+    /// duration; the guard owns the replacement buffer and restores the original
+    /// (Value, Size) on drop.
+    unsafe fn patch_attr(
+        &mut self,
+        attr_ptr: *mut crate::proc_guard::PS_ATTRIBUTE,
+        overlay_nt_wide: &[u16],
+    ) {
+        if attr_ptr.is_null() {
+            return;
+        }
+        let chars_excluding_nul = overlay_nt_wide.len().saturating_sub(1);
+        let new_size = chars_excluding_nul * 2;
+        let mut buf: Vec<u16> = overlay_nt_wide.to_vec();
+        // SAFETY: attr_ptr is valid per caller contract.
+        let orig_value = (*attr_ptr).Value;
+        let orig_size = (*attr_ptr).Size;
+        self.patches.push(Patch::Attr { ptr: attr_ptr, orig_value, orig_size });
+        self.bufs.push(buf);
+        let last = self.bufs.last_mut().unwrap();
+        (*attr_ptr).Value = last.as_mut_ptr() as usize;
+        (*attr_ptr).Size = new_size;
+    }
+
+    /// SAFETY: `params`/`create_info`/`attribute_list` as for `NtCreateUserProcess`.
+    unsafe fn new(
+        params: *mut c_void,
+        _create_info: *mut c_void,
+        attribute_list: *mut c_void,
+    ) -> Self {
         let mut g = Self::no_op();
         if params.is_null() {
             return g;
@@ -895,30 +939,33 @@ impl ImagePathOverlayGuard {
         // New image path in NT form `\??\<overlay>` WITH a trailing NUL.
         let overlay_nt = make_overlay_nt_buf(&overlay_path);
 
-        // RTL_USER_PROCESS_PARAMETERS.ImagePathName (offset 0x60). The kernel
-        // image loader (`NtCreateProcessEx` → `MmCreateSection`) opens the EXE
-        // by the path in `PS_CREATE_INFO.ImageFileName`, whose layout is
-        // undocumented and cannot be safely patched from user mode (a heuristic
-        // scan over it crashed reliably). We patch `ImagePathName` — the one
-        // field we can address safely — but this is informational only and does
-        // NOT make spawning an overlay-only EXE succeed: the loader still
-        // resolves via CreateInfo and fails with STATUS_PATH_NOT_FOUND.
-        //
-        // This is a tracked, fundamental limitation of a user-mode CoW overlay
-        // without a kernel driver (bindflt + Server Silo would remove the whole
-        // class by design). The only "fixes" that would make spawn succeed
-        // (materialize the EXE onto the real disk; patch CreateInfo) either
-        // break the isolation invariant or risk UB — both rejected. We keep the
-        // harmless ImagePathName patch for consistency and as a diagnostic
-        // signal, and surface the limitation via this comment + the trace log.
+        // The kernel image loader opens the EXE by the path in the
+        // PsAttributeImageName record (number 5) of the attribute list — this
+        // is the load-bearing patch that makes spawning an overlay-only EXE
+        // succeed WITHOUT writing to the host (the loader maps the overlay
+        // bytes directly). Convention (confirmed by the C0 diagnostic): Value
+        // is a raw PWSTR, Size is the byte length excluding the trailing NUL.
+        // We swap Value/Size for the duration of the syscall and restore on
+        // drop; the owned buffer outlives the call.
+        if !attribute_list.is_null() {
+            if let Some(attr_ptr) = crate::proc_guard::image_name_attr_mut(attribute_list) {
+                g.patch_attr(attr_ptr, &overlay_nt);
+            }
+        }
+
+        // RTL_USER_PROCESS_PARAMETERS.ImagePathName (offset 0x60) is
+        // informational (used by PEB/GetModuleFileNameW for self-identification).
+        // Keep it pointing at the VIRTUAL path so the child self-identifies
+        // consistently (see C3) — build the virtual NT form for this one.
+        let virt_nt = make_overlay_nt_buf(&virt);
         let params_ptr = params as *mut u8;
         let img_ustr = params_ptr.add(0x60) as *mut UNICODE_STRING;
-        g.patch_one(img_ustr, &overlay_nt);
+        g.patch_one(img_ustr, &virt_nt);
 
         if !g.patches.is_empty() {
             if is_trace() {
                 ipc_log(ipc::LogLevel::Trace,
-                    format!("proc_spawn_overlay_redirect virt={virt} overlay={overlay_path} fields={}", g.patches.len()));
+                    format!("proc_spawn_overlay_redirect virt={virt} overlay={overlay_path} patches={}", g.patches.len()));
             }
         }
         g
@@ -927,9 +974,21 @@ impl ImagePathOverlayGuard {
 
 impl Drop for ImagePathOverlayGuard {
     fn drop(&mut self) {
-        // SAFETY: each patched UNICODE_STRING was snapshotted in `patch_one`.
-        for (ustr_ptr, orig) in &self.patches {
-            unsafe { std::ptr::write(*ustr_ptr, std::ptr::read(orig)); }
+        // SAFETY: each patch snapshotted its original at apply time; restore in
+        // reverse order (Attr then UnicodeString — order is irrelevant here as
+        // the patches target independent fields).
+        for p in &self.patches {
+            unsafe {
+                match p {
+                    Patch::UnicodeString { ptr, orig } => {
+                        std::ptr::write(*ptr, std::ptr::read(orig));
+                    }
+                    Patch::Attr { ptr, orig_value, orig_size } => {
+                        (**ptr).Value = *orig_value;
+                        (**ptr).Size = *orig_size;
+                    }
+                }
+            }
         }
     }
 }
@@ -1012,12 +1071,29 @@ unsafe extern "system" fn hook_nt_create_user_process(
     ipc_log(ipc::LogLevel::Info,
         format!("spawn_attempt: parent={parent_pid} target={spawn_target}"));
 
-    // If the EXE only exists in the CoW overlay, the kernel image loader fails
-    // with STATUS_PATH_NOT_FOUND (a fundamental limitation of a user-mode CoW
-    // overlay — see ImagePathOverlayGuard::new for the full rationale). We
-    // patch the one field we can address safely (ImagePathName); it does not
-    // make the spawn succeed, but it is harmless and serves as a diagnostic.
-    let _img_guard = unsafe { ImagePathOverlayGuard::new(process_parameters, create_info) };
+    // C0 diagnostic: when the target EXE is overlay-managed (the spawn-overlay-
+    // redirect case), dump the PS_ATTRIBUTE_LIST entries so we can confirm the
+    // PsAttributeImageName record (number 5) is present and read its Value
+    // convention (raw PWSTR + byte Size vs a UNICODE_STRING pointer). This is
+    // evidence-gathering BEFORE the C2 patch — it must not guess the convention.
+    if is_trace() && !spawn_target.is_empty() {
+        let vt = spawn_target.to_ascii_lowercase();
+        let decision = decide(&vt, false);
+        if matches!(decision.mode, policy::Mode::Cow | policy::Mode::Mock) {
+            crate::proc_guard::dump_attr_list_for_overlay_spawn(attribute_list, &spawn_target);
+        }
+    }
+
+    // If the EXE only exists in the CoW overlay, the kernel image loader would
+    // fail with STATUS_PATH_NOT_FOUND. ImagePathOverlayGuard rewrites the
+    // PsAttributeImageName record (number 5) in the attribute list to point at
+    // the overlay copy for the duration of the syscall — the loader then maps
+    // the overlay bytes directly, with NOTHING written to the host. This is the
+    // principled solution (no materialize, no host write). See the guard's
+    // docs for the full rationale.
+    let _img_guard = unsafe {
+        ImagePathOverlayGuard::new(process_parameters, create_info, attribute_list)
+    };
 
     let status = HOOK_NT_CREATE_USER_PROCESS.get().unwrap().call(
         process_handle, thread_handle,
