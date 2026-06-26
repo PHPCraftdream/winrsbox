@@ -22,7 +22,10 @@ pub(crate) struct PolicyInner {
     pub(crate) db: Arc<redb::Database>,
     pub(crate) cache: Cache<u128, Arc<Decision>>,
     pub(crate) snapshot: arc_swap::ArcSwap<decide::Snapshot>,
-    pub(crate) sandbox_root: PathBuf,
+    /// Same-volume overlay layout: maps a virtual drive to an overlay root on
+    /// that same volume, so kernel-reported drive letters (from the handle's
+    /// physical volume) are correct. Falls back to a single primary root.
+    pub(crate) overlay_layout: crate::path::OverlayLayout,
     pub(crate) mock_dirs_root: PathBuf,
     pub(crate) project_root_lower: String,
 }
@@ -31,6 +34,23 @@ impl Policy {
     pub fn open_or_create(
         db_path: &Path,
         sandbox_root: PathBuf,
+        mock_dirs_root: PathBuf,
+        project_root: PathBuf,
+    ) -> Result<Self, PolicyError> {
+        Self::open_or_create_with_layout(
+            db_path,
+            crate::path::OverlayLayout::single(sandbox_root),
+            mock_dirs_root,
+            project_root,
+        )
+    }
+
+    /// Open the policy with an explicit same-volume overlay layout (per-drive
+    /// roots). Used by the launcher to place the overlay for each virtual
+    /// drive on that same drive (fixes the drive-letter identity leak).
+    pub fn open_or_create_with_layout(
+        db_path: &Path,
+        overlay_layout: crate::path::OverlayLayout,
         mock_dirs_root: PathBuf,
         project_root: PathBuf,
     ) -> Result<Self, PolicyError> {
@@ -56,7 +76,7 @@ impl Policy {
                 db,
                 cache: Cache::new(16384),
                 snapshot: arc_swap::ArcSwap::from(snapshot),
-                sandbox_root,
+                overlay_layout,
                 mock_dirs_root,
                 project_root_lower,
             }),
@@ -70,6 +90,11 @@ impl Policy {
         Arc::clone(&self.inner.db)
     }
 
+    /// The overlay layout (per-drive same-volume roots).
+    pub fn overlay_layout(&self) -> &crate::path::OverlayLayout {
+        &self.inner.overlay_layout
+    }
+
     pub fn load_config(&self, path: &Path) -> Result<(), PolicyError> {
         let src = std::fs::read_to_string(path)?;
         let cfg: db::Config = ktav::from_str(&src)
@@ -81,8 +106,11 @@ impl Policy {
         Ok(())
     }
 
+    /// The primary overlay root (project drive). Kept for backward compat
+    /// with callers that publish FS_SANDBOX_ROOT; prefer `overlay_layout()`
+    /// for per-drive resolution.
     pub fn sandbox_root(&self) -> &Path {
-        &self.inner.sandbox_root
+        self.inner.overlay_layout.primary()
     }
 
     pub fn mock_dirs_root(&self) -> &Path {

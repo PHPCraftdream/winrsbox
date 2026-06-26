@@ -82,13 +82,47 @@ impl TestEnv {
         TestEnv { base, project_root, state_dir }
     }
 
-    /// Mirrors policy::path::mirror_into_overlay logic: strip the colon,
-    /// normalize slashes, drop leading backslash, join under workdir/.
+    /// Mirrors policy::path::mirror_into_overlay_layout (Path 1 same-volume
+    /// layout): the overlay path is `<root>\<volume-relative-tail>` (NO drive
+    /// component — the drive is implicit in the chosen root's volume). When
+    /// the target's drive differs from the project drive, the launcher places
+    /// a same-volume root under %LOCALAPPDATA%\.winrsbox; when it matches, the
+    /// primary state_dir/workdir root is used.
     fn overlay_for(&self, dos_path: &str) -> PathBuf {
         let lower = dos_path.to_lowercase();
-        let sanitized = lower.replace(':', "").replace('/', "\\");
-        let sanitized = sanitized.trim_start_matches('\\');
-        self.state_dir.join("workdir").join(sanitized)
+        // Strip "<drive>:" prefix → volume-relative tail.
+        let tail = if lower.as_bytes().len() >= 2 && lower.as_bytes()[1] == b':' {
+            &lower[2..]
+        } else {
+            &lower[..]
+        };
+        let sanitized = tail.replace('/', "\\").trim_start_matches('\\').to_string();
+        let drive = lower.chars().next().unwrap_or('d').to_ascii_lowercase();
+        let project_drive = self
+            .project_root
+            .to_string_lossy()
+            .chars()
+            .next()
+            .map(|c| c.to_ascii_lowercase())
+            .unwrap_or('d');
+        if drive == project_drive {
+            // Same drive as project → primary_root (state_dir/workdir).
+            self.state_dir.join("workdir").join(&sanitized)
+        } else {
+            // Different drive → same-volume root under %LOCALAPPDATA%.
+            let session = self
+                .project_root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "project".to_string());
+            std::env::var("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| self.state_dir.parent().unwrap().to_path_buf())
+                .join(".winrsbox")
+                .join(session)
+                .join("workdir")
+                .join(&sanitized)
+        }
     }
 }
 
