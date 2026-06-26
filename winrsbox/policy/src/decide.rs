@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
@@ -213,6 +213,31 @@ fn path_is_plain_file(dos_path: &str) -> bool {
     match std::fs::symlink_metadata(dos_path) {
         Ok(md) => md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
         Err(_) => false,
+    }
+}
+
+/// Consult the PHYSICAL overlay mirror tree (not the index) for whether a
+/// virtual path is alive in the overlay. The overlay tree is the source of
+/// truth; `OVERLAY_IDX` is only a cache that can have holes — most notably
+/// from relative-open creates against an already-overlay-redirected directory
+/// handle (the kernel creates the file under the overlay, but the create does
+/// not flow through the index-recording Cow branch). Without this physical
+/// check, reads of such files (e.g. a cloned repo's `.git`, `agent/`,
+/// `readme.md`) miss the index and passthrough to the real disk, where they
+/// don't exist → `STATUS_OBJECT_NAME_NOT_FOUND`. This makes the model behave
+/// like a real OverlayFS: presence is defined by the overlay filesystem, the
+/// index just accelerates the common hit path.
+///
+/// `lower` is the lowercased virtual DOS path; `sandbox_root` is the overlay
+/// storage root. Returns the concrete overlay DOS path when the file/dir
+/// exists there, else `None`. Uses `symlink_metadata` (no-follow) so a
+/// reparse point planted in the overlay is not falsely reported as a live
+/// regular node.
+fn physical_overlay_path(lower: &str, sandbox_root: &Path) -> Option<PathBuf> {
+    let mirror = path::mirror_into_overlay(lower, sandbox_root);
+    match std::fs::symlink_metadata(&mirror) {
+        Ok(_) => Some(mirror),
+        Err(_) => None,
     }
 }
 
@@ -674,14 +699,19 @@ impl Policy {
                 .and_then(|t| t.get(&*lower).ok().flatten().is_some().then_some(()))
                 .is_some();
             if is_whiteouted {
-                let has_overlay = txn.open_table(db::OVERLAY_IDX)
+                // "Alive in the overlay" = present in the index OR physically
+                // materialized (relative-create holes). Either means the path
+                // was revived after the delete; fall through to Cow below.
+                let idx_hit = txn.open_table(db::OVERLAY_IDX)
                     .ok()
                     .and_then(|t| t.get(&*lower).ok().flatten().map(|_| ()))
                     .is_some();
-                if !has_overlay {
+                let phys_hit = !idx_hit
+                    && physical_overlay_path(&lower, &self.inner.sandbox_root).is_some();
+                if !(idx_hit || phys_hit) {
                     return Decision { mode: Mode::Hidden, overlay: None, cow_from: None, mock_payload: None };
                 }
-                // has_overlay: fall through (revive) — normal flow returns Cow below.
+                // alive: fall through (revive) — normal flow returns Cow below.
             }
         }
 
@@ -725,6 +755,8 @@ impl Policy {
             db::RuleMode::Deny => Decision { mode: Mode::Deny, overlay: None, cow_from: None, mock_payload: None },
             db::RuleMode::Passthrough => {
                 if !write_access {
+                    // Index first (fast path): an exact-key hit redirects the
+                    // read into the overlay.
                     if let Ok(txn) = self.inner.db.begin_read() {
                         if let Ok(t) = txn.open_table(db::OVERLAY_IDX) {
                             if let Ok(Some(v)) = t.get(&*lower) {
@@ -732,6 +764,16 @@ impl Policy {
                                 return Decision { mode: Mode::Cow, overlay: Some(ov), cow_from: None, mock_payload: None };
                             }
                         }
+                    }
+                    // Index MISS → consult the PHYSICAL overlay mirror tree
+                    // (source of truth). This catches files that exist in the
+                    // overlay but were never indexed (relative-open-create
+                    // holes, e.g. a cloned repo's `.git`/`agent/`). Without it,
+                    // the read passthroughs to the real disk and fails with
+                    // STATUS_OBJECT_NAME_NOT_FOUND. The mirror check is a single
+                    // local stat; HookCache amortizes it across repeated reads.
+                    if let Some(ov) = physical_overlay_path(&lower, &self.inner.sandbox_root) {
+                        return Decision { mode: Mode::Cow, overlay: Some(ov), cow_from: None, mock_payload: None };
                     }
                 }
                 passthrough()
