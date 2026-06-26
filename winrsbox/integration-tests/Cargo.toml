@@ -278,6 +278,10 @@ name = "escape_token_impersonate"
 path = "src/bin/escape_token_impersonate.rs"
 
 [[bin]]
+name = "escape_ntfs_ea"
+path = "src/bin/escape_ntfs_ea.rs"
+
+[[bin]]
 name = "escape_dll_sideload"
 path = "src/bin/escape_dll_sideload.rs"
 
