@@ -21,9 +21,19 @@ use serial_test::serial;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn find_binary(name: &str) -> PathBuf {
+/// Resolve the workspace target dir, respecting `CARGO_TARGET_DIR`
+/// (set when the workspace uses a non-default target dir) and falling
+/// back to `<workspace>/target` for the standard in-tree layout.
+fn target_dir() -> PathBuf {
     let manifest = env!("CARGO_MANIFEST_DIR");
-    let target_dir = Path::new(manifest).parent().unwrap().join("target");
+    let workspace_root = Path::new(manifest).parent().unwrap();
+    std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace_root.join("target"))
+}
+
+fn find_binary(name: &str) -> PathBuf {
+    let target_dir = target_dir();
     for profile in ["release", "debug"] {
         let p = target_dir.join(profile).join(format!("{name}.exe"));
         if p.exists() {
@@ -36,8 +46,7 @@ fn find_binary(name: &str) -> PathBuf {
 fn find_launcher() -> PathBuf { find_binary("winrsbox") }
 
 fn find_hook_dll() -> PathBuf {
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let target_dir = Path::new(manifest).parent().unwrap().join("target");
+    let target_dir = target_dir();
     for profile in ["release", "debug"] {
         let p = target_dir.join(profile).join("hook.dll");
         if p.exists() {

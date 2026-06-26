@@ -18,10 +18,19 @@ use serial_test::serial;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn find_binary(name: &str) -> PathBuf {
+/// Resolve the workspace target dir, respecting `CARGO_TARGET_DIR`
+/// (set when the workspace uses a non-default target dir) and falling
+/// back to `<workspace>/target` for the standard in-tree layout.
+fn target_dir() -> PathBuf {
     let manifest = env!("CARGO_MANIFEST_DIR");
-    let target_dir = Path::new(manifest).parent().unwrap().join("target");
+    let workspace_root = Path::new(manifest).parent().unwrap();
+    std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace_root.join("target"))
+}
 
+fn find_binary(name: &str) -> PathBuf {
+    let target_dir = target_dir();
     // Try release first, then debug
     for profile in ["release", "debug"] {
         let p = target_dir.join(profile).join(format!("{name}.exe"));
@@ -34,8 +43,7 @@ fn find_binary(name: &str) -> PathBuf {
 
 fn find_launcher() -> PathBuf { find_binary("winrsbox") }
 fn find_hook_dll() -> PathBuf {
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let target_dir = Path::new(manifest).parent().unwrap().join("target");
+    let target_dir = target_dir();
     for profile in ["release", "debug"] {
         let p = target_dir.join(profile).join("hook.dll");
         if p.exists() {
@@ -495,9 +503,32 @@ fn strict_blocks_junction_creation() {
 #[test]
 #[serial]
 fn strict_blocks_hardlink_creation() {
+    // Under the CoW model a hardlink to an out-of-project target is not
+    // hard-denied — it is redirected into the overlay. The payload can't tell
+    // "absorbed" from "leaked" from inside the sandbox (its own probes are
+    // hooked), so the load-bearing check is the OUTER real-disk leak guard.
+    let target = std::env::temp_dir().join("fs-sandbox-hardlink-test.dat");
+    let source = std::env::temp_dir().join("fs-sandbox-hardlink-source.dat");
+    let _ = std::fs::remove_file(&target);
+    let _ = std::fs::remove_file(&source);
+
     let r = run_payload("escape_hardlink", "scan");
-    assert_eq!(r.status.code(), Some(5),
-        "escape_hardlink should exit 5 (blocked)\nstderr: {}", r.stderr);
+    let code = r.status.code();
+    // exit 0 = CoW-absorbed (allowed), exit 5 = hard-denied. Both are safe;
+    // anything else is an unexpected payload failure.
+    assert!(code == Some(0) || code == Some(5),
+        "escape_hardlink should exit 0 (CoW-absorbed) or 5 (denied), got {:?}\nstderr: {}", code, r.stderr);
+
+    // OUTER LEAK GUARD: neither the link target nor the source may have
+    // materialized on the real disk. If either exists, the CoW redirect
+    // failed and the sandbox leaked.
+    assert!(!target.exists(),
+        "hardlink target LEAKED to real disk: {} — CoW isolation failed!\nstderr: {}", target.display(), r.stderr);
+    assert!(!source.exists(),
+        "hardlink source LEAKED to real disk: {} — CoW isolation failed!\nstderr: {}", source.display(), r.stderr);
+
+    let _ = std::fs::remove_file(&target);
+    let _ = std::fs::remove_file(&source);
 }
 
 #[test]
@@ -929,10 +960,26 @@ fn strict_blocks_service_changeconfig() {
 #[test]
 #[serial]
 fn strict_blocks_rename_outside_sandbox() {
+    // Under the CoW model a rename to an out-of-project target is not
+    // hard-denied — it is redirected into the overlay. The payload can't tell
+    // "absorbed" from "leaked" from inside the sandbox (its own `.exists()`
+    // probe is hooked and observes the overlay copy), so the load-bearing
+    // check is the OUTER real-disk leak guard.
+    let dst_real = std::path::Path::new(r"C:\Windows\Temp\winrsbox_escape_rename.txt");
+    let _ = std::fs::remove_file(dst_real);
+
     let r = run_payload("escape_rename_outside_sandbox", "scan");
     let code = r.status.code();
-    assert!(code == Some(5) || code == Some(6),
-        "rename outside sandbox should be blocked, got {:?}\nstderr: {}", code, r.stderr);
+    // exit 0 = CoW-absorbed (allowed), exit 5 = hard-denied. Both are safe.
+    assert!(code == Some(0) || code == Some(5),
+        "rename outside sandbox should exit 0 (CoW-absorbed) or 5 (denied), got {:?}\nstderr: {}", code, r.stderr);
+
+    // OUTER LEAK GUARD: the destination must NOT exist on the real disk.
+    // If it does, the CoW redirect failed and the file escaped the sandbox.
+    assert!(!dst_real.exists(),
+        "rename target LEAKED to real disk: {} — CoW isolation failed!\nstderr: {}", dst_real.display(), r.stderr);
+
+    let _ = std::fs::remove_file(dst_real);
 }
 
 #[test]

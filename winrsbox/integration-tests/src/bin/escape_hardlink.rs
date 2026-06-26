@@ -70,11 +70,13 @@ fn main() {
             11, // FileLinkInformation
         );
         winapi::um::handleapi::CloseHandle(h);
-        let _ = std::fs::remove_file(&target);
-        let _ = std::fs::remove_file(&source);
+        // Deliberately do NOT remove source/target: those self-deletes run
+        // under our own CoW hooks (overlay whiteout) and would mask a real
+        // leak from the outer test process. The outer process owns the
+        // real-disk leak check, so leave artifacts in place.
 
         if status >= 0 {
-            eprintln!("[escape_hardlink] HARD LINK CREATED — escape possible! status=0x{status:08x}");
+            eprintln!("[escape_hardlink] link op returned success status=0x{status:08x} (CoW-absorbed unless outer check finds a leak)");
             std::process::exit(0);
         } else if status as u32 == 0xC0000022 {
             eprintln!("[escape_hardlink] blocked: STATUS_ACCESS_DENIED");

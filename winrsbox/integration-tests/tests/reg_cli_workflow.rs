@@ -2,10 +2,20 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::PathBuf;
 
+/// Resolve path to the winrsbox binary.
+///
+/// Respects `CARGO_TARGET_DIR` (set by cargo when the workspace uses a
+/// non-default target dir, e.g. via env or `.cargo/config.toml`), falling
+/// back to `<workspace>/target/debug` for the standard layout. Without this,
+/// these integration tests silently break whenever the workspace target dir
+/// is not the in-tree `target/`.
 fn winrsbox_path() -> PathBuf {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let workspace_root = PathBuf::from(manifest_dir).parent().unwrap().to_path_buf();
-    workspace_root.join("target").join("debug").join("winrsbox.exe")
+    let target_root = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| workspace_root.join("target"));
+    target_root.join("debug").join("winrsbox.exe")
 }
 
 fn winrsbox() -> Command {
