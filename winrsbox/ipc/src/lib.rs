@@ -175,7 +175,7 @@ pub enum Req {
         stack_top: Vec<u64>,
     },
     RegDecide { key_path: String, value_name: Option<String>, write: bool },
-    RegWrite { key_path: String, value_name: String, value_json: Vec<u8> },
+    RegWrite { key_path: String, value_name: String, value: policy::reg::RegValue },
     RegDeleteValue { key_path: String, value_name: String },
     RegDeleteKey { key_path: String },
     NetDecide { host: String, port: u16 },
@@ -570,12 +570,14 @@ mod tests {
 
     #[test]
     fn req_reg_write_roundtrip() {
-        let msg = Req::RegWrite { key_path: "k".into(), value_name: "v".into(), value_json: vec![1,2,3] };
+        use policy::reg::{RegData, RegType, RegValue};
+        let val = RegValue { typ: RegType::Sz, data: RegData::String("hello".into()) };
+        let msg = Req::RegWrite { key_path: "k".into(), value_name: "v".into(), value: val.clone() };
         let mut buf = Cursor::new(Vec::new());
         write_msg(&mut buf, &msg).unwrap();
         buf.set_position(0);
         let dec: Req = read_msg(&mut buf).unwrap();
-        match dec { Req::RegWrite { value_json, .. } => assert_eq!(value_json, vec![1,2,3]), _ => panic!() }
+        match dec { Req::RegWrite { value, .. } => assert_eq!(value, val), _ => panic!() }
     }
 
     #[test]

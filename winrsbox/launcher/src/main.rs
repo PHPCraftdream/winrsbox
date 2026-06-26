@@ -355,6 +355,13 @@ async fn main() -> Result<()> {
     );
     policy.load_config(&cfg_path)?;
 
+    // Registry policy — shares the FS policy DB; overlay store lives under
+    // <state_dir>/workreg. Required for sandboxed installers that write user
+    // env-vars / config to the registry (CoW-overlayed, host untouched).
+    let workreg_root = cfg_path.parent().unwrap().join("workreg");
+    std::fs::create_dir_all(&workreg_root)?;
+    let reg_policy = Arc::new(policy::RegistryPolicy::open(policy.db(), workreg_root)?);
+
     // Named pipe name — use launcher PID for uniqueness
     let pipe_name = format!(r"\\.\pipe\fs-sandbox-{}", std::process::id());
 
@@ -404,6 +411,7 @@ async fn main() -> Result<()> {
     // ── Pipe server (accept loop in background task) ──────────────────────
     {
         let policy = Arc::clone(&policy);
+        let reg_policy = Arc::clone(&reg_policy);
         let stats = Arc::clone(&stats);
         let child_pids = Arc::clone(&child_pids);
         let pipe_name2 = pipe_name.clone();
@@ -416,6 +424,7 @@ async fn main() -> Result<()> {
             if let Err(e) = pipe_server::pipe_accept_loop(
                 &pipe_name2,
                 policy,
+                reg_policy,
                 stats,
                 child_pids,
                 violations_log2,
