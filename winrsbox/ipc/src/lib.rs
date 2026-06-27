@@ -33,8 +33,18 @@ pub struct SessionConfig {
     /// policy.redb live). Published so the hook can recognise overlay paths
     /// on delete and convert them back to virtual DOS paths via
     /// `policy::path::unmirror_from_overlay`.
+    ///
+    /// When the overlay spans multiple volumes (same-volume overlay layout),
+    /// `overlay_roots` carries the full per-drive root list; `sandbox_root`
+    /// remains the primary (project-drive) root for backward compat.
     #[serde(default)]
     pub sandbox_root: String,
+    /// All overlay roots (per-drive, same-volume layout). Non-empty = multi-
+    /// volume layout; the hook masks paths against EVERY root and derives the
+    /// drive letter from the root that matched. When empty, the hook falls
+    /// back to `sandbox_root` (legacy single-root behaviour).
+    #[serde(default)]
+    pub overlay_roots: Vec<String>,
     pub trace: bool,
     pub guard: String,
     pub allow_rwx: bool,
@@ -617,6 +627,7 @@ mod tests {
             dll_path: r"D:\bin\hook.dll".into(),
             cwd: r"D:\sandbox\workdir".into(),
             sandbox_root: r"D:\sandbox".into(),
+            overlay_roots: vec![],
             trace: true,
             guard: "scan".into(),
             allow_rwx: false,

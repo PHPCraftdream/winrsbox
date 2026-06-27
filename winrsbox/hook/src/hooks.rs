@@ -415,24 +415,36 @@ fn unmirror_overlay_handle_relative(
     overlay_dos: &str,
     sandbox_root: Option<&str>,
 ) -> Option<String> {
-    let sb = sandbox_root?;
-    let sb_lower = sb.to_lowercase();
-    let sb_trimmed = sb_lower.trim_end_matches('\\');
-    if sb_trimmed.is_empty() {
-        return None;
+    // Candidate overlay-roots: all per-drive same-volume roots if published,
+    // else the legacy single sandbox_root. A relative-open handle may point
+    // into ANY of them (e.g. a C:-root overlay for a C: virtual path), so try
+    // each until one prefix-matches and unmirrors cleanly.
+    let roots: Vec<&str> = match crate::ipc_client::OVERLAY_ROOTS.get() {
+        Some(list) if !list.is_empty() => list.iter().map(|s| s.as_str()).collect(),
+        _ => sandbox_root.into_iter().collect(),
+    };
+    for sb in roots {
+        let sb_lower = sb.to_lowercase();
+        let sb_trimmed = sb_lower.trim_end_matches('\\');
+        if sb_trimmed.is_empty() {
+            continue;
+        }
+        if !policy::path::pattern_matches_prefix(sb_trimmed, overlay_dos) {
+            continue;
+        }
+        let overlay_pbuf = std::path::PathBuf::from(overlay_dos);
+        if let Some(virtual_dos) = policy::path::unmirror_from_overlay(
+            &overlay_pbuf,
+            std::path::Path::new(sb_trimmed),
+        ) {
+            // `unmirror_from_overlay` rebuilds `<letter>:\<rest>` from path
+            // components but does not lowercase; lowercase to match the
+            // canonical form used by the overlay mirror keys, denylist, and
+            // decide path comparison.
+            return Some(virtual_dos.to_ascii_lowercase());
+        }
     }
-    if !policy::path::pattern_matches_prefix(sb_trimmed, overlay_dos) {
-        return None;
-    }
-    let overlay_pbuf = std::path::PathBuf::from(overlay_dos);
-    let virtual_dos = policy::path::unmirror_from_overlay(
-        &overlay_pbuf,
-        std::path::Path::new(sb_trimmed),
-    )?;
-    // `unmirror_from_overlay` rebuilds `<letter>:\<rest>` from path components
-    // but does not lowercase; lowercase to match the canonical form used by the
-    // overlay mirror keys, denylist, and decide path comparison.
-    Some(virtual_dos.to_ascii_lowercase())
+    None
 }
 
 pub(crate) unsafe fn extract_raw_nt_path(attrs: *const OBJECT_ATTRIBUTES) -> Option<String> {

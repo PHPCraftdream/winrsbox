@@ -542,6 +542,14 @@ async fn main() -> Result<()> {
         dll_path: dll_path.clone(),
         cwd: cwd_str.clone(),
         sandbox_root: sandbox_root.to_string_lossy().into_owned(),
+        // Publish ALL overlay roots (per-drive same-volume layout) so the hook
+        // can mask paths against every root and derive the drive letter from
+        // the matched one. Empty = single-root legacy fallback in the hook.
+        overlay_roots: policy
+            .overlay_layout()
+            .all_roots()
+            .map(|(_drive, root)| root.to_string_lossy().into_owned())
+            .collect(),
         trace: cli.trace || effective_log_level.eq_ignore_ascii_case("trace"),
         guard: match cli.guard {
             GuardLevel::None => "none".into(),

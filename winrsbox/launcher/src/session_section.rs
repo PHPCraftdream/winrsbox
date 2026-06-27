@@ -107,6 +107,7 @@ mod tests {
             dll_path: r"D:\bin\hook.dll".into(),
             cwd: r"D:\sandbox".into(),
             sandbox_root: r"D:\sandbox_root".into(),
+            overlay_roots: vec![],
             trace: true,
             guard: "scan".into(),
             allow_rwx: false,
