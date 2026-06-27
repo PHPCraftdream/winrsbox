@@ -114,11 +114,16 @@ pub(crate) unsafe fn query_handle_dos_path(handle: HANDLE) -> Option<String> {
 
 /// Given a RootDirectory handle and a filename from FILE_RENAME/LINK_INFORMATION,
 /// resolve to an absolute lowercase DOS path. Returns None on failure.
+///
+/// If the resolved path lands inside the overlay storage (because the root
+/// handle was itself CoW-redirected), it is unmirrored back to its virtual
+/// form — WITHOUT this, `decide` would mirror the overlay path AGAIN,
+/// producing a double-nested overlay location and breaking rename operations.
 unsafe fn resolve_dest_path(root: HANDLE, name: &str) -> Option<String> {
-    if root.is_null() {
+    let raw = if root.is_null() {
         // name is absolute (NT path like \??\C:\... or DOS like C:\...)
         let name_u16: Vec<u16> = name.encode_utf16().collect();
-        policy::path::nt_to_dos_lower(&name_u16)
+        policy::path::nt_to_dos_lower(&name_u16)?
     } else {
         // Relative: resolve root handle path, then append name
         let base = query_handle_dos_path(root)?;
@@ -127,8 +132,15 @@ unsafe fn resolve_dest_path(root: HANDLE, name: &str) -> Option<String> {
         } else {
             format!("{}\\{}", base, name)
         };
-        Some(full.to_ascii_lowercase())
-    }
+        full.to_ascii_lowercase()
+    };
+    // Unmirror: if the resolved path is under an overlay root (because the
+    // root handle lives in the overlay), convert it back to its virtual form
+    // so decide/mirror operates on the correct path. Without this the rename
+    // dest is double-mirrored into a nested overlay location.
+    let sb_root = hooks::SANDBOX_ROOT.get().map(|s| s.as_str());
+    let unmirrored = hooks::unmirror_overlay_handle_relative(&raw, sb_root);
+    Some(unmirrored.unwrap_or(raw))
 }
 
 /// Returns true if a rename/hardlink destination is an escape vector and must

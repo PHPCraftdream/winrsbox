@@ -324,6 +324,23 @@ pub(crate) unsafe fn resolve_for_hook(
 
     // Fast path: ObjectName already in absolute NT form (`\??\C:\…`).
     if let Some(dos) = policy::path::nt_to_dos_lower(name_slice) {
+        // Self-block guard (class #64 for ABSOLUTE paths, symmetric with the
+        // relative-open case at line 321). A sandboxed process that learned
+        // its own overlay path via a passthrough query channel (class-9
+        // FileNameInformation or NtQueryObject — neither masked, by design)
+        // will re-open it ABSOLUTELY. Without this unmirror, the absolute
+        // overlay path (e.g. `c:\users\…\.winrsbox\<session>\workdir\…
+        // \clone\.git`) hits `canonical_denylist_status`'s `\.winrsbox\`
+        // rule and returns NAME_NOT_FOUND — a self-DoS that breaks the
+        // sandboxed process's own CoW files. Unmirror the overlay path back
+        // to its virtual form for the POLICY decision; the kernel-open path
+        // (`pre_resolved = None`) stays on the absolute overlay path so the
+        // real file under the overlay is opened. Control files (policy.redb,
+        // session-config inside .winrsbox but NOT under workdir\) remain
+        // denied — unmirror only succeeds for paths under a known overlay
+        // workdir root.
+        let sb_root = SANDBOX_ROOT.get().map(|s| s.as_str());
+        let dos = unmirror_overlay_handle_relative(&dos, sb_root).unwrap_or(dos);
         return Some((dos, None));
     }
 
@@ -411,7 +428,7 @@ pub(crate) fn join_bare_relative_to_nt(cwd: &[u16], name: &[u16]) -> Vec<u16> {
 /// Pure over its inputs — callers pass `Some(sb_root)` from `SANDBOX_ROOT.get()`
 /// in production and a literal string in tests (avoids contending with the
 /// process-global `OnceLock`).
-fn unmirror_overlay_handle_relative(
+pub(crate) fn unmirror_overlay_handle_relative(
     overlay_dos: &str,
     sandbox_root: Option<&str>,
 ) -> Option<String> {
@@ -433,14 +450,52 @@ fn unmirror_overlay_handle_relative(
             continue;
         }
         let overlay_pbuf = std::path::PathBuf::from(overlay_dos);
+        // Try BOTH layouts: the Path-1 same-volume layout (no <drive>\
+        // component — the drive is implicit in the chosen root) AND the legacy
+        // layout (<root>\<drive>\<rest>). The same-volume layout is the
+        // primary; the legacy fallback covers old overlay paths that still
+        // carry the drive component.
+        // Path 1 layout: strip root, prepend the root's drive letter.
+        // Also handle the legacy layout (<root>\<drive>\<rest>): if the first
+        // component after root is a single ASCII letter, use it as the drive
+        // and skip it (old <drive>\ component). Otherwise the root's drive
+        // is the virtual drive (Path 1 same-volume layout, no <drive>\ comp).
+        if let Ok(rest) = overlay_pbuf.strip_prefix(sb_trimmed) {
+            let root_drive = sb_trimmed.chars().next().filter(|c| c.is_ascii_alphabetic());
+            let mut comps = rest.components();
+            let first = comps.next();
+            // Check if the first component is a single ASCII letter (old layout).
+            let (drive, remaining) = match first {
+                Some(std::path::Component::Normal(s))
+                    if s.len() == 1 && s.to_str().map(|c| c.chars().next().unwrap_or('\0').is_ascii_alphabetic()).unwrap_or(false) =>
+                {
+                    // Old layout: <root>\<drive>\<rest> — drive from first comp.
+                    (s.to_str().unwrap().chars().next(), comps)
+                }
+                _ => {
+                    // Path 1 layout: <root>\<rest> — drive from root.
+                    (root_drive, rest.components())
+                }
+            };
+            if let Some(d) = drive {
+                let mut virtual_dos = format!("{}:", d);
+                for c in remaining {
+                    match c {
+                        std::path::Component::Normal(s) => {
+                            virtual_dos.push('\\');
+                            virtual_dos.push_str(s.to_str()?);
+                        }
+                        _ => {}
+                    }
+                }
+                return Some(virtual_dos.to_ascii_lowercase());
+            }
+        }
+        // Legacy layout fallback.
         if let Some(virtual_dos) = policy::path::unmirror_from_overlay(
             &overlay_pbuf,
             std::path::Path::new(sb_trimmed),
         ) {
-            // `unmirror_from_overlay` rebuilds `<letter>:\<rest>` from path
-            // components but does not lowercase; lowercase to match the
-            // canonical form used by the overlay mirror keys, denylist, and
-            // decide path comparison.
             return Some(virtual_dos.to_ascii_lowercase());
         }
     }
@@ -524,7 +579,23 @@ pub(crate) fn canonical_denylist_status(canon: &str) -> Option<(NTSTATUS, &'stat
     // Sandbox state directory — masked as non-existent (NAME_NOT_FOUND) so the
     // process treats `.winrsbox` as absent rather than forbidden.
     if canon.contains(r"\.winrsbox\") || canon.ends_with(r"\.winrsbox") {
-        return Some((STATUS_OBJECT_NAME_NOT_FOUND, "winrsbox"));
+        // Self-access carve-out (symmetric with unmirror_overlay_handle_relative
+        // for relative opens): a sandboxed process that learned its own overlay
+        // path via a passthrough query channel (class-9 FileNameInformation or
+        // NtQueryObject — neither masked by design) will re-open its OWN CoW
+        // files ABSOLUTELY. Without this carve-out, the absolute overlay path
+        // (e.g. `c:\users\…\.winrsbox\<session>\workdir\…\.git`) is blocked by
+        // the `\.winrsbox\` rule → NAME_NOT_FOUND → the process's own files
+        // become inaccessible. This is a self-DoS, not a probing attack.
+        //
+        // Only carve out paths UNDER a known overlay workdir root — control
+        // files (policy.redb, session-config, violations.log) live inside
+        // `.winrsbox` but NOT under `workdir\`, so they stay denied. The match
+        // is case-insensitive (canon is already lowercased) and segment-
+        // anchored via `pattern_matches_prefix`.
+        if !is_self_overlay_workdir_access(&canon) {
+            return Some((STATUS_OBJECT_NAME_NOT_FOUND, "winrsbox"));
+        }
     }
     None
 }
@@ -608,6 +679,46 @@ pub(crate) unsafe fn check_path_traversal(attrs: *const OBJECT_ATTRIBUTES, creat
     }
 
     None
+}
+
+/// Return true iff a canonicalized lowercased DOS path is under one of the
+/// known overlay WORKDIR roots (i.e. it is the sandboxed process's own CoW
+/// data, re-opened absolutely after a passthrough query leaked the overlay
+/// location). This is the self-access carve-out for the `\.winrsbox\` deny
+/// rule: control files (policy.redb, session-config) live under `.winrsbox`
+/// but NOT under `workdir\`, so they remain denied.
+///
+/// `canon` is already ASCII-lowercased + canonicalized (per-segment trailing
+/// dot/space stripped) by `canonicalize_for_denylist`. Matching is segment-
+/// anchored via `pattern_matches_prefix` to avoid sibling-prefix false hits.
+fn is_self_overlay_workdir_access(canon: &str) -> bool {
+    // Try the multi-root layout first (Path 1), then the legacy single root.
+    let roots: Vec<&str> = match crate::ipc_client::OVERLAY_ROOTS.get() {
+        Some(list) if !list.is_empty() => list.iter().map(|s| s.as_str()).collect(),
+        _ => match SANDBOX_ROOT.get() {
+            Some(s) => vec![s.as_str()],
+            None => return false,
+        },
+    };
+    // `canon` may carry the `\??\` NT prefix; strip it for the DOS comparison.
+    let canon_dos = strip_nt_dos_prefix(canon).unwrap_or(canon);
+    for root in &roots {
+        let root_lower = root.to_ascii_lowercase();
+        let root_trimmed = root_lower.trim_end_matches('\\');
+        if root_trimmed.is_empty() {
+            continue;
+        }
+        if policy::path::pattern_matches_prefix(root_trimmed, canon_dos) {
+            return true;
+        }
+    }
+    // Diagnostic: log why the carve-out didn't match.
+    if is_trace() {
+        ipc_log(ipc::LogLevel::Trace,
+            format!("carveout_miss: canon_dos={canon_dos} roots_count={} first_root={:?}",
+                roots.len(), roots.first()));
+    }
+    false
 }
 
 /// Strip the `\??\` (or `\\?\`) prefix from an NT DOS-form path string.
@@ -1235,6 +1346,17 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(sb_root) = std::env::var("FS_SANDBOX_ROOT") {
         let _ = crate::ipc_client::SANDBOX_ROOT.set(sb_root);
     }
+
+    // Always load the session section from the shared memory mapping, EVEN
+    // when env vars are present. Env vars cover pipe_name/dll_path/cwd/trace/
+    // sandbox_root (legacy single-root), but the multi-root overlay layout
+    // (overlay_roots) is ONLY published via the session section — there is no
+    // env var for it. Without this call, the hook never learns about the C:
+    // overlay root, and multi-root path masking (path_info_guard /
+    // unmirror_overlay_handle_relative / the .winrsbox self-access carve-out)
+    // all fail to match C: overlay paths → raw overlay path leaks → git clone
+    // self-DoS.
+    let _ = crate::ipc_client::try_load_session_config_from_section();
 
     macro_rules! install {
         ($lock:expr, $sym:literal, $hook_fn:expr, $fn_ty:ty) => {{
