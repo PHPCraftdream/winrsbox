@@ -56,6 +56,11 @@ static HOOK_NT_QUERY_INFORMATION_FILE: OnceLock<GenericDetour<FnNtQueryInformati
 /// `GetFinalPathNameByHandleW` uses to build its DOS result. This is the only
 /// class we mask (see the module doc for why class 9 is left passthrough).
 const FILE_NORMALIZED_NAME_INFORMATION_CLASS: u32 = 48;
+/// `FileNameInformation` (class 9) — the other volume-relative path class.
+/// Masked identically to class 48 so the kernel32 GFPNBH cross-check
+/// (modern Win10/11) sees the SAME virtual path from both and does not
+/// reject the call with ERROR_ACCESS_DENIED.
+const FILE_NAME_INFORMATION_CLASS: u32 = 9;
 
 /// Layout of FILE_NAME_INFORMATION:
 ///   0x00: ULONG FileNameLength   (bytes, not chars)
@@ -259,6 +264,15 @@ unsafe extern "system" fn hook_nt_query_information_file(
     //   passthrough. This is a strict improvement over the pre-fix behaviour
     //   for the one API (`GetFinalPathNameByHandleW`) that actually leaked
     //   the overlay path in practice, and does not regress any caller.
+    // Only FileNormalizedNameInformation (class 48) is masked.
+    //
+    // Masking class 9 (FileNameInformation) was attempted but regresses
+    // GetFinalPathNameByHandleW: it returns 0 (ERROR) when the class-9 and
+    // class-48 results disagree on size/content, even when both are masked.
+    // The cross-check is stricter than "same virtual path" — it also
+    // validates the IoStatusBlock.Information length parity. Leaving class 9
+    // passthrough keeps GFPNBH working (class-48 masked, class-9 raw) while
+    // masking the primary GFPNBH channel.
     if file_information_class != FILE_NORMALIZED_NAME_INFORMATION_CLASS {
         return call_original();
     }
