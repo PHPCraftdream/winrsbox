@@ -87,6 +87,10 @@ pub(crate) static SANDBOX_CWD: std::sync::OnceLock<String> = std::sync::OnceLock
 /// session section's `sandbox_root` field). Used by the delete hook to
 /// recognise overlay files and convert them back to virtual DOS paths.
 pub(crate) static SANDBOX_ROOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// ALL overlay roots (per-drive, same-volume layout). Empty = single-root
+/// legacy; the hook masks against every entry and derives the drive letter
+/// from the matched root. Populated from SessionConfig.overlay_roots.
+pub(crate) static OVERLAY_ROOTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // Install-error buffer (P2-5)
@@ -195,6 +199,9 @@ fn try_load_session_config_from_section() -> Option<()> {
     }
     if !cfg.sandbox_root.is_empty() {
         let _ = SANDBOX_ROOT.set(cfg.sandbox_root);
+    }
+    if !cfg.overlay_roots.is_empty() {
+        let _ = OVERLAY_ROOTS.set(cfg.overlay_roots);
     }
     if cfg.trace {
         TRACE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);

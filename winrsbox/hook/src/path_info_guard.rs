@@ -120,92 +120,93 @@ pub(crate) fn rewrite_file_name_information(
     // FileName does not include a drive letter; it begins with `\`.
     let overlay_rel = String::from_utf16_lossy(&name_u16);
 
-    // Build the overlay DOS path by prepending the SANDBOX_ROOT drive letter.
-    // The overlay always lives on the same volume as sandbox_root, so the
-    // drive letter of the handle's volume equals sandbox_root's drive letter.
-    let drive_letter = sandbox_root
-        .as_bytes()
-        .first()
-        .copied()
-        .filter(|c| c.is_ascii_alphabetic())?;
-    // Preserve the original case of the kernel-reported path — only the
-    // prefix-match against sandbox_root is case-insensitive. Lowercasing the
-    // input here would corrupt the virtual path's case (e.g. `HEAD` → `head`).
-    let mut overlay_dos = String::with_capacity(2 + overlay_rel.len());
-    overlay_dos.push(drive_letter as char);
-    overlay_dos.push(':');
-    // overlay_rel begins with `\`; append verbatim.
-    overlay_dos.push_str(&overlay_rel);
+    // Build the candidate overlay-roots list: all known same-volume overlay
+    // roots (per-drive layout) if published, else fall back to the legacy
+    // single `sandbox_root`. Each root is an absolute DOS path on a specific
+    // volume; the handle's volume determines which root matched, and the
+    // matched root's drive letter is the CORRECT letter for the virtual path.
+    //
+    // (Old single-root code assumed "overlay always lives on the same volume
+    // as sandbox_root" — true pre-Path-1, false once a second root on another
+    // volume was added. That assumption's breakage caused the C:-handle path
+    // to miss-match against the D: primary root and leak the raw overlay path.)
+    let roots: Vec<&str> = match crate::ipc_client::OVERLAY_ROOTS.get() {
+        Some(list) if !list.is_empty() => list.iter().map(|s| s.as_str()).collect(),
+        _ => vec![sandbox_root],
+    };
 
-    // Match against sandbox_root (case-insensitive). Require a path-component
-    // boundary so `C:\sb` does not prefix-match `C:\sbx\…`. Compare a lowercased
-    // copy of the overlay path against the lowercased root.
-    let root_lower = sandbox_root.to_ascii_lowercase();
-    let root_trimmed = root_lower.trim_end_matches('\\');
-    if root_trimmed.is_empty() {
-        return None;
-    }
-    let overlay_dos_lower = overlay_dos.to_ascii_lowercase();
-    let overlay_root_prefix_lower = overlay_dos_lower.get(..root_trimmed.len())?;
-    if overlay_root_prefix_lower != root_trimmed {
-        // Not inside the overlay — leave the buffer untouched.
-        return None;
-    }
-    // Boundary check: byte after the prefix must be `\` (or the path equals it).
-    if overlay_dos_lower.len() > root_trimmed.len()
-        && overlay_dos_lower.as_bytes()[root_trimmed.len()] != b'\\'
-    {
-        return None;
+    // Try each root: build an overlay DOS path under that root's drive letter,
+    // case-insensitive prefix-match with a path-component boundary, then
+    // unmirror to recover the virtual DOS path. The first matching root wins.
+    for root in roots {
+        let root_lower = root.to_ascii_lowercase();
+        let root_trimmed = root_lower.trim_end_matches('\\');
+        if root_trimmed.is_empty() {
+            continue;
+        }
+        let drive_letter = match root.as_bytes().first().copied() {
+            Some(c) if c.is_ascii_alphabetic() => c,
+            _ => continue,
+        };
+        // Build the overlay DOS path under this root's drive letter.
+        let mut overlay_dos = String::with_capacity(2 + overlay_rel.len());
+        overlay_dos.push(drive_letter as char);
+        overlay_dos.push(':');
+        overlay_dos.push_str(&overlay_rel);
+
+        let overlay_dos_lower = overlay_dos.to_ascii_lowercase();
+        let Some(prefix) = overlay_dos_lower.get(..root_trimmed.len()) else {
+            continue;
+        };
+        if prefix != root_trimmed {
+            continue;
+        }
+        // Boundary check: byte after the prefix must be `\` (or end of path).
+        if overlay_dos_lower.len() > root_trimmed.len()
+            && overlay_dos_lower.as_bytes()[root_trimmed.len()] != b'\\'
+        {
+            continue;
+        }
+
+        // Recover the virtual DOS path. unmirror_from_overlay uses
+        // Path::strip_prefix which is case-SENSITIVE, so pass the root slice
+        // from the case-preserved overlay_dos (original case preserved).
+        let overlay_root_preserved = &overlay_dos[..root_trimmed.len()];
+        let overlay_pbuf = std::path::PathBuf::from(&overlay_dos);
+        let virtual_dos = match policy::path::unmirror_from_overlay(
+            &overlay_pbuf,
+            std::path::Path::new(overlay_root_preserved),
+        ) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        // FileNameInformation is volume-relative (no drive letter). Strip the
+        // recovered `<letter>:` to produce `\proj\.git\HEAD`.
+        let virtual_rel = strip_drive_prefix(&virtual_dos);
+
+        let new_u16: Vec<u16> = virtual_rel.encode_utf16().collect();
+        let new_name_bytes = new_u16.len() * 2;
+        if new_name_bytes > name_len {
+            return None;
+        }
+        let mut out = buf.to_vec();
+        out[NAME_LEN_OFF..NAME_LEN_OFF + 4]
+            .copy_from_slice(&(new_name_bytes as u32).to_le_bytes());
+        for (i, &u) in new_u16.iter().enumerate() {
+            let off = NAME_OFF + i * 2;
+            out[off..off + 2].copy_from_slice(&u.to_le_bytes());
+        }
+        let slack_start = NAME_OFF + new_name_bytes;
+        let slack_end = NAME_OFF + name_len;
+        for b in &mut out[slack_start..slack_end] {
+            *b = 0;
+        }
+        return Some(out);
     }
 
-    // Recover the virtual DOS path (`d:\proj\.git\HEAD`). unmirror_from_overlay
-    // uses Path::strip_prefix which is case-SENSITIVE, so we must pass the root
-    // exactly as it appears in the kernel-reported overlay path (preserving the
-    // original case), not the lowercased sandbox_root. Slice it out of the
-    // case-preserved overlay_dos using the length we just validated.
-    let overlay_root_preserved = &overlay_dos[..root_trimmed.len()];
-    let overlay_pbuf = std::path::PathBuf::from(&overlay_dos);
-    let virtual_dos = policy::path::unmirror_from_overlay(
-        &overlay_pbuf,
-        std::path::Path::new(overlay_root_preserved),
-    )?;
-
-    // FileNameInformation semantically returns a path RELATIVE TO THE VOLUME,
-    // without a drive letter. Strip the `<letter>:` prefix from the virtual
-    // DOS path to produce `\proj\.git\HEAD`.
-    let virtual_rel = strip_drive_prefix(&virtual_dos);
-
-    // Encode the new FileName as UTF-16.
-    let new_u16: Vec<u16> = virtual_rel.encode_utf16().collect();
-    let new_name_bytes = new_u16.len() * 2;
-
-    // Fail-open: if the new content would NOT fit in the original slot, leave
-    // the buffer as-is. We only ever shorten in place.
-    if new_name_bytes > name_len {
-        return None;
-    }
-
-    // Build the rewritten buffer: copy the original, then overwrite FileName
-    // and FileNameLength. Trailing bytes after the new name are zeroed so a
-    // reader honouring FileNameLength sees clean data (the kernel fills the
-    // tail with whatever was there; for masking correctness we clear it).
-    let mut out = buf.to_vec();
-    // New FileNameLength (bytes).
-    out[NAME_LEN_OFF..NAME_LEN_OFF + 4]
-        .copy_from_slice(&(new_name_bytes as u32).to_le_bytes());
-    // New FileName WCHARs.
-    for (i, &u) in new_u16.iter().enumerate() {
-        let off = NAME_OFF + i * 2;
-        out[off..off + 2].copy_from_slice(&u.to_le_bytes());
-    }
-    // Zero the slack between new_name_bytes and the old name_len so no stale
-    // overlay bytes leak past FileNameLength.
-    let slack_start = NAME_OFF + new_name_bytes;
-    let slack_end = NAME_OFF + name_len;
-    for b in &mut out[slack_start..slack_end] {
-        *b = 0;
-    }
-    Some(out)
+    // No root matched — leave the buffer untouched (non-overlay path).
+    None
 }
 
 /// Strip the leading `<letter>:` drive prefix from a DOS path, returning the
