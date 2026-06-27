@@ -131,7 +131,7 @@ static SESSION_FALLBACK_TRIED: std::sync::atomic::AtomicBool =
 /// it at startup). Used as a fallback when env vars were scrubbed by the
 /// hosted process (e.g. MSYS2 first-run helpers inheriting an empty env).
 /// Returns `Some(())` if at least the pipe name was loaded.
-fn try_load_session_config_from_section() -> Option<()> {
+pub(crate) fn try_load_session_config_from_section() -> Option<()> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use winapi::shared::minwindef::FALSE;
@@ -201,7 +201,13 @@ fn try_load_session_config_from_section() -> Option<()> {
         let _ = SANDBOX_ROOT.set(cfg.sandbox_root);
     }
     if !cfg.overlay_roots.is_empty() {
+        eprintln!(
+            "[hook/{pid}] session config: overlay_roots count={} roots={:?}",
+            cfg.overlay_roots.len(), cfg.overlay_roots,
+        );
         let _ = OVERLAY_ROOTS.set(cfg.overlay_roots);
+    } else {
+        eprintln!("[hook/{pid}] session config: overlay_roots EMPTY (falling back to sandbox_root only)");
     }
     if cfg.trace {
         TRACE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
