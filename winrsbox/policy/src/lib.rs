@@ -631,6 +631,37 @@ mod tests {
         assert!(!p.is_whiteouted(r"d:\ext\file.txt"), "marker gone after clear");
     }
 
+    /// Bug #78: clear_whiteout must also remove descendant whiteouts.
+    ///
+    /// Scenario: SSH clone fails → git cleanup whiteouts the repo dir AND all
+    /// children (.git, .git\config, …). HTTPS retry re-creates the repo dir
+    /// (reviving its own whiteout) but `.git` keeps its stale whiteout so git's
+    /// subsequent FILE_OPEN for `.git` sees Hidden → clone failure.
+    ///
+    /// The fix: `clear_whiteout(parent)` bulk-removes all `parent\*` entries.
+    #[test]
+    fn clear_whiteout_cascades_to_children() {
+        let (_dir, p, _project) = make_policy_with_project("proj");
+        // Simulate SSH-clone whiteouts: parent dir + children + deeper children.
+        p.record_whiteout(r"d:\repo\hermes-agent").unwrap();
+        p.record_whiteout(r"d:\repo\hermes-agent\.git").unwrap();
+        p.record_whiteout(r"d:\repo\hermes-agent\.git\config").unwrap();
+        p.record_whiteout(r"d:\repo\hermes-agent\.git\HEAD").unwrap();
+        // Unrelated sibling prefix — must NOT be touched.
+        p.record_whiteout(r"d:\repo\hermes-agent-old\file.txt").unwrap();
+
+        // Revival of parent:
+        p.clear_whiteout(r"d:\repo\hermes-agent").unwrap();
+
+        assert!(!p.is_whiteouted(r"d:\repo\hermes-agent"), "parent whiteout cleared");
+        assert!(!p.is_whiteouted(r"d:\repo\hermes-agent\.git"), ".git child cleared");
+        assert!(!p.is_whiteouted(r"d:\repo\hermes-agent\.git\config"), "deep child cleared");
+        assert!(!p.is_whiteouted(r"d:\repo\hermes-agent\.git\HEAD"), "deep child cleared");
+        // Sibling prefix must survive.
+        assert!(p.is_whiteouted(r"d:\repo\hermes-agent-old\file.txt"),
+            "sibling-prefix entry must not be touched");
+    }
+
     #[test]
     fn record_whiteout_invalidates_cache() {
         // record_overlay clears the cache; record_whiteout must do the same
