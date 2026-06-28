@@ -670,6 +670,9 @@ pub(crate) unsafe extern "system" fn hook_nt_query_attributes_file(
     };
 
     let decision = decide(&dos, false);
+    if is_trace() {
+        ipc_log(ipc::LogLevel::Trace, format!("fs_decide NtQueryAttributesFile: {dos} write=false mode={:?}", decision.mode));
+    }
     match decision.mode {
         Mode::Hidden => STATUS_OBJECT_NAME_NOT_FOUND,
         Mode::Passthrough => {
@@ -779,6 +782,9 @@ pub(crate) unsafe extern "system" fn hook_nt_query_full_attributes_file(
     };
 
     let decision = decide(&dos, false);
+    if is_trace() {
+        ipc_log(ipc::LogLevel::Trace, format!("fs_decide NtQueryFullAttributesFile: {dos} write=false mode={:?}", decision.mode));
+    }
     match decision.mode {
         Mode::Hidden => STATUS_OBJECT_NAME_NOT_FOUND,
         Mode::Passthrough => {
