@@ -371,11 +371,25 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
             // build configs).
             // SAFETY: object_attributes is non-null.
             let mut h = HookedAttrs::redirect(&*object_attributes, &overlay_dos, false);
-            HOOK_NT_CREATE_FILE.get().unwrap().call(
+            if is_trace() {
+                let exists = std::path::Path::new(&overlay_dos).exists();
+                ipc_log(
+                    ipc::LogLevel::Trace,
+                    format!("fs_cow_create_pre dos={dos} disp={create_disposition:#x} overlay_exists={exists} overlay={overlay_dos}"),
+                );
+            }
+            let status = HOOK_NT_CREATE_FILE.get().unwrap().call(
                 file_handle, desired_access, h.as_ptr_mut(), io_status_block,
                 allocation_size, file_attributes, share_access, create_disposition,
                 create_options, ea_buffer, ea_length,
-            )
+            );
+            if is_trace() && (dos.contains("config.lock") || status != 0) {
+                ipc_log(
+                    ipc::LogLevel::Trace,
+                    format!("fs_cow_create_post status=0x{status:08x} dos={dos} disp={create_disposition:#x}"),
+                );
+            }
+            status
         }
         Mode::Mock => {
             let Some(payload) = decision.mock_payload else {
