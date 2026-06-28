@@ -968,4 +968,183 @@ mod tests {
         assert_eq!(pairs.len(), 1, "only direct child; grandchild must be excluded, got: {:?}", pairs);
         assert_eq!(pairs[0].1, "Direct_Child");
     }
+
+    // ── Regression ratchet: Pattern #1 — overlay-only mixed-case dir via OVERLAY_CASE
+    //
+    // Scenario: the real host disk has no such directory (overlay-only creation,
+    // e.g. `%LOCALAPPDATA%\uv\cache\builds-v0\.tmpXXXX` inside the sandbox).
+    // The hook writes via `record_overlay` (lowercase key) + `record_overlay_case`
+    // (original basename with mixed case). A subsequent dir enumeration queries
+    // `overlay_children_with_case(parent)` — the IPC fallback path in
+    // `build_case_map_with_fallback`. This test asserts the full policy-side
+    // chain: record + query → pair returned → lower matches physical name,
+    // original matches the name the user actually typed.
+    //
+    // REGRESSION TARGET: if `record_overlay_case` becomes a no-op (e.g. the
+    // OVERLAY_CASE table write is silently skipped) OR `overlay_children_with_case`
+    // filters too aggressively, this test fails — catching a re-introduction
+    // of the "overlay-only dir listed with wrong case" bug (#74 variant B).
+    #[test]
+    fn overlay_case_integration_overlay_only_dir() {
+        let (_dir, p, _project) = make_policy_with_project("proj");
+
+        // Simulates: hook processes NtCreateFile for
+        //   C:\LocalAppData\uv\cache\builds-v0\.tmpAbCd\My_Package-1.2.3
+        // Physical overlay path is lowercase.  Original basename has mixed case.
+        let parent_lower    = r"c:\localappdata\uv\cache\builds-v0\.tmpabcd";
+        let child_lower     = r"c:\localappdata\uv\cache\builds-v0\.tmpabcd\my_package-1.2.3";
+        let original_name   = "My_Package-1.2.3";
+        let overlay_phys    = r"C:\sb\localappdata\uv\cache\builds-v0\.tmpabcd\my_package-1.2.3";
+
+        // Step 1: hook records overlay entry (lowercase key → physical path).
+        p.record_overlay(child_lower, overlay_phys).unwrap();
+
+        // Step 2: hook records the original-case basename.
+        p.record_overlay_case(child_lower, original_name);
+
+        // Step 3: dir-filter queries the policy daemon for overlay-only children.
+        // This is what `build_case_map_with_fallback`'s IPC fallback calls server-side.
+        let pairs = p.overlay_children_with_case(parent_lower);
+
+        assert_eq!(
+            pairs.len(), 1,
+            "exactly one child with a case record expected, got: {:?}", pairs
+        );
+        let (lower_got, original_got) = &pairs[0];
+        assert_eq!(lower_got, "my_package-1.2.3",
+            "lowercase key must match the physical storage name");
+        assert_eq!(original_got, original_name,
+            "original name must be the mixed-case name recorded at write time");
+
+        // Step 4 (invariant): a purely-lowercase basename is NOT stored, so it
+        // never appears in the IPC response.  Git object directories use names
+        // like "4b825dc642cb6eb9a060e54bf8d69288fbee4904" — all hex lowercase.
+        // These must NOT pollute the OVERLAY_CASE table (optimization guard, also
+        // the mechanism that kept the `72d46d9` case-preservation fix from
+        // corrupting all-lowercase git object names on the HTTPS retry).
+        let git_objects_lower = r"c:\localappdata\uv\cache\builds-v0\.tmpabcd\git_objects";
+        let git_obj_name      = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+        p.record_overlay(
+            &format!("{}\\{}", git_objects_lower, git_obj_name),
+            &format!("C:\\sb\\{}", git_obj_name),
+        ).unwrap();
+        p.record_overlay_case(
+            &format!("{}\\{}", git_objects_lower, git_obj_name),
+            git_obj_name, // all-lowercase → must be silently skipped
+        );
+        let git_pairs = p.overlay_children_with_case(git_objects_lower);
+        assert!(
+            git_pairs.is_empty(),
+            "all-lowercase git object name must NOT be stored in OVERLAY_CASE; got: {:?}", git_pairs
+        );
+    }
+
+    // ── Regression ratchet: Pattern #5 — proxy for "large git clone unaffected"
+    //
+    // The real `72d46d9` regression broke large `git clone` because the
+    // case-preservation hook rewrote git's lowercase-hex object filenames
+    // (e.g. "4b825dc6…") incorrectly.  A full git clone is too slow/flaky
+    // for CI.  This proxy test confirms the deterministic policy-side property
+    // that guards against the regression:
+    //
+    //   "An all-lowercase path stored in OVERLAY_CASE via record_overlay_case
+    //    is silently dropped (optimization), so overlay_children_with_case
+    //    returns empty for a directory containing only lowercase-hex-named
+    //    overlay entries — exactly the guarantee that stops the rewrite hook
+    //    from ever touching git object file names."
+    //
+    // REGRESSION TARGET: if `record_overlay_case` is changed to store
+    // all-lowercase names too (removing the `to_ascii_lowercase()` guard),
+    // the second assertion fails and `overlay_children_with_case` starts
+    // returning entries for git object dirs — re-introducing the `72d46d9` bug.
+    //
+    // NOTE: A live end-to-end test requires network + 5–10 min clone time and
+    // is deliberately manual-only (see docs/checkpoints/ for the 3/3 manual
+    // verification record). This proxy covers the deterministic half.
+    #[test]
+    fn git_clone_case_proxy_lowercase_hex_objects_not_stored() {
+        let (_dir, p, _project) = make_policy_with_project("proj");
+
+        // Simulate a git object pack layout inside the sandbox overlay.
+        // All names are lowercase hex — representative of real git pack files.
+        let git_objects_dir = r"c:\repo\.git\objects\pack";
+        let hex_names = [
+            "pack-4b825dc642cb6eb9a060e54bf8d69288fbee4904.idx",
+            "pack-4b825dc642cb6eb9a060e54bf8d69288fbee4904.pack",
+            "pack-deadbeefcafe0000000000000000000000000000.idx",
+        ];
+
+        for name in &hex_names {
+            let full_lower = format!("{}\\{}", git_objects_dir, name);
+            let phys       = format!("C:\\sb\\repo\\.git\\objects\\pack\\{}", name);
+            p.record_overlay(&full_lower, &phys).unwrap();
+            // Hook calls record_overlay_case with the original name; for all-
+            // lowercase git names the original IS the lowercase → no-op.
+            p.record_overlay_case(&full_lower, name);
+        }
+
+        // The IPC fallback (overlay_children_with_case) must return empty:
+        // git object names are all-lowercase, so OVERLAY_CASE has no entries
+        // for this directory. The dir-filter rewrite path then has nothing to
+        // do and leaves the buffer unchanged — no corruption of git pack index.
+        let pairs = p.overlay_children_with_case(git_objects_dir);
+        assert!(
+            pairs.is_empty(),
+            "no OVERLAY_CASE entries must exist for all-lowercase git object names; \
+             got {pairs:?} — reverting would re-introduce the 72d46d9 regression"
+        );
+
+        // Sanity: a second directory with a mixed-case overlay entry IS stored
+        // and returned.  This confirms the mechanism works and the empty result
+        // above is because of the all-lowercase filter, not a broken table.
+        let mixed_dir  = r"c:\repo\src";
+        let mixed_full = r"c:\repo\src\MyModule";
+        p.record_overlay(mixed_full, r"C:\sb\repo\src\mymodule").unwrap();
+        p.record_overlay_case(mixed_full, "MyModule");
+        let mixed_pairs = p.overlay_children_with_case(mixed_dir);
+        assert_eq!(mixed_pairs.len(), 1,
+            "mixed-case entry must be stored and retrievable; control group");
+        assert_eq!(mixed_pairs[0].1, "MyModule");
+    }
+
+    // ── Regression ratchet: Pattern #2 — multi-level whiteout cascade
+    //
+    // NOTE: `clear_whiteout_cascades_to_children` already covers this at the
+    // policy level with dir + .git + .git\config + .git\HEAD + sibling prefix.
+    // Verification that it exists (OBSERVED):
+    //   winrsbox/policy/src/lib.rs:643  fn clear_whiteout_cascades_to_children
+    //
+    // No additional test needed; the existing one is already the tight regression
+    // guard.  Listed here for completeness of the ratchet inventory.
+
+    // ── Regression ratchet: Pattern #3 — Passthrough/Hidden not cached by decide()
+    //
+    // The two tests `passthrough_not_stored_in_hook_cache` and
+    // `hidden_not_stored_in_hook_cache` in hook/src/hooks.rs test the RAW
+    // HookCache API, not the decide()-level skip at line 233:
+    //
+    //     if !matches!(d.mode, Mode::Passthrough | Mode::Hidden) {
+    //         cache().insert(dos_path, write, d.clone());
+    //     }
+    //
+    // Testing this skip directly requires calling decide(), which calls
+    // ipc_decide() (live IPC to the policy server) and is therefore not
+    // exercisable at unit-test level without a running winrsbox server.
+    //
+    // CONSEQUENCE: the decide()-skip branch is covered by E2E/manual tests only
+    // (Hermes install verification, Bug #75/#78 notes in the commit log).
+    // The unit tests confirm the cache CAN store Passthrough/Hidden via raw
+    // insert — i.e. the filter is in decide(), not the cache data structure.
+    // This is the strongest assertion possible at unit level.  Intentionally
+    // left as manual-only for the decide() path.
+
+    // ── Regression ratchet: Pattern #4 — partial-delete whiteout branches
+    //
+    // All four branches of decide_post_delete() are tested in
+    // hook/src/fs_metadata_guard.rs (OBSERVED):
+    //   - decide_post_delete_success_removes_idx
+    //   - decide_post_delete_not_empty_records_whiteout_keeps_overlay
+    //   - decide_post_delete_sharing_violation_records_whiteout_keeps_overlay
+    //   - decide_post_delete_other_error_skips
+    // No additional coverage needed here.
 }
