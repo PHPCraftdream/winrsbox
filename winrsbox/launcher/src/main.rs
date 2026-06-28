@@ -344,7 +344,19 @@ async fn main() -> Result<()> {
     let target_args = cli.target;
 
     // Open / create policy DB
-    let db_path = sandbox_root.join("policy.redb");
+    // Policy DB lives at the STATE-DIR level (parent of workdir), NOT inside
+    // the overlay root. This is a security invariant: "under workdir = ONLY
+    // agent CoW data". If policy.redb lived under workdir, the self-access
+    // carve-out in the hook (which allows absolute overlay-path reopens for
+    // the process's own CoW files) would expose it — an agent could read or
+    // corrupt its own policy database.
+    let state_dir = cfg_path.parent().unwrap_or(&sandbox_root);
+    let db_path = state_dir.join("policy.redb");
+    // Migration: move an existing DB from the old workdir-internal location.
+    let old_db_path = sandbox_root.join("policy.redb");
+    if !db_path.exists() && old_db_path.exists() {
+        let _ = std::fs::rename(&old_db_path, &db_path);
+    }
 
     // Same-volume overlay layout (fixes the drive-letter identity leak — Bug A):
     // the overlay for each virtual drive must live on THAT SAME drive, so the

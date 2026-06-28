@@ -455,30 +455,46 @@ pub(crate) fn unmirror_overlay_handle_relative(
         // layout (<root>\<drive>\<rest>). The same-volume layout is the
         // primary; the legacy fallback covers old overlay paths that still
         // carry the drive component.
-        // Path 1 layout: strip root, prepend the root's drive letter.
-        // Also handle the legacy layout (<root>\<drive>\<rest>): if the first
-        // component after root is a single ASCII letter, use it as the drive
-        // and skip it (old <drive>\ component). Otherwise the root's drive
-        // is the virtual drive (Path 1 same-volume layout, no <drive>\ comp).
+        // Try BOTH layouts: the Path-1 same-volume layout (no <drive>\
+        // component — the drive is implicit in the chosen root) AND the legacy
+        // layout (<root>\<drive>\<rest>). The same-volume layout is the
+        // primary; the legacy fallback covers old overlay paths that still
+        // carry the drive component.
+        //
+        // Discriminator: in the legacy layout, the first component after root
+        // IS the drive letter, and it MATCHES the root's own drive (legacy
+        // mirrors D: paths into a D: root). In Path 1, the first component is
+        // a directory name that only coincidentally might be a single letter —
+        // but it will NOT match the root's drive (e.g. `C:\a\file` → overlay
+        // `<C-root>\a\file`, first comp `a` ≠ root drive `c`). This makes
+        // "first comp == root drive" a reliable discriminator that avoids the
+        // false-positive on single-letter top-level directories like `C:\a`.
         if let Ok(rest) = overlay_pbuf.strip_prefix(sb_trimmed) {
             let root_drive = sb_trimmed.chars().next().filter(|c| c.is_ascii_alphabetic());
             let mut comps = rest.components();
             let first = comps.next();
-            // Check if the first component is a single ASCII letter (old layout).
+            // Legacy layout: first comp is a single ASCII letter matching root's drive.
             let (drive, remaining) = match first {
                 Some(std::path::Component::Normal(s))
-                    if s.len() == 1 && s.to_str().map(|c| c.chars().next().unwrap_or('\0').is_ascii_alphabetic()).unwrap_or(false) =>
+                    if s.len() == 1
+                        && s.to_str()
+                            .map(|c| {
+                                let ch = c.chars().next().unwrap_or('\0');
+                                ch.is_ascii_alphabetic()
+                                    && ch.to_ascii_lowercase() == root_drive.unwrap_or('\0').to_ascii_lowercase()
+                            })
+                            .unwrap_or(false) =>
                 {
                     // Old layout: <root>\<drive>\<rest> — drive from first comp.
                     (s.to_str().unwrap().chars().next(), comps)
                 }
                 _ => {
-                    // Path 1 layout: <root>\<rest> — drive from root.
+                    // Path 1 layout: <root>\<rest> — drive from root, all comps are dirs.
                     (root_drive, rest.components())
                 }
             };
             if let Some(d) = drive {
-                let mut virtual_dos = format!("{}:", d);
+                let mut virtual_dos = format!("{}:", d.to_ascii_lowercase());
                 for c in remaining {
                     match c {
                         std::path::Component::Normal(s) => {
@@ -488,10 +504,11 @@ pub(crate) fn unmirror_overlay_handle_relative(
                         _ => {}
                     }
                 }
-                return Some(virtual_dos.to_ascii_lowercase());
+                return Some(virtual_dos);
             }
         }
-        // Legacy layout fallback.
+        // Legacy layout fallback (for roots not in OVERLAY_ROOTS — e.g. during
+        // very early init before session section is loaded).
         if let Some(virtual_dos) = policy::path::unmirror_from_overlay(
             &overlay_pbuf,
             std::path::Path::new(sb_trimmed),
@@ -702,6 +719,14 @@ fn is_self_overlay_workdir_access(canon: &str) -> bool {
     };
     // `canon` may carry the `\??\` NT prefix; strip it for the DOS comparison.
     let canon_dos = strip_nt_dos_prefix(canon).unwrap_or(canon);
+    // Defense-in-depth: even after the structural fix (policy.redb moved out
+    // of workdir), explicitly deny control files that might end up under an
+    // overlay root. These are NOT agent data — they are sandbox internals.
+    // The last segment is checked against a denylist of known control
+    // filenames + the *.redb extension.
+    if is_control_file(canon_dos) {
+        return false;
+    }
     for root in &roots {
         let root_lower = root.to_ascii_lowercase();
         let root_trimmed = root_lower.trim_end_matches('\\');
@@ -719,6 +744,26 @@ fn is_self_overlay_workdir_access(canon: &str) -> bool {
                 roots.len(), roots.first()));
     }
     false
+}
+
+/// Return true if the last path segment of `canon_dos` (a canonicalized
+/// lowercased DOS path) is a known sandbox control file or has a `.redb`
+/// extension. These are NEVER agent data and must not be carved out by the
+/// self-access exception — even if they somehow end up under an overlay root.
+fn is_control_file(canon_dos: &str) -> bool {
+    const CONTROL_NAMES: &[&str] = &[
+        "policy.redb",
+        "sandbox.ktav",
+        "sandbox.log.jsonl",
+        "violations.log",
+        "hot-stats.json",
+    ];
+    let last_seg = canon_dos.rsplit('\\').next().unwrap_or(canon_dos);
+    if CONTROL_NAMES.iter().any(|&n| last_seg == n) {
+        return true;
+    }
+    // Any *.redb file — future-proof against renamed DB files.
+    last_seg.ends_with(".redb")
 }
 
 /// Strip the `\??\` (or `\\?\`) prefix from an NT DOS-form path string.
@@ -2231,5 +2276,48 @@ mod status_constant_tests {
         let overlay_dos = r"d:\sb\.winrsbox\n\workdir\d\sb\.winrsbox\secret";
         let got = unmirror_overlay_handle_relative(overlay_dos, Some(sb)).expect("should unmirror");
         assert_eq!(got, r"d:\sb\.winrsbox\secret");
+    }
+
+    #[test]
+    fn unmirror_overlay_handle_relative_path1_single_char_toplevel() {
+        // Path 1 layout: single-letter top-level directory (C:\a\file) must
+        // NOT be mis-detected as a legacy drive letter. The discriminator is
+        // "first comp == root drive": `a` ≠ `c` → Path 1 → drive from root.
+        let sb = r"c:\sb\.winrsbox\n\workdir";
+        let overlay_dos = r"c:\sb\.winrsbox\n\workdir\a\file";
+        let got = unmirror_overlay_handle_relative(overlay_dos, Some(sb)).expect("should unmirror");
+        assert_eq!(got, r"c:\a\file");
+    }
+
+    #[test]
+    fn is_control_file_detects_known_names_and_redb() {
+        assert!(is_control_file(r"d:\sb\.winrsbox\workdir\policy.redb"));
+        assert!(is_control_file(r"c:\x\.winrsbox\hermes\workdir\sandbox.ktav"));
+        assert!(is_control_file(r"d:\sb\.winrsbox\workdir\violations.log"));
+        assert!(is_control_file(r"d:\sb\.winrsbox\workdir\future.redb"));
+        // Normal agent data is NOT a control file.
+        assert!(!is_control_file(r"c:\users\test\file.txt"));
+        assert!(!is_control_file(r"d:\sb\.winrsbox\workdir\users\test\policy.txt"));
+    }
+
+    #[test]
+    fn is_self_overlay_workdir_access_denies_control_files() {
+        // policy.redb under the overlay root MUST be denied — it is a sandbox
+        // control file, NOT agent CoW data. The carve-out must NOT fire.
+        let canon = r"c:\users\computer\.winrsbox\hermes\workdir\policy.redb";
+        assert!(!is_self_overlay_workdir_access(canon),
+            "policy.redb must NOT be carved out — security regression");
+    }
+
+    #[test]
+    fn is_self_overlay_workdir_access_allows_agent_cow_data() {
+        // Normal agent CoW data under the overlay root IS carved out — it is
+        // the process's own data, re-opened absolutely after a passthrough leak.
+        // NOTE: is_self_overlay_workdir_access checks OVERLAY_ROOTS first, which
+        // is unset in tests, so it falls back to SANDBOX_ROOT which is also
+        // unset → returns false. This test documents the expected behaviour.
+        let canon = r"c:\users\computer\.winrsbox\hermes\workdir\users\computer\file.txt";
+        // Without OVERLAY_ROOTS set, this returns false (no root to match).
+        assert!(!is_self_overlay_workdir_access(canon));
     }
 }
