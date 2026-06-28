@@ -15,15 +15,6 @@ pub fn nt_to_dos_lower(raw: &[u16]) -> Option<String> {
     _nt_to_dos_impl(raw, true)
 }
 
-/// Same as `nt_to_dos_lower` but PRESERVES the original case of the path.
-/// Used by the hook to build the physical overlay path: the overlay file must
-/// be created with the original case so that case-sensitive consumers (Python
-/// importlib's FileFinder caches os.listdir() results and does case-SENSITIVE
-/// set lookups) can resolve modules whose names contain uppercase letters.
-pub fn nt_to_dos_preserve(raw: &[u16]) -> Option<String> {
-    _nt_to_dos_impl(raw, false)
-}
-
 fn _nt_to_dos_impl(raw: &[u16], lowercase: bool) -> Option<String> {
     // Trim trailing NUL units
     let raw = match raw.iter().position(|&u| u == 0) {

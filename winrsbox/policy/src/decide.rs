@@ -779,16 +779,7 @@ impl Policy {
                 passthrough()
             }
             db::RuleMode::Cow | db::RuleMode::Redirect => {
-                // Build the overlay path from the ORIGINAL-CASE dos_path, not
-                // the lowercased `lower`. The physical overlay directory/file
-                // must preserve case so that case-sensitive consumers (Python
-                // importlib FileFinder caches os.listdir() results and does
-                // case-SENSITIVE set lookups) can find modules whose names
-                // contain uppercase letters (e.g. distutils.compilers.C).
-                // The OVERLAY_IDX KEY (used below for record_overlay in the
-                // hook) remains lowercased for case-insensitive lookup, but
-                // the physical PATH value preserves the original case.
-                let overlay = path::mirror_into_overlay_layout(dos_path, &self.inner.overlay_layout);
+                let overlay = path::mirror_into_overlay_layout(&lower, &self.inner.overlay_layout);
                 let existing_overlay = if let Ok(txn) = self.inner.db.begin_read() {
                     if let Ok(t) = txn.open_table(db::OVERLAY_IDX) {
                         t.get(&*lower).ok().flatten().map(|v| PathBuf::from(v.value()))
