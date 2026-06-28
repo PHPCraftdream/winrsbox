@@ -317,32 +317,51 @@ unsafe extern "system" fn hook_nt_set_information_file(
                         }
                     };
                     let dest_lower = dest.to_ascii_lowercase();
-                    // Source-side bookkeeping. For a *rename* (not hardlink),
-                    // the kernel moves the source file to the destination, so
-                    // the source overlay copy disappears and its OVERLAY_IDX
-                    // entry must not keep pointing at the now-missing path
-                    // (otherwise a later `compute` would treat the source as
-                    // revived-into-overlay when it is in fact gone). For a
-                    // *hardlink* (FileLinkInfo) the source stays, so we skip
-                    // the cleanup. We also record a whiteout for the source
-                    // virtual path on rename so the sandbox view reflects that
-                    // the source name no longer exists (mirrors a real delete).
                     let is_link = class == FILE_LINK_INFO_CLASS
                         || class == FILE_LINK_EX_INFO_CLASS;
-                    if !is_link {
-                        if let Some(src) = query_handle_dos_path(handle) {
-                            let src_lower = src.to_ascii_lowercase();
-                            hooks::ipc_clear_overlay(&src_lower);
-                            hooks::ipc_record_whiteout(&src_lower);
-                            hooks::cache().invalidate(&src_lower);
+                    // Source-side bookkeeping. For a *rename* (not hardlink),
+                    let src_raw_for_check: String = if !is_link {
+                        query_handle_dos_path(handle).unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    if !is_link && !src_raw_for_check.is_empty() {
+                        // Unmirror the source path: the handle lives in the
+                        // overlay (CoW-redirected), so query_handle_dos_path
+                        // returns the OVERLAY path, not the virtual path.
+                        let sb_root = hooks::SANDBOX_ROOT.get().map(|s| s.as_str());
+                        let src = hooks::unmirror_overlay_handle_relative(&src_raw_for_check, sb_root)
+                            .unwrap_or_else(|| src_raw_for_check.clone());
+                        let src_lower = src.to_ascii_lowercase();
+                        if hooks::is_trace() {
+                            let fsize = std::fs::metadata(&src_raw_for_check).map(|m| m.len()).unwrap_or(u64::MAX);
+                            hooks::ipc_log(ipc::LogLevel::Trace,
+                                format!("fs_setinfo_rename_src src_virtual={src_lower} src_overlay={src_raw_for_check} size={fsize}"));
                         }
+                        hooks::ipc_clear_overlay(&src_lower);
+                        hooks::ipc_record_whiteout(&src_lower);
+                        hooks::cache().invalidate(&src_lower);
                     }
                     hooks::ipc_record_overlay(&dest_lower, &overlay_dos);
                     hooks::cache().invalidate(&dest_lower);
 
-                    return setinfo_rename_to_overlay(
+                    let status = setinfo_rename_to_overlay(
                         handle, iosb, info, len, class, &overlay_dos,
                     );
+                    if hooks::is_trace() {
+                        // Post-rename: check if SOURCE file (config.lock) was actually
+                        // moved away. NtSetInformationFile(FileRenameInfo) is a MOVE,
+                        // so the source should NOT exist after.
+                        let src_still_exists = if !src_raw_for_check.is_empty() {
+                            std::fs::metadata(&src_raw_for_check).is_ok()
+                        } else {
+                            false
+                        };
+                        hooks::ipc_log(ipc::LogLevel::Trace,
+                            format!("fs_setinfo_rename_result class={class} status=0x{status:08x} dest={dest_lower} src_gone={} src_overlay={src_raw_for_check}",
+                                !src_still_exists));
+                    }
+                    return status;
                 }
                 policy::Mode::Deny | policy::Mode::Hidden => {
                     if hooks::is_trace() {
@@ -382,48 +401,54 @@ unsafe extern "system" fn hook_nt_set_information_file(
                     // NEVER touched (invariant #1). Two sub-cases:
                     //
                     // (a) The handle resolves INTO the sandbox overlay storage
-                    //     (path is under sandbox_root). This is a CoW'd copy the
-                    //     agent previously created; it lives inside the sandbox
-                    //     so we may really delete it, then record a whiteout for
-                    //     the VIRTUAL path so the lower layer (if any) stays hidden.
+                    //     (path is under ANY overlay root — primary or per-drive).
+                    //     This is a CoW'd copy the agent previously created; it
+                    //     lives inside the sandbox so we may really delete it,
+                    //     then record a whiteout for the VIRTUAL path.
                     //
                     // (b) The handle resolves to a real external file. We must
                     //     NOT call the original (that would delete the real file).
-                    //     Record a whiteout for the path and return SUCCESS so the
-                    //     caller believes the delete succeeded.
-                    if let Some(sb_root) = hooks::SANDBOX_ROOT.get() {
-                        let sb_lower = sb_root.to_lowercase();
+                    //     Record a whiteout for the path and return SUCCESS.
+                    //
+                    // The overlay-root check iterates ALL roots (multi-root Path
+                    // 1 layout), not just the primary SANDBOX_ROOT. Without this,
+                    // C: overlay files (config.lock, etc.) fall through to case
+                    // (b) — whiteout without physical deletion — leaving the
+                    // overlay file in place. A subsequent FILE_CREATE then hits
+                    // STATUS_OBJECT_NAME_COLLISION on the leftover file, breaking
+                    // git's atomic config-lock workflow.
+                    let overlay_roots: Vec<&str> = match crate::ipc_client::OVERLAY_ROOTS.get() {
+                        Some(list) if !list.is_empty() => list.iter().map(|s| s.as_str()).collect(),
+                        _ => hooks::SANDBOX_ROOT.get().map(|s| vec![s.as_str()]).unwrap_or_default(),
+                    };
+                    let mut matched_overlay = false;
+                    for sb in &overlay_roots {
+                        let sb_lower = sb.to_lowercase();
                         let sb_trimmed = sb_lower.trim_end_matches('\\');
-                        if !sb_trimmed.is_empty()
-                            && policy::path::pattern_matches_prefix(sb_trimmed, &path)
-                        {
-                            // (a) overlay copy: really delete it (the path is
-                            // inside the sandbox, safe to mutate), then whiteout
-                            // the virtual path so the lower layer stays hidden.
-                            let overlay_pbuf = std::path::PathBuf::from(&path);
-                            let virtual_dos = policy::path::unmirror_from_overlay(
-                                &overlay_pbuf,
-                                std::path::Path::new(sb_trimmed),
-                            ).unwrap_or_else(|| path.clone());
-                            let status = call_original();
-                            if status == 0 {
-                                let lower = virtual_dos.to_lowercase();
-                                // The overlay file is gone — drop the index
-                                // entry too, otherwise `compute` would still
-                                // see has_overlay=true and treat the path as
-                                // revived (surfacing the real lower file
-                                // instead of Hidden).
-                                hooks::ipc_clear_overlay(&lower);
-                                hooks::ipc_record_whiteout(&lower);
-                                hooks::cache().invalidate(&lower);
-                                if hooks::is_trace() {
-                                    hooks::ipc_log(ipc::LogLevel::Trace,
-                                        format!("fs_whiteout_overlay_delete virtual={virtual_dos} overlay={path}"));
-                                }
+                        if sb_trimmed.is_empty() { continue; }
+                        if !policy::path::pattern_matches_prefix(sb_trimmed, &path) { continue; }
+                        matched_overlay = true;
+                        // (a) overlay copy: really delete it (the path is
+                        // inside the sandbox, safe to mutate), then whiteout
+                        // the virtual path so the lower layer stays hidden.
+                        // Use multi-root unmirror (OVERLAY_ROOTS-aware).
+                        let sb_root_opt = hooks::SANDBOX_ROOT.get().map(|s| s.as_str());
+                        let virtual_dos = hooks::unmirror_overlay_handle_relative(&path, sb_root_opt)
+                            .unwrap_or_else(|| path.clone());
+                        let status = call_original();
+                        if status == 0 {
+                            let lower = virtual_dos.to_lowercase();
+                            hooks::ipc_clear_overlay(&lower);
+                            hooks::ipc_record_whiteout(&lower);
+                            hooks::cache().invalidate(&lower);
+                            if hooks::is_trace() {
+                                hooks::ipc_log(ipc::LogLevel::Trace,
+                                    format!("fs_whiteout_overlay_delete virtual={virtual_dos} overlay={path}"));
                             }
-                            return status;
                         }
+                        return status;
                     }
+                    if matched_overlay { unreachable!(); }
 
                     // (b) real external file: do NOT delete it. Record the
                     // whiteout and return SUCCESS so the caller sees a
@@ -516,9 +541,19 @@ unsafe fn setinfo_rename_to_overlay(
         hooks::ipc_log(ipc::LogLevel::Trace,
             format!("fs_setinfo_rename_overlay class={class} overlay={overlay_dos}"));
     }
-    HOOK_NT_SET_INFO_FILE.get().unwrap().call(
+    let status = HOOK_NT_SET_INFO_FILE.get().unwrap().call(
         handle, iosb, new_info, new_len as u32, class,
-    )
+    );
+    // Diagnostic: check whether the source file was actually moved (rename =
+    // move, not copy). A lingering source file causes "File exists" on the next
+    // config.lock create cycle, breaking git's atomic config commit.
+    if hooks::is_trace() && status == 0 {
+        let src_still_exists = std::fs::metadata(overlay_dos).is_ok();
+        hooks::ipc_log(ipc::LogLevel::Trace,
+            format!("fs_setinfo_rename_postcheck status=0x{status:08x} src_gone={} overlay={overlay_dos}",
+                !src_still_exists));
+    }
+    status
 }
 
 unsafe extern "system" fn hook_nt_fs_control_file(
