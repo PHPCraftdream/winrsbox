@@ -185,6 +185,7 @@ pub fn is_write_access(desired: ACCESS_MASK, disposition: u32) -> bool {
 
 pub(crate) const STATUS_ACCESS_DENIED: NTSTATUS = 0xC000_0022_u32 as NTSTATUS;
 pub(crate) const STATUS_OBJECT_NAME_NOT_FOUND: NTSTATUS = 0xC000_0034_u32 as NTSTATUS;
+pub(crate) const STATUS_OBJECT_NAME_COLLISION: NTSTATUS = 0xC000_0035_u32 as NTSTATUS;
 pub(crate) const STATUS_PRIVILEGE_NOT_HELD: NTSTATUS = 0xC000_0061_u32 as NTSTATUS;
 /// Returned by the KTM (transacted-registry) hook handlers — these syscalls
 /// give callers a CLR/RegOpenKeyTransacted-style escape vector around the
@@ -610,9 +611,23 @@ pub(crate) fn canonical_denylist_status(canon: &str) -> Option<(NTSTATUS, &'stat
         // `.winrsbox` but NOT under `workdir\`, so they stay denied. The match
         // is case-insensitive (canon is already lowercased) and segment-
         // anchored via `pattern_matches_prefix`.
-        if !is_self_overlay_workdir_access(&canon) {
-            return Some((STATUS_OBJECT_NAME_NOT_FOUND, "winrsbox"));
+        if is_self_overlay_workdir_access(&canon) {
+            return None;
         }
+        // Ancestor carve-out: when the process resolved its gitdir to the
+        // overlay path (via GetFinalPathNameByHandle / class-9 leak), git's
+        // canonical-path resolution walks UP the path chain, checking each
+        // parent directory via stat()/GetFileAttributes. If `.winrsbox` or
+        // `.winrsbox\hermes` is masked as NOT_FOUND, the chain breaks and
+        // git aborts ("unable to create directory for ..."). If the path is
+        // an ANCESTOR of a known overlay root, don't block — the process is
+        // walking its own legitimate path chain, not probing for sandbox
+        // internals. Control files (siblings of `workdir\`, like `policy.redb`)
+        // are NOT ancestors → stay blocked.
+        if is_overlay_root_ancestor(&canon) {
+            return None;
+        }
+        return Some((STATUS_OBJECT_NAME_NOT_FOUND, "winrsbox"));
     }
     None
 }
@@ -689,6 +704,26 @@ pub(crate) unsafe fn check_path_traversal(attrs: *const OBJECT_ATTRIBUTES, creat
     let raw_nt = extract_raw_nt_path(attrs)?;
     let canon = canonicalize_for_denylist(&raw_nt);
     if let Some((status, reason)) = canonical_denylist_status(&canon) {
+        // Pragmatic mkdir handling: when the process resolved its gitdir to
+        // the overlay path (via GetFinalPathNameByHandle / class-9 leak),
+        // git's safe_create_leading_directories walks the full path from
+        // root, calling mkdir for each component. When it reaches `.winrsbox`
+        // (the ancestor of the overlay root), our denylist masks it as
+        // NAME_NOT_FOUND. Git interprets this as ENOENT from mkdir →
+        // "unable to create directory" → clone aborts.
+        //
+        // Fix: for directory creation (mkdir = FILE_DIRECTORY_FILE), return
+        // STATUS_OBJECT_NAME_COLLISION (EEXIST) instead of NOT_FOUND. Git's
+        // mkdir sees "already exists" → skips → continues to the next dir.
+        // This is safe: the directory physically exists, and we're just
+        // letting the caller's mkdir-then-check-EEXIST logic proceed.
+        const FILE_DIRECTORY_FILE: u32 = 0x00000001;
+        if reason == "winrsbox"
+            && status == STATUS_OBJECT_NAME_NOT_FOUND
+            && create_options & FILE_DIRECTORY_FILE != 0
+        {
+            return Some(STATUS_OBJECT_NAME_COLLISION);
+        }
         if is_trace() {
             ipc_log(ipc::LogLevel::Trace, format!("fs_block_{reason}: {}", raw_nt));
         }
@@ -696,6 +731,34 @@ pub(crate) unsafe fn check_path_traversal(attrs: *const OBJECT_ATTRIBUTES, creat
     }
 
     None
+}
+
+/// Return true iff `canon` is a strict ANCESTOR of a known overlay root
+/// (i.e., the root starts with `canon\`). Used to carve out `.winrsbox`
+/// and `.winrsbox\hermes` from the denylist so the process's canonical-
+/// path resolution (walking up the chain) doesn't break when it resolved
+/// its gitdir to the overlay path. Control files (siblings of `workdir\`)
+/// are NOT ancestors → stay denied.
+fn is_overlay_root_ancestor(canon: &str) -> bool {
+    let canon_dos = strip_nt_dos_prefix(canon).unwrap_or(canon);
+    let canon_trimmed = canon_dos.trim_end_matches('\\');
+    if canon_trimmed.is_empty() { return false; }
+    let roots: Vec<&str> = match crate::ipc_client::OVERLAY_ROOTS.get() {
+        Some(list) if !list.is_empty() => list.iter().map(|s| s.as_str()).collect(),
+        _ => match SANDBOX_ROOT.get() {
+            Some(s) => vec![s.as_str()],
+            None => return false,
+        },
+    };
+    for root in &roots {
+        let root_lower = root.to_ascii_lowercase();
+        let root_trimmed = root_lower.trim_end_matches('\\');
+        // canon is an ancestor of root if root starts with `canon\`.
+        if root_trimmed.starts_with(&format!("{}\\", canon_trimmed)) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Return true iff a canonicalized lowercased DOS path is under one of the
