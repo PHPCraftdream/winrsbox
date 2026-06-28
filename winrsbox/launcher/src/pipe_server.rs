@@ -1077,6 +1077,10 @@ fn handle_connection(
                 let _ = policy.record_overlay(&orig, &overlay);
                 Resp::Ok
             }
+            Req::RecordOverlayCase { path, original_basename } => {
+                policy.record_overlay_case(&path, &original_basename);
+                Resp::Ok
+            }
             Req::ClearOverlay { path } => {
                 match policy.clear_overlay(&path) {
                     Ok(()) => Resp::Ok,
@@ -1099,6 +1103,10 @@ fn handle_connection(
             Req::WhiteoutsUnder { dir } => {
                 let names = policy.whiteouts_under(&dir);
                 Resp::Whiteouts(names)
+            }
+            Req::OverlayChildrenWithCase { dir } => {
+                let pairs = policy.overlay_children_with_case(&dir);
+                Resp::OverlayChildrenWithCase(pairs)
             }
             Req::Log { pid, level, msg } => {
                 let level_str = match level {

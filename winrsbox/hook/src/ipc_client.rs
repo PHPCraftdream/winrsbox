@@ -397,6 +397,31 @@ pub(crate) fn ipc_record_overlay(orig: &str, overlay: &str) {
     });
 }
 
+/// Record the original-case basename for an overlay entry.
+///
+/// `lower_path` is the lowercased virtual DOS path (same key as OVERLAY_IDX).
+/// `original_basename` is the last path segment with original case.
+///
+/// No-op when `original_basename` is empty or already all-lowercase (there
+/// is nothing to preserve — the overlay's lowercase storage is already
+/// correct). Sends `RecordOverlayCase` IPC to the policy daemon which
+/// writes to the `OVERLAY_CASE` table.
+pub(crate) fn ipc_record_overlay_case(lower_path: &str, original_basename: &str) {
+    if original_basename.is_empty() {
+        return;
+    }
+    // Skip when case is already lowercase — nothing to preserve.
+    if original_basename == original_basename.to_ascii_lowercase() {
+        return;
+    }
+    let _ = ensure_ipc_and(|opt| {
+        let _ = try_send(opt, &ipc::Req::RecordOverlayCase {
+            path: lower_path.to_owned(),
+            original_basename: original_basename.to_owned(),
+        });
+    });
+}
+
 /// Remove an OVERLAY_IDX entry (used after physically deleting an overlay
 /// copy so the index doesn't point at a missing file).
 pub(crate) fn ipc_clear_overlay(orig: &str) {
@@ -434,6 +459,20 @@ pub(crate) fn ipc_whiteouts_under(dir: &str) -> Option<Vec<String>> {
     ensure_ipc_and(|opt| {
         match try_send(opt, &ipc::Req::WhiteoutsUnder { dir: dir.to_owned() }) {
             Some(ipc::Resp::Whiteouts(names)) => Some(names),
+            _ => None,
+        }
+    }).flatten()
+}
+
+/// Return `(lowercase_name, original_case_name)` pairs for overlay-only
+/// direct children of `dir` that have a recorded original-case basename.
+/// Used by `dir_filter::build_case_map` as a fallback when `read_dir` fails
+/// (overlay-only directories have no real-disk counterpart).
+/// Returns None on IPC failure; caller treats that as empty set.
+pub(crate) fn ipc_overlay_children_with_case(dir: &str) -> Option<Vec<(String, String)>> {
+    ensure_ipc_and(|opt| {
+        match try_send(opt, &ipc::Req::OverlayChildrenWithCase { dir: dir.to_owned() }) {
+            Some(ipc::Resp::OverlayChildrenWithCase(pairs)) => Some(pairs),
             _ => None,
         }
     }).flatten()

@@ -343,6 +343,20 @@ unsafe extern "system" fn hook_nt_set_information_file(
                         hooks::cache().invalidate(&src_lower);
                     }
                     hooks::ipc_record_overlay(&dest_lower, &overlay_dos);
+                    // Record original-case basename (variant B hybrid — rename path).
+                    // `dest_name` is the raw rename-information buffer decoded from
+                    // UTF-16 before resolve_dest_path lowercased it; its last component
+                    // preserves the caller's original case (e.g. "Mixed_Case_Dir").
+                    // This is the same fix as the NtCreateFile / NtOpenFile paths:
+                    // resolve_dest_path calls nt_to_dos_lower, so `dest` is lowercase.
+                    {
+                        let trimmed = dest_name.trim_end_matches(|c| c == '\\' || c == '/');
+                        if let Some(basename) = trimmed.rsplit(|c| c == '\\' || c == '/').next() {
+                            if !basename.is_empty() && basename.bytes().any(|b: u8| b.is_ascii_uppercase()) {
+                                hooks::ipc_record_overlay_case(&dest_lower, basename);
+                            }
+                        }
+                    }
                     hooks::cache().invalidate(&dest_lower);
 
                     let status = setinfo_rename_to_overlay(

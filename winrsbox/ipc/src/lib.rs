@@ -144,6 +144,13 @@ pub enum Req {
     SpawnedChild { parent_pid: u32, child_pid: u32, child_exe: String },
     Decide { dos_path: String, write: bool },
     RecordOverlay { orig: String, overlay: String },
+    /// Record the original-case basename for an overlay entry.
+    /// Sent immediately after `RecordOverlay` when the caller has access
+    /// to the original-case path. The policy daemon stores the basename
+    /// in `OVERLAY_CASE` so the directory-enumeration hook can restore
+    /// original case for overlay-only directories (e.g. uv's temp build
+    /// envs that exist only inside the sandbox).
+    RecordOverlayCase { path: String, original_basename: String },
     /// Remove an OVERLAY_IDX entry. Called when an overlay copy is physically
     /// deleted so the index doesn't keep pointing at a missing file (which
     /// would defeat a concurrent whiteout).
@@ -156,6 +163,11 @@ pub enum Req {
     ClearWhiteout { path: String },
     /// Return the filenames of whiteouted direct children of `dir`.
     WhiteoutsUnder { dir: String },
+    /// Return `(lowercase_name, original_case_name)` pairs for overlay entries
+    /// that are direct children of `dir` AND have a recorded original-case
+    /// basename. Used by the hook's `build_case_map` to restore case for
+    /// overlay-only directories that have no real-disk counterpart.
+    OverlayChildrenWithCase { dir: String },
     Log { pid: u32, level: LogLevel, msg: String },
     RegisterChild { pid: u32 },
     InjectionViolation {
@@ -202,6 +214,9 @@ pub enum Resp {
     MemDecision { allow: bool },
     /// Filenames of whiteouted direct children of a directory (for enumerate hiding).
     Whiteouts(Vec<String>),
+    /// `(lowercase_name, original_case_name)` pairs for overlay entries that are
+    /// direct children of the queried directory and have a recorded case.
+    OverlayChildrenWithCase(Vec<(String, String)>),
 }
 
 #[derive(Error, Debug)]
@@ -755,6 +770,75 @@ mod tests {
         let dec: Resp = read_msg(&mut buf).unwrap();
         match dec {
             Resp::Whiteouts(names) => assert!(names.is_empty()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn req_overlay_children_with_case_roundtrip() {
+        let msg = Req::OverlayChildrenWithCase {
+            dir: r"c:\localappdata\uv\cache\builds-v0\.tmpabcd".into(),
+        };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Req = read_msg(&mut buf).unwrap();
+        match dec {
+            Req::OverlayChildrenWithCase { dir } => {
+                assert_eq!(dir, r"c:\localappdata\uv\cache\builds-v0\.tmpabcd");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn resp_overlay_children_with_case_roundtrip() {
+        let msg = Resp::OverlayChildrenWithCase(vec![
+            ("mixed_case_dir".to_string(), "Mixed_Case_Dir".to_string()),
+            ("lib64".to_string(), "Lib64".to_string()),
+        ]);
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Resp = read_msg(&mut buf).unwrap();
+        match dec {
+            Resp::OverlayChildrenWithCase(pairs) => {
+                assert_eq!(pairs.len(), 2);
+                assert_eq!(pairs[0], ("mixed_case_dir".to_string(), "Mixed_Case_Dir".to_string()));
+                assert_eq!(pairs[1], ("lib64".to_string(), "Lib64".to_string()));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn resp_overlay_children_with_case_empty_roundtrip() {
+        let msg = Resp::OverlayChildrenWithCase(vec![]);
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Resp = read_msg(&mut buf).unwrap();
+        match dec {
+            Resp::OverlayChildrenWithCase(pairs) => assert!(pairs.is_empty()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn req_record_overlay_case_roundtrip() {
+        let msg = Req::RecordOverlayCase {
+            path: r"c:\test\mixed_case_dir".into(),
+            original_basename: "Mixed_Case_Dir".into(),
+        };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Req = read_msg(&mut buf).unwrap();
+        match dec {
+            Req::RecordOverlayCase { path, original_basename } => {
+                assert_eq!(path, r"c:\test\mixed_case_dir");
+                assert_eq!(original_basename, "Mixed_Case_Dir");
+            }
             _ => panic!("wrong variant"),
         }
     }

@@ -40,6 +40,7 @@ pub(crate) use crate::ipc_client::{
     ipc_log,
     ipc_log_violation,
     ipc_record_overlay,
+    ipc_record_overlay_case,
     ipc_clear_overlay,
     ipc_clear_whiteout,
     ipc_record_whiteout,
@@ -529,6 +530,39 @@ pub(crate) unsafe fn extract_raw_nt_path(attrs: *const OBJECT_ATTRIBUTES) -> Opt
     if char_count == 0 { return None; }
     let name_slice = std::slice::from_raw_parts(ustr.Buffer, char_count);
     Some(String::from_utf16_lossy(name_slice))
+}
+
+/// Extract the basename (last path component) from an NT OBJECT_ATTRIBUTES
+/// path, preserving original case from the UNICODE_STRING buffer.
+///
+/// Used by variant B hybrid case-rewrite: `nt_to_dos_lower` (called by
+/// `resolve_for_hook`) lowercases the entire path, so by the time we have
+/// `dos`, the original case information is gone. This function reads the
+/// UNICODE_STRING buffer BEFORE lowercasing and returns only the last
+/// component so the original-case basename can be stored in OVERLAY_CASE.
+///
+/// Returns `None` when:
+///  - `attrs` is null or has no ObjectName
+///  - The path is empty or ends with a separator (directory-open trailing `\`)
+///  - The basename is all-ASCII-lowercase (no case to preserve)
+///
+/// # SAFETY
+/// `attrs` must be valid for reads for the duration of this call (same
+/// lifetime guarantee as `extract_raw_nt_path` and `resolve_for_hook`).
+pub(crate) unsafe fn extract_nt_basename(attrs: *const OBJECT_ATTRIBUTES) -> Option<String> {
+    let raw = extract_raw_nt_path(attrs)?;
+    // Strip optional trailing separator (directory opens end with `\`).
+    let trimmed = raw.trim_end_matches(|c| c == '\\' || c == '/');
+    let basename = trimmed.rsplit(|c| c == '\\' || c == '/').next()?;
+    if basename.is_empty() { return None; }
+    // Only return when there is at least one uppercase ASCII letter — if the
+    // basename is already all-lowercase, ipc_record_overlay_case would skip it
+    // anyway (its own guard), so avoid the IPC round-trip entirely.
+    if basename.bytes().any(|b| b.is_ascii_uppercase()) {
+        Some(basename.to_owned())
+    } else {
+        None
+    }
 }
 
 /// Mirror NTFS canonicalization: NTFS strips trailing dots and spaces from
