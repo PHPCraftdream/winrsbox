@@ -147,10 +147,11 @@ pub(crate) fn try_load_session_config_from_section() -> Option<()> {
     // SAFETY: name_wide is null-terminated UTF-16; we pass FALSE for inherit.
     let h = unsafe { OpenFileMappingW(FILE_MAP_READ, FALSE, name_wide.as_ptr()) };
     if h.is_null() {
-        let pid = unsafe { GetCurrentProcessId() };
-        eprintln!(
-            "[hook/{pid}] session section open failed (launcher not running?)",
-        );
+        // Silent: stderr output from the hook DLL corrupts PowerShell's
+        // $ErrorActionPreference="Stop" handling (NativeCommandError wraps
+        // stderr lines as exceptions). The launcher's own log captures all
+        // hook diagnostics via ipc_log; eprintln is reserved for truly
+        // fatal DllMain-time errors where IPC is not yet available.
         return None;
     }
     // SAFETY: h is a valid mapping handle from OpenFileMappingW.
@@ -178,16 +179,19 @@ pub(crate) fn try_load_session_config_from_section() -> Option<()> {
     let cfg = match parsed {
         Ok(c) => c,
         Err(e) => {
-            let pid = unsafe { GetCurrentProcessId() };
-            eprintln!("[hook/{pid}] session section parse failed: {e}");
+            // Silent (see comment above): stderr from hook DLL breaks
+            // PowerShell NativeCommandError handling.
+            let _ = e;
             return None;
         }
     };
-    let pid = unsafe { GetCurrentProcessId() };
-    eprintln!(
-        "[hook/{pid}] loaded session config from Local\\WinRsBoxSession (pipe={})",
-        cfg.pipe_name,
-    );
+    let _pid = unsafe { GetCurrentProcessId() };
+    // Route diagnostics through IPC log (ipc_log) instead of stderr.
+    // eprintln from the hook DLL corrupts PowerShell's
+    // $ErrorActionPreference="Stop" handling: stderr lines from native
+    // commands are wrapped as NativeCommandError exceptions, aborting
+    // installers that spawn sandboxed children. The hook should NEVER
+    // write to the process's stderr.
     if !cfg.pipe_name.is_empty() {
         let _ = PIPE_NAME.set(cfg.pipe_name);
     }
@@ -201,13 +205,7 @@ pub(crate) fn try_load_session_config_from_section() -> Option<()> {
         let _ = SANDBOX_ROOT.set(cfg.sandbox_root);
     }
     if !cfg.overlay_roots.is_empty() {
-        eprintln!(
-            "[hook/{pid}] session config: overlay_roots count={} roots={:?}",
-            cfg.overlay_roots.len(), cfg.overlay_roots,
-        );
         let _ = OVERLAY_ROOTS.set(cfg.overlay_roots);
-    } else {
-        eprintln!("[hook/{pid}] session config: overlay_roots EMPTY (falling back to sandbox_root only)");
     }
     if cfg.trace {
         TRACE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);

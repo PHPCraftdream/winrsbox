@@ -360,6 +360,42 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
                 }
             };
             let lower = dos.to_lowercase();
+
+            // CoW read-passthrough: on a READ of a file with no overlay copy,
+            // open the REAL file (passthrough). CoW = copy-on-WRITE, not copy-
+            // on-read. The overlay copy is only created on first WRITE. Without
+            // this passthrough, reads of existing files outside project_root
+            // (e.g. C:\Users\…\.gitconfig) fail with NOT_FOUND because the
+            // overlay path doesn't exist yet. This broke `git config --global`
+            // and many other tools that read config from the user profile.
+            let overlay_exists_phys = std::path::Path::new(&overlay_dos).exists();
+            if !is_write_access(desired_access, create_disposition) && !overlay_exists_phys {
+                // Don't record an overlay entry — the file is still real.
+                // The hook cache's Cow decision is fine: if a later WRITE
+                // arrives, it will copy-on-write and record the overlay then.
+                cache().invalidate(&lower);
+                let mut copy = match HookedAttrs::copy_passthrough_inner(
+                    &*object_attributes, pre_resolved.as_deref()
+                ) {
+                    Some(c) => c,
+                    None => {
+                        if is_trace() {
+                            ipc_log(
+                                ipc::LogLevel::Trace,
+                                format!("cow_read_passthrough_copy_failed: {dos}"),
+                            );
+                        }
+                        set_io_status(io_status_block, STATUS_ACCESS_DENIED);
+                        return STATUS_ACCESS_DENIED;
+                    }
+                };
+                return HOOK_NT_CREATE_FILE.get().unwrap().call(
+                    file_handle, desired_access, copy.as_ptr_mut(), io_status_block,
+                    allocation_size, file_attributes, share_access, create_disposition,
+                    create_options, ea_buffer, ea_length,
+                );
+            }
+
             ipc_record_overlay(&lower, &overlay_dos);
             cache().invalidate(&lower);
 
