@@ -1,6 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
+use redb::ReadableTable as _;
 
 use crate::{db, path, ensure_lower, trim_trailing_sep, Mode, Decision, PolicyError};
 
@@ -233,10 +234,39 @@ fn path_is_plain_file(dos_path: &str) -> bool {
 /// exists there, else `None`. Uses `symlink_metadata` (no-follow) so a
 /// reparse point planted in the overlay is not falsely reported as a live
 /// regular node.
+///
+/// Only returns `Some` if the overlay entry is either a FILE or a DIRECTORY
+/// that does NOT exist on the real filesystem. A directory that exists in the
+/// overlay AND on the real disk is a "passthrough directory with sparse overlay
+/// children" — opening it through the overlay would expose an INCOMPLETE
+/// listing (missing real-disk entries such as Python's stdlib `Lib/` modules
+/// that were not written during a particular session). For such directories the
+/// merged-view requirement falls on `NtQueryDirectoryFile`'s enum-hook instead;
+/// here we fall through so the caller opens the real-disk directory and the
+/// enum hook can later inject overlay-only entries.
+///
+/// Exception: if the overlay directory is in OVERLAY_IDX the caller already
+/// handled it above (index fast-path) and never reaches here, so we don't need
+/// to re-check OVERLAY_IDX.
 fn physical_overlay_path(lower: &str, layout: &path::OverlayLayout) -> Option<PathBuf> {
     let mirror = path::mirror_into_overlay_layout(lower, layout);
     match std::fs::symlink_metadata(&mirror) {
-        Ok(_) => Some(mirror),
+        Ok(meta) if meta.is_dir() => {
+            // Overlay directory exists. Check if the REAL path also exists as a
+            // directory (both present → passthrough directory with sparse overlay
+            // children → fall through so real-disk directory handle is used).
+            let real = std::path::Path::new(lower);
+            if real.is_dir() {
+                // Both overlay and real exist → incomplete merged directory:
+                // do NOT redirect; let the caller passthrough to real disk.
+                None
+            } else {
+                // Only overlay has the directory (e.g. new clone destination):
+                // redirect so the opener gets a valid directory handle.
+                Some(mirror)
+            }
+        }
+        Ok(_) => Some(mirror), // file (or other non-dir) → always redirect
         Err(_) => None,
     }
 }
@@ -397,13 +427,37 @@ impl Policy {
 
     /// Remove a whiteout marker for `path` (revive). Called when a create at a
     /// whiteouted path re-materialises the file in the overlay.
+    ///
+    /// Also removes all descendent whiteouts (paths under `path\`). This is
+    /// the OverlayFS revival semantic: re-creating a parent directory implies a
+    /// clean slate for its entire subtree. Without this, a retry-clone scenario
+    /// where a failed SSH clone whiteouts both the parent dir and all its
+    /// children (`.git`, `.git\config`, …) leaves the children permanently
+    /// hidden even after the parent is re-created by the HTTPS retry, because
+    /// git opens `.git` with FILE_OPEN (not FILE_CREATE), bypassing the
+    /// per-path revive gate (bug #78).
     pub fn clear_whiteout(&self, path: &str) -> Result<(), PolicyError> {
         let lower_raw = ensure_lower(path);
         let lower = trim_trailing_sep(&lower_raw);
         let txn = self.inner.db.begin_write()?;
         {
             let mut t = txn.open_table(db::WHITEOUTS)?;
+            // Remove exact entry.
             t.remove(lower)?;
+            // Remove all descendant entries: keys with prefix `lower\`.
+            let prefix = format!("{}\\", lower);
+            let child_keys: Vec<String> = t
+                .range(prefix.as_str()..)
+                .map(|iter| {
+                    iter.flatten()
+                        .map(|(k, _v)| k.value().to_owned())
+                        .take_while(|k| k.starts_with(&prefix))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for k in child_keys {
+                t.remove(k.as_str())?;
+            }
         }
         txn.commit()?;
         self.inner.cache.clear();
