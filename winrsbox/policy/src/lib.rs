@@ -849,4 +849,92 @@ mod tests {
             d_write2.mode,
         );
     }
+
+    // ── OVERLAY_CASE tests (variant B hybrid case-rewrite) ──────────────────
+
+    /// 7.1 — Backward compat: existing OVERLAY_IDX entries (without any
+    /// OVERLAY_CASE record) yield an empty Vec from overlay_children_with_case.
+    /// No panic, no corruption.
+    #[test]
+    fn overlay_case_legacy_entries_yield_empty() {
+        let (_dir, p, _project) = make_policy_with_project("proj");
+        // Write to OVERLAY_IDX only (simulating a legacy entry).
+        p.record_overlay(r"c:\test\some_dir", r"C:\sb\test\some_dir").unwrap();
+        // overlay_children_with_case on the parent must return empty (no case
+        // record exists for the child).
+        let pairs = p.overlay_children_with_case(r"c:\test");
+        assert!(
+            pairs.is_empty(),
+            "legacy entry without case record must yield empty pairs, got: {:?}", pairs
+        );
+    }
+
+    /// 7.2 — Roundtrip: record a case for a new entry, retrieve it.
+    #[test]
+    fn overlay_case_roundtrip() {
+        let (_dir, p, _project) = make_policy_with_project("proj");
+        // Simulate an overlay write with original case "Mixed_Case_Dir".
+        let lower_path = r"c:\localappdata\uv\cache\builds-v0\.tmpabcd\mixed_case_dir";
+        let parent = r"c:\localappdata\uv\cache\builds-v0\.tmpabcd";
+        p.record_overlay(lower_path, r"C:\sb\mixed_case_dir").unwrap();
+        p.record_overlay_case(lower_path, "Mixed_Case_Dir");
+        let pairs = p.overlay_children_with_case(parent);
+        assert_eq!(pairs.len(), 1, "expected 1 pair, got: {:?}", pairs);
+        let (lower, original) = &pairs[0];
+        assert_eq!(lower, "mixed_case_dir");
+        assert_eq!(original, "Mixed_Case_Dir");
+    }
+
+    /// 7.3 — Already-lowercase basename is NOT stored (optimization guard).
+    #[test]
+    fn overlay_case_lowercase_basename_not_stored() {
+        let (_dir, p, _project) = make_policy_with_project("proj");
+        let lower_path = r"c:\test\lowercase_dir";
+        p.record_overlay(lower_path, r"C:\sb\lowercase_dir").unwrap();
+        p.record_overlay_case(lower_path, "lowercase_dir"); // all lowercase → no-op
+        let pairs = p.overlay_children_with_case(r"c:\test");
+        assert!(
+            pairs.is_empty(),
+            "all-lowercase basename must not be stored, got: {:?}", pairs
+        );
+    }
+
+    /// 7.4 — Multiple children, only those with case records returned.
+    #[test]
+    fn overlay_case_multiple_children_mixed() {
+        let (_dir, p, _project) = make_policy_with_project("proj");
+        let parent = r"c:\test";
+        // child_a: has case record
+        p.record_overlay(r"c:\test\child_a", r"C:\sb\child_a").unwrap();
+        p.record_overlay_case(r"c:\test\child_a", "Child_A");
+        // child_b: all-lowercase → no case record stored
+        p.record_overlay(r"c:\test\child_b", r"C:\sb\child_b").unwrap();
+        p.record_overlay_case(r"c:\test\child_b", "child_b");
+        // child_c: has case record
+        p.record_overlay(r"c:\test\child_c", r"C:\sb\child_c").unwrap();
+        p.record_overlay_case(r"c:\test\child_c", "Child_C");
+
+        let pairs = p.overlay_children_with_case(parent);
+        assert_eq!(pairs.len(), 2, "only 2 children have case records, got: {:?}", pairs);
+        let names: Vec<&str> = pairs.iter().map(|(_, o)| o.as_str()).collect();
+        assert!(names.contains(&"Child_A"), "Child_A must be in pairs");
+        assert!(names.contains(&"Child_C"), "Child_C must be in pairs");
+    }
+
+    /// 7.5 — Direct-child boundary: descendants beyond one level not included.
+    #[test]
+    fn overlay_case_only_direct_children() {
+        let (_dir, p, _project) = make_policy_with_project("proj");
+        let parent = r"c:\test";
+        // Direct child.
+        p.record_overlay(r"c:\test\Direct_Child", r"C:\sb\direct_child").unwrap();
+        p.record_overlay_case(r"c:\test\direct_child", "Direct_Child");
+        // Grandchild — must NOT appear under parent.
+        p.record_overlay(r"c:\test\Direct_Child\Grandchild", r"C:\sb\direct_child\grandchild").unwrap();
+        p.record_overlay_case(r"c:\test\direct_child\grandchild", "Grandchild");
+
+        let pairs = p.overlay_children_with_case(parent);
+        assert_eq!(pairs.len(), 1, "only direct child; grandchild must be excluded, got: {:?}", pairs);
+        assert_eq!(pairs[0].1, "Direct_Child");
+    }
 }

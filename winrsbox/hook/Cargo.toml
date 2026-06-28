@@ -42,6 +42,7 @@ pretty_assertions = { workspace = true }
 rstest = { workspace = true }
 proptest = { workspace = true }
 policy = { path = "../policy" }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "cache"

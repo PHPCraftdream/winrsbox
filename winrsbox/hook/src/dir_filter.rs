@@ -1,11 +1,16 @@
-// dir_filter — NtQueryDirectoryFile hook.
+// dir_filter — NtQueryDirectoryFile + NtQueryDirectoryFileEx hooks.
 //
 // Filters `.winrsbox` entries and whiteouted (tombstoned) entries from
 // directory listings so sandboxed processes see a consistent merged view:
 //  - the sandbox state directory is invisible;
 //  - files deleted via whiteout (OverlayFS-style) vanish from listings even
 //    though the real lower file is untouched on disk.
+//
+// Also rewrites entry names from lowercase overlay storage back to their
+// original case (the physical overlay stores everything lowercase; callers
+// need to see the original mixed-case names from the real host disk).
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use detour2::GenericDetour;
@@ -17,7 +22,7 @@ use crate::anti_rec;
 use crate::hooks;
 
 // ---------------------------------------------------------------------------
-// Type alias
+// Type aliases
 // ---------------------------------------------------------------------------
 
 type FnNtQueryDirectoryFile = unsafe extern "system" fn(
@@ -34,11 +39,30 @@ type FnNtQueryDirectoryFile = unsafe extern "system" fn(
     u8,                      // RestartScan
 ) -> NTSTATUS;
 
+/// NtQueryDirectoryFileEx — same as NtQueryDirectoryFile but replaces
+/// ReturnSingleEntry+RestartScan with a single QueryFlags ULONG.
+/// SL_RESTART_SCAN = 0x00000001, SL_RETURN_SINGLE_ENTRY = 0x00000002.
+type FnNtQueryDirectoryFileEx = unsafe extern "system" fn(
+    HANDLE,                  // FileHandle
+    HANDLE,                  // Event
+    *mut c_void,             // ApcRoutine
+    *mut c_void,             // ApcContext
+    *mut IO_STATUS_BLOCK,    // IoStatusBlock
+    *mut c_void,             // FileInformation
+    u32,                     // Length
+    u32,                     // FileInformationClass
+    u32,                     // QueryFlags (replaces ReturnSingleEntry + RestartScan)
+    *mut UNICODE_STRING,     // FileName (filter pattern, optional)
+) -> NTSTATUS;
+
 // ---------------------------------------------------------------------------
 // Detour storage
 // ---------------------------------------------------------------------------
 
 static HOOK_NT_QUERY_DIRECTORY_FILE: OnceLock<GenericDetour<FnNtQueryDirectoryFile>> =
+    OnceLock::new();
+
+static HOOK_NT_QUERY_DIRECTORY_FILE_EX: OnceLock<GenericDetour<FnNtQueryDirectoryFileEx>> =
     OnceLock::new();
 
 // ---------------------------------------------------------------------------
@@ -193,8 +217,252 @@ fn dot_winrsbox_u16() -> Vec<u16> {
     ".winrsbox".encode_utf16().collect()
 }
 
+/// Core of `build_case_map`: takes the directory path and a callable that
+/// provides overlay-case fallback pairs.
+///
+/// Separated for testability: production code passes the real IPC client;
+/// unit tests pass a stub closure that returns a hard-coded list.
+///
+/// # SAFETY
+/// When `overlay_fallback` is the real IPC client, this must be called while
+/// the `anti_rec` guard is held so the inner `read_dir` bypasses our hook.
+unsafe fn build_case_map_with_fallback(
+    dir_dos: &str,
+    overlay_fallback: impl Fn(&str) -> Option<Vec<(String, String)>>,
+) -> Option<HashMap<String, Vec<u16>>> {
+    let mut map = HashMap::new();
+    let mut had_anything = false;
+
+    // (1) Real-disk first — original case from the host filesystem.
+    // std::fs::read_dir calls NtQueryDirectoryFileEx internally on Windows.
+    // Because the anti_rec guard is held on this thread, the inner hook call
+    // returns immediately (calls original) — we read the real host disk, not
+    // the overlay layer.
+    if let Ok(rd) = std::fs::read_dir(dir_dos) {
+        for entry in rd.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                let lower = name.to_ascii_lowercase();
+                let wide: Vec<u16> = name.encode_utf16().collect();
+                map.insert(lower, wide);
+                had_anything = true;
+            }
+        }
+    }
+
+    // (2) OVERLAY_CASE fallback — merges in overlay-only entries.
+    // Real-disk wins on collision: `.entry(lower).or_insert_with(…)` only
+    // fills the map when the key is absent, so an overlay entry for a path
+    // that ALSO exists on real disk is silently superseded by the real name.
+    if let Some(pairs) = overlay_fallback(dir_dos) {
+        for (lower, original) in pairs {
+            map.entry(lower).or_insert_with(|| original.encode_utf16().collect());
+            had_anything = true;
+        }
+    }
+
+    if had_anything { Some(map) } else { None }
+}
+
+/// Build a case-rewrite lookup: lowercase ASCII name → correct-case UTF-16.
+///
+/// Primary source: real host directory at `dir_dos` (bypassing the overlay
+/// via the anti-recursion guard already set by the caller). Returns original-
+/// case names from the host disk for all entries that exist there.
+///
+/// Fallback: when the directory has no real-disk counterpart (overlay-only
+/// creation — e.g. `%LOCALAPPDATA%\uv\cache\builds-v0\.tmpXXXXXX` inside
+/// the sandbox), `read_dir` returns ENOENT. In that case we consult the
+/// policy daemon's `OVERLAY_CASE` index via IPC to obtain original-case
+/// basenames recorded at write time. Real-disk entries win on collision
+/// (`.entry(k).or_insert_with(…)`), so the existing behaviour is preserved
+/// for paths that have both a real-disk file and an overlay copy.
+///
+/// Returns `None` only when BOTH sources return nothing (no entries at all),
+/// which signals to the caller that no rewrite is needed for this directory.
+///
+/// # SAFETY
+/// Must be called while the `anti_rec` guard is held so the inner
+/// `read_dir` → `NtQueryDirectoryFileEx` path bypasses our hook and reads
+/// the real (unredirected) host disk.
+unsafe fn build_case_map(dir_dos: &str) -> Option<HashMap<String, Vec<u16>>> {
+    build_case_map_with_fallback(
+        dir_dos,
+        crate::ipc_client::ipc_overlay_children_with_case,
+    )
+}
+
+/// Walk the buffer and rewrite every entry's FileName to its original case
+/// according to `case_map`. Length stays the same (only case differs);
+/// this is a pure in-place byte-level rewrite with no structural changes.
+///
+/// # SAFETY
+/// `buf`/`total_size` must be a valid writable NtQueryDirectoryFile buffer
+/// for the given `class`. `case_map` maps lowercase name → original-case UTF-16.
+unsafe fn rewrite_entry_case(
+    buf: *mut u8,
+    total_size: usize,
+    class: u32,
+    case_map: &HashMap<String, Vec<u16>>,
+) {
+    let Some((name_len_off, name_off)) = dir_info_name_offsets(class) else {
+        return;
+    };
+
+    let mut cur = buf;
+    let end = buf.add(total_size);
+
+    while cur < end {
+        let avail = (end as usize) - (cur as usize);
+        if avail < name_len_off + 4 {
+            break;
+        }
+        // SAFETY: NextEntryOffset at offset 0, guarded by avail.
+        let next_off = *(cur as *const u32) as usize;
+        // SAFETY: FileNameLength at class-specific offset, guarded by avail.
+        let name_len = *(cur.add(name_len_off) as *const u32) as usize;
+
+        if name_len >= 2 && name_off + name_len <= avail {
+            let name_ptr = cur.add(name_off) as *mut u16;
+            let chars = name_len / 2;
+            // SAFETY: from_raw_parts_mut for `chars` u16s; `name_off + name_len <= avail`.
+            let name_slice = std::slice::from_raw_parts(name_ptr, chars);
+
+            // Build the lowercase lookup key.
+            let lower: String = std::char::decode_utf16(name_slice.iter().copied())
+                .map(|r| r.unwrap_or('\u{FFFD}'))
+                .flat_map(|c| c.to_ascii_lowercase().to_string().chars().collect::<Vec<_>>())
+                .collect();
+
+            if let Some(correct) = case_map.get(&lower) {
+                // Only rewrite when same length (case change only). Length
+                // difference would require structural changes — skip those.
+                if correct.len() == chars {
+                    // SAFETY: from_raw_parts_mut; length matches.
+                    let dst = std::slice::from_raw_parts_mut(name_ptr, chars);
+                    dst.copy_from_slice(correct.as_slice());
+                }
+            }
+        }
+
+        if next_off == 0 || next_off > avail {
+            break;
+        }
+        cur = cur.add(next_off);
+    }
+}
+
+/// Shared post-processing: filter hidden entries, then rewrite entry case.
+///
+/// Called after the original NtQueryDirectoryFile / NtQueryDirectoryFileEx
+/// returns STATUS_SUCCESS. Reads the real host directory once (via `build_case_map`,
+/// which uses the anti_rec guard to bypass our own hook) and rewrites all
+/// surviving entry names to their original case.
+///
+/// Returns the NTSTATUS to return to the caller.
+///
+/// # SAFETY
+/// `file_information`/`io_status_block` are the kernel-filled output buffers.
+/// `dir_dos` is the virtual DOS path (may be None when handle resolution fails).
+unsafe fn process_dir_output(
+    file_information: *mut c_void,
+    io_status_block: *mut IO_STATUS_BLOCK,
+    file_information_class: u32,
+    dir_dos: Option<&str>,
+    original_status: NTSTATUS,
+) -> NTSTATUS {
+    if original_status != 0 {
+        return original_status;
+    }
+    if io_status_block.is_null() || file_information.is_null() {
+        return original_status;
+    }
+    // IoStatusBlock.Information (offset 8 on x64) contains bytes written.
+    // SAFETY: io_status_block validated non-null; Information at offset 8 on x64.
+    let info_size = *((io_status_block as *const u8).add(8) as *const usize);
+    if info_size == 0 {
+        return original_status;
+    }
+
+    // Resolve the virtual DOS path for the directory being enumerated.
+    //
+    // query_handle_dos_path calls GetFinalPathNameByHandleW which internally
+    // calls NtQueryInformationFile(FileNormalizedNameInformation, class 48).
+    // The path_info_guard hook normally unmirrors overlay paths back to virtual,
+    // but because anti_rec is ALREADY HELD on this thread (we set it at the top
+    // of hook_nt_query_directory_file[_ex]), path_info_guard's anti_rec::enter()
+    // returns None and it calls the original without unmasking. As a result
+    // query_handle_dos_path returns the OVERLAY PHYSICAL PATH (lowercase), not
+    // the virtual path.
+    //
+    // Fix: unmirror the overlay-physical path back to virtual here, once.
+    // The virtual path is then used for:
+    //  (a) ipc_whiteouts_under — needs virtual path (policy server keys on it)
+    //  (b) build_case_map — opens virtual path with anti_rec held → NtCreateFile
+    //      bypasses CoW redirect → reads real host disk (original case)
+    let virtual_dir: Option<String> = if let Some(raw) = dir_dos {
+        let sb_root = hooks::SANDBOX_ROOT.get().map(|s| s.as_str());
+        Some(hooks::unmirror_overlay_handle_relative(raw, sb_root)
+            .unwrap_or_else(|| raw.to_string()))
+    } else {
+        None
+    };
+
+    // Build the hide set: `.winrsbox` is always hidden, plus any whiteouted
+    // direct children of the directory being enumerated.
+    let mut hide_names: Vec<Vec<u16>> = vec![dot_winrsbox_u16()];
+    if let Some(ref dir) = virtual_dir {
+        if let Some(names) = crate::ipc_client::ipc_whiteouts_under(dir) {
+            for n in names {
+                hide_names.push(n.encode_utf16().collect());
+            }
+        }
+    }
+
+    let mut only_hidden = false;
+    if filter_entries(
+        file_information as *mut u8,
+        info_size,
+        file_information_class,
+        &hide_names,
+        &mut only_hidden,
+    ) {
+        if only_hidden {
+            const STATUS_NO_MORE_FILES: NTSTATUS = 0x0000_0104_u32 as NTSTATUS;
+            if hooks::is_trace() {
+                hooks::ipc_log(ipc::LogLevel::Trace, "fs_hide_enum: only hidden entries".into());
+            }
+            return STATUS_NO_MORE_FILES;
+        }
+        if hooks::is_trace() {
+            hooks::ipc_log(ipc::LogLevel::Trace, "fs_hide_enum: entries filtered from listing".into());
+        }
+    }
+
+    // Case-rewrite: look up each surviving entry's name on the real host disk
+    // and restore original case. Only applies when virtual_dir resolves to a
+    // real directory on disk; overlay-only dirs are skipped (build_case_map → None).
+    if let Some(ref dir) = virtual_dir {
+        // std::fs::read_dir(virtual_dir) with anti_rec held → NtCreateFile
+        // hook bypasses CoW (anti_rec::enter() returns None → calls original)
+        // → original NtCreateFile opens the real host disk at virtual_dir.
+        // Result: case_map contains original-case names from the real disk.
+        if let Some(case_map) = build_case_map(dir) {
+            if !case_map.is_empty() {
+                rewrite_entry_case(
+                    file_information as *mut u8,
+                    info_size,
+                    file_information_class,
+                    &case_map,
+                );
+            }
+        }
+    }
+
+    original_status
+}
+
 // ---------------------------------------------------------------------------
-// Hook implementation
+// Hook implementations
 // ---------------------------------------------------------------------------
 
 // SAFETY: Called by detour2 dispatcher with ntdll!NtQueryDirectoryFile ABI.
@@ -227,58 +495,53 @@ unsafe extern "system" fn hook_nt_query_directory_file(
         return_single_entry, file_name, restart_scan,
     );
 
-    if status != 0 {
-        return status;
-    }
-
-    // IoStatusBlock.Information (offset 8 on x64) contains bytes written
-    if io_status_block.is_null() || file_information.is_null() {
-        return status;
-    }
-    // SAFETY: read of IoStatusBlock.Information at offset 8 on x64 — pointer validated non-null above.
-    let info_size = *((io_status_block as *const u8).add(8) as *const usize);
-    if info_size == 0 {
-        return status;
-    }
-
-    // Build the hide set: `.winrsbox` is always hidden, plus any whiteouted
-    // direct children of the directory being enumerated. We resolve the
-    // directory's DOS path from file_handle (one GetFinalPathNameByHandleW
-    // call) and issue ONE IPC WhiteoutsUnder request for it. If the IPC
-    // fails or the dir has no whiteouts, only the `.winrsbox` filter applies.
-    let mut hide_names: Vec<Vec<u16>> = vec![dot_winrsbox_u16()];
     let dir_dos = crate::fs_metadata_guard::query_handle_dos_path(file_handle);
-    if let Some(ref dir) = dir_dos {
-        if let Some(names) = crate::ipc_client::ipc_whiteouts_under(dir) {
-            for n in names {
-                hide_names.push(n.encode_utf16().collect());
-            }
-        }
-    }
-
-    let mut only_hidden = false;
-    if filter_entries(
-        file_information as *mut u8,
-        info_size,
+    process_dir_output(
+        file_information,
+        io_status_block,
         file_information_class,
-        &hide_names,
-        &mut only_hidden,
-    ) {
-        if only_hidden {
-            // Every entry was hidden — return NO_MORE_FILES so the caller
-            // sees an empty directory.
-            const STATUS_NO_MORE_FILES: NTSTATUS = 0x0000_0104_u32 as NTSTATUS;
-            if hooks::is_trace() {
-                hooks::ipc_log(ipc::LogLevel::Trace, "fs_hide_enum: only hidden entries".into());
-            }
-            return STATUS_NO_MORE_FILES;
-        }
-        if hooks::is_trace() {
-            hooks::ipc_log(ipc::LogLevel::Trace, "fs_hide_enum: entries filtered from listing".into());
-        }
-    }
+        dir_dos.as_deref(),
+        status,
+    )
+}
 
-    status
+// SAFETY: Called by detour2 dispatcher with ntdll!NtQueryDirectoryFileEx ABI.
+unsafe extern "system" fn hook_nt_query_directory_file_ex(
+    file_handle: HANDLE,
+    event: HANDLE,
+    apc_routine: *mut c_void,
+    apc_context: *mut c_void,
+    io_status_block: *mut IO_STATUS_BLOCK,
+    file_information: *mut c_void,
+    length: u32,
+    file_information_class: u32,
+    query_flags: u32,
+    file_name: *mut UNICODE_STRING,
+) -> NTSTATUS {
+    let Some(_guard) = anti_rec::enter() else {
+        // SAFETY: detour2 trampoline matches FnNtQueryDirectoryFileEx ABI.
+        return HOOK_NT_QUERY_DIRECTORY_FILE_EX.get().unwrap().call(
+            file_handle, event, apc_routine, apc_context, io_status_block,
+            file_information, length, file_information_class,
+            query_flags, file_name,
+        );
+    };
+
+    // SAFETY: detour2 trampoline matches FnNtQueryDirectoryFileEx ABI.
+    let status = HOOK_NT_QUERY_DIRECTORY_FILE_EX.get().unwrap().call(
+        file_handle, event, apc_routine, apc_context, io_status_block,
+        file_information, length, file_information_class,
+        query_flags, file_name,
+    );
+
+    let dir_dos = crate::fs_metadata_guard::query_handle_dos_path(file_handle);
+    process_dir_output(
+        file_information,
+        io_status_block,
+        file_information_class,
+        dir_dos.as_deref(),
+        status,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -304,12 +567,14 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     install!(HOOK_NT_QUERY_DIRECTORY_FILE, "NtQueryDirectoryFile\0", hook_nt_query_directory_file, FnNtQueryDirectoryFile);
+    install!(HOOK_NT_QUERY_DIRECTORY_FILE_EX, "NtQueryDirectoryFileEx\0", hook_nt_query_directory_file_ex, FnNtQueryDirectoryFileEx);
 
     Ok(())
 }
 
 pub unsafe fn uninstall() {
     if let Some(h) = HOOK_NT_QUERY_DIRECTORY_FILE.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_NT_QUERY_DIRECTORY_FILE_EX.get() { let _ = h.disable(); }
 }
 
 // ---------------------------------------------------------------------------
@@ -748,5 +1013,121 @@ mod tests {
             cur += next_off;
         }
         assert_eq!(got, vec!["a.txt".to_string(), "c.txt".to_string()]);
+    }
+
+    /// Case-rewrite unit test: buffer with lowercase entry "c", case_map has
+    /// "c" → "C". After rewrite_entry_case, the buffer contains "C".
+    #[test]
+    fn rewrite_entry_case_lowercase_to_uppercase() {
+        let mut buf = build_dir_info_buffer(&["c"]);
+        let mut case_map = HashMap::new();
+        case_map.insert("c".to_string(), "C".encode_utf16().collect::<Vec<u16>>());
+        // SAFETY: buf is a valid writable class-1 buffer built above.
+        unsafe {
+            rewrite_entry_case(buf.as_mut_ptr(), buf.len(), 1, &case_map);
+        }
+        let names = collect_names(&buf);
+        assert_eq!(names, vec!["C".to_string()]);
+    }
+
+    /// Case-rewrite: entry name not in case_map → unchanged.
+    #[test]
+    fn rewrite_entry_case_no_match_unchanged() {
+        let mut buf = build_dir_info_buffer(&["hello"]);
+        let case_map: HashMap<String, Vec<u16>> = HashMap::new();
+        // SAFETY: buf is a valid writable class-1 buffer built above.
+        unsafe {
+            rewrite_entry_case(buf.as_mut_ptr(), buf.len(), 1, &case_map);
+        }
+        let names = collect_names(&buf);
+        assert_eq!(names, vec!["hello".to_string()]);
+    }
+
+    /// Case-rewrite: multiple entries, only one is in the map.
+    #[test]
+    fn rewrite_entry_case_partial_match() {
+        let mut buf = build_dir_info_buffer(&["c", "other"]);
+        let mut case_map = HashMap::new();
+        case_map.insert("c".to_string(), "C".encode_utf16().collect::<Vec<u16>>());
+        // SAFETY: buf is a valid writable class-1 buffer built above.
+        unsafe {
+            rewrite_entry_case(buf.as_mut_ptr(), buf.len(), 1, &case_map);
+        }
+        let names = collect_names(&buf);
+        assert_eq!(names, vec!["C".to_string(), "other".to_string()]);
+    }
+
+    // ── build_case_map_with_fallback tests (7.3 / 7.4) ─────────────────────
+
+    /// 7.3 — read_dir fails (ENOENT), IPC fallback returns one pair.
+    /// Result: map contains that pair; returns Some.
+    #[test]
+    fn build_case_map_fallback_used_when_read_dir_fails() {
+        let nonexistent = r"C:\___no_such_dir_for_winrsbox_test___";
+        let result = unsafe {
+            build_case_map_with_fallback(
+                nonexistent,
+                |_dir| Some(vec![("foo".to_string(), "Foo".to_string())]),
+            )
+        };
+        let map = result.expect("fallback should produce a non-empty map");
+        let wide: Vec<u16> = "Foo".encode_utf16().collect();
+        assert_eq!(map.get("foo"), Some(&wide), "fallback entry 'Foo' must appear");
+    }
+
+    /// 7.4 — read_dir succeeds (returns "Real"), IPC fallback returns ("real", "FromIndex").
+    /// Real-disk entry wins: value for "real" must be "Real" UTF-16, NOT "FromIndex".
+    #[test]
+    fn build_case_map_real_disk_wins_over_fallback() {
+        // Use the current directory (guaranteed to exist) and ask for a key that
+        // we control via the stub. We seed the real-disk part via stub_real to
+        // avoid depending on actual file names in the cwd; instead we bypass
+        // read_dir and inject via the "real disk" path through the same
+        // `build_case_map_with_fallback` API by constructing a two-stage fallback.
+        //
+        // Actually: we can't inject into the read_dir path without the filesystem.
+        // Use a temp dir with a known file to give read_dir one real entry.
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("Real");
+        std::fs::write(&file_path, b"").unwrap();
+
+        let dir_str = dir.path().to_str().expect("tempdir path must be UTF-8");
+        let result = unsafe {
+            build_case_map_with_fallback(
+                dir_str,
+                |_dir| Some(vec![
+                    ("real".to_string(), "FromIndex".to_string()),
+                ]),
+            )
+        };
+        let map = result.expect("must return Some with real-disk entry");
+        // real_disk path reports "Real" (windows FS preserves creation case).
+        // The key is its lowercase: "real".
+        if let Some(wide) = map.get("real") {
+            // Convert back to string for assertion clarity.
+            let name: String = std::char::decode_utf16(wide.iter().copied())
+                .map(|r| r.unwrap_or('\u{FFFD}'))
+                .collect();
+            // Real-disk name must win; "FromIndex" must NOT appear.
+            assert_ne!(
+                name, "FromIndex",
+                "IPC fallback must not override real-disk entry",
+            );
+            // Real-disk value is "Real" (Windows FS returns creation case for
+            // files in a temp dir; NTFS returns whatever case was used at create).
+            // We only assert that it's NOT FromIndex (defensive guard).
+        }
+        // Regardless: the fallback entry must NOT have overwritten real-disk
+        // — verified implicitly by the ne above.
+    }
+
+    /// 7.3b — Both sources return nothing → None.
+    #[test]
+    fn build_case_map_empty_both_sources_returns_none() {
+        let nonexistent = r"C:\___no_such_dir_for_winrsbox_test_2___";
+        let result = unsafe {
+            build_case_map_with_fallback(nonexistent, |_dir| None)
+        };
+        assert!(result.is_none(), "empty both sources must return None");
     }
 }

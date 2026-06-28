@@ -672,6 +672,7 @@ dependencies = [
  "proptest",
  "quick_cache",
  "rstest",
+ "tempfile",
  "widestring",
  "winapi",
  "xxhash-rust",

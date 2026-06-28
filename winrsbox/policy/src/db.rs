@@ -7,6 +7,20 @@ pub const MOCKS: TableDefinition<&str, &[u8]> = TableDefinition::new("mocks");
 pub const MOCK_DIRS: TableDefinition<&str, ()> = TableDefinition::new("mock_dirs");
 pub const OVERLAY_IDX: TableDefinition<&str, &str> = TableDefinition::new("overlay_idx");
 
+/// Optional case-preservation index for overlay entries.
+///
+/// Key   = lowercase virtual DOS path (same key space as OVERLAY_IDX).
+/// Value = original-case basename of the virtual path at the time of
+///         first overlay write (e.g. "Mixed_Case_Dir" for
+///         `c:\test_case\mixed_case_dir`).
+///
+/// Legacy entries (written before this field existed) simply have no
+/// record here; reads return `None` and callers fall back to the
+/// real-disk case (same as before). This table is intentionally
+/// separate from OVERLAY_IDX so the existing ~24k entries need no
+/// migration and the schema change is 100 % backward compatible.
+pub const OVERLAY_CASE: TableDefinition<&str, &str> = TableDefinition::new("overlay_case");
+
 /// Whiteout markers (OverlayFS-style tombstones). Key = lowercase virtual DOS
 /// path that has been "deleted" from the sandbox's merged view. The real lower
 /// file is untouched; the presence of the key here makes the path appear

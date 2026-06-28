@@ -15,7 +15,8 @@ use crate::hooked_attrs::HookedAttrs;
 use crate::hooks::{
     check_path_traversal, check_device_block, decide, resolve_for_hook,
     is_write_access, materialize_mock_overlay,
-    prepare_overlay, set_io_status, ipc_record_overlay,
+    prepare_overlay, set_io_status, ipc_record_overlay, ipc_record_overlay_case,
+    extract_nt_basename,
     FILE_CREATE, FILE_OPEN_IF, FILE_OVERWRITE_IF, FILE_SUPERSEDE,
     STATUS_ACCESS_DENIED, STATUS_OBJECT_NAME_NOT_FOUND,
 };
@@ -155,6 +156,11 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
         set_io_status(io_status_block, status);
         return status;
     }
+
+    // Variant B hybrid: capture original-case basename NOW, before
+    // resolve_for_hook / nt_to_dos_lower lowercases the path.
+    // SAFETY: object_attributes is valid per NT ABI for this call's duration.
+    let original_basename: Option<String> = extract_nt_basename(object_attributes as *const _);
 
     // H5 resolve-once: resolve RootDirectory handle EXACTLY ONCE here. The
     // returned `pre_resolved` (Some for relative opens) is reused verbatim in
@@ -397,6 +403,15 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
             }
 
             ipc_record_overlay(&lower, &overlay_dos);
+            // Record original-case basename so the directory-enumeration hook
+            // can restore case for overlay-only dirs (variant B hybrid).
+            // Use `original_basename` captured before nt_to_dos_lower (which
+            // lowercases the entire path), so the true caller-supplied case is
+            // preserved. Falls back to the dos basename when the early capture
+            // returned None (path already all-lowercase — nothing to preserve).
+            if let Some(ref basename) = original_basename {
+                ipc_record_overlay_case(&lower, basename);
+            }
             cache().invalidate(&lower);
 
             // Cow: redirect to overlay path. Keep orig's SQOS verbatim
@@ -481,6 +496,10 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
         set_io_status(io_status_block, status);
         return status;
     }
+
+    // Variant B hybrid: capture original-case basename before nt_to_dos_lower.
+    // SAFETY: object_attributes is valid per NT ABI for this call's duration.
+    let original_basename: Option<String> = extract_nt_basename(object_attributes as *const _);
 
     // H5 resolve-once (same pattern as NtCreateFile above).
     let Some((dos, pre_resolved)) = resolve_for_hook(object_attributes as *const _) else {
@@ -594,6 +613,11 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
             };
             let lower = dos.to_lowercase();
             ipc_record_overlay(&lower, &overlay_dos);
+            // Record original-case basename (variant B hybrid — NtOpenFile path).
+            // Use `original_basename` captured before nt_to_dos_lower lowercased the path.
+            if let Some(ref basename) = original_basename {
+                ipc_record_overlay_case(&lower, basename);
+            }
             cache().invalidate(&lower);
 
             // SAFETY: object_attributes is non-null.

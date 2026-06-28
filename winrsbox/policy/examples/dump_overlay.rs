@@ -3,6 +3,7 @@
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 const OVERLAY_IDX: TableDefinition<&str, &str> = TableDefinition::new("overlay_idx");
+const OVERLAY_CASE: TableDefinition<&str, &str> = TableDefinition::new("overlay_case");
 const WHITEOUTS: TableDefinition<&str, ()> = TableDefinition::new("whiteouts");
 
 fn main() {
@@ -33,6 +34,30 @@ fn main() {
         for s in samples {
             println!("  {s}");
         }
+    }
+
+    if let Ok(c) = txn.open_table(OVERLAY_CASE) {
+        println!("OVERLAY_CASE total entries: {}", c.len().expect("len"));
+        if let Some(f) = &filter {
+            let mut case_matched = 0usize;
+            let mut case_samples = Vec::new();
+            for e in c.iter().expect("iter").flatten() {
+                let (k, v) = e;
+                let key = k.value().to_owned();
+                if key.contains(f.as_str()) {
+                    case_matched += 1;
+                    if case_samples.len() < 5 {
+                        case_samples.push(format!("{}  =>  {}", key, v.value()));
+                    }
+                }
+            }
+            if case_matched > 0 {
+                println!("OVERLAY_CASE matched '{}': {}", f, case_matched);
+                for s in case_samples { println!("  {s}"); }
+            }
+        }
+    } else {
+        println!("OVERLAY_CASE table: not present (old DB or no case entries yet)");
     }
 
     if let Ok(w) = txn.open_table(WHITEOUTS) {

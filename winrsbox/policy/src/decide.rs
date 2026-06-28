@@ -309,6 +309,74 @@ impl Policy {
         Ok(())
     }
 
+    /// Record the original-case basename for an overlay entry.
+    ///
+    /// Writes to `OVERLAY_CASE` using the same lowercase-virtual-path key
+    /// as `OVERLAY_IDX`. The value is the caller-supplied original-case
+    /// basename (e.g. `"Mixed_Case_Dir"`). No-op if `original_basename` is
+    /// empty or already lowercase (nothing to preserve).
+    ///
+    /// This method is intentionally infallible from the caller's perspective:
+    /// failure to record case is non-fatal — the hook's `build_case_map`
+    /// falls back to real-disk enumeration for entries without a case record.
+    pub fn record_overlay_case(&self, lower_path: &str, original_basename: &str) {
+        if original_basename.is_empty() {
+            return;
+        }
+        // Only worth storing when case differs from lowercase (optimization).
+        if original_basename == original_basename.to_ascii_lowercase() {
+            return;
+        }
+        let key = trim_trailing_sep(lower_path);
+        let _ = (|| -> Result<(), PolicyError> {
+            let txn = self.inner.db.begin_write()?;
+            {
+                let mut t = txn.open_table(db::OVERLAY_CASE)?;
+                t.insert(key, original_basename)?;
+            }
+            txn.commit()?;
+            Ok(())
+        })();
+    }
+
+    /// Return `(lowercase_name, original_case_name)` pairs for all direct
+    /// children of `dir` that have a recorded original-case basename in
+    /// `OVERLAY_CASE`.
+    ///
+    /// `dir` must be the lowercase virtual DOS path of the parent directory
+    /// (e.g. `c:\localappdata\uv\cache\builds-v0\.tmpXXXXXX`). Only
+    /// DIRECT children (single path segment beyond `dir\`) are returned.
+    ///
+    /// Returns an empty Vec on any error or when no children with case
+    /// records exist.
+    pub fn overlay_children_with_case(&self, dir: &str) -> Vec<(String, String)> {
+        let dir_lower = ensure_lower(dir);
+        let dir_trimmed = dir_lower.trim_end_matches('\\');
+        if dir_trimmed.is_empty() {
+            return Vec::new();
+        }
+        let prefix_with_sep = format!("{}\\", dir_trimmed);
+        let Ok(txn) = self.inner.db.begin_read() else { return Vec::new() };
+        let Ok(t) = txn.open_table(db::OVERLAY_CASE) else { return Vec::new() };
+        let mut out = Vec::new();
+        let iter = if let Ok(iter) = t.range(prefix_with_sep.as_str()..) {
+            iter
+        } else {
+            return Vec::new();
+        };
+        for entry in iter.flatten() {
+            let key = entry.0.value();
+            let Some(rest) = key.strip_prefix(&prefix_with_sep) else { break };
+            // Direct children only — no further backslash.
+            if rest.contains('\\') {
+                continue;
+            }
+            let original_name = entry.1.value().to_owned();
+            out.push((rest.to_owned(), original_name));
+        }
+        out
+    }
+
     /// Record a whiteout (delete-marker / tombstone) for `path`. The real
     /// lower file is never touched; the marker only hides the path from the
     /// sandbox's merged view. Keyed on the ASCII-lowercased virtual DOS path.
