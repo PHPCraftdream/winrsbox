@@ -82,6 +82,52 @@ const FILE_DISPOSITION_INFO_CLASS: u32 = 13;
 const FILE_DISPOSITION_EX_INFO_CLASS: u32 = 64;
 
 // ---------------------------------------------------------------------------
+// NTSTATUS constants used by the disposition handler
+// ---------------------------------------------------------------------------
+
+const STATUS_SUCCESS: NTSTATUS = 0;
+/// Directory still has open handles or children (handle-contention / race).
+const STATUS_DIRECTORY_NOT_EMPTY: NTSTATUS = 0xC000_0101_u32 as NTSTATUS;
+/// Another process has the file open in an incompatible share mode.
+const STATUS_SHARING_VIOLATION: NTSTATUS   = 0xC000_0043_u32 as NTSTATUS;
+
+// ---------------------------------------------------------------------------
+// Post-delete whiteout decision
+// ---------------------------------------------------------------------------
+
+/// What the overlay-delete handler should do after `call_original()` returns.
+#[derive(Debug, PartialEq)]
+enum WhiteoutAction {
+    /// Status is a hard error — do not record any whiteout.
+    Skip,
+    /// Record the whiteout but keep the OVERLAY_IDX entry (physical overlay
+    /// file may still exist due to handle contention / non-emptiness).
+    RecordWhiteoutKeepOverlay,
+    /// Record the whiteout AND remove the OVERLAY_IDX entry (file is physically
+    /// gone, overlay storage is clean).
+    RecordWhiteoutAndRemoveIdx,
+}
+
+/// Pure decision function: given the NTSTATUS returned by the kernel for a
+/// `NtSetInformationFile(FileDispositionInfo, delete=true)` call on an
+/// overlay-resident path, decide what the hook should do next.
+///
+/// Returning `RecordWhiteout*` for `STATUS_DIRECTORY_NOT_EMPTY` and
+/// `STATUS_SHARING_VIOLATION` fixes bug #76: when handle contention prevents
+/// the kernel from completing the physical delete, we still need to hide the
+/// path from the sandbox view so a subsequent clone into the same location
+/// succeeds.
+fn decide_post_delete(status: NTSTATUS) -> WhiteoutAction {
+    match status {
+        STATUS_SUCCESS => WhiteoutAction::RecordWhiteoutAndRemoveIdx,
+        STATUS_DIRECTORY_NOT_EMPTY | STATUS_SHARING_VIOLATION => {
+            WhiteoutAction::RecordWhiteoutKeepOverlay
+        }
+        _ => WhiteoutAction::Skip,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FSCTL constants
 // ---------------------------------------------------------------------------
 
@@ -450,15 +496,33 @@ unsafe extern "system" fn hook_nt_set_information_file(
                         let virtual_dos = hooks::unmirror_overlay_handle_relative(&path, sb_root_opt)
                             .unwrap_or_else(|| path.clone());
                         let status = call_original();
-                        if status == 0 {
-                            let lower = virtual_dos.to_lowercase();
-                            hooks::ipc_clear_overlay(&lower);
-                            hooks::ipc_record_whiteout(&lower);
-                            hooks::cache().invalidate(&lower);
-                            if hooks::is_trace() {
-                                hooks::ipc_log(ipc::LogLevel::Trace,
-                                    format!("fs_whiteout_overlay_delete virtual={virtual_dos} overlay={path}"));
+                        let lower = virtual_dos.to_lowercase();
+                        match decide_post_delete(status) {
+                            WhiteoutAction::RecordWhiteoutAndRemoveIdx => {
+                                hooks::ipc_clear_overlay(&lower);
+                                hooks::ipc_record_whiteout(&lower);
+                                hooks::cache().invalidate(&lower);
+                                if hooks::is_trace() {
+                                    hooks::ipc_log(ipc::LogLevel::Trace,
+                                        format!("fs_whiteout_overlay_delete virtual={virtual_dos} overlay={path}"));
+                                }
                             }
+                            WhiteoutAction::RecordWhiteoutKeepOverlay => {
+                                // Physical delete failed (handle contention /
+                                // NOT_EMPTY) but the virtual path must be hidden
+                                // so a subsequent create in the same location
+                                // succeeds.  Do NOT remove OVERLAY_IDX — the
+                                // physical file may still be present.
+                                hooks::ipc_record_whiteout(&lower);
+                                hooks::cache().invalidate(&lower);
+                                if hooks::is_trace() {
+                                    hooks::ipc_log(ipc::LogLevel::Trace,
+                                        format!("whiteout_recorded_on_partial_delete \
+                                                 status=0x{:08X} virtual={virtual_dos} overlay={path}",
+                                                status as u32));
+                                }
+                            }
+                            WhiteoutAction::Skip => {}
                         }
                         return status;
                     }
@@ -762,5 +826,46 @@ mod tests {
         // through set_io_status (same offset) is sound.
         let raw_status = unsafe { *(&iosb as *const _ as *const NTSTATUS) };
         assert_eq!(raw_status, STATUS_ACCESS_DENIED);
+    }
+
+    // -----------------------------------------------------------------------
+    // decide_post_delete — pure logic, no IPC, no detours
+    // -----------------------------------------------------------------------
+
+    /// STATUS_SUCCESS → whiteout + remove OVERLAY_IDX (file is physically gone).
+    #[test]
+    fn decide_post_delete_success_removes_idx() {
+        assert_eq!(
+            decide_post_delete(STATUS_SUCCESS),
+            WhiteoutAction::RecordWhiteoutAndRemoveIdx,
+        );
+    }
+
+    /// STATUS_DIRECTORY_NOT_EMPTY → whiteout but KEEP OVERLAY_IDX (physical
+    /// file still present due to handle contention).  This is the bug-#76
+    /// fix: the old code returned `Skip` here.
+    #[test]
+    fn decide_post_delete_not_empty_records_whiteout_keeps_overlay() {
+        assert_eq!(
+            decide_post_delete(STATUS_DIRECTORY_NOT_EMPTY),
+            WhiteoutAction::RecordWhiteoutKeepOverlay,
+        );
+    }
+
+    /// STATUS_SHARING_VIOLATION → same treatment as NOT_EMPTY.
+    #[test]
+    fn decide_post_delete_sharing_violation_records_whiteout_keeps_overlay() {
+        assert_eq!(
+            decide_post_delete(STATUS_SHARING_VIOLATION),
+            WhiteoutAction::RecordWhiteoutKeepOverlay,
+        );
+    }
+
+    /// Any other error status → Skip (do not record a spurious whiteout).
+    #[test]
+    fn decide_post_delete_other_error_skips() {
+        // STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034
+        let other: NTSTATUS = 0xC000_0034_u32 as NTSTATUS;
+        assert_eq!(decide_post_delete(other), WhiteoutAction::Skip);
     }
 }
