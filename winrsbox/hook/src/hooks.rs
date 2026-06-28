@@ -313,7 +313,7 @@ pub(crate) unsafe fn resolve_for_hook(
         let mut full: Vec<u16> = base;
         full.push(b'\\' as u16);
         full.extend_from_slice(name_slice);
-        let dos = policy::path::nt_to_dos_lower(&full)?;
+        let dos = policy::path::nt_to_dos_preserve(&full)?;
         // Relative-open whose directory handle was itself a CoW'd overlay file:
         // see `unmirror_overlay_handle_relative` for the rationale. Returns the
         // original `dos` unchanged when the handle does not resolve into the
@@ -324,7 +324,13 @@ pub(crate) unsafe fn resolve_for_hook(
     }
 
     // Fast path: ObjectName already in absolute NT form (`\??\C:\…`).
-    if let Some(dos) = policy::path::nt_to_dos_lower(name_slice) {
+    // Use nt_to_dos_PRESERVE (not _lower) so the original case is kept.
+    // The lowercased form is derived explicitly where needed (cache key,
+    // OVERLAY_IDX key, denylist). The physical overlay path MUST preserve
+    // case so that case-sensitive consumers (Python importlib FileFinder)
+    // can find modules whose names contain uppercase letters
+    // (e.g. distutils.compilers.C vs .c).
+    if let Some(dos) = policy::path::nt_to_dos_preserve(name_slice) {
         // Self-block guard (class #64 for ABSOLUTE paths, symmetric with the
         // relative-open case at line 321). A sandboxed process that learned
         // its own overlay path via a passthrough query channel (class-9
