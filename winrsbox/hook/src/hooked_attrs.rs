@@ -109,13 +109,24 @@ impl HookedAttrs {
         } else {
             orig.SecurityQualityOfService
         };
+        // OBJ_DONT_REPARSE (0x1000): when the caller sets this flag the kernel
+        // will return STATUS_REPARSE_POINT_ENCOUNTERED if any component of the
+        // path traversal is a reparse point. This is a legitimate TOCTOU
+        // defence for opens on the REAL filesystem, but it causes
+        // `NtOpenFile(FILE_OPEN_REPARSE_POINT)` on a NON-reparse-point entry
+        // inside our overlay mirror to return STATUS_NOT_A_REPARSE_POINT
+        // (0xC000050B → Win32 4395 = "The object manager encountered a reparse
+        // point…"). The overlay tree is our own trusted storage; there are no
+        // adversary-controlled reparse points in it, so stripping this flag for
+        // the overlay-redirected call is safe and avoids the false 4395 error.
+        const OBJ_DONT_REPARSE: u32 = 0x1000;
         let attrs = OBJECT_ATTRIBUTES {
             Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
             RootDirectory: std::ptr::null_mut(),
             // ObjectName left null here — as_ptr_mut() patches it to
             // &self.ustr right before returning the pointer to the kernel.
             ObjectName: std::ptr::null_mut(),
-            Attributes: orig.Attributes | OBJ_CASE_INSENSITIVE,
+            Attributes: (orig.Attributes | OBJ_CASE_INSENSITIVE) & !OBJ_DONT_REPARSE,
             SecurityDescriptor: orig.SecurityDescriptor,
             SecurityQualityOfService: sqos,
         };
@@ -423,6 +434,36 @@ mod tests {
         };
         let h = unsafe { HookedAttrs::redirect(&orig, r"C:\a.txt", false) };
         assert!(h.attrs.Attributes & OBJ_CASE_INSENSITIVE != 0);
+    }
+
+    /// Fix for os error 4395: when the caller sets OBJ_DONT_REPARSE (0x1000)
+    /// in Attributes, passing it through to an overlay-redirected NtOpenFile
+    /// with FILE_OPEN_REPARSE_POINT causes STATUS_NOT_A_REPARSE_POINT
+    /// (0xC000050B → Win32 4395) on non-reparse-point overlay directories.
+    /// The overlay is our own trusted storage, so stripping OBJ_DONT_REPARSE
+    /// for the redirected call is safe.
+    #[test]
+    fn redirect_strips_obj_dont_reparse() {
+        const OBJ_DONT_REPARSE: u32 = 0x1000;
+        let orig = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: std::ptr::null_mut(),
+            ObjectName: std::ptr::null_mut(),
+            // Simulate Rust remove_dir_all: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE
+            Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
+        };
+        let h = unsafe { HookedAttrs::redirect(&orig, r"C:\overlay\scripts", false) };
+        assert!(
+            h.attrs.Attributes & OBJ_CASE_INSENSITIVE != 0,
+            "OBJ_CASE_INSENSITIVE must be set"
+        );
+        assert_eq!(
+            h.attrs.Attributes & OBJ_DONT_REPARSE,
+            0,
+            "OBJ_DONT_REPARSE must be stripped from overlay-redirected attrs"
+        );
     }
 
     /// Audit M-S2 — the whole point of TOCTOU copy. After we build the

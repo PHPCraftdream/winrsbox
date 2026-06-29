@@ -455,6 +455,16 @@ unsafe extern "system" fn hook_nt_set_information_file(
                 *(info as *const u8) != 0 // DeleteFile = TRUE
             };
             if wants_delete {
+                // Tripwire for diag_4395_posix_disp: capture the FileDispositionExInfo
+                // flags before dispatching so we can log them on failure without a
+                // second pointer dereference.
+                let disp_ex_flags: u32 = if class == FILE_DISPOSITION_EX_INFO_CLASS
+                    && (len as usize) >= 4
+                {
+                    *(info as *const u32)
+                } else {
+                    0
+                };
                 if let Some(path) = query_handle_dos_path(handle) {
                     let in_project = hooks::SANDBOX_CWD.get().map_or(false, |cwd| {
                         policy::path::pattern_matches_prefix(&cwd.to_lowercase(), &path)
@@ -511,11 +521,14 @@ unsafe extern "system" fn hook_nt_set_information_file(
                         // appears in sandbox.log and is easy to find when
                         // investigating the pywin32 / uv install failure.
                         if status == STATUS_REPARSE_POINT_ENCOUNTERED {
+                            let posix = (disp_ex_flags & 0x8) != 0;
                             hooks::ipc_log(ipc::LogLevel::Warn,
-                                format!("diag_4395_reparse_point_encountered \
-                                         status=0x{:08X} virtual={virtual_dos} overlay={path} \
-                                         class={class}",
-                                        status as u32));
+                                format!("diag_4395_posix_disp \
+                                         handle=0x{handle_val:x} \
+                                         class={class} disp_flags=0x{disp_ex_flags:08x} \
+                                         posix={posix} status=0x{status:08X} \
+                                         virtual={virtual_dos} overlay={path}",
+                                        handle_val = handle as usize));
                         }
                         match decide_post_delete(status) {
                             WhiteoutAction::RecordWhiteoutAndRemoveIdx => {
@@ -566,6 +579,30 @@ unsafe extern "system" fn hook_nt_set_information_file(
                         hooks::set_io_status(iosb, 0); // STATUS_SUCCESS
                     }
                     return 0; // STATUS_SUCCESS
+                } else {
+                    // query_handle_dos_path returned None — the handle is
+                    // opaque to GetFinalPathNameByHandleW. Pass through to the
+                    // kernel and catch any 4395 so the tripwire fires.
+                    //
+                    // FILE_DISPOSITION_POSIX_SEMANTICS flag = bit 3 (0x8).
+                    // When set, POSIX-delete semantics are requested: the file
+                    // is unlinked even if other handles are open (like unlink(2)).
+                    let posix = (disp_ex_flags & 0x8) != 0;
+                    let status = call_original();
+                    if status == STATUS_REPARSE_POINT_ENCOUNTERED {
+                        hooks::ipc_log(
+                            ipc::LogLevel::Warn,
+                            format!(
+                                "diag_4395_posix_disp \
+                                 handle=0x{handle_val:x} \
+                                 class={class} disp_flags=0x{disp_ex_flags:08x} \
+                                 posix={posix} status=0x{status:08x} \
+                                 note=handle_unresolvable",
+                                handle_val = handle as usize,
+                            ),
+                        );
+                    }
+                    return status;
                 }
             }
         }

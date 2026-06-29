@@ -194,7 +194,32 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
             set_io_status(io_status_block, STATUS_ACCESS_DENIED);
             return STATUS_ACCESS_DENIED;
         }
-        return call_original!();
+        // Tripwire: catch 4395 from relative-opens (RootDirectory != NULL) that
+        // we could not resolve. If the overlay-redirected parent handle is
+        // opaque to resolve_for_hook, the kernel receives the original relative
+        // request and may return STATUS_REPARSE_POINT_ENCOUNTERED.
+        {
+            const STATUS_REPARSE_POINT_ENCOUNTERED_RC: NTSTATUS = 0xC000_0274_u32 as NTSTATUS;
+            let is_relative = !(*object_attributes).RootDirectory.is_null();
+            let status = call_original!();
+            if status == STATUS_REPARSE_POINT_ENCOUNTERED_RC {
+                let raw = crate::hooks::extract_raw_nt_path(object_attributes as *const _)
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                let root_val = (*object_attributes).RootDirectory as usize;
+                ipc_log(
+                    ipc::LogLevel::Warn,
+                    format!(
+                        "diag_4395_rel_create \
+                         pid={pid} root_handle=0x{root_val:x} relative={is_relative} \
+                         name={raw} access={desired_access:#x} share={share_access:#x} \
+                         disp={create_disposition:#x} opts={create_options:#x} \
+                         status=0x{status:08x}",
+                        pid = winapi::um::processthreadsapi::GetCurrentProcessId(),
+                    ),
+                );
+            }
+            return status;
+        }
     };
 
     {
@@ -524,7 +549,29 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
             set_io_status(io_status_block, STATUS_ACCESS_DENIED);
             return STATUS_ACCESS_DENIED;
         }
-        return call_original!();
+        // Tripwire: catch 4395 from relative-opens (RootDirectory != NULL) that
+        // we could not resolve — same rationale as the NtCreateFile counterpart.
+        {
+            const STATUS_REPARSE_POINT_ENCOUNTERED_RO: NTSTATUS = 0xC000_0274_u32 as NTSTATUS;
+            let is_relative = !(*object_attributes).RootDirectory.is_null();
+            let status = call_original!();
+            if status == STATUS_REPARSE_POINT_ENCOUNTERED_RO {
+                let raw = crate::hooks::extract_raw_nt_path(object_attributes as *const _)
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                let root_val = (*object_attributes).RootDirectory as usize;
+                ipc_log(
+                    ipc::LogLevel::Warn,
+                    format!(
+                        "diag_4395_rel_open \
+                         pid={pid} root_handle=0x{root_val:x} relative={is_relative} \
+                         name={raw} access={desired_access:#x} share={share_access:#x} \
+                         opts={open_options:#x} status=0x{status:08x}",
+                        pid = winapi::um::processthreadsapi::GetCurrentProcessId(),
+                    ),
+                );
+            }
+            return status;
+        }
     };
 
     {
@@ -634,10 +681,23 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
                 file_handle, desired_access, h.as_ptr_mut(),
                 io_status_block, share_access, open_options,
             );
-            // Always log STATUS_REPARSE_POINT_ENCOUNTERED (0xC0000274 / os error 4395)
-            // so it appears in sandbox.log at WARN level even without trace mode.
+            // Always log STATUS_REPARSE_POINT_ENCOUNTERED / STATUS_NOT_A_REPARSE_POINT
+            // (os error 4395) at WARN level so they appear in sandbox.log even without
+            // trace mode.
+            //
+            // Root cause of os error 4395 from this call site: the original caller
+            // (e.g. Rust's remove_dir_all) sets OBJ_DONT_REPARSE (0x1000) in
+            // OBJECT_ATTRIBUTES.Attributes + FILE_OPEN_REPARSE_POINT in open_options.
+            // Passing OBJ_DONT_REPARSE through to the overlay-redirected call causes
+            // NtOpenFile on a non-reparse-point overlay directory to return
+            // STATUS_NOT_A_REPARSE_POINT (0xC000050B → Win32 4395). The fix is in
+            // HookedAttrs::redirect: it now strips OBJ_DONT_REPARSE from Attributes
+            // before handing the OBJECT_ATTRIBUTES to the kernel for the overlay path.
             const STATUS_REPARSE_POINT_ENCOUNTERED_OPEN: i32 = 0xC000_0274_u32 as i32;
-            if status == STATUS_REPARSE_POINT_ENCOUNTERED_OPEN {
+            const STATUS_NOT_A_REPARSE_POINT: i32 = 0xC000_050B_u32 as i32;
+            if status == STATUS_REPARSE_POINT_ENCOUNTERED_OPEN
+                || status == STATUS_NOT_A_REPARSE_POINT
+            {
                 ipc_log(
                     ipc::LogLevel::Warn,
                     format!("diag_4395_cow_open dos={dos} opts={open_options:#x} access={desired_access:#x} status=0x{status:08x} overlay={overlay_dos}"),

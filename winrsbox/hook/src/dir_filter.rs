@@ -418,6 +418,18 @@ unsafe fn process_dir_output(
         }
     }
 
+    // Diagnostic: log the hide set and directory being filtered so we can
+    // trace WHY entries disappear from a given directory listing.
+    if hooks::is_trace() && hide_names.len() > 1 {
+        let extra: Vec<String> = hide_names.iter().skip(1)
+            .map(|w| String::from_utf16_lossy(w).to_string())
+            .collect();
+        hooks::ipc_log(ipc::LogLevel::Trace,
+            format!("fs_hide_enum_whitelist dir={} whiteouts={:?}",
+                virtual_dir.as_deref().unwrap_or("<none>"),
+                extra));
+    }
+
     let mut only_hidden = false;
     if filter_entries(
         file_information as *mut u8,
@@ -429,12 +441,16 @@ unsafe fn process_dir_output(
         if only_hidden {
             const STATUS_NO_MORE_FILES: NTSTATUS = 0x0000_0104_u32 as NTSTATUS;
             if hooks::is_trace() {
-                hooks::ipc_log(ipc::LogLevel::Trace, "fs_hide_enum: only hidden entries".into());
+                hooks::ipc_log(ipc::LogLevel::Trace,
+                    format!("fs_hide_enum: only hidden entries dir={}",
+                        virtual_dir.as_deref().unwrap_or("<none>")));
             }
             return STATUS_NO_MORE_FILES;
         }
         if hooks::is_trace() {
-            hooks::ipc_log(ipc::LogLevel::Trace, "fs_hide_enum: entries filtered from listing".into());
+            hooks::ipc_log(ipc::LogLevel::Trace,
+                format!("fs_hide_enum: entries filtered from listing dir={}",
+                    virtual_dir.as_deref().unwrap_or("<none>")));
         }
     }
 
