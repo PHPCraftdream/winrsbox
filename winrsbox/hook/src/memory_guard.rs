@@ -67,6 +67,20 @@ type FnNtUnmapViewOfSection = unsafe extern "system" fn(
     *mut c_void,    // BaseAddress
 ) -> NTSTATUS;
 
+// SectionInformationClass = 1 (SectionImageInformation).
+// Used to probe whether a section was created with SEC_IMAGE before we map it,
+// so we can distinguish PE image loads (legitimate PAGE_EXECUTE_WRITECOPY) from
+// anonymous/file-mapped sections with surprising execute protection.
+type FnNtQuerySection = unsafe extern "system" fn(
+    HANDLE,         // SectionHandle
+    u32,            // SectionInformationClass
+    *mut c_void,    // SectionInformation
+    usize,          // SectionInformationLength
+    *mut usize,     // ReturnLength (optional)
+) -> NTSTATUS;
+
+static NT_QUERY_SECTION: OnceLock<FnNtQuerySection> = OnceLock::new();
+
 // ---------------------------------------------------------------------------
 // Detour storage
 // ---------------------------------------------------------------------------
@@ -249,11 +263,25 @@ fn get_mapped_file_path(addr: *const c_void) -> Option<String> {
     }
 }
 
-/// Check if a NT-device-form path points to a system DLL (System32/SysWOW64).
-/// Used to skip scanning trusted Microsoft DLLs.
+/// Check if a NT-device-form path points to a trusted Windows system location
+/// that should be exempt from the direct-syscall .text scan.
+///
+/// Trusted locations:
+///   - System32 / SysWOW64: core Win32 DLLs (always trusted)
+///   - Windows\Microsoft.NET\: CLR runtime DLLs (clr.dll, mscoreei.dll, etc.)
+///   - Windows\assembly\: CLR GAC and NGen'd native images (.ni.dll).
+///     NGen precompiles managed assemblies to native code; the resulting
+///     .ni.dll files legitimately contain `syscall` instructions generated
+///     by the CLR JIT for P/Invoke and runtime-internal calls.
+///
+/// All of these paths are under C:\Windows, which is write-denied in the
+/// sandbox policy, so the path cannot be spoofed by the agent at runtime.
 pub fn is_system_dll_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    lower.contains(r"\windows\system32\") || lower.contains(r"\windows\syswow64\")
+    lower.contains(r"\windows\system32\")
+        || lower.contains(r"\windows\syswow64\")
+        || lower.contains(r"\windows\microsoft.net\")
+        || lower.contains(r"\windows\assembly\")
 }
 
 fn get_mapped_file_basename(addr: *const c_void) -> Option<String> {
@@ -341,6 +369,81 @@ fn is_image_mapping(addr: *const c_void) -> bool {
         );
         ret != 0 && mbi.Type == MEM_IMAGE
     }
+}
+
+/// Query the section object via NtQuerySection(SectionImageInformation) to
+/// determine if it was created with SEC_IMAGE (i.e., it maps a PE file as a
+/// process image rather than a flat file-backed or anonymous mapping).
+///
+/// This is the authoritative pre-mapping check for distinguishing PE image
+/// loads (where PAGE_EXECUTE_WRITECOPY is the normal NT loader protection)
+/// from anonymous or plain file-backed sections (where executable protection
+/// signals shellcode/manual-map).
+///
+/// Returns true if the section is SEC_IMAGE, false if not or on any error
+/// (fails closed — the post-mapping VirtualQuery check then covers the rest).
+fn is_section_image_backed(section_handle: HANDLE) -> bool {
+    if section_handle.is_null() {
+        return false;
+    }
+    let Some(nt_query) = NT_QUERY_SECTION.get() else {
+        return false;
+    };
+    // SECTION_IMAGE_INFORMATION layout (first 64 bytes are always present).
+    // We only care whether the call succeeds — a non-image section returns
+    // STATUS_SECTION_NOT_IMAGE (0xC0000049) and we return false.
+    let mut info = [0u8; 64];
+    let mut ret_len: usize = 0;
+    // SAFETY: info is a valid mutable buffer; section_handle was passed to
+    // NtMapViewOfSection by the caller and is valid for the duration of the hook.
+    // SectionInformationClass=1 = SectionImageInformation.
+    let status = unsafe {
+        nt_query(
+            section_handle,
+            1, // SectionImageInformation
+            info.as_mut_ptr() as *mut c_void,
+            info.len(),
+            &mut ret_len,
+        )
+    };
+    status >= 0
+}
+
+/// Decide whether a MapView mapping should be allowed based on its type and
+/// protection.
+///
+/// `is_image`       — true when VirtualQuery reports MEM_IMAGE (SEC_IMAGE) or
+///                    NtQuerySection confirmed SEC_IMAGE pre-mapping.
+/// `is_file_backed` — true when GetMappedFileNameW returns a path for the
+///                    mapping (file-backed section, not anonymous/pagefile).
+/// `effective_protect` — win32_protect OR'd with mbi.Protect (actual pages).
+///
+/// Returns true when the mapping is ALLOWED, false when it should be DENIED.
+///
+/// Policy:
+///   - SEC_IMAGE (is_image): all execute protections allowed. PAGE_EXECUTE_
+///     WRITECOPY is the NT loader's normal protection for image sections; CLR
+///     and all .NET apps depend on it.
+///   - file-backed (is_file_backed, !is_image): non-image sections backed by
+///     a disk file (GetMappedFileNameW succeeds). CLR maps .ni.dll/.dll as
+///     plain file views; content-scan at full/static level catches injected
+///     direct-syscall payloads without blocking legitimate CLR loads.
+///   - anonymous (!is_image, !is_file_backed): pagefile-backed section with
+///     no backing file — the classic shellcode / manual-map pattern → deny.
+pub(crate) fn decide_mapview_protection(
+    is_image: bool,
+    is_file_backed: bool,
+    effective_protect: u32,
+) -> bool {
+    if is_image {
+        return true;
+    }
+    if !is_executable(effective_protect) {
+        return true;
+    }
+    // Executable non-image: allow only file-backed (MEM_MAPPED) mappings;
+    // deny anonymous (MEM_PRIVATE) mappings.
+    is_file_backed
 }
 
 // ---------------------------------------------------------------------------
@@ -645,6 +748,16 @@ unsafe extern "system" fn hook_nt_map_view_of_section(
         return call_original();
     };
 
+    // Pre-mapping SEC_IMAGE check: query the section object BEFORE mapping it.
+    // NtQuerySection(SectionImageInformation) succeeds only for SEC_IMAGE
+    // sections (PE files opened by the NT loader). This is authoritative and
+    // avoids the VirtualQuery ambiguity that causes the post-mapping
+    // is_image_mapping() to return false for some CLR managed-assembly loads
+    // (e.g. mscorlib.ni.dll, system.dll) where the NT loader maps a
+    // file-backed section that VirtualQuery reports as MEM_MAPPED rather than
+    // MEM_IMAGE, even though the underlying file IS a PE image.
+    let section_is_image = is_section_image_backed(section_handle);
+
     // Call original first — we need the mapped base to distinguish SEC_IMAGE
     // (normal DLL loading) from anonymous sections (shellcode/manual map).
     let status = call_original();
@@ -657,8 +770,10 @@ unsafe extern "system" fn hook_nt_map_view_of_section(
         return status;
     }
 
-    // Post-check: SEC_IMAGE double-map of critical system DLLs
-    if is_image_mapping(mapped_base) {
+    // Image mapping: either VirtualQuery confirms MEM_IMAGE, or the pre-mapping
+    // NtQuerySection confirmed SEC_IMAGE (covers CLR managed-assembly paths where
+    // VirtualQuery may report MEM_MAPPED for a valid PE image section).
+    if is_image_mapping(mapped_base) || section_is_image {
         if let Some(basename) = get_mapped_file_basename(mapped_base) {
             if is_critical_dll(&basename) {
                 if let Some(unmap_fn) = unmap_section_original_pub() {
@@ -715,7 +830,8 @@ unsafe extern "system" fn hook_nt_map_view_of_section(
             } // full || static
         }
     } else {
-        // Non-image mapping: block if executable (requested OR actual protection)
+        // Non-image mapping (VirtualQuery did not return MEM_IMAGE and
+        // NtQuerySection did not confirm SEC_IMAGE).
         let mut effective = win32_protect;
         let mut mbi: winapi::um::winnt::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
         let ret = winapi::um::memoryapi::VirtualQuery(
@@ -727,12 +843,48 @@ unsafe extern "system" fn hook_nt_map_view_of_section(
             effective |= mbi.Protect;
         }
         if is_executable(effective) {
-            let unmap = unmap_section_original_pub();
-            if let Some(unmap_fn) = unmap {
-                unmap_fn(-1isize as HANDLE, mapped_base);
+            // Both anonymous (pagefile-backed) sections and file-backed sections
+            // appear as MEM_MAPPED after NtMapViewOfSection. Distinguish them by
+            // querying whether the mapping has an underlying file:
+            //   - GetMappedFileNameW succeeds  → file-backed (disk-backed section).
+            //     CLR maps managed assemblies (.ni.dll) this way with
+            //     PAGE_EXECUTE_WRITECOPY — a legitimate read-only copy-on-write
+            //     view. Blocking it terminates .NET / PowerShell at startup.
+            //   - GetMappedFileNameW fails (returns 0) → anonymous / pagefile-
+            //     backed section. This is the classic shellcode / manual-map
+            //     injection pattern → deny regardless of mode.
+            //   - VirtualQuery failed (ret == 0) → err on the side of caution
+            //     and treat as anonymous → deny.
+            let is_file_backed = get_mapped_file_path(mapped_base).is_some();
+
+            if !is_file_backed {
+                // Anonymous or pagefile-backed executable mapping: deny.
+                let unmap = unmap_section_original_pub();
+                if let Some(unmap_fn) = unmap {
+                    unmap_fn(-1isize as HANDLE, mapped_base);
+                }
+                let size = if view_size.is_null() { 0 } else { *view_size as u64 };
+                report_and_terminate(ipc::AllocKind::MapView, mbi.Protect, size, mapped_base as u64);
             }
-            let size = if view_size.is_null() { 0 } else { *view_size as u64 };
-            report_and_terminate(ipc::AllocKind::MapView, mbi.Protect, size, mapped_base as u64);
+            // File-backed non-image executable mapping: scan for direct
+            // syscalls at full/static level. An attacker could write shellcode
+            // to a file and map it; the content scan closes that gap without
+            // blocking CLR's legitimate file-view PE loads.
+            if (is_full_mode() || is_static_mode()) && is_file_backed {
+                let view_bytes = if view_size.is_null() { 0usize } else { *view_size };
+                if view_bytes > 0 && view_bytes <= 64 * 1024 * 1024 {
+                    let bytes = std::slice::from_raw_parts(mapped_base as *const u8, view_bytes);
+                    let hits = policy::scan::find_direct_syscalls(bytes, mapped_base as u64);
+                    if !hits.is_empty() {
+                        let unmap = unmap_section_original_pub();
+                        if let Some(unmap_fn) = unmap {
+                            unmap_fn(-1isize as HANDLE, mapped_base);
+                        }
+                        let size = if view_size.is_null() { 0 } else { *view_size as u64 };
+                        report_and_terminate(ipc::AllocKind::MapView, mbi.Protect, size, mapped_base as u64);
+                    }
+                }
+            }
         }
     }
 
@@ -984,6 +1136,13 @@ pub unsafe fn install(guard_level: &str) -> Result<(), Box<dyn std::error::Error
     if let Some(addr) = crate::hooks::ntdll_export("NtUnmapViewOfSection\0".as_bytes()) {
         let _ = NT_UNMAP_ORIG.set(std::mem::transmute::<usize, FnNtUnmapViewOfSection>(addr as usize));
     }
+    // Resolve NtQuerySection for the SEC_IMAGE pre-check in the MapView hook.
+    // Not all ntdll versions export this under the Nt* name; failure is non-fatal
+    // (the post-mapping VirtualQuery path still handles the common case).
+    if let Some(addr) = crate::hooks::ntdll_export("NtQuerySection\0".as_bytes()) {
+        // SAFETY: addr is the real ntdll NtQuerySection export matching FnNtQuerySection.
+        let _ = NT_QUERY_SECTION.set(std::mem::transmute::<usize, FnNtQuerySection>(addr as usize));
+    }
 
     Ok(())
 }
@@ -1167,9 +1326,17 @@ mod tests {
 
     #[test]
     fn is_system_dll_path_detection() {
+        // Win32 system dirs
         assert!(is_system_dll_path(r"\Device\HarddiskVolume3\Windows\System32\user32.dll"));
         assert!(is_system_dll_path(r"\Device\HarddiskVolume3\Windows\SysWOW64\kernel32.dll"));
         assert!(is_system_dll_path(r"\device\harddiskvolume1\windows\system32\ntdll.dll"));
+        // CLR runtime (.NET Framework)
+        assert!(is_system_dll_path(r"\Device\HarddiskVolume4\Windows\Microsoft.NET\Framework64\v4.0.30319\clr.dll"));
+        assert!(is_system_dll_path(r"\Device\HarddiskVolume4\Windows\Microsoft.NET\Framework64\v4.0.30319\mscoreei.dll"));
+        // NGen'd native images — contain legitimate syscall instructions
+        assert!(is_system_dll_path(r"\Device\HarddiskVolume4\Windows\assembly\NativeImages_v4.0.30319_64\mscorlib\abc\mscorlib.ni.dll"));
+        assert!(is_system_dll_path(r"\device\harddiskvolume3\windows\assembly\nativeimages_v4.0.30319_64\system.ni.dll"));
+        // Untrusted user-space paths
         assert!(!is_system_dll_path(r"\Device\HarddiskVolume3\Users\x\AppData\evil.dll"));
         assert!(!is_system_dll_path(r"\Device\HarddiskVolume3\Program Files\app\plugin.dll"));
         assert!(!is_system_dll_path(""));
@@ -1184,5 +1351,60 @@ mod tests {
         let basename = get_mapped_file_basename(hmod as *const c_void);
         assert!(basename.is_some());
         assert_eq!(basename.unwrap(), "ntdll.dll");
+    }
+
+    // ---------------------------------------------------------------------------
+    // decide_mapview_protection tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn decide_image_section_always_allowed() {
+        // SEC_IMAGE sections: all protect values allowed, including RWX variants.
+        assert!(decide_mapview_protection(true, false, PAGE_EXECUTE_WRITECOPY));
+        assert!(decide_mapview_protection(true, false, PAGE_EXECUTE_READWRITE));
+        assert!(decide_mapview_protection(true, false, PAGE_EXECUTE_READ));
+        assert!(decide_mapview_protection(true, false, PAGE_EXECUTE));
+        assert!(decide_mapview_protection(true, false, 0x04)); // PAGE_READWRITE
+    }
+
+    #[test]
+    fn decide_file_backed_non_exec_allowed() {
+        // MEM_MAPPED without execute: no threat.
+        assert!(decide_mapview_protection(false, true, 0x02)); // PAGE_READONLY
+        assert!(decide_mapview_protection(false, true, 0x04)); // PAGE_READWRITE
+    }
+
+    #[test]
+    fn decide_file_backed_exec_allowed_for_clr() {
+        // CLR maps .ni.dll/.dll as file-backed (MEM_MAPPED) with
+        // PAGE_EXECUTE_WRITECOPY. This must be allowed — blocking it
+        // terminates .NET / PowerShell at startup (bug #80).
+        assert!(decide_mapview_protection(false, true, PAGE_EXECUTE_WRITECOPY));
+        assert!(decide_mapview_protection(false, true, PAGE_EXECUTE_READ));
+    }
+
+    #[test]
+    fn decide_private_exec_denied() {
+        // Anonymous (MEM_PRIVATE) executable mapping: shellcode pattern → deny.
+        assert!(!decide_mapview_protection(false, false, PAGE_EXECUTE_WRITECOPY));
+        assert!(!decide_mapview_protection(false, false, PAGE_EXECUTE_READWRITE));
+        assert!(!decide_mapview_protection(false, false, PAGE_EXECUTE_READ));
+        assert!(!decide_mapview_protection(false, false, PAGE_EXECUTE));
+    }
+
+    #[test]
+    fn decide_private_non_exec_allowed() {
+        // Anonymous non-executable mapping: fine (data).
+        assert!(decide_mapview_protection(false, false, 0x04)); // PAGE_READWRITE
+        assert!(decide_mapview_protection(false, false, 0x02)); // PAGE_READONLY
+    }
+
+    #[test]
+    fn decide_vquery_fail_exec_denied() {
+        // When VirtualQuery fails (is_file_backed=false, is_image=false),
+        // treat as anonymous → deny if executable.
+        assert!(!decide_mapview_protection(false, false, PAGE_EXECUTE));
+        // Non-executable with VirtualQuery failure: allow.
+        assert!(decide_mapview_protection(false, false, 0x04));
     }
 }
