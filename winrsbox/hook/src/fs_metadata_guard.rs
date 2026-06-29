@@ -90,6 +90,12 @@ const STATUS_SUCCESS: NTSTATUS = 0;
 const STATUS_DIRECTORY_NOT_EMPTY: NTSTATUS = 0xC000_0101_u32 as NTSTATUS;
 /// Another process has the file open in an incompatible share mode.
 const STATUS_SHARING_VIOLATION: NTSTATUS   = 0xC000_0043_u32 as NTSTATUS;
+/// The object manager encountered a reparse point while retrieving an object.
+/// Returned by some kernel filter drivers (e.g. AnviFPFltd) or when a path
+/// component inside the overlay is unexpectedly tagged as a reparse point.
+/// Treat the same as NOT_EMPTY: the physical delete did not complete but we
+/// still need to hide the virtual path so a subsequent install succeeds.
+const STATUS_REPARSE_POINT_ENCOUNTERED: NTSTATUS = 0xC000_0274_u32 as NTSTATUS;
 
 // ---------------------------------------------------------------------------
 // Post-delete whiteout decision
@@ -112,15 +118,18 @@ enum WhiteoutAction {
 /// `NtSetInformationFile(FileDispositionInfo, delete=true)` call on an
 /// overlay-resident path, decide what the hook should do next.
 ///
-/// Returning `RecordWhiteout*` for `STATUS_DIRECTORY_NOT_EMPTY` and
-/// `STATUS_SHARING_VIOLATION` fixes bug #76: when handle contention prevents
-/// the kernel from completing the physical delete, we still need to hide the
-/// path from the sandbox view so a subsequent clone into the same location
-/// succeeds.
+/// Returning `RecordWhiteout*` for `STATUS_DIRECTORY_NOT_EMPTY`,
+/// `STATUS_SHARING_VIOLATION`, and `STATUS_REPARSE_POINT_ENCOUNTERED` fixes
+/// bug #76/#79: when the physical delete is blocked by handle contention, a
+/// non-empty directory, or a reparse-point interception by a kernel filter
+/// driver (e.g. AnviFPFltd), we still need to hide the virtual path so a
+/// subsequent install/clone into the same location succeeds.
 fn decide_post_delete(status: NTSTATUS) -> WhiteoutAction {
     match status {
         STATUS_SUCCESS => WhiteoutAction::RecordWhiteoutAndRemoveIdx,
-        STATUS_DIRECTORY_NOT_EMPTY | STATUS_SHARING_VIOLATION => {
+        STATUS_DIRECTORY_NOT_EMPTY
+        | STATUS_SHARING_VIOLATION
+        | STATUS_REPARSE_POINT_ENCOUNTERED => {
             WhiteoutAction::RecordWhiteoutKeepOverlay
         }
         _ => WhiteoutAction::Skip,
@@ -497,6 +506,17 @@ unsafe extern "system" fn hook_nt_set_information_file(
                             .unwrap_or_else(|| path.clone());
                         let status = call_original();
                         let lower = virtual_dos.to_lowercase();
+                        // Diagnostic: always log STATUS_REPARSE_POINT_ENCOUNTERED
+                        // (os error 4395) regardless of trace level so it
+                        // appears in sandbox.log and is easy to find when
+                        // investigating the pywin32 / uv install failure.
+                        if status == STATUS_REPARSE_POINT_ENCOUNTERED {
+                            hooks::ipc_log(ipc::LogLevel::Warn,
+                                format!("diag_4395_reparse_point_encountered \
+                                         status=0x{:08X} virtual={virtual_dos} overlay={path} \
+                                         class={class}",
+                                        status as u32));
+                        }
                         match decide_post_delete(status) {
                             WhiteoutAction::RecordWhiteoutAndRemoveIdx => {
                                 hooks::ipc_clear_overlay(&lower);
@@ -509,10 +529,11 @@ unsafe extern "system" fn hook_nt_set_information_file(
                             }
                             WhiteoutAction::RecordWhiteoutKeepOverlay => {
                                 // Physical delete failed (handle contention /
-                                // NOT_EMPTY) but the virtual path must be hidden
-                                // so a subsequent create in the same location
-                                // succeeds.  Do NOT remove OVERLAY_IDX — the
-                                // physical file may still be present.
+                                // NOT_EMPTY / reparse-point filter) but the
+                                // virtual path must be hidden so a subsequent
+                                // create in the same location succeeds. Do NOT
+                                // remove OVERLAY_IDX — the physical file may
+                                // still be present.
                                 hooks::ipc_record_whiteout(&lower);
                                 hooks::cache().invalidate(&lower);
                                 if hooks::is_trace() {
@@ -857,6 +878,20 @@ mod tests {
     fn decide_post_delete_sharing_violation_records_whiteout_keeps_overlay() {
         assert_eq!(
             decide_post_delete(STATUS_SHARING_VIOLATION),
+            WhiteoutAction::RecordWhiteoutKeepOverlay,
+        );
+    }
+
+    /// STATUS_REPARSE_POINT_ENCOUNTERED (0xC0000274 / os error 4395) → whiteout
+    /// but KEEP OVERLAY_IDX, same as NOT_EMPTY treatment. This is bug-#79:
+    /// when a kernel filter driver (e.g. AnviFPFltd) intercepts the physical
+    /// delete and returns this status, the virtual path must still be hidden
+    /// so a subsequent install attempt can succeed. The old code returned
+    /// `Skip` here, leaving the sandbox in a broken state.
+    #[test]
+    fn decide_post_delete_reparse_point_encountered_records_whiteout_keeps_overlay() {
+        assert_eq!(
+            decide_post_delete(STATUS_REPARSE_POINT_ENCOUNTERED),
             WhiteoutAction::RecordWhiteoutKeepOverlay,
         );
     }

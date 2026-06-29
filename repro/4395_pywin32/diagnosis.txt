@@ -1,0 +1,125 @@
+STATUS_REPARSE_POINT_ENCOUNTERED (0xC0000274 / os error 4395) during uv sync pywin32==311
+
+=== OBSERVED FAILURE ===
+
+  error: Failed to install: pywin32-311-cp311-cp311-win_amd64.whl (pywin32==311)
+    Caused by: failed to remove directory
+      `c:\users\computer\appdata\local\hermes\hermes-agent\venv\Lib\site-packages\pywin32-311.data`:
+      The object manager encountered a reparse point while retrieving an object. (os error 4395)
+
+  (from repro/hermes_install_variant_b_final.log:811, repro/fix78_20260628_181521.log:425)
+
+=== ROOT CAUSE ANALYSIS ===
+
+The error occurs during uv's cleanup phase after hardlinking pywin32 scripts:
+  1. uv installs pywin32 by creating pywin32-311.data/ in site-packages (-> overlay)
+  2. uv hardlinks pywin32_postinstall.py and pywin32_testall.py into scripts/
+  3. uv calls std::fs::remove_dir_all("pywin32-311.data") as cleanup
+
+uv's Rust stdlib (1.65+) implements remove_dir_all using:
+  - NtCreateFile with FILE_OPEN_REPARSE_POINT | FILE_DELETE_ON_CLOSE
+  - NtSetInformationFile(FileDispositionInformationEx, flags=DELETE|POSIX_SEMANTICS)
+
+The exact call that triggers 4395 is not yet confirmed (requires trace-level log from a
+failing run). Two candidates:
+
+  A) NtSetInformationFile(FileDispositionInformationEx) on an overlay dir/file.
+     Possible if AnviFPFltd (kernel protection filter, running at Automatic startup)
+     intercepts the disposition call and returns STATUS_REPARSE_POINT_ENCOUNTERED
+     as an unusual protection response.
+
+  B) NtCreateFile on the overlay path (with FILE_OPEN_REPARSE_POINT in create_options).
+     Less likely since no reparse points were found in the overlay path components.
+
+CONFIRMED:
+  - No reparse points in overlay path components (verified with fsutil, PowerShell)
+  - No reparse points in any ancestor directories
+  - AnviFPFltd kernel filter IS running (Automatic startup)
+  - CldFlt (Cloud Files) IS running but OneDrive NOT installed
+  - The overlay files ARE hardlinks with nlink=3 (to uv cache and venv/scripts)
+  - Python's shutil.rmtree SUCCEEDS on the same path (different NT code path)
+
+DIAGNOSTIC LOGGING:
+  The following WARN-level messages will appear in sandbox.log.jsonl after this fix
+  when the 4395 condition is triggered:
+
+  - "diag_4395_cow_create dos=... disp=... opts=... access=... status=0xc0000274"
+    -> 4395 from NtCreateFile CoW redirect (fs_hooks.rs)
+
+  - "diag_4395_cow_open dos=... opts=... access=... status=0xc0000274 overlay=..."
+    -> 4395 from NtOpenFile CoW redirect (fs_hooks.rs)
+
+  - "diag_4395_reparse_point_encountered status=0xC0000274 virtual=... overlay=... class=..."
+    -> 4395 from NtSetInformationFile disposition (fs_metadata_guard.rs)
+
+  Enable sandbox.log.jsonl by adding to sandbox.ktav:
+    log_level: warn
+  (or trace for full detail)
+
+=== PREVIOUS BUG: decide_post_delete() SKIPped 4395 ===
+
+Before this fix, when STATUS_REPARSE_POINT_ENCOUNTERED was returned from the kernel
+for a file disposition call on an overlay path, decide_post_delete() fell to
+WhiteoutAction::Skip (no whiteout recorded). This left the sandbox in an inconsistent
+state: the virtual path was neither deleted nor properly tombstoned, so a subsequent
+install attempt would encounter a stale overlay entry.
+
+=== FIX APPLIED (bug #79) ===
+
+Files changed:
+  winrsbox/hook/src/fs_metadata_guard.rs
+  winrsbox/hook/src/fs_hooks.rs
+
+1. Added STATUS_REPARSE_POINT_ENCOUNTERED constant (0xC0000274).
+
+2. decide_post_delete(): STATUS_REPARSE_POINT_ENCOUNTERED now maps to
+   WhiteoutAction::RecordWhiteoutKeepOverlay (same as NOT_EMPTY/SHARING_VIOLATION).
+   The physical overlay file may still be present, but the virtual path is hidden
+   from the sandbox view.
+
+3. Diagnostic logging (WARN level, no trace required):
+   - fs_metadata_guard.rs: logs path, overlay, class when 4395 from disposition
+   - fs_hooks.rs: logs path, options, access mask when 4395 from NtCreateFile CoW
+   - fs_hooks.rs: logs path, options, access mask when 4395 from NtOpenFile CoW
+
+4. New test: decide_post_delete_reparse_point_encountered_records_whiteout_keeps_overlay()
+   Tests pass: 315 (was 314)
+
+=== REMAINING LIMITATION ===
+
+The fix records a whiteout for the virtual path, but if the physical overlay file
+still exists (because deletion was blocked), decide() sees:
+  - whiteout = true, idx_hit depends on recorded overlay entry
+  - phys_hit = physical_overlay_path() returns Some (overlay exists, real path doesn't)
+  => falls through to Cow mode, NOT Hidden
+
+This means: the virtual path may still appear accessible (Mode::Cow) even with the
+whiteout recorded. The whiteout IS recorded and suppresses spurious cache entries,
+but does not fully hide the path while the physical overlay remains.
+
+CONSEQUENCE: The status 4395 is STILL returned to uv. uv still sees the failure and
+falls back to PyPI resolve. This fix is a partial improvement (correct bookkeeping)
+but does NOT fully suppress the uv install failure.
+
+=== DIRECTION FOR COMPLETE FIX ===
+
+Option 1: Return STATUS_SUCCESS to caller when 4395 is returned from a disposition call
+          AND also clear the overlay IDX entry. This requires physically removing the
+          overlay file/dir through a different mechanism:
+          - Try NtDeleteFile (one-shot: open+mark+close) instead of disposition info
+          - Or try DeleteFileW/RemoveDirectoryW (Win32 level, may bypass filter)
+          Risk: if the alternative deletion also fails, the overlay is truly stuck.
+
+Option 2: Investigate WHY AnviFPFltd (or CldFlt) returns 4395. It may be protectable
+          files being opened with FILE_DELETE_ON_CLOSE that triggers the filter.
+          Possible mitigation: open WITHOUT FILE_DELETE_ON_CLOSE, then set disposition
+          separately (though Rust std already does this in some versions).
+
+Option 3: Exempt the .winrsbox overlay directory from AnviFPFltd protection by
+          adding it to the AnviFPFltd configuration (if supported).
+
+Option 4: Add a retry loop in the hook: when 4395 is returned from disposition on
+          an overlay file, wait 10ms and retry with RemoveDirectoryW/DeleteFileW.
+
+The diagnostic logging added by this fix will reveal the exact call site and path
+in sandbox.log.jsonl on the next failing run, enabling precise root cause confirmation.
