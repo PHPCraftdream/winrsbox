@@ -735,6 +735,40 @@ mod tests {
         assert!(names.is_empty(), "d:\\foo must not see d:\\foobar's children");
     }
 
+    #[test]
+    fn whiteouts_under_excludes_revived_overlay_child() {
+        // Regression for #81 (ghost coherence): a whiteout on a child that ALSO
+        // has a live physical overlay must NOT be reported as hidden — `compute`
+        // revives such a name to Mode::Cow (VISIBLE), so enumeration must agree.
+        // A blocked physical delete (RecordWhiteoutKeepOverlay) leaves whiteout
+        // + overlay both present; if `whiteouts_under` still hid it, the parent
+        // dir would be un-removable: read_dir reports empty, the kernel rmdir
+        // hits the physical child → STATUS_DIRECTORY_NOT_EMPTY (145) / POSIX
+        // STATUS_REPARSE_POINT_ENCOUNTERED (4395), and recursive delete diverges.
+        let (_dir, p, _project) = make_policy_with_project("proj");
+
+        // Materialize a physical overlay file for the "alive" child (simulates a
+        // delete that was blocked and left the overlay copy behind).
+        let alive = p.decide(r"d:\ghost\alive.txt", true).overlay
+            .expect("write decision yields a Cow overlay path");
+        std::fs::create_dir_all(alive.parent().unwrap()).unwrap();
+        std::fs::write(&alive, b"x").unwrap();
+
+        // Both children carry a whiteout; only "gone" lacks a live overlay.
+        p.record_whiteout(r"d:\ghost\gone.txt").unwrap();
+        p.record_whiteout(r"d:\ghost\alive.txt").unwrap();
+
+        let names = p.whiteouts_under(r"d:\ghost");
+        assert_eq!(names, vec!["gone.txt".to_string()],
+            "only the bare whiteout hides; the revived (whiteout+overlay) child must stay visible, got {names:?}");
+
+        // Coherence with compute(): alive → Cow (visible), gone → Hidden.
+        assert_eq!(p.decide(r"d:\ghost\alive.txt", false).mode, Mode::Cow,
+            "revived child must resolve to Cow in compute()");
+        assert_eq!(p.decide(r"d:\ghost\gone.txt", false).mode, Mode::Hidden,
+            "bare whiteout must resolve to Hidden in compute()");
+    }
+
     // ── decide() + whiteout integration tests ─────────────────────────────
 
     #[test]

@@ -23,9 +23,14 @@ const DATA_DIR: &str =
     r"C:\users\computer\appdata\local\hermes\hermes-agent\venv\Lib\site-packages\pywin32-311.data";
 
 fn main() {
-    println!("[repro] Target: {DATA_DIR}");
+    // Optional argv[1] overrides the default virtual path — lets us run the
+    // exact same std::fs::remove_dir_all against an arbitrary copy (e.g. a
+    // non-overlay temp dir) to isolate sandbox-induced failures from
+    // environmental ones (kernel filter / hardlink quirks).
+    let target = std::env::args().nth(1).unwrap_or_else(|| DATA_DIR.to_string());
+    println!("[repro] Target: {target}");
 
-    let path = Path::new(DATA_DIR);
+    let path = Path::new(&target);
     if !path.exists() {
         println!("[repro] SKIP: directory does not exist (sandbox not pre-seeded)");
         println!("[repro] Re-seed: run PowerShell to create the overlay directory:");

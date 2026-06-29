@@ -518,29 +518,55 @@ impl Policy {
         let prefix_with_sep = format!("{}\\", dir_trimmed);
         let Ok(txn) = self.inner.db.begin_read() else { return Vec::new() };
         let Ok(t) = txn.open_table(db::WHITEOUTS) else { return Vec::new() };
-        let mut out = Vec::new();
+        // Collect direct-child whiteout keys (full lowercase virtual paths) first
+        // so the later revival check can open OVERLAY_IDX in the same read txn
+        // without aliasing the WHITEOUTS iterator.
+        let mut candidates: Vec<String> = Vec::new();
         // range over keys >= prefix_with_sep; stop once we pass the dir's scope.
-        let iter = if let Ok(iter) = t.range(prefix_with_sep.as_str()..) {
-            iter
-        } else {
-            return Vec::new();
-        };
-        for entry in iter.flatten() {
-            let key = entry.0.value();
-            // Must start with `dir\` — otherwise it's a different directory.
-            let Some(rest) = key.strip_prefix(&prefix_with_sep) else { break };
-            // A direct child has no further backslash. Descendants of a
-            // subdirectory (e.g. `dir\sub\file`) are not direct children of
-            // `dir` and must not be reported here — enumeration of `dir`
-            // would list `sub`, not `file`.
-            if rest.contains('\\') {
+        if let Ok(iter) = t.range(prefix_with_sep.as_str()..) {
+            for entry in iter.flatten() {
+                let key = entry.0.value();
+                // Must start with `dir\` — otherwise it's a different directory.
+                let Some(rest) = key.strip_prefix(&prefix_with_sep) else { break };
+                // A direct child has no further backslash. Descendants of a
+                // subdirectory (e.g. `dir\sub\file`) are not direct children of
+                // `dir` and must not be reported here — enumeration of `dir`
+                // would list `sub`, not `file`.
+                if rest.contains('\\') {
+                    continue;
+                }
+                candidates.push(key.to_owned());
+            }
+        }
+        // A whiteout only HIDES a name in the merged view when that name is not
+        // revived by a live overlay entry. This mirrors `compute` exactly:
+        // whiteout + (idx_hit || phys_hit) => Mode::Cow (VISIBLE), only a bare
+        // whiteout => Mode::Hidden. Enumeration MUST agree with `compute`, or a
+        // name that `compute` resolves as a live Cow file would still be hidden
+        // from listings — a "ghost": invisible to enumeration yet physically
+        // present in the overlay. Such ghosts arise from `RecordWhiteoutKeepOverlay`
+        // (blocked physical delete, e.g. contended uv cleanup of pywin32-311.data)
+        // and make the parent directory un-removable: `read_dir` reports empty,
+        // so a recursive delete issues a plain `rmdir`, which the kernel rejects
+        // with STATUS_DIRECTORY_NOT_EMPTY (os error 145) — or, under POSIX-
+        // semantics deletes, STATUS_REPARSE_POINT_ENCOUNTERED (os error 4395) —
+        // because the physical child still exists. Skipping revived names here
+        // re-exposes the child so the recursive delete can drain it leaf-up.
+        let idx = txn.open_table(db::OVERLAY_IDX).ok();
+        let mut out = Vec::new();
+        for key in candidates {
+            let idx_hit = idx
+                .as_ref()
+                .and_then(|t| t.get(key.as_str()).ok().flatten())
+                .is_some();
+            let revived = idx_hit
+                || physical_overlay_path(&key, &self.inner.overlay_layout).is_some();
+            if revived {
                 continue;
             }
-            // Also stop if this key is a sibling-prefix miss (e.g. dir=`c:\foo`
-            // and key=`c:\foobar\baz`): the range lower bound placed it
-            // lexicographically after `c:\foo\`, but `c:\foobar` lacks the
-            // separator so strip_prefix already broke above. Still, guard.
-            out.push(rest.to_owned());
+            if let Some(rest) = key.strip_prefix(&prefix_with_sep) {
+                out.push(rest.to_owned());
+            }
         }
         out
     }
