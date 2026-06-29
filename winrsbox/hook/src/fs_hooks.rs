@@ -434,7 +434,15 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
                 allocation_size, file_attributes, share_access, create_disposition,
                 create_options, ea_buffer, ea_length,
             );
-            if is_trace() && (dos.contains("config.lock") || status != 0) {
+            // Always log STATUS_REPARSE_POINT_ENCOUNTERED (0xC0000274 / os error 4395)
+            // so it appears in sandbox.log at WARN level even without trace mode.
+            const STATUS_REPARSE_POINT_ENCOUNTERED: i32 = 0xC000_0274_u32 as i32;
+            if status == STATUS_REPARSE_POINT_ENCOUNTERED {
+                ipc_log(
+                    ipc::LogLevel::Warn,
+                    format!("diag_4395_cow_create dos={dos} disp={create_disposition:#x} opts={create_options:#x} access={desired_access:#x} status=0x{status:08x}"),
+                );
+            } else if is_trace() && (dos.contains("config.lock") || status != 0) {
                 ipc_log(
                     ipc::LogLevel::Trace,
                     format!("fs_cow_create_post status=0x{status:08x} dos={dos} disp={create_disposition:#x}"),
@@ -622,10 +630,20 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
 
             // SAFETY: object_attributes is non-null.
             let mut h = HookedAttrs::redirect(&*object_attributes, &overlay_dos, false);
-            HOOK_NT_OPEN_FILE.get().unwrap().call(
+            let status = HOOK_NT_OPEN_FILE.get().unwrap().call(
                 file_handle, desired_access, h.as_ptr_mut(),
                 io_status_block, share_access, open_options,
-            )
+            );
+            // Always log STATUS_REPARSE_POINT_ENCOUNTERED (0xC0000274 / os error 4395)
+            // so it appears in sandbox.log at WARN level even without trace mode.
+            const STATUS_REPARSE_POINT_ENCOUNTERED_OPEN: i32 = 0xC000_0274_u32 as i32;
+            if status == STATUS_REPARSE_POINT_ENCOUNTERED_OPEN {
+                ipc_log(
+                    ipc::LogLevel::Warn,
+                    format!("diag_4395_cow_open dos={dos} opts={open_options:#x} access={desired_access:#x} status=0x{status:08x} overlay={overlay_dos}"),
+                );
+            }
+            status
         }
         Mode::Mock => {
             let Some(payload) = decision.mock_payload else {
