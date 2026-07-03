@@ -44,7 +44,19 @@ const CLSID_DENYLIST: &[DenyEntry] = &[
     DenyEntry { clsid: guid(0xF935DC22, 0x1CF0, 0x11D0, [0xAD,0xB9,0x00,0xC0,0x4F,0xD5,0x8A,0x0B]), name: "WScript.Shell.1" },
     DenyEntry { clsid: guid(0x0D43FE01, 0xF093, 0x11CF, [0x89,0x40,0x00,0xA0,0xC9,0x05,0x42,0x28]), name: "Scripting.FileSystemObject" },
 
-    // WMI (Win32_Process.Create)
+    // WMI (WbemLocator / SWbemLocator) — ALWAYS blocked (bug #88 re-audit).
+    //
+    // These MUST stay denied in every tier. Allowing them so that read-only
+    // `Get-CimInstance` works is unsafe: once the WMI locator is activated and a
+    // proxy marshalled, `Win32_Process.Create` (and every other write-method)
+    // becomes reachable as a plain method call over the same DCOM object-exporter
+    // channel. com_guard only gates CLSID *activation*, never method calls on an
+    // open proxy, and the actual spawn is performed by the out-of-proc, un-hooked
+    // `wmiprvse.exe` (launched by DcomLaunch outside our Job Object) — our
+    // NtCreateUserProcess / wmic LOLBin hook never sees it. There is no way to
+    // distinguish a read from a spawn at the COM/ALPC layer, so read-only WMI
+    // cannot be offered without a full containment escape. WMI-dependent tools
+    // must use `--guard none`.
     DenyEntry { clsid: guid(0x4590F811, 0x1D3A, 0x11D0, [0x89,0x1F,0x00,0xAA,0x00,0x4B,0x2E,0x24]), name: "WbemLocator" },
     DenyEntry { clsid: guid(0x76A64158, 0xCB41, 0x11D1, [0x8B,0x02,0x00,0x60,0x08,0x06,0xD9,0xB6]), name: "WbemScripting.SWbemLocator" },
 
@@ -780,5 +792,32 @@ mod tests {
     #[test]
     fn clsid_null_not_denied() {
         assert_eq!(check_denylist(std::ptr::null()), None);
+    }
+
+    // ── WMI/WBEM always blocked (bug #88 re-audit) ──────────────────────────
+    //
+    // WbemLocator / WbemScripting.SWbemLocator MUST be blocked in EVERY tier.
+    // Allowing them so read-only Get-CimInstance works also exposes
+    // Win32_Process.Create over the same DCOM proxy — a full escape that spawns
+    // arbitrary host processes via the un-hooked wmiprvse.exe. There is no safe
+    // partial allow; WMI-dependent tools use --guard none.
+
+    #[test]
+    fn wbem_locator_blocked_in_every_tier() {
+        let clsid = guid(0x4590F811, 0x1D3A, 0x11D0, [0x89,0x1F,0x00,0xAA,0x00,0x4B,0x2E,0x24]);
+        assert_eq!(check_denylist(&clsid), Some("WbemLocator"));
+    }
+
+    #[test]
+    fn wbem_scripting_locator_blocked_in_every_tier() {
+        let clsid = guid(0x76A64158, 0xCB41, 0x11D1, [0x8B,0x02,0x00,0x60,0x08,0x06,0xD9,0xB6]);
+        assert_eq!(check_denylist(&clsid), Some("WbemScripting.SWbemLocator"));
+    }
+
+    #[test]
+    fn non_wmi_dangerous_clsid_blocked() {
+        // Shell.Application must be blocked.
+        let clsid = guid(0x13709620, 0xC279, 0x11CE, [0xA4,0x9E,0x44,0x45,0x53,0x54,0x00,0x00]);
+        assert_eq!(check_denylist(&clsid), Some("Shell.Application"));
     }
 }

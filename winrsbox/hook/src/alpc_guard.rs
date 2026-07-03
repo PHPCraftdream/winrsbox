@@ -48,10 +48,26 @@ static HOOK_ALPC_CONNECT: OnceLock<GenericDetour<FnNtAlpcConnectPort>> = OnceLoc
 // These enable COM activation → WMI → process creation outside sandbox.
 const DANGEROUS_PORT_SUBSTRINGS: &[&str] = &[
     // COM/OLE activation (existing)
-    "ole",          // COM/OLE activation service
     "actkernel",    // COM activation kernel port
     "comlaunch",    // COM launch service
     "dcomlaunch",   // \RPC Control\dcomlaunch — DcomLaunch (spawns COM servers as SYSTEM)
+    // Generic DCOM object-exporter + WMI core LRPC — ALWAYS blocked.
+    //
+    // WMI ESCAPE (bug #88 re-audit): `\RPC Control\OLE<hex>` is the generic
+    // per-object DCOM data channel. Once a WMI proxy is marshaled, EVERY method
+    // call — including `Win32_Process.Create` — travels over this channel. It is
+    // NOT possible to distinguish read-only enumeration from `Create` at the ALPC
+    // layer (same port, same proxy; the method is a vtable/DISPID offset buried in
+    // marshalled packets). com_guard only gates CLSID *activation*, never method
+    // calls on an already-open proxy. The spawn itself is performed by the
+    // out-of-proc, un-hooked `wmiprvse.exe` (launched by DcomLaunch outside our
+    // Job Object), so our NtCreateUserProcess hook never sees it. Therefore
+    // allowing "ole"/"wmi"/"wbem" opens a full containment escape (arbitrary host
+    // process spawn + host-disk write). They stay always-blocked; read-only WMI
+    // cannot be safely offered. Workaround for WMI-dependent tools: --guard none.
+    "ole",          // \RPC Control\OLE<hex> — generic DCOM object exporter
+    "wmi",          // \RPC Control\WMI* — WMI core service
+    "wbem",         // \RPC Control\WBEM* — WMI scripting service
     // Security services / privilege brokers
     //
     // `lsarpc` is intentionally NOT in this list. Cygwin/MSYS2 bash and
@@ -71,10 +87,6 @@ const DANGEROUS_PORT_SUBSTRINGS: &[&str] = &[
     "seclogon",     // \RPC Control\seclogon — secondary logon / RunAs (priv escalation)
     "appinfo",      // \RPC Control\appinfo — UAC elevation broker (AppInfo service)
     "wmsgk",        // WMsgKMessagePort — window message dispatch
-    // WMI direct ALPC bypass (sandbox uses direct LRPC to WMI service
-    // instead of CoCreateInstance(WbemLocator) which com_guard catches)
-    "wmi",          // \RPC Control\WMI* — WMI core service
-    "wbem",         // \RPC Control\WBEM* — WMI scripting service
     "spool",        // \RPC Control\spoolss — Print Spooler RPC (PrintNightmare class)
     "schedule",     // \RPC Control\schedule — Task Scheduler direct LRPC
                     // (bypass for Schedule.Service COM which com_guard blocks)
@@ -264,10 +276,10 @@ mod tests {
 
     #[test]
     fn dangerous_port_detection() {
-        // Existing — COM/OLE patterns
-        assert!(is_dangerous_port(r"\RPC Control\OLE12345"));
+        // COM activation brokers — blocked in EVERY tier.
         assert!(is_dangerous_port("actkernel_port"));
         assert!(is_dangerous_port("ComLaunch"));
+        assert!(is_dangerous_port(r"\RPC Control\dcomlaunch"));
 
         // NEW — security service patterns
         //
@@ -284,7 +296,10 @@ mod tests {
         // Print Spooler RPC (PrintNightmare class)
         assert!(is_dangerous_port(r"\RPC Control\spoolss"));
 
-        // WMI direct ALPC bypass patterns
+        // WMI direct ALPC bypass patterns — ALWAYS blocked (bug #88 re-audit):
+        // allowing them opens Win32_Process.Create via the generic DCOM
+        // object-exporter channel (full escape). Read-only WMI cannot be
+        // distinguished from write-methods at the ALPC layer.
         assert!(is_dangerous_port(r"\RPC Control\WMI_RPC_12345"));
         assert!(is_dangerous_port(r"\RPC Control\WbemLevel1Login"));
 
@@ -319,6 +334,23 @@ mod tests {
         assert!(!is_dangerous_port(r"\RPC Control\Console"));
         assert!(!is_dangerous_port(r"\RPC Control\ConsoleNotificationPort"));
         assert!(!is_dangerous_port(r"\BaseNamedObjects\GoogleChromeServiceSocket"));
+    }
+
+    #[test]
+    fn ole_dcom_port_always_blocked() {
+        // Bug #88 re-audit: the generic \RPC Control\OLE<hex> DCOM object-exporter
+        // port is ALWAYS blocked. Allowing it (as an earlier #88 fix attempt did)
+        // lets Win32_Process.Create — a method call marshalled over this same
+        // channel — spawn arbitrary host processes via the un-hooked wmiprvse.exe,
+        // a full containment escape. Read-only WMI cannot be distinguished from
+        // write-methods at the ALPC layer, so there is no safe partial allow.
+        assert!(is_dangerous_port(r"\RPC Control\OLE58BCCC182C1065EBB0"));
+        assert!(is_dangerous_port(r"\RPC Control\OLE12345"));
+
+        // The COM activation brokers stay denied too.
+        assert!(is_dangerous_port(r"\RPC Control\dcomlaunch"));
+        assert!(is_dangerous_port("actkernel_port"));
+        assert!(is_dangerous_port("ComLaunch"));
     }
 
     // -- classify_port_name -----------------------------------------------------

@@ -534,6 +534,12 @@ fn strict_blocks_hardlink_creation() {
 #[test]
 #[serial]
 fn strict_blocks_alpc_com_activation() {
+    // Bug #88 re-audit: the generic \RPC Control\OLE<hex> DCOM object-exporter
+    // port is ALWAYS blocked (including scan). Allowing it lets
+    // Win32_Process.Create — a method call over the same DCOM channel — spawn
+    // arbitrary host processes via the un-hooked wmiprvse.exe. Read-only WMI
+    // cannot be distinguished from write-methods at the ALPC layer, so there is
+    // no safe partial allow; WMI-dependent tools must use --guard none.
     let r = run_payload("escape_alpc_com", "scan");
     assert_eq!(r.status.code(), Some(5),
         "escape_alpc_com should exit 5 (blocked)\nstderr: {}", r.stderr);
@@ -962,6 +968,10 @@ fn strict_blocks_com_wscript() {
 #[test]
 #[serial]
 fn strict_blocks_com_wmi() {
+    // Bug #88 re-audit: WbemLocator / WbemScripting.SWbemLocator activation is
+    // ALWAYS blocked (including scan). Allowing it to enable read-only WMI also
+    // exposes Win32_Process.Create over the same DCOM proxy (full escape via the
+    // un-hooked wmiprvse.exe). No safe partial allow exists.
     let r = run_payload("escape_com_wmi", "scan");
     assert_eq!(r.status.code(), Some(5),
         "WbemLocator CoCreateInstance should be blocked\nstderr: {}", r.stderr);

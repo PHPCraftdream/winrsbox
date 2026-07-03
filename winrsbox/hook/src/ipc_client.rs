@@ -250,6 +250,7 @@ pub(crate) fn is_trace() -> bool {
     TRACE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+
 pub(crate) fn cache() -> &'static HookCache {
     CACHE.get_or_init(HookCache::new)
 }
