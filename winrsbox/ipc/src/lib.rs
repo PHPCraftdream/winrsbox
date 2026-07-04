@@ -196,6 +196,24 @@ pub enum Req {
         caller_module: Option<String>,
         stack_top: Vec<u64>,
     },
+    /// A sandboxed process tried to reach an escape-class endpoint that has no
+    /// legitimate use from inside the sandbox — a COM-activation / DCOM /
+    /// WMI / privilege-escalation / persistence broker, whether via a denied
+    /// CLSID activation (`vector = "com-clsid"`, `detail` = class name) or a
+    /// direct ALPC connect to the broker port (`vector = "alpc-port"`, `detail`
+    /// = port name). The hook treats this as a deliberate containment-escape
+    /// attempt and self-terminates the process (fail-stop) rather than merely
+    /// denying — a denied process just keeps probing other vectors. Reported so
+    /// the launcher counts it as a violation and records it for forensics.
+    EscapeViolation {
+        pid: u32,
+        exe: String,
+        vector: String,
+        detail: String,
+        caller_pc: u64,
+        caller_module: Option<String>,
+        stack_top: Vec<u64>,
+    },
     RegDecide { key_path: String, value_name: Option<String>, write: bool },
     RegWrite { key_path: String, value_name: String, value: policy::reg::RegValue },
     RegDeleteValue { key_path: String, value_name: String },
@@ -516,6 +534,32 @@ mod tests {
                 assert_eq!(pid, 123);
                 assert_eq!(kind, AllocKind::Allocate);
                 assert_eq!(requested_protect, 0x40);
+                assert_eq!(stack_top.len(), 2);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn req_escape_violation_roundtrip() {
+        let msg = Req::EscapeViolation {
+            pid: 321,
+            exe: r"c:\app\evil.exe".into(),
+            vector: "alpc-port".into(),
+            detail: r"\RPC Control\OLE58BCCC182C1065EBB0".into(),
+            caller_pc: 0x7ff8a1234567,
+            caller_module: Some(r"c:\windows\system32\combase.dll".into()),
+            stack_top: vec![0x7ff8a1234567, 0x7ff8a1234568],
+        };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Req = read_msg(&mut buf).unwrap();
+        match dec {
+            Req::EscapeViolation { pid, vector, detail, stack_top, .. } => {
+                assert_eq!(pid, 321);
+                assert_eq!(vector, "alpc-port");
+                assert_eq!(detail, r"\RPC Control\OLE58BCCC182C1065EBB0");
                 assert_eq!(stack_top.len(), 2);
             }
             _ => panic!("wrong variant"),

@@ -1205,6 +1205,38 @@ fn handle_connection(
                 }
                 Resp::Ok
             }
+            Req::EscapeViolation {
+                pid, exe, vector, detail, caller_pc, caller_module, stack_top,
+            } => {
+                stats.violations.fetch_add(1, Ordering::Relaxed);
+                hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let caller_str = caller_module.as_deref().unwrap_or("<anonymous>");
+                eprintln!(
+                    "[VIOLATION] pid={pid} kind=Escape vector={vector} detail={detail} caller={caller_str} pc=0x{caller_pc:x} — process terminated",
+                );
+                jsonl_log::log_immediate(jsonl_log::Event::violation(
+                    pid, "Escape",
+                    &format!("vector={vector} detail={detail} pc=0x{caller_pc:x} action=terminate"),
+                ));
+                let stack_json: Vec<String> = stack_top.iter().map(|f| format!("\"0x{f:x}\"")).collect();
+                let line = format!(
+                    "{{\"pid\":{pid},\"exe\":\"{}\",\"kind\":\"Escape\",\"vector\":\"{vector}\",\"detail\":\"{}\",\"action\":\"terminate\",\"caller_pc\":\"0x{caller_pc:x}\",\"caller_module\":{},\"stack\":[{}]}}\n",
+                    exe.replace('\\', "\\\\").replace('"', "\\\""),
+                    detail.replace('\\', "\\\\").replace('"', "\\\""),
+                    match &caller_module {
+                        Some(m) => format!("\"{}\"", m.replace('\\', "\\\\").replace('"', "\\\"")),
+                        None => "null".to_string(),
+                    },
+                    stack_json.join(","),
+                );
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true).open(violations_log)
+                {
+                    let _ = f.write_all(line.as_bytes());
+                }
+                Resp::Ok
+            }
             Req::RegDecide { key_path, value_name, write } => {
                 // Layer 1 (security, hardcoded): persistence/DLL-injection
                 // deny-suffixes always deny on write, EXCEPT a benign value-name

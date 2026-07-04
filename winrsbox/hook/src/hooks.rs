@@ -56,6 +56,65 @@ pub(crate) use crate::ipc_client::{
 };
 
 // ---------------------------------------------------------------------------
+// Escape-vector fail-stop
+//
+// Shared by com_guard (denied CLSID activation) and alpc_guard (connect to an
+// escape-class broker port). These endpoints have no legitimate use from inside
+// the sandbox, so an attempt to reach one is treated as a deliberate
+// containment-escape and the process is terminated rather than merely denied (a
+// denied process just keeps probing other vectors). Mirrors the report+kill
+// shape of `inject_guard` / `memory_guard`: capture a short stack, send a
+// structured violation over IPC (so the launcher counts it and writes it to
+// violations.log), drop a local crash breadcrumb, then TerminateProcess.
+//
+// MUST be called with `anti_rec` already entered by the calling hook, so the
+// IPC pipe I/O it performs re-enters our own fs hooks as passthrough (no
+// recursion) — the same contract inject/memory terminate paths rely on.
+pub(crate) fn report_and_terminate_escape(vector: &str, detail: &str) -> ! {
+    let pid = unsafe { winapi::um::processthreadsapi::GetCurrentProcessId() };
+    let stack = crate::memory_guard::capture_stack_pub(3, 16);
+    let caller_pc = stack.first().copied().unwrap_or(0);
+    let caller_module =
+        crate::memory_guard::module_path_for_address(caller_pc as *const winapi::ctypes::c_void);
+    let exe = crate::memory_guard::get_own_exe_path_pub();
+
+    let _ = ipc_log_violation(ipc::Req::EscapeViolation {
+        pid,
+        exe: exe.clone(),
+        vector: vector.to_string(),
+        detail: detail.to_string(),
+        caller_pc,
+        caller_module: caller_module.clone(),
+        stack_top: stack.clone(),
+    });
+
+    let tmp = std::env::temp_dir();
+    let path = tmp.join(format!("fs-sandbox-violation-{pid}.log"));
+    let line = format!(
+        "{{\"pid\":{pid},\"exe\":\"{}\",\"kind\":\"Escape\",\"vector\":\"{vector}\",\"detail\":\"{}\",\"caller_pc\":\"0x{caller_pc:x}\"}}\n",
+        exe.replace('\\', "\\\\").replace('"', "\\\""),
+        detail.replace('\\', "\\\\").replace('"', "\\\""),
+    );
+    let _ = std::fs::write(&path, line.as_bytes());
+
+    let msg = format!(
+        "[VIOLATION] pid={pid} kind=Escape vector={vector} detail={detail} pc=0x{caller_pc:x}\0",
+    );
+    let wide: Vec<u16> = msg.encode_utf16().collect();
+    // SAFETY: wide is a valid null-terminated UTF-16 string.
+    unsafe { winapi::um::debugapi::OutputDebugStringW(wide.as_ptr()) };
+
+    // SAFETY: GetCurrentProcess() always returns a valid pseudo-handle.
+    unsafe {
+        winapi::um::processthreadsapi::TerminateProcess(
+            winapi::um::processthreadsapi::GetCurrentProcess(),
+            0xC000_0005,
+        );
+    }
+    loop { unsafe { winapi::um::synchapi::Sleep(1000) }; }
+}
+
+// ---------------------------------------------------------------------------
 // Device-namespace -> DOS drive mapping
 //
 // `NtQueryObject(ObjectNameInformation)` on a directory handle returns the

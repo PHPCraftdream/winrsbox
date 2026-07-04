@@ -32,64 +32,73 @@ const fn guid(d1: u32, d2: u16, d3: u16, d4: [u8; 8]) -> GUID {
 struct DenyEntry {
     clsid: GUID,
     name: &'static str,
+    /// When true, activating this CLSID from inside the sandbox is treated as a
+    /// deliberate containment-escape attempt and the process is TERMINATED
+    /// (fail-stop) instead of merely denied. Reserved for classes whose only
+    /// purpose is to spawn processes / run commands / move laterally / reach
+    /// WMI (`Win32_Process.Create`). Classes that legitimate software might
+    /// activate for benign reasons (file I/O, background download) stay
+    /// `terminate: false` — denied gracefully, not killed.
+    terminate: bool,
 }
 
 const CLSID_DENYLIST: &[DenyEntry] = &[
-    // Shell escape
-    DenyEntry { clsid: guid(0x13709620, 0xC279, 0x11CE, [0xA4,0x9E,0x44,0x45,0x53,0x54,0x00,0x00]), name: "Shell.Application" },
-    DenyEntry { clsid: guid(0x9BA05972, 0xF6A8, 0x11CF, [0xA4,0x42,0x00,0xA0,0xC9,0x0A,0x8F,0x39]), name: "ShellWindows" },
+    // Shell escape — ShellExecute spawn / lateral. KILL.
+    DenyEntry { clsid: guid(0x13709620, 0xC279, 0x11CE, [0xA4,0x9E,0x44,0x45,0x53,0x54,0x00,0x00]), name: "Shell.Application", terminate: true },
+    DenyEntry { clsid: guid(0x9BA05972, 0xF6A8, 0x11CF, [0xA4,0x42,0x00,0xA0,0xC9,0x0A,0x8F,0x39]), name: "ShellWindows", terminate: true },
 
-    // Scripting host
-    DenyEntry { clsid: guid(0x72C24DD5, 0xD70A, 0x438B, [0x8A,0x42,0x98,0x42,0x4B,0x88,0xAF,0xB8]), name: "WScript.Shell" },
-    DenyEntry { clsid: guid(0xF935DC22, 0x1CF0, 0x11D0, [0xAD,0xB9,0x00,0xC0,0x4F,0xD5,0x8A,0x0B]), name: "WScript.Shell.1" },
-    DenyEntry { clsid: guid(0x0D43FE01, 0xF093, 0x11CF, [0x89,0x40,0x00,0xA0,0xC9,0x05,0x42,0x28]), name: "Scripting.FileSystemObject" },
+    // Scripting host — WScript.Shell.Run/Exec spawns processes. KILL.
+    DenyEntry { clsid: guid(0x72C24DD5, 0xD70A, 0x438B, [0x8A,0x42,0x98,0x42,0x4B,0x88,0xAF,0xB8]), name: "WScript.Shell", terminate: true },
+    DenyEntry { clsid: guid(0xF935DC22, 0x1CF0, 0x11D0, [0xAD,0xB9,0x00,0xC0,0x4F,0xD5,0x8A,0x0B]), name: "WScript.Shell.1", terminate: true },
+    // FileSystemObject is file I/O only — it goes through our hooked file APIs
+    // (no FS-containment bypass) and legitimate scripts use it. Deny, don't kill.
+    DenyEntry { clsid: guid(0x0D43FE01, 0xF093, 0x11CF, [0x89,0x40,0x00,0xA0,0xC9,0x05,0x42,0x28]), name: "Scripting.FileSystemObject", terminate: false },
 
-    // WMI (WbemLocator / SWbemLocator) — ALWAYS blocked (bug #88 re-audit).
+    // WMI (WbemLocator / SWbemLocator) — DENY, do NOT kill (bug #88 re-audit).
     //
-    // These MUST stay denied in every tier. Allowing them so that read-only
-    // `Get-CimInstance` works is unsafe: once the WMI locator is activated and a
-    // proxy marshalled, `Win32_Process.Create` (and every other write-method)
-    // becomes reachable as a plain method call over the same DCOM object-exporter
-    // channel. com_guard only gates CLSID *activation*, never method calls on an
-    // open proxy, and the actual spawn is performed by the out-of-proc, un-hooked
-    // `wmiprvse.exe` (launched by DcomLaunch outside our Job Object) — our
-    // NtCreateUserProcess / wmic LOLBin hook never sees it. There is no way to
-    // distinguish a read from a spawn at the COM/ALPC layer, so read-only WMI
-    // cannot be offered without a full containment escape. WMI-dependent tools
-    // must use `--guard none`.
-    DenyEntry { clsid: guid(0x4590F811, 0x1D3A, 0x11D0, [0x89,0x1F,0x00,0xAA,0x00,0x4B,0x2E,0x24]), name: "WbemLocator" },
-    DenyEntry { clsid: guid(0x76A64158, 0xCB41, 0x11D1, [0x8B,0x02,0x00,0x60,0x08,0x06,0xD9,0xB6]), name: "WbemScripting.SWbemLocator" },
+    // Denying the locator activation already fully blocks the Win32_Process.Create
+    // escape: without the proxy, the spawn method is never reachable. But WMI is
+    // dual-use — benign tools (tasklist, systeminfo, Get-CimInstance reads) also
+    // activate the locator. Killing on it would terminate those benign readers as
+    // collateral while adding NO security (the escape is already blocked by the
+    // deny). So WMI stays a graceful deny; genuine spawn/escape vectors below/above
+    // are the ones that fail-stop. WMI-dependent tooling uses `--guard none`.
+    DenyEntry { clsid: guid(0x4590F811, 0x1D3A, 0x11D0, [0x89,0x1F,0x00,0xAA,0x00,0x4B,0x2E,0x24]), name: "WbemLocator", terminate: false },
+    DenyEntry { clsid: guid(0x76A64158, 0xCB41, 0x11D1, [0x8B,0x02,0x00,0x60,0x08,0x06,0xD9,0xB6]), name: "WbemScripting.SWbemLocator", terminate: false },
 
-    // Task Scheduler
-    DenyEntry { clsid: guid(0x0F87369F, 0xA4E5, 0x4CFC, [0xBD,0x3E,0x73,0xE6,0x15,0x45,0x72,0xDD]), name: "Schedule.Service" },
-    DenyEntry { clsid: guid(0x148BD52A, 0xA2AB, 0x11CE, [0xB1,0x1F,0x00,0xAA,0x00,0x53,0x05,0x03]), name: "CTaskScheduler" },
+    // Task Scheduler — persistence + spawn. KILL.
+    DenyEntry { clsid: guid(0x0F87369F, 0xA4E5, 0x4CFC, [0xBD,0x3E,0x73,0xE6,0x15,0x45,0x72,0xDD]), name: "Schedule.Service", terminate: true },
+    DenyEntry { clsid: guid(0x148BD52A, 0xA2AB, 0x11CE, [0xB1,0x1F,0x00,0xAA,0x00,0x53,0x05,0x03]), name: "CTaskScheduler", terminate: true },
 
-    // BITS
-    DenyEntry { clsid: guid(0x4991D34B, 0x80A1, 0x4291, [0x83,0xB6,0x33,0x28,0x36,0x6B,0x90,0x97]), name: "BackgroundCopyManager" },
+    // BITS — background download/persistence. Ambiguous enough (a benign updater
+    // could reach for it) that we deny rather than kill.
+    DenyEntry { clsid: guid(0x4991D34B, 0x80A1, 0x4291, [0x83,0xB6,0x33,0x28,0x36,0x6B,0x90,0x97]), name: "BackgroundCopyManager", terminate: false },
 
-    // Office (high-impact if installed)
-    DenyEntry { clsid: guid(0x00024500, 0x0000, 0x0000, [0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46]), name: "Excel.Application" },
-    DenyEntry { clsid: guid(0x000209FF, 0x0000, 0x0000, [0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46]), name: "Word.Application" },
-    DenyEntry { clsid: guid(0x0006F03A, 0x0000, 0x0000, [0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46]), name: "Outlook.Application" },
+    // Office (macro / DDE spawn + lateral). KILL.
+    DenyEntry { clsid: guid(0x00024500, 0x0000, 0x0000, [0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46]), name: "Excel.Application", terminate: true },
+    DenyEntry { clsid: guid(0x000209FF, 0x0000, 0x0000, [0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46]), name: "Word.Application", terminate: true },
+    DenyEntry { clsid: guid(0x0006F03A, 0x0000, 0x0000, [0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46]), name: "Outlook.Application", terminate: true },
 
-    // DCOM lateral-movement / in-proc script execution
-    DenyEntry { clsid: guid(0x49B2791A, 0xB1AE, 0x4C90, [0x9B,0x8E,0xE8,0x60,0xBA,0x07,0xF8,0x89]), name: "MMC20.Application" },
-    DenyEntry { clsid: guid(0xC08AFD90, 0xF2A1, 0x11D1, [0x84,0x55,0x00,0xA0,0xC9,0x1F,0x38,0x80]), name: "ShellBrowserWindow" },
-    DenyEntry { clsid: guid(0x0E59F1D5, 0x1FBE, 0x11D0, [0x8F,0xF2,0x00,0xA0,0xD1,0x00,0x38,0xBC]), name: "ScriptControl" },
-    DenyEntry { clsid: guid(0x0002DF01, 0x0000, 0x0000, [0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46]), name: "InternetExplorer.Application" },
+    // DCOM lateral-movement / in-proc script execution — all spawn/exec. KILL.
+    DenyEntry { clsid: guid(0x49B2791A, 0xB1AE, 0x4C90, [0x9B,0x8E,0xE8,0x60,0xBA,0x07,0xF8,0x89]), name: "MMC20.Application", terminate: true },
+    DenyEntry { clsid: guid(0xC08AFD90, 0xF2A1, 0x11D1, [0x84,0x55,0x00,0xA0,0xC9,0x1F,0x38,0x80]), name: "ShellBrowserWindow", terminate: true },
+    DenyEntry { clsid: guid(0x0E59F1D5, 0x1FBE, 0x11D0, [0x8F,0xF2,0x00,0xA0,0xD1,0x00,0x38,0xBC]), name: "ScriptControl", terminate: true },
+    DenyEntry { clsid: guid(0x0002DF01, 0x0000, 0x0000, [0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46]), name: "InternetExplorer.Application", terminate: true },
 ];
 
 fn clsid_eq(a: &GUID, b: &GUID) -> bool {
     a.Data1 == b.Data1 && a.Data2 == b.Data2 && a.Data3 == b.Data3 && a.Data4 == b.Data4
 }
 
-fn check_denylist(clsid: *const GUID) -> Option<&'static str> {
+/// Returns `Some((name, terminate))` for a denylisted CLSID: `name` for logging,
+/// `terminate` selecting fail-stop (kill) vs graceful deny. `None` if allowed.
+fn check_denylist(clsid: *const GUID) -> Option<(&'static str, bool)> {
     if clsid.is_null() { return None; }
     // SAFETY: deref of non-null GUID pointer — caller must ensure it points to a valid GUID.
     let clsid = unsafe { &*clsid };
     for entry in CLSID_DENYLIST {
         if clsid_eq(clsid, &entry.clsid) {
-            return Some(entry.name);
+            return Some((entry.name, entry.terminate));
         }
     }
     None
@@ -298,7 +307,12 @@ unsafe extern "system" fn hook_co_create_instance(
         return call_original();
     };
 
-    if let Some(name) = check_denylist(rclsid) {
+    if let Some((name, terminate)) = check_denylist(rclsid) {
+        if terminate {
+            // Escape-class CLSID (spawn / lateral-movement / WMI): fail-stop.
+            // Reports the violation over IPC and never returns.
+            crate::hooks::report_and_terminate_escape("com-clsid", name);
+        }
         if is_trace() {
             ipc_log(ipc::LogLevel::Trace,
                 format!("com_blocked clsid={} ctx=0x{:x}", name, dw_cls_context));
@@ -346,7 +360,10 @@ unsafe extern "system" fn hook_co_create_instance_ex(
         return call_original();
     };
 
-    if let Some(name) = check_denylist(clsid) {
+    if let Some((name, terminate)) = check_denylist(clsid) {
+        if terminate {
+            crate::hooks::report_and_terminate_escape("com-clsid", name);
+        }
         if is_trace() {
             ipc_log(ipc::LogLevel::Trace,
                 format!("com_blocked_ex clsid={} ctx=0x{:x}", name, dw_cls_ctx));
@@ -376,7 +393,10 @@ unsafe extern "system" fn hook_co_get_class_object(
         return call_original();
     };
 
-    if let Some(name) = check_denylist(rclsid) {
+    if let Some((name, terminate)) = check_denylist(rclsid) {
+        if terminate {
+            crate::hooks::report_and_terminate_escape("com-clsid", name);
+        }
         if is_trace() {
             ipc_log(ipc::LogLevel::Trace,
                 format!("com_classobject_blocked clsid={} ctx=0x{:x}", name, dw_cls_context));
@@ -762,25 +782,25 @@ mod tests {
     #[test]
     fn clsid_mmc20_application_denied() {
         let clsid = guid(0x49B2791A, 0xB1AE, 0x4C90, [0x9B,0x8E,0xE8,0x60,0xBA,0x07,0xF8,0x89]);
-        assert_eq!(check_denylist(&clsid), Some("MMC20.Application"));
+        assert_eq!(check_denylist(&clsid), Some(("MMC20.Application", true)));
     }
 
     #[test]
     fn clsid_shell_browser_window_denied() {
         let clsid = guid(0xC08AFD90, 0xF2A1, 0x11D1, [0x84,0x55,0x00,0xA0,0xC9,0x1F,0x38,0x80]);
-        assert_eq!(check_denylist(&clsid), Some("ShellBrowserWindow"));
+        assert_eq!(check_denylist(&clsid), Some(("ShellBrowserWindow", true)));
     }
 
     #[test]
     fn clsid_script_control_denied() {
         let clsid = guid(0x0E59F1D5, 0x1FBE, 0x11D0, [0x8F,0xF2,0x00,0xA0,0xD1,0x00,0x38,0xBC]);
-        assert_eq!(check_denylist(&clsid), Some("ScriptControl"));
+        assert_eq!(check_denylist(&clsid), Some(("ScriptControl", true)));
     }
 
     #[test]
     fn clsid_internet_explorer_denied() {
         let clsid = guid(0x0002DF01, 0x0000, 0x0000, [0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46]);
-        assert_eq!(check_denylist(&clsid), Some("InternetExplorer.Application"));
+        assert_eq!(check_denylist(&clsid), Some(("InternetExplorer.Application", true)));
     }
 
     #[test]
@@ -794,30 +814,45 @@ mod tests {
         assert_eq!(check_denylist(std::ptr::null()), None);
     }
 
-    // ── WMI/WBEM always blocked (bug #88 re-audit) ──────────────────────────
+    // ── WMI/WBEM blocked, DENY not kill (bug #88 re-audit) ──────────────────
     //
-    // WbemLocator / WbemScripting.SWbemLocator MUST be blocked in EVERY tier.
-    // Allowing them so read-only Get-CimInstance works also exposes
-    // Win32_Process.Create over the same DCOM proxy — a full escape that spawns
-    // arbitrary host processes via the un-hooked wmiprvse.exe. There is no safe
-    // partial allow; WMI-dependent tools use --guard none.
+    // WbemLocator / WbemScripting.SWbemLocator MUST be blocked in EVERY tier
+    // (the deny fully prevents the Win32_Process.Create escape). But WMI is
+    // dual-use — benign tools (tasklist, systeminfo, Get-CimInstance reads) also
+    // activate the locator — so it is a graceful deny, NOT a fail-stop kill
+    // (terminate = false). WMI-dependent tools use --guard none.
 
     #[test]
-    fn wbem_locator_blocked_in_every_tier() {
+    fn wbem_locator_blocked_but_not_killed() {
         let clsid = guid(0x4590F811, 0x1D3A, 0x11D0, [0x89,0x1F,0x00,0xAA,0x00,0x4B,0x2E,0x24]);
-        assert_eq!(check_denylist(&clsid), Some("WbemLocator"));
+        assert_eq!(check_denylist(&clsid), Some(("WbemLocator", false)));
     }
 
     #[test]
-    fn wbem_scripting_locator_blocked_in_every_tier() {
+    fn wbem_scripting_locator_blocked_but_not_killed() {
         let clsid = guid(0x76A64158, 0xCB41, 0x11D1, [0x8B,0x02,0x00,0x60,0x08,0x06,0xD9,0xB6]);
-        assert_eq!(check_denylist(&clsid), Some("WbemScripting.SWbemLocator"));
+        assert_eq!(check_denylist(&clsid), Some(("WbemScripting.SWbemLocator", false)));
     }
 
     #[test]
-    fn non_wmi_dangerous_clsid_blocked() {
-        // Shell.Application must be blocked.
-        let clsid = guid(0x13709620, 0xC279, 0x11CE, [0xA4,0x9E,0x44,0x45,0x53,0x54,0x00,0x00]);
-        assert_eq!(check_denylist(&clsid), Some("Shell.Application"));
+    fn spawn_class_clsids_terminate() {
+        // Shell / scripting-host / DCOM-lateral classes exist only to spawn or
+        // run commands → fail-stop (terminate = true).
+        let shell = guid(0x13709620, 0xC279, 0x11CE, [0xA4,0x9E,0x44,0x45,0x53,0x54,0x00,0x00]);
+        assert_eq!(check_denylist(&shell), Some(("Shell.Application", true)));
+        let wscript = guid(0x72C24DD5, 0xD70A, 0x438B, [0x8A,0x42,0x98,0x42,0x4B,0x88,0xAF,0xB8]);
+        assert_eq!(check_denylist(&wscript), Some(("WScript.Shell", true)));
+        let sched = guid(0x0F87369F, 0xA4E5, 0x4CFC, [0xBD,0x3E,0x73,0xE6,0x15,0x45,0x72,0xDD]);
+        assert_eq!(check_denylist(&sched), Some(("Schedule.Service", true)));
+    }
+
+    #[test]
+    fn ambiguous_clsids_deny_but_do_not_terminate() {
+        // FileSystemObject (hooked file I/O, legit scripts use it) and BITS
+        // (benign updaters) are denied but NOT killed — terminate = false.
+        let fso = guid(0x0D43FE01, 0xF093, 0x11CF, [0x89,0x40,0x00,0xA0,0xC9,0x05,0x42,0x28]);
+        assert_eq!(check_denylist(&fso), Some(("Scripting.FileSystemObject", false)));
+        let bits = guid(0x4991D34B, 0x80A1, 0x4291, [0x83,0xB6,0x33,0x28,0x36,0x6B,0x90,0x97]);
+        assert_eq!(check_denylist(&bits), Some(("BackgroundCopyManager", false)));
     }
 }

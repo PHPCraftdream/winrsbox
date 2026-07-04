@@ -44,52 +44,72 @@ type FnNtAlpcConnectPort = unsafe extern "system" fn(
 
 static HOOK_ALPC_CONNECT: OnceLock<GenericDetour<FnNtAlpcConnectPort>> = OnceLock::new();
 
-// Port name substrings that indicate dangerous RPC endpoints.
-// These enable COM activation → WMI → process creation outside sandbox.
-const DANGEROUS_PORT_SUBSTRINGS: &[&str] = &[
-    // COM/OLE activation (existing)
+// Action to take on an ALPC connect to a matched endpoint.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum PortAction {
+    /// Not a guarded endpoint — pass the connect through.
+    Allow,
+    /// Guarded, but legitimate software commonly probes it and handles the
+    /// refusal gracefully. Return STATUS_ACCESS_DENIED and let the caller live.
+    Deny,
+    /// Escape-class endpoint (COM-activation / DCOM object-exporter / WMI /
+    /// privilege-escalation / persistence broker). There is NO legitimate use
+    /// for these from inside the sandbox, so a connect attempt is a deliberate
+    /// containment-escape attempt. Fail-stop: report a violation and terminate
+    /// the process rather than politely denying (a denied process just keeps
+    /// probing other escape vectors).
+    Kill,
+}
+
+// ESCAPE-CLASS endpoints → terminate the process on connect.
+//
+// These brokers spawn processes / activate out-of-proc COM as SYSTEM / enumerate
+// the SAM / elevate — none of which a sandboxed process has any legitimate reason
+// to reach. Empirically verified (trace runs) that normal workloads (PowerShell,
+// in-proc COM, git, node/python toolchains) never connect to any of these; only
+// deliberate escape/priv-esc/persistence attempts do.
+const ESCAPE_CLASS_PORT_SUBSTRINGS: &[&str] = &[
+    // COM/DCOM activation brokers (spawn out-of-proc / SYSTEM COM servers)
     "actkernel",    // COM activation kernel port
     "comlaunch",    // COM launch service
     "dcomlaunch",   // \RPC Control\dcomlaunch — DcomLaunch (spawns COM servers as SYSTEM)
-    // Generic DCOM object-exporter + WMI core LRPC — ALWAYS blocked.
-    //
-    // WMI ESCAPE (bug #88 re-audit): `\RPC Control\OLE<hex>` is the generic
-    // per-object DCOM data channel. Once a WMI proxy is marshaled, EVERY method
-    // call — including `Win32_Process.Create` — travels over this channel. It is
-    // NOT possible to distinguish read-only enumeration from `Create` at the ALPC
-    // layer (same port, same proxy; the method is a vtable/DISPID offset buried in
-    // marshalled packets). com_guard only gates CLSID *activation*, never method
-    // calls on an already-open proxy. The spawn itself is performed by the
-    // out-of-proc, un-hooked `wmiprvse.exe` (launched by DcomLaunch outside our
-    // Job Object), so our NtCreateUserProcess hook never sees it. Therefore
-    // allowing "ole"/"wmi"/"wbem" opens a full containment escape (arbitrary host
-    // process spawn + host-disk write). They stay always-blocked; read-only WMI
-    // cannot be safely offered. Workaround for WMI-dependent tools: --guard none.
-    "ole",          // \RPC Control\OLE<hex> — generic DCOM object exporter
-    "wmi",          // \RPC Control\WMI* — WMI core service
-    "wbem",         // \RPC Control\WBEM* — WMI scripting service
-    // Security services / privilege brokers
-    //
-    // `lsarpc` is intentionally NOT in this list. Cygwin/MSYS2 bash and
-    // most Windows runtimes call `LsaOpenPolicy(POLICY_LOOKUP_NAMES)` very
-    // early during init for SID↔name resolution; an ALPC block there
-    // doesn't stop them (they print a warning and fall through) but
-    // pollutes every shell session with `lsa_open_policy(NULL) failed`.
-    // The dangerous LSA operations (`LsaAddAccountRights`, etc.) require
-    // `POLICY_CREATE_ACCOUNT` / `POLICY_TRUST_ADMIN` on the policy object,
-    // which a medium-IL sandbox token cannot acquire from `LsaOpenPolicy`
-    // in the first place — Windows' own ACL on the LSA policy object is
-    // the real gate. The real privilege-escalation vectors (`samr` for
-    // password hashes, `seclogon` for RunAs, `appinfo` for UAC) stay
-    // blocked below.
-    "samr",         // \RPC Control\samr — SAM database (account enum)
-    "winreg",       // \RPC Control\winreg — remote registry
+    // Privilege-escalation / credential brokers
+    "samr",         // \RPC Control\samr — SAM database (password hashes / account enum)
     "seclogon",     // \RPC Control\seclogon — secondary logon / RunAs (priv escalation)
     "appinfo",      // \RPC Control\appinfo — UAC elevation broker (AppInfo service)
-    "wmsgk",        // WMsgKMessagePort — window message dispatch
-    "spool",        // \RPC Control\spoolss — Print Spooler RPC (PrintNightmare class)
+    // Persistence
     "schedule",     // \RPC Control\schedule — Task Scheduler direct LRPC
                     // (bypass for Schedule.Service COM which com_guard blocks)
+];
+
+// DENY-ONLY endpoints → STATUS_ACCESS_DENIED, process keeps running.
+//
+// Defense-in-depth: these are dangerous enough to block, but legitimate software
+// (printer enumeration, registry probes, AppX-aware installers, WMI reads like
+// tasklist / Get-CimInstance) may touch them and is written to handle the refusal
+// gracefully. Killing on these would break benign workloads, so we only deny.
+//
+// WMI (bug #88 re-audit): `\RPC Control\OLE<hex>` is the generic per-object DCOM
+// data channel; `WMI*` / `WBEM*` are the WMI core/scripting LRPC. The
+// Win32_Process.Create escape is already fully blocked upstream by com_guard's
+// graceful CLSID deny (no proxy → no spawn method), so these ports need only be
+// denied, not killed — killing them would take out benign WMI readers (tasklist,
+// systeminfo, Get-CimInstance) as collateral for no added security. WMI-dependent
+// tools use `--guard none`.
+//
+// `lsarpc` is intentionally NOT guarded at all. Cygwin/MSYS2 bash and most
+// Windows runtimes call `LsaOpenPolicy(POLICY_LOOKUP_NAMES)` very early during
+// init for SID↔name resolution; a block there doesn't stop them (they warn and
+// fall through) but pollutes every shell session. The dangerous LSA operations
+// (`LsaAddAccountRights`, etc.) require rights a medium-IL sandbox token cannot
+// acquire from `LsaOpenPolicy` in the first place — Windows' own ACL is the gate.
+const DENY_PORT_SUBSTRINGS: &[&str] = &[
+    "ole",          // \RPC Control\OLE<hex> — generic DCOM object exporter (WMI reads)
+    "wmi",          // \RPC Control\WMI* — WMI core service
+    "wbem",         // \RPC Control\WBEM* — WMI scripting service
+    "winreg",       // \RPC Control\winreg — remote registry
+    "wmsgk",        // WMsgKMessagePort — window message dispatch
+    "spool",        // \RPC Control\spoolss — Print Spooler RPC (PrintNightmare class)
     // Deployment / session / reporting brokers
     "appxsvc",      // \RPC Control\appxsvc — AppX deployment service
     "appx",         // \RPC Control\appx* — AppX activation (prefix also matches appxsvc)
@@ -112,16 +132,33 @@ const DANGEROUS_PORT_SUBSTRINGS: &[&str] = &[
 /// deny on it — that could break legit ALPC; we only refuse the oversized read).
 const MAX_PORT_NAME_CHARS: usize = 1024;
 
-fn is_dangerous_port(name: &str) -> bool {
+/// Classify an ALPC port name into Allow / Deny / Kill.
+///
+/// Escape-class matches take precedence over deny-only. Matching is on the last
+/// path segment (after the final `\` or `/`) with `starts_with`, so `"ole"` in
+/// `Console` / `GoogleChrome...` does not false-positive.
+fn classify_port(name: &str) -> PortAction {
     let lower = name.to_ascii_lowercase();
-    // Get last path segment (after final \ or /) so that "ole" in
-    // "Console" or "GoogleChrome..." does not false-positive.
     let segment = match lower.rfind(|c| c == '\\' || c == '/') {
         Some(idx) => &lower[idx + 1..],
         None => &lower,
     };
-    DANGEROUS_PORT_SUBSTRINGS.iter().any(|&p| segment.starts_with(p))
+    if ESCAPE_CLASS_PORT_SUBSTRINGS.iter().any(|&p| segment.starts_with(p)) {
+        return PortAction::Kill;
+    }
+    if DENY_PORT_SUBSTRINGS.iter().any(|&p| segment.starts_with(p)) {
+        return PortAction::Deny;
+    }
+    PortAction::Allow
 }
+
+/// True when the port is guarded at all (Deny OR Kill). Retained as a thin
+/// wrapper so the broad denylist regression tests read naturally.
+#[cfg(test)]
+fn is_dangerous_port(name: &str) -> bool {
+    classify_port(name) != PortAction::Allow
+}
+
 
 // SAFETY: Called by detour2 dispatcher with ntdll!NtAlpcConnectPort ABI.
 unsafe extern "system" fn hook_nt_alpc_connect_port(
@@ -169,22 +206,31 @@ unsafe extern "system" fn hook_nt_alpc_connect_port(
                 // <= MAX_PORT_NAME_CHARS, <= max_chars, and Buffer non-null.
                 let name_slice = std::slice::from_raw_parts(ustr.Buffer, char_count);
                 let name = String::from_utf16_lossy(name_slice);
-                if is_dangerous_port(&name) {
-                    if crate::hooks::is_trace() {
-                        crate::hooks::ipc_log_violation(ipc::Req::Log {
-                            pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
-                            level: ipc::LogLevel::Warn,
-                            msg: format!("ALPC DENY: {name}"),
-                        });
+                match classify_port(&name) {
+                    PortAction::Kill => {
+                        // Escape-class endpoint: fail-stop. Reports the violation
+                        // over IPC and never returns (terminates the process).
+                        crate::hooks::report_and_terminate_escape("alpc-port", &name);
                     }
-                    return STATUS_ACCESS_DENIED;
-                }
-                // Diagnostic: log every ALLOWED connect under trace. Pure
-                // visibility — needed to spot DNS / SChannel / proxy
-                // resolvers that travel through unfamiliar port names.
-                if crate::hooks::is_trace() {
-                    crate::hooks::ipc_log(ipc::LogLevel::Trace,
-                        format!("alpc_connect: {name}"));
+                    PortAction::Deny => {
+                        if crate::hooks::is_trace() {
+                            crate::hooks::ipc_log_violation(ipc::Req::Log {
+                                pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                                level: ipc::LogLevel::Warn,
+                                msg: format!("ALPC DENY: {name}"),
+                            });
+                        }
+                        return STATUS_ACCESS_DENIED;
+                    }
+                    PortAction::Allow => {
+                        // Diagnostic: log every ALLOWED connect under trace. Pure
+                        // visibility — needed to spot DNS / SChannel / proxy
+                        // resolvers that travel through unfamiliar port names.
+                        if crate::hooks::is_trace() {
+                            crate::hooks::ipc_log(ipc::LogLevel::Trace,
+                                format!("alpc_connect: {name}"));
+                        }
+                    }
                 }
             }
             PortNameStatus::Malformed(reason) => {
@@ -334,6 +380,66 @@ mod tests {
         assert!(!is_dangerous_port(r"\RPC Control\Console"));
         assert!(!is_dangerous_port(r"\RPC Control\ConsoleNotificationPort"));
         assert!(!is_dangerous_port(r"\BaseNamedObjects\GoogleChromeServiceSocket"));
+    }
+
+    #[test]
+    fn escape_class_ports_trigger_kill() {
+        // COM/DCOM activation + WMI + priv-esc + persistence brokers → Kill.
+        // A sandboxed process connecting to any of these is a deliberate
+        // containment-escape attempt; fail-stop rather than politely deny.
+        for p in [
+            r"\RPC Control\actkernel",
+            r"\RPC Control\comlaunch",
+            r"\RPC Control\dcomlaunch",
+            r"\RPC Control\samr",
+            r"\RPC Control\seclogon",
+            r"\RPC Control\appinfo",
+            r"\RPC Control\schedule",
+        ] {
+            assert_eq!(classify_port(p), PortAction::Kill, "expected Kill for {p}");
+        }
+    }
+
+    #[test]
+    fn deny_only_ports_do_not_kill() {
+        // Defense-in-depth endpoints legit software probes and handles a refusal
+        // for → Deny (ACCESS_DENIED), NEVER Kill. Killing here would break benign
+        // workloads (printer enumeration, registry probes, AppX installers, and
+        // WMI reads like tasklist / Get-CimInstance). The WMI ports (ole/wmi/wbem)
+        // are here — the escape is blocked upstream by com_guard's CLSID deny, so
+        // killing them would only take out benign WMI readers as collateral.
+        for p in [
+            r"\RPC Control\OLE58BCCC182C1065EBB0",
+            r"\RPC Control\OLE12345",
+            r"\RPC Control\WMI_RPC_12345",
+            r"\RPC Control\WbemLevel1Login",
+            r"\RPC Control\winreg",
+            r"\RPC Control\spoolss",
+            r"\RPC Control\appxsvc",
+            r"\RPC Control\AppXDeploymentClient",
+            r"\RPC Control\pchsvc",
+            r"\RPC Control\terminalserver",
+            r"\RPC Control\iiscertobj",
+            r"WMsgKMessagePort",
+        ] {
+            assert_eq!(classify_port(p), PortAction::Deny, "expected Deny for {p}");
+        }
+    }
+
+    #[test]
+    fn safe_ports_allowed() {
+        // Legit endpoints normal workloads use (verified empirically via trace):
+        // epmapper (COM endpoint resolution), keysvc, ntsvcs, LSARPC, DNS.
+        for p in [
+            r"\RPC Control\epmapper",
+            r"\RPC Control\keysvc",
+            r"\RPC Control\ntsvcs",
+            r"\RPC Control\LSARPC_ENDPOINT",
+            r"\RPC Control\lsarpc",
+            r"\RPC Control\DnsResolver",
+        ] {
+            assert_eq!(classify_port(p), PortAction::Allow, "expected Allow for {p}");
+        }
     }
 
     #[test]
