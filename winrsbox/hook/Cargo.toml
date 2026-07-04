@@ -3,6 +3,10 @@ name = "hook"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+description = "winrsbox ntdll-level hook DLL — CoW FS redirect, memory/inject/COM/ALPC guards"
+repository = "https://github.com/PHPCraftdream/winrsbox"
+# Internal implementation crate — released as source with winrsbox, not to crates.io.
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]

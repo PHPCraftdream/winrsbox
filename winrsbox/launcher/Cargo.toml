@@ -5,6 +5,10 @@ edition = "2021"
 description = "Windows filesystem sandbox for AI agents (CoW overlay, ntdll-level hooks)"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/PHPCraftdream/winrsbox"
+homepage = "https://github.com/PHPCraftdream/winrsbox"
+readme = "../../README.md"
+keywords = ["sandbox", "windows", "security", "filesystem", "hooks"]
+categories = ["os::windows-apis", "command-line-utilities"]
 
 [lib]
 name = "winrsbox"
