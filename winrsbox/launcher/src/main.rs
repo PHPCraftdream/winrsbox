@@ -255,8 +255,23 @@ fn build_delegation_command(target: &[String]) -> std::process::Command {
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 /// cancel-safe: NO — top-level main is not meant to be cancelled
+///
+/// Thin wrapper around `run()`: any error must exit via `std::process::exit`
+/// rather than a bare `?`-propagated return, because the pipe-accept loop
+/// parks a blocking-pool thread in `ConnectNamedPipe` with no timeout — if
+/// `main` returns normally, `#[tokio::main]`'s generated wrapper drops the
+/// `Runtime`, which blocks joining that thread. Since no client will ever
+/// connect once startup has failed, a plain `return Err(..)` here hangs the
+/// process indefinitely instead of reporting the error.
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
 
     // Back-compat dispatch: if first arg after binary is a known subcommand,
@@ -430,11 +445,19 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|src| ktav::from_str::<policy::db::Config>(&src).ok())
         .and_then(|c| c.log_level);
-    let effective_log_level = cli
-        .log_level
-        .clone()
-        .or(ktav_log_level)
-        .unwrap_or_else(|| "info".to_string());
+    // `--trace` is a blanket "show me everything" switch: it also raises the
+    // JSONL/console verbosity to trace, on top of the FS_SANDBOX_TRACE gate
+    // it sets for hook.dll below. Without this, `--trace` would enable
+    // hook-side trace events while the console (gated on jsonl_log's level)
+    // stayed silent for them.
+    let effective_log_level = if cli.trace {
+        "trace".to_string()
+    } else {
+        cli.log_level
+            .clone()
+            .or(ktav_log_level)
+            .unwrap_or_else(|| "info".to_string())
+    };
     jsonl_log::init(
         cfg_path.parent().unwrap().join("sandbox.log.jsonl"),
         &effective_log_level,
@@ -499,7 +522,7 @@ async fn main() -> Result<()> {
     // Sanitize sensitive env vars BEFORE child inherits them.
     // Removes API keys, tokens, secrets, credentials from the environment.
     let removed = winrsbox::env_guard::sanitize();
-    if removed > 0 {
+    if removed > 0 && winrsbox::jsonl_log::console_verbose() {
         println!("[sandbox] env: sanitized {removed} sensitive variables");
     }
 
@@ -713,7 +736,9 @@ async fn main() -> Result<()> {
                     }
                 }
                 let fc = engine.filter_count();
-                println!("[sandbox] WFP: {fc} outbound filters registered");
+                if winrsbox::jsonl_log::console_verbose() {
+                    println!("[sandbox] WFP: {fc} outbound filters registered");
+                }
                 jsonl_log::log(jsonl_log::Event::wfp(fc));
                 Some(engine)
             }
@@ -734,11 +759,18 @@ async fn main() -> Result<()> {
         });
         match winrsbox::etw_listener::start(pid_checker) {
             Ok(h) => {
-                println!("[sandbox] ETW: Kernel-Process listener active");
+                if winrsbox::jsonl_log::console_verbose() {
+                    println!("[sandbox] ETW: Kernel-Process listener active");
+                }
                 Some(h)
             }
             Err(e) => {
-                eprintln!("[sandbox] ETW unavailable: {e}");
+                // Monitoring-only layer (etw_listener.rs) — commonly unavailable
+                // simply because the launcher isn't elevated. Not a containment
+                // gap, so keep it off the console unless --trace.
+                if winrsbox::jsonl_log::console_verbose() {
+                    eprintln!("[sandbox] ETW unavailable: {e}");
+                }
                 None
             }
         }
@@ -786,7 +818,9 @@ async fn main() -> Result<()> {
     };
 
     if wait_result.0 == 0 { // WAIT_OBJECT_0
-        println!("[sandbox] hook.dll init confirmed (pid {})", proc_info.dwProcessId);
+        if winrsbox::jsonl_log::console_verbose() {
+            println!("[sandbox] hook.dll init confirmed (pid {})", proc_info.dwProcessId);
+        }
     } else {
         eprintln!(
             "[sandbox] CRITICAL: hook.dll did not signal init within 5s, killing child pid={}",
@@ -801,7 +835,9 @@ async fn main() -> Result<()> {
     }
     unsafe { CloseHandle(init_event).ok() };
 
-    println!("[sandbox] target started (pid {})", proc_info.dwProcessId);
+    if winrsbox::jsonl_log::console_verbose() {
+        println!("[sandbox] target started (pid {})", proc_info.dwProcessId);
+    }
 
     // ── Wait for target process ───────────────────────────────────────────
     // Offload the blocking wait to spawn_blocking so the tokio executor

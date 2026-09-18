@@ -972,7 +972,9 @@ fn handle_connection(
                         &format!("claimed_pid={pid}"),
                     ));
                 }
-                println!("[sandbox] hello from pid={client_pid} exe={exe_path}");
+                if jsonl_log::console_verbose() {
+                    println!("[sandbox] hello from pid={client_pid} exe={exe_path}");
+                }
                 hot_stats.totals.hellos.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 jsonl_log::log(jsonl_log::Event::hello(client_pid, &exe_path));
                 let exe_lower = exe_path.to_ascii_lowercase();
@@ -1016,7 +1018,9 @@ fn handle_connection(
                         &format!("claimed_parent={parent_pid} child={child_pid}"),
                     ));
                 }
-                println!("[sandbox] child spawned: parent={client_pid} child={child_pid} exe={child_exe}");
+                if jsonl_log::console_verbose() {
+                    println!("[sandbox] child spawned: parent={client_pid} child={child_pid} exe={child_exe}");
+                }
                 hot_stats.totals.children.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 jsonl_log::log(jsonl_log::Event::child(client_pid, child_pid, &child_exe));
                 child_pids.push(child_pid);
@@ -1115,7 +1119,12 @@ fn handle_connection(
                     LogLevel::Warn => "WARN ",
                     LogLevel::Error => "ERROR",
                 };
-                println!("[hook/{pid}] {level_str} {msg}");
+                // Always surface real errors; routine INFO/WARN/TRACE hook
+                // diagnostics only hit the console under --trace (they always
+                // persist to the JSONL below regardless).
+                if matches!(level, LogLevel::Error) || jsonl_log::console_verbose() {
+                    println!("[hook/{pid}] {level_str} {msg}");
+                }
                 // Persist to JSONL. INFO/WARN/ERROR are rare and load-bearing
                 // for forensics (spawn_attempt, fs_decide on writes, denials):
                 // flush them to disk immediately so a hung or idle sandbox
@@ -1129,7 +1138,9 @@ fn handle_connection(
                 Resp::Ok
             }
             Req::RegisterChild { pid } => {
-                println!("[sandbox] child registered: pid={pid}");
+                if jsonl_log::console_verbose() {
+                    println!("[sandbox] child registered: pid={pid}");
+                }
                 child_pids.push(pid);
                 Resp::Ok
             }

@@ -42,6 +42,16 @@ fn level_enabled(level: LogLevel) -> bool {
     level as u8 <= LOG_LEVEL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether routine per-event console chatter (hello/child/spawn_attempt/...)
+/// should print to stdout. These events always persist to the JSONL
+/// regardless — this only gates the human-facing console, which stays quiet
+/// by default so it doesn't drown out the sandboxed target's own output.
+/// Mirrors the file log level: only `trace` (`--trace` / `--log-level
+/// trace`) turns it on.
+pub fn console_verbose() -> bool {
+    level_enabled(LogLevel::Trace)
+}
+
 pub fn log(event: Event) {
     if !level_enabled(event.level()) { return; }
     if let Some(logger) = LOGGER.get() {
