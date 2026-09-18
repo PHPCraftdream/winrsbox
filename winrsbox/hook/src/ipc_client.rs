@@ -215,6 +215,16 @@ pub(crate) fn try_load_session_config_from_section() -> Option<()> {
 
 /// Ensure `PIPE_NAME` is populated, attempting a one-shot fallback to the
 /// shared session section if env vars were scrubbed in this process.
+///
+/// Test builds must never reach the real `OpenFileMappingW` in
+/// `try_load_session_config_from_section`: `Local\WinRsBoxSession` is scoped
+/// to the whole logon session, not this process, so if a real winrsbox
+/// launcher happens to be running on the machine, `cargo test` would read
+/// ITS real `SessionConfig` and permanently poison the process-wide
+/// `OVERLAY_ROOTS`/`SANDBOX_ROOT` OnceLocks for the rest of the test binary —
+/// this is exactly what caused path_info_guard/hooks tests to flake under
+/// parallel execution depending on ambient system state.
+#[cfg(not(test))]
 fn ensure_pipe_name_loaded() {
     if PIPE_NAME.get().is_some() {
         return;
@@ -224,6 +234,11 @@ fn ensure_pipe_name_loaded() {
     }
     let _ = try_load_session_config_from_section();
 }
+
+/// Test-build stub: never touches the real `Local\WinRsBoxSession` section.
+/// See the doc comment on the `#[cfg(not(test))]` variant above.
+#[cfg(test)]
+fn ensure_pipe_name_loaded() {}
 
 /// Consecutive IPC failures counter for fail-closed self-termination (P1-3 audit fix).
 pub(crate) static IPC_CONSECUTIVE_FAILURES: std::sync::atomic::AtomicU32 =
