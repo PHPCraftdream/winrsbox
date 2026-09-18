@@ -1141,6 +1141,107 @@ mod tests {
         assert_eq!(mixed_pairs[0].1, "MyModule");
     }
 
+    // ── overlay_children (enum-merge fix: ghost-file listing bug) ──────────
+    //
+    // `overlay_children(dir)` returns ALL overlay-only direct children of
+    // `dir` — regardless of whether an OVERLAY_CASE record exists — because
+    // the enum-hook injects them into real directory listings so a CoW'd
+    // file outside project_root is no longer invisible to `dir`/`ls` while
+    // still readable via direct open (the "ghost file" bug).
+
+    #[test]
+    fn overlay_children_returns_direct_children_only() {
+        let (_dir, p, _project) = make_policy_with_project("proj");
+        p.record_overlay(r"d:\out\a.txt", r"C:\sb\out\a.txt").unwrap();
+        p.record_overlay(r"d:\out\b.log", r"C:\sb\out\b.log").unwrap();
+        // Descendant of a subdir — NOT a direct child of d:\out.
+        p.record_overlay(r"d:\out\sub\deep.txt", r"C:\sb\out\sub\deep.txt").unwrap();
+        // Different directory entirely.
+        p.record_overlay(r"d:\bar\c.txt", r"C:\sb\bar\c.txt").unwrap();
+
+        let mut names: Vec<String> = p.overlay_children(r"d:\out")
+            .into_iter().map(|(n, _)| n).collect();
+        names.sort();
+        assert_eq!(names, vec!["a.txt".to_string(), "b.log".to_string()],
+            "overlay_children must return only direct children");
+    }
+
+    #[test]
+    fn overlay_children_empty_when_no_match() {
+        let (_dir, p, _project) = make_policy_with_project("proj");
+        p.record_overlay(r"d:\out\a.txt", r"C:\sb\out\a.txt").unwrap();
+        let entries = p.overlay_children(r"d:\empty");
+        assert!(entries.is_empty(), "no overlay entries under an unrelated dir");
+    }
+
+    #[test]
+    fn overlay_children_sibling_prefix_not_confused() {
+        let (_dir, p, _project) = make_policy_with_project("proj");
+        p.record_overlay(r"d:\outbar\evil.txt", r"C:\sb\outbar\evil.txt").unwrap();
+        let entries = p.overlay_children(r"d:\out");
+        assert!(entries.is_empty(), "d:\\out must not see d:\\outbar's children");
+    }
+
+    /// No OVERLAY_CASE record exists (legacy / lowercase-created entry) →
+    /// the raw lowercase key segment is used as the basename, not dropped.
+    /// This is the key behavioral difference from `overlay_children_with_case`,
+    /// which requires a case record and would return nothing here.
+    #[test]
+    fn overlay_children_falls_back_to_lowercase_without_case_record() {
+        let (_dir, p, _project) = make_policy_with_project("proj");
+        p.record_overlay(r"d:\out\probe_cmd.txt", r"C:\sb\out\probe_cmd.txt").unwrap();
+        let entries = p.overlay_children(r"d:\out");
+        assert_eq!(entries.len(), 1, "got: {:?}", entries);
+        assert_eq!(entries[0].0, "probe_cmd.txt");
+    }
+
+    /// When an OVERLAY_CASE record exists, the original-case name wins over
+    /// the lowercase key.
+    #[test]
+    fn overlay_children_uses_case_record_when_present() {
+        let (_dir, p, _project) = make_policy_with_project("proj");
+        p.record_overlay(r"d:\out\mixed_case_dir", r"C:\sb\out\mixed_case_dir").unwrap();
+        p.record_overlay_case(r"d:\out\mixed_case_dir", "Mixed_Case_Dir");
+        let entries = p.overlay_children(r"d:\out");
+        assert_eq!(entries.len(), 1, "got: {:?}", entries);
+        assert_eq!(entries[0].0, "Mixed_Case_Dir");
+    }
+
+    /// `is_dir` reflects the real type of the physical overlay node: a file
+    /// on disk at the overlay path → false.
+    #[test]
+    fn overlay_children_is_dir_false_for_file() {
+        let (dir, p, _project) = make_policy_with_project("proj");
+        let phys = dir.path().join("overlay_file.txt");
+        std::fs::write(&phys, b"x").unwrap();
+        p.record_overlay(r"d:\out\probe.txt", phys.to_str().unwrap()).unwrap();
+        let entries = p.overlay_children(r"d:\out");
+        assert_eq!(entries.len(), 1, "got: {:?}", entries);
+        assert_eq!(entries[0], ("probe.txt".to_string(), false));
+    }
+
+    /// `is_dir` → true when the physical overlay node is a real directory.
+    #[test]
+    fn overlay_children_is_dir_true_for_directory() {
+        let (dir, p, _project) = make_policy_with_project("proj");
+        let phys = dir.path().join("overlay_subdir");
+        std::fs::create_dir_all(&phys).unwrap();
+        p.record_overlay(r"d:\out\subdir", phys.to_str().unwrap()).unwrap();
+        let entries = p.overlay_children(r"d:\out");
+        assert_eq!(entries.len(), 1, "got: {:?}", entries);
+        assert_eq!(entries[0], ("subdir".to_string(), true));
+    }
+
+    /// The overlay physical path doesn't exist on disk (e.g. race / stale
+    /// index entry) → is_dir defaults to false rather than panicking.
+    #[test]
+    fn overlay_children_missing_physical_path_defaults_not_dir() {
+        let (_dir, p, _project) = make_policy_with_project("proj");
+        p.record_overlay(r"d:\out\stale.txt", r"C:\sb\does\not\exist.txt").unwrap();
+        let entries = p.overlay_children(r"d:\out");
+        assert_eq!(entries, vec![("stale.txt".to_string(), false)]);
+    }
+
     // ── Regression ratchet: Pattern #2 — multi-level whiteout cascade
     //
     // NOTE: `clear_whiteout_cascades_to_children` already covers this at the

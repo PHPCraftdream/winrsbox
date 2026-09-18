@@ -494,6 +494,20 @@ pub(crate) fn ipc_overlay_children_with_case(dir: &str) -> Option<Vec<(String, S
     }).flatten()
 }
 
+/// Return `(basename, is_dir)` pairs for ALL overlay-only direct children of
+/// `dir` (OVERLAY_IDX), regardless of whether a case record exists. Used by
+/// the enum-hook to inject overlay-only entries into a real directory's
+/// listing (see `dir_filter::append_overlay_entries`). Returns `None` on IPC
+/// failure; caller treats that as an empty set (no injection, not a hang).
+pub(crate) fn ipc_overlay_children(dir: &str) -> Option<Vec<(String, bool)>> {
+    ensure_ipc_and(|opt| {
+        match try_send(opt, &ipc::Req::OverlayChildren { dir: dir.to_owned() }) {
+            Some(ipc::Resp::OverlayChildren(entries)) => Some(entries),
+            _ => None,
+        }
+    }).flatten()
+}
+
 pub(crate) fn ipc_register_child(pid: u32) {
     let _ = ensure_ipc_and(|opt| {
         let _ = try_send(opt, &ipc::Req::RegisterChild { pid });

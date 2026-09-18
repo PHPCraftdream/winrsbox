@@ -1112,6 +1112,10 @@ fn handle_connection(
                 let pairs = policy.overlay_children_with_case(&dir);
                 Resp::OverlayChildrenWithCase(pairs)
             }
+            Req::OverlayChildren { dir } => {
+                let entries = policy.overlay_children(&dir);
+                Resp::OverlayChildren(entries)
+            }
             Req::Log { pid, level, msg } => {
                 let level_str = match level {
                     LogLevel::Trace => "TRACE",

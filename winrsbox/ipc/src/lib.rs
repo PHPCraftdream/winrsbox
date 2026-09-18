@@ -168,6 +168,12 @@ pub enum Req {
     /// basename. Used by the hook's `build_case_map` to restore case for
     /// overlay-only directories that have no real-disk counterpart.
     OverlayChildrenWithCase { dir: String },
+    /// Return `(basename, is_dir)` pairs for ALL overlay entries (OVERLAY_IDX)
+    /// that are direct children of `dir`, regardless of case-record presence.
+    /// Used by the enum-hook to inject overlay-only files/dirs into a real
+    /// directory's listing (the "passthrough directory with sparse overlay
+    /// children" merge that `physical_overlay_path` defers to enumeration for).
+    OverlayChildren { dir: String },
     Log { pid: u32, level: LogLevel, msg: String },
     RegisterChild { pid: u32 },
     InjectionViolation {
@@ -235,6 +241,9 @@ pub enum Resp {
     /// `(lowercase_name, original_case_name)` pairs for overlay entries that are
     /// direct children of the queried directory and have a recorded case.
     OverlayChildrenWithCase(Vec<(String, String)>),
+    /// `(basename, is_dir)` pairs for overlay-only direct children of the
+    /// queried directory (see `Req::OverlayChildren`).
+    OverlayChildren(Vec<(String, bool)>),
 }
 
 #[derive(Error, Debug)]
@@ -883,6 +892,52 @@ mod tests {
                 assert_eq!(path, r"c:\test\mixed_case_dir");
                 assert_eq!(original_basename, "Mixed_Case_Dir");
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn req_overlay_children_roundtrip() {
+        let msg = Req::OverlayChildren { dir: r"c:\users\computer\desktop\pc\vv".into() };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Req = read_msg(&mut buf).unwrap();
+        match dec {
+            Req::OverlayChildren { dir } => assert_eq!(dir, r"c:\users\computer\desktop\pc\vv"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn resp_overlay_children_roundtrip() {
+        let msg = Resp::OverlayChildren(vec![
+            ("probe_cmd.txt".to_string(), false),
+            ("some_dir".to_string(), true),
+        ]);
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Resp = read_msg(&mut buf).unwrap();
+        match dec {
+            Resp::OverlayChildren(entries) => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0], ("probe_cmd.txt".to_string(), false));
+                assert_eq!(entries[1], ("some_dir".to_string(), true));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn resp_overlay_children_empty_roundtrip() {
+        let msg = Resp::OverlayChildren(vec![]);
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Resp = read_msg(&mut buf).unwrap();
+        match dec {
+            Resp::OverlayChildren(entries) => assert!(entries.is_empty()),
             _ => panic!("wrong variant"),
         }
     }

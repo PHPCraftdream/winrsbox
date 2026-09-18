@@ -87,6 +87,161 @@ const fn dir_info_name_offsets(class: u32) -> Option<(usize, usize)> {
     }
 }
 
+/// FileAttributes field offset for directory-info classes that have one.
+/// Shared prefix across classes 1/2/3/37/38 (CreationTime..AllocationSize
+/// then FileAttributes at 0x38); `FileNamesInformation` (12) omits
+/// attributes entirely (NextEntryOffset, FileIndex, FileNameLength only).
+const fn dir_info_attr_offset(class: u32) -> Option<usize> {
+    match class {
+        1 | 2 | 3 | 37 | 38 => Some(0x38),
+        _ => None,
+    }
+}
+
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+
+/// Lowercase FileNames of every entry in a (possibly already hide-filtered)
+/// NtQueryDirectoryFile buffer. Used so overlay-only injection never
+/// double-lists a name the real disk already reported.
+///
+/// # SAFETY
+/// `buf` must be valid for `size` bytes (or `size == 0`, in which case `buf`
+/// is never dereferenced) containing a well-formed buffer for `class`.
+unsafe fn collect_present_names_lower(buf: *const u8, size: usize, class: u32) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let Some((name_len_off, name_off)) = dir_info_name_offsets(class) else {
+        return out;
+    };
+    if buf.is_null() || size == 0 {
+        return out;
+    }
+    let mut cur = 0usize;
+    while cur < size {
+        let avail = size - cur;
+        if avail < name_len_off + 4 { break; }
+        // SAFETY: NextEntryOffset @ 0, FileNameLength @ name_len_off — guarded by avail.
+        let next_off = *(buf.add(cur) as *const u32) as usize;
+        let name_len = *(buf.add(cur + name_len_off) as *const u32) as usize;
+        if name_len >= 2 && name_off + name_len <= avail {
+            // SAFETY: FileName @ name_off, `chars` u16s — bounded by the check above.
+            let name_ptr = buf.add(cur + name_off) as *const u16;
+            let chars = name_len / 2;
+            let name_slice = std::slice::from_raw_parts(name_ptr, chars);
+            let lower: String = std::char::decode_utf16(name_slice.iter().copied())
+                .map(|r| r.unwrap_or('\u{FFFD}'))
+                .flat_map(|c| c.to_ascii_lowercase().to_string().chars().collect::<Vec<_>>())
+                .collect();
+            out.insert(lower);
+        }
+        if next_off == 0 || next_off > avail { break; }
+        cur += next_off;
+    }
+    out
+}
+
+/// Appends directory-info records for `extra` `(name, is_dir)` pairs into
+/// the unused tail of a caller-provided NtQueryDirectoryFile buffer,
+/// chaining them after whatever real entries occupy `[0, used_size)`. This
+/// is the enum-side half of the merged-view overlay model: a CoW write
+/// outside `project_root` into a directory that also exists on the real
+/// disk isolates into the overlay without touching the real directory (see
+/// `policy::decide::compute`), so the real listing alone never shows it —
+/// this function injects it back in, keeping `dir`/`ls` consistent with
+/// direct-open reads that already resolve such paths via `OVERLAY_IDX`.
+///
+/// Entries that don't fit within `capacity` are silently dropped — this
+/// mirrors NtQueryDirectoryFile's own truncation behavior (a caller that
+/// pages through a directory sees them on a later call). Known limitation:
+/// on a directory large enough to need multiple successful
+/// NtQueryDirectoryFile calls, extras are (best-effort) re-injected on every
+/// such call, since this function has no per-handle continuation state —
+/// acceptable for the common case this fixes (a handful of overlay-only
+/// files in an otherwise small directory).
+///
+/// Unsupported `class` values and an empty `extra` are both a no-op.
+///
+/// Returns the new used size: `used_size <= result <= capacity`.
+///
+/// # SAFETY
+/// `buf` must be writable for `capacity` bytes. `[0, used_size)` must
+/// already hold a valid NtQueryDirectoryFile linked-list buffer for `class`
+/// (terminated by an entry with `NextEntryOffset == 0`), or `used_size == 0`
+/// for an empty listing.
+unsafe fn append_overlay_entries(
+    buf: *mut u8,
+    used_size: usize,
+    capacity: usize,
+    class: u32,
+    extra: &[(String, bool)],
+) -> usize {
+    let Some((name_len_off, name_off)) = dir_info_name_offsets(class) else {
+        return used_size;
+    };
+    if extra.is_empty() {
+        return used_size;
+    }
+
+    // Locate the current tail entry (NextEntryOffset == 0) so its offset can
+    // be patched once the first new record is appended. `None` means the
+    // buffer is currently empty — the first appended entry starts at 0.
+    let mut prev_start: Option<usize> = None;
+    if used_size > 0 {
+        let mut cur = 0usize;
+        loop {
+            let avail = used_size - cur;
+            if avail < 4 { break; }
+            // SAFETY: NextEntryOffset @ 0 — guarded by avail >= 4.
+            let next_off = *(buf.add(cur) as *const u32) as usize;
+            if next_off == 0 || next_off > avail {
+                prev_start = Some(cur);
+                break;
+            }
+            cur += next_off;
+        }
+    }
+
+    let mut write_at = used_size;
+
+    for (name, is_dir) in extra {
+        let name_u16: Vec<u16> = name.encode_utf16().collect();
+        let name_bytes = name_u16.len() * 2;
+        let entry_len = name_off + name_bytes;
+        let entry_len_aligned = (entry_len + 7) & !7;
+        if write_at + entry_len_aligned > capacity {
+            break; // doesn't fit — drop this and every subsequent extra
+        }
+
+        // SAFETY: `write_at + entry_len_aligned <= capacity`, just checked.
+        let entry_ptr = buf.add(write_at);
+        // Zero the header: this region (past used_size) is caller-owned
+        // scratch space, not guaranteed zeroed by the kernel.
+        std::ptr::write_bytes(entry_ptr, 0, entry_len_aligned);
+        // NextEntryOffset = 0 — this entry is the new tail until (if) the
+        // next extra gets linked after it below.
+        *(entry_ptr as *mut u32) = 0;
+        *(entry_ptr.add(name_len_off) as *mut u32) = name_bytes as u32;
+        if let Some(attr_off) = dir_info_attr_offset(class) {
+            let attrs = if *is_dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL };
+            *(entry_ptr.add(attr_off) as *mut u32) = attrs;
+        }
+        let name_dst = entry_ptr.add(name_off) as *mut u16;
+        for (j, &u) in name_u16.iter().enumerate() {
+            *name_dst.add(j) = u;
+        }
+
+        // Link the previous tail (real or previously-appended) to this entry.
+        if let Some(prev) = prev_start {
+            *(buf.add(prev) as *mut u32) = (write_at - prev) as u32;
+        }
+
+        prev_start = Some(write_at);
+        write_at += entry_len_aligned;
+    }
+
+    write_at
+}
+
 /// Walk the linked-list buffer returned by NtQueryDirectoryFile and remove any
 /// entry whose FileName matches a name in `hide_names` (case-insensitive,
 /// compared as UTF-16). `.winrsbox` is always in the hide set. For unhandled
@@ -369,6 +524,7 @@ unsafe fn process_dir_output(
     file_information_class: u32,
     dir_dos: Option<&str>,
     original_status: NTSTATUS,
+    capacity: usize,
 ) -> NTSTATUS {
     if original_status != 0 {
         return original_status;
@@ -474,6 +630,43 @@ unsafe fn process_dir_output(
         }
     }
 
+    // Merge overlay-only entries: a CoW write outside project_root into a
+    // directory that also exists on the real disk isolates into the overlay
+    // without ever touching the real directory (policy::decide::compute), so
+    // the real NtQueryDirectoryFile result above never includes it even
+    // though a direct open by name already resolves it via OVERLAY_IDX — the
+    // "ghost file" bug. Inject those entries here so both channels agree.
+    if let Some(ref dir) = virtual_dir {
+        if let Some(mut extras) = crate::ipc_client::ipc_overlay_children(dir) {
+            if !extras.is_empty() {
+                // SAFETY: file_information is valid for info_size bytes (kernel-filled).
+                let present = collect_present_names_lower(
+                    file_information as *const u8, info_size, file_information_class,
+                );
+                extras.retain(|(name, _)| !present.contains(&name.to_ascii_lowercase()));
+                if !extras.is_empty() {
+                    // SAFETY: file_information is writable for `capacity` bytes
+                    // (the caller's original NtQueryDirectoryFile `length` argument).
+                    let new_size = append_overlay_entries(
+                        file_information as *mut u8,
+                        info_size,
+                        capacity,
+                        file_information_class,
+                        &extras,
+                    );
+                    if new_size > info_size {
+                        // SAFETY: io_status_block validated non-null above; Information at offset 8 on x64.
+                        *((io_status_block as *mut u8).add(8) as *mut usize) = new_size;
+                        if hooks::is_trace() {
+                            hooks::ipc_log(ipc::LogLevel::Trace,
+                                format!("fs_enum_overlay_merge dir={dir} added={}", extras.len()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     original_status
 }
 
@@ -518,6 +711,7 @@ unsafe extern "system" fn hook_nt_query_directory_file(
         file_information_class,
         dir_dos.as_deref(),
         status,
+        length as usize,
     )
 }
 
@@ -557,6 +751,7 @@ unsafe extern "system" fn hook_nt_query_directory_file_ex(
         file_information_class,
         dir_dos.as_deref(),
         status,
+        length as usize,
     )
 }
 
@@ -1145,5 +1340,228 @@ mod tests {
             build_case_map_with_fallback(nonexistent, |_dir| None)
         };
         assert!(result.is_none(), "empty both sources must return None");
+    }
+
+    // ── overlay-entry injection (enum-merge fix: ghost-file listing bug) ───
+    //
+    // A CoW write outside project_root into a directory that ALSO exists on
+    // the real disk gets isolated into the overlay (never touching the real
+    // directory — see policy::decide's merged-view model). The real
+    // NtQueryDirectoryFile result for that directory is therefore real-disk-
+    // only and never shows the overlay-only file, even though a direct open
+    // by name finds it via OVERLAY_IDX — a "ghost file" invisible to
+    // `dir`/`ls` but readable via `type`/`cat`. These functions merge
+    // overlay-only entries into the listing buffer so both channels agree.
+
+    /// Collect (lowercase name, FileAttributes) pairs from a class-1 buffer.
+    /// Test-only helper; production code never needs to READ attributes.
+    fn collect_names_and_attrs(buf: &[u8]) -> Vec<(String, u32)> {
+        const ATTR_OFF: usize = 0x38;
+        const NAME_LEN_OFF: usize = 0x3C;
+        const NAME_OFF: usize = 0x40;
+        let mut out = Vec::new();
+        let mut cur = 0usize;
+        while cur < buf.len() {
+            if cur + NAME_OFF > buf.len() { break; }
+            let next_off = u32::from_le_bytes([buf[cur], buf[cur+1], buf[cur+2], buf[cur+3]]) as usize;
+            let attrs = u32::from_le_bytes([
+                buf[cur+ATTR_OFF], buf[cur+ATTR_OFF+1], buf[cur+ATTR_OFF+2], buf[cur+ATTR_OFF+3],
+            ]);
+            let name_len = u32::from_le_bytes([
+                buf[cur+NAME_LEN_OFF], buf[cur+NAME_LEN_OFF+1],
+                buf[cur+NAME_LEN_OFF+2], buf[cur+NAME_LEN_OFF+3],
+            ]) as usize;
+            if name_len == 0 || cur + NAME_OFF + name_len > buf.len() { break; }
+            let chars = name_len / 2;
+            let mut name = String::new();
+            for j in 0..chars {
+                let off = cur + NAME_OFF + j * 2;
+                let u = u16::from_le_bytes([buf[off], buf[off+1]]);
+                name.push(char::from_u32(u as u32).unwrap_or('?'));
+            }
+            out.push((name, attrs));
+            if next_off == 0 { break; }
+            cur += next_off;
+        }
+        out
+    }
+
+    #[test]
+    fn dir_info_attr_offset_known_classes() {
+        assert_eq!(dir_info_attr_offset(1), Some(0x38));
+        assert_eq!(dir_info_attr_offset(2), Some(0x38));
+        assert_eq!(dir_info_attr_offset(3), Some(0x38));
+        assert_eq!(dir_info_attr_offset(37), Some(0x38));
+        assert_eq!(dir_info_attr_offset(38), Some(0x38));
+    }
+
+    #[test]
+    fn dir_info_attr_offset_class_12_has_no_attribute_field() {
+        assert_eq!(dir_info_attr_offset(12), None);
+    }
+
+    #[test]
+    fn dir_info_attr_offset_unhandled_class_is_none() {
+        assert_eq!(dir_info_attr_offset(999), None);
+    }
+
+    #[test]
+    fn collect_present_names_lower_reads_existing_entries() {
+        let buf = build_dir_info_buffer(&["Foo.txt", "bar.log"]);
+        // SAFETY: buf is a valid class-1 buffer built above.
+        let present = unsafe { collect_present_names_lower(buf.as_ptr(), buf.len(), 1) };
+        assert!(present.contains("foo.txt"));
+        assert!(present.contains("bar.log"));
+        assert_eq!(present.len(), 2);
+    }
+
+    #[test]
+    fn collect_present_names_lower_empty_buffer() {
+        let present = unsafe { collect_present_names_lower(std::ptr::null(), 0, 1) };
+        assert!(present.is_empty());
+    }
+
+    #[test]
+    fn append_overlay_entries_into_empty_buffer() {
+        let mut buf = vec![0u8; 256];
+        let extra = vec![("new.txt".to_string(), false)];
+        // SAFETY: buf is a writable 256-byte scratch buffer.
+        let new_size = unsafe {
+            append_overlay_entries(buf.as_mut_ptr(), 0, buf.len(), 1, &extra)
+        };
+        assert!(new_size > 0);
+        let names = collect_names(&buf[..new_size]);
+        assert_eq!(names, vec!["new.txt".to_string()]);
+    }
+
+    #[test]
+    fn append_overlay_entries_after_existing_tail() {
+        let mut existing = build_dir_info_buffer(&["a.txt", "b.txt"]);
+        let used = existing.len();
+        existing.resize(used + 256, 0); // free space for the appended entry
+        let extra = vec![("new.txt".to_string(), false)];
+        // SAFETY: existing is writable, sized used+256.
+        let new_size = unsafe {
+            append_overlay_entries(existing.as_mut_ptr(), used, existing.len(), 1, &extra)
+        };
+        assert!(new_size > used);
+        let names = collect_names(&existing[..new_size]);
+        assert_eq!(names, vec!["a.txt".to_string(), "b.txt".to_string(), "new.txt".to_string()],
+            "appended entry must be reachable by walking the existing chain");
+    }
+
+    #[test]
+    fn append_overlay_entries_multiple_extras_all_fit() {
+        let mut buf = vec![0u8; 512];
+        let extra = vec![
+            ("one.txt".to_string(), false),
+            ("two.txt".to_string(), false),
+            ("three.txt".to_string(), false),
+        ];
+        // SAFETY: buf is a writable 512-byte scratch buffer.
+        let new_size = unsafe {
+            append_overlay_entries(buf.as_mut_ptr(), 0, buf.len(), 1, &extra)
+        };
+        let names = collect_names(&buf[..new_size]);
+        assert_eq!(names, vec!["one.txt".to_string(), "two.txt".to_string(), "three.txt".to_string()]);
+    }
+
+    #[test]
+    fn append_overlay_entries_empty_extra_list_is_noop() {
+        let mut buf = build_dir_info_buffer(&["a.txt"]);
+        let used = buf.len();
+        let original = buf.clone();
+        // SAFETY: buf is a valid class-1 buffer.
+        let new_size = unsafe {
+            append_overlay_entries(buf.as_mut_ptr(), used, used, 1, &[])
+        };
+        assert_eq!(new_size, used);
+        assert_eq!(buf, original);
+    }
+
+    #[test]
+    fn append_overlay_entries_sets_directory_attribute_bit() {
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        let mut buf = vec![0u8; 256];
+        let extra = vec![("subdir".to_string(), true)];
+        // SAFETY: buf is a writable 256-byte scratch buffer.
+        let new_size = unsafe {
+            append_overlay_entries(buf.as_mut_ptr(), 0, buf.len(), 1, &extra)
+        };
+        let entries = collect_names_and_attrs(&buf[..new_size]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "subdir");
+        assert_eq!(entries[0].1 & FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_DIRECTORY,
+            "directory entry must carry FILE_ATTRIBUTE_DIRECTORY");
+    }
+
+    #[test]
+    fn append_overlay_entries_sets_normal_attribute_bit_for_file() {
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+        let mut buf = vec![0u8; 256];
+        let extra = vec![("probe.txt".to_string(), false)];
+        // SAFETY: buf is a writable 256-byte scratch buffer.
+        let new_size = unsafe {
+            append_overlay_entries(buf.as_mut_ptr(), 0, buf.len(), 1, &extra)
+        };
+        let entries = collect_names_and_attrs(&buf[..new_size]);
+        assert_eq!(entries[0].1, FILE_ATTRIBUTE_NORMAL);
+    }
+
+    #[test]
+    fn append_overlay_entries_respects_capacity_drops_overflow() {
+        // class-1 entry for "a.txt" (5 chars) is exactly 0x50 bytes
+        // (0x40 header + 10 name bytes, aligned up to 0x50) — capacity fits
+        // exactly one such entry and nothing more; the second, much longer
+        // name must be dropped, not overflow the buffer.
+        let mut buf = vec![0xAAu8; 0x60]; // 0xAA sentinel: detects OOB writes past capacity
+        let capacity = 0x50;
+        let extra = vec![("a.txt".to_string(), false), ("this_one_does_not_fit.txt".to_string(), false)];
+        // SAFETY: buf is 0x60 bytes; we pass capacity=0x50 as the hard limit.
+        let new_size = unsafe {
+            append_overlay_entries(buf.as_mut_ptr(), 0, capacity, 1, &extra)
+        };
+        assert_eq!(new_size, capacity, "the one entry that fits must exactly fill capacity");
+        let names = collect_names(&buf[..new_size]);
+        assert_eq!(names, vec!["a.txt".to_string()], "second (too-long) name must be dropped");
+        // Bytes beyond `capacity` must be untouched (still the 0xAA sentinel).
+        assert!(buf[capacity..].iter().all(|&b| b == 0xAA),
+            "must not write past the caller-provided capacity");
+    }
+
+    #[test]
+    fn append_overlay_entries_unsupported_class_is_noop() {
+        let mut buf = vec![0u8; 256];
+        let extra = vec![("new.txt".to_string(), false)];
+        // SAFETY: buf is writable; class 999 is unhandled.
+        let new_size = unsafe {
+            append_overlay_entries(buf.as_mut_ptr(), 0, buf.len(), 999, &extra)
+        };
+        assert_eq!(new_size, 0, "unsupported class must not append anything");
+    }
+
+    #[test]
+    fn append_overlay_entries_class_12_no_attribute_field() {
+        // class 12: FileNamesInformation — 0x0C header, no FileAttributes field.
+        let mut buf = vec![0u8; 128];
+        let extra = vec![("new.txt".to_string(), false)];
+        // SAFETY: buf is a writable 128-byte scratch buffer.
+        let new_size = unsafe {
+            append_overlay_entries(buf.as_mut_ptr(), 0, buf.len(), 12, &extra)
+        };
+        assert!(new_size > 0);
+        // Walk class-12 layout directly (NAME_LEN_OFF=0x08, NAME_OFF=0x0C).
+        const NAME_LEN_OFF_12: usize = 0x08;
+        const NAME_OFF_12: usize = 0x0C;
+        let name_len = u32::from_le_bytes([
+            buf[NAME_LEN_OFF_12], buf[NAME_LEN_OFF_12+1], buf[NAME_LEN_OFF_12+2], buf[NAME_LEN_OFF_12+3],
+        ]) as usize;
+        let chars = name_len / 2;
+        let mut name = String::new();
+        for j in 0..chars {
+            let off = NAME_OFF_12 + j * 2;
+            name.push(char::from_u32(u16::from_le_bytes([buf[off], buf[off+1]]) as u32).unwrap_or('?'));
+        }
+        assert_eq!(name, "new.txt");
     }
 }

@@ -407,6 +407,55 @@ impl Policy {
         out
     }
 
+    /// Return `(basename, is_dir)` pairs for ALL overlay entries (OVERLAY_IDX)
+    /// that are direct children of `dir`, regardless of whether an
+    /// OVERLAY_CASE record exists (unlike `overlay_children_with_case`, which
+    /// only reports entries with a recorded original-case basename).
+    ///
+    /// Used by the enum-hook to inject overlay-only files/directories into a
+    /// real directory's listing — the merge `physical_overlay_path`'s doc
+    /// comment defers to enumeration for "passthrough directory with sparse
+    /// overlay children" (a CoW write outside `project_root` into a
+    /// directory that also exists on the real disk).
+    ///
+    /// `is_dir` reflects a live stat of the physical overlay path; a missing
+    /// or unreadable path defaults to `false` rather than erroring, since a
+    /// stale index entry must not break enumeration.
+    pub fn overlay_children(&self, dir: &str) -> Vec<(String, bool)> {
+        let dir_lower = ensure_lower(dir);
+        let dir_trimmed = dir_lower.trim_end_matches('\\');
+        if dir_trimmed.is_empty() {
+            return Vec::new();
+        }
+        let prefix_with_sep = format!("{}\\", dir_trimmed);
+        let Ok(txn) = self.inner.db.begin_read() else { return Vec::new() };
+        let Ok(idx) = txn.open_table(db::OVERLAY_IDX) else { return Vec::new() };
+        // OVERLAY_CASE is created lazily on the first `record_overlay_case`
+        // write — a DB with only lowercase-created overlay entries never
+        // touches it. Missing table just means "no case records anywhere",
+        // not "bail out": every entry falls back to its lowercase key.
+        let case = txn.open_table(db::OVERLAY_CASE).ok();
+
+        let mut out = Vec::new();
+        let Ok(iter) = idx.range(prefix_with_sep.as_str()..) else { return Vec::new() };
+        for entry in iter.flatten() {
+            let key = entry.0.value();
+            let Some(rest) = key.strip_prefix(&prefix_with_sep) else { break };
+            // Direct children only — no further backslash.
+            if rest.contains('\\') {
+                continue;
+            }
+            let overlay_phys = entry.1.value();
+            let is_dir = std::fs::metadata(overlay_phys).map(|m| m.is_dir()).unwrap_or(false);
+            let name = case.as_ref()
+                .and_then(|t| t.get(key).ok().flatten())
+                .map(|v| v.value().to_owned())
+                .unwrap_or_else(|| rest.to_owned());
+            out.push((name, is_dir));
+        }
+        out
+    }
+
     /// Record a whiteout (delete-marker / tombstone) for `path`. The real
     /// lower file is never touched; the marker only hides the path from the
     /// sandbox's merged view. Keyed on the ASCII-lowercased virtual DOS path.
