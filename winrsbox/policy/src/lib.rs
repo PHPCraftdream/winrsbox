@@ -14,7 +14,7 @@ pub(crate) mod registry;
 use std::path::PathBuf;
 use thiserror::Error;
 
-pub use decide::{Verdict, ConsideredRule, TracedDecision};
+pub use decide::{Verdict, ConsideredRule, TracedDecision, OverlayChildMeta};
 pub use policy_impl::Policy;
 pub use registry::{RegDecision, RegistryPolicy};
 
@@ -1160,7 +1160,7 @@ mod tests {
         p.record_overlay(r"d:\bar\c.txt", r"C:\sb\bar\c.txt").unwrap();
 
         let mut names: Vec<String> = p.overlay_children(r"d:\out")
-            .into_iter().map(|(n, _)| n).collect();
+            .into_iter().map(|e| e.name).collect();
         names.sort();
         assert_eq!(names, vec!["a.txt".to_string(), "b.log".to_string()],
             "overlay_children must return only direct children");
@@ -1192,7 +1192,7 @@ mod tests {
         p.record_overlay(r"d:\out\probe_cmd.txt", r"C:\sb\out\probe_cmd.txt").unwrap();
         let entries = p.overlay_children(r"d:\out");
         assert_eq!(entries.len(), 1, "got: {:?}", entries);
-        assert_eq!(entries[0].0, "probe_cmd.txt");
+        assert_eq!(entries[0].name, "probe_cmd.txt");
     }
 
     /// When an OVERLAY_CASE record exists, the original-case name wins over
@@ -1204,7 +1204,7 @@ mod tests {
         p.record_overlay_case(r"d:\out\mixed_case_dir", "Mixed_Case_Dir");
         let entries = p.overlay_children(r"d:\out");
         assert_eq!(entries.len(), 1, "got: {:?}", entries);
-        assert_eq!(entries[0].0, "Mixed_Case_Dir");
+        assert_eq!(entries[0].name, "Mixed_Case_Dir");
     }
 
     /// `is_dir` reflects the real type of the physical overlay node: a file
@@ -1217,7 +1217,8 @@ mod tests {
         p.record_overlay(r"d:\out\probe.txt", phys.to_str().unwrap()).unwrap();
         let entries = p.overlay_children(r"d:\out");
         assert_eq!(entries.len(), 1, "got: {:?}", entries);
-        assert_eq!(entries[0], ("probe.txt".to_string(), false));
+        assert_eq!(entries[0].name, "probe.txt");
+        assert!(!entries[0].is_dir);
     }
 
     /// `is_dir` → true when the physical overlay node is a real directory.
@@ -1229,17 +1230,59 @@ mod tests {
         p.record_overlay(r"d:\out\subdir", phys.to_str().unwrap()).unwrap();
         let entries = p.overlay_children(r"d:\out");
         assert_eq!(entries.len(), 1, "got: {:?}", entries);
-        assert_eq!(entries[0], ("subdir".to_string(), true));
+        assert_eq!(entries[0].name, "subdir");
+        assert!(entries[0].is_dir);
     }
 
     /// The overlay physical path doesn't exist on disk (e.g. race / stale
-    /// index entry) → is_dir defaults to false rather than panicking.
+    /// index entry) → is_dir defaults to false and all metadata is zeroed,
+    /// rather than panicking.
     #[test]
-    fn overlay_children_missing_physical_path_defaults_not_dir() {
+    fn overlay_children_missing_physical_path_defaults_zeroed() {
         let (_dir, p, _project) = make_policy_with_project("proj");
         p.record_overlay(r"d:\out\stale.txt", r"C:\sb\does\not\exist.txt").unwrap();
         let entries = p.overlay_children(r"d:\out");
-        assert_eq!(entries, vec![("stale.txt".to_string(), false)]);
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.name, "stale.txt");
+        assert!(!e.is_dir);
+        assert_eq!(e.size, 0);
+        assert_eq!(e.creation_time, 0);
+        assert_eq!(e.last_access_time, 0);
+        assert_eq!(e.last_write_time, 0);
+    }
+
+    /// A real physical overlay file's size and write time are reported
+    /// verbatim — this is what lets `dir` show a plausible size/date instead
+    /// of the placeholder 0-byte / 1601-01-01 that a synthesized zeroed
+    /// entry would otherwise show (the merged-listing metadata mismatch a
+    /// live agent flagged as a stealth defect).
+    #[test]
+    fn overlay_children_reports_real_size_and_nonzero_write_time() {
+        let (dir, p, _project) = make_policy_with_project("proj");
+        let phys = dir.path().join("overlay_file.txt");
+        std::fs::write(&phys, b"twelve bytes").unwrap(); // 12 bytes
+        p.record_overlay(r"d:\out\probe.txt", phys.to_str().unwrap()).unwrap();
+        let entries = p.overlay_children(r"d:\out");
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        assert_eq!(e.size, 12);
+        assert!(e.last_write_time > 0, "a just-written file must have a nonzero FILETIME");
+        assert!(e.creation_time > 0);
+    }
+
+    /// A physical overlay directory reports size 0 (directories have no
+    /// EndOfFile) but still a real, nonzero write time.
+    #[test]
+    fn overlay_children_directory_reports_zero_size_nonzero_time() {
+        let (dir, p, _project) = make_policy_with_project("proj");
+        let phys = dir.path().join("overlay_subdir");
+        std::fs::create_dir_all(&phys).unwrap();
+        p.record_overlay(r"d:\out\subdir", phys.to_str().unwrap()).unwrap();
+        let entries = p.overlay_children(r"d:\out");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size, 0);
+        assert!(entries[0].last_write_time > 0);
     }
 
     // ── Regression ratchet: Pattern #2 — multi-level whiteout cascade

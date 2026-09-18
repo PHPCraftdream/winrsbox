@@ -243,7 +243,7 @@ pub enum Resp {
     OverlayChildrenWithCase(Vec<(String, String)>),
     /// `(basename, is_dir)` pairs for overlay-only direct children of the
     /// queried directory (see `Req::OverlayChildren`).
-    OverlayChildren(Vec<(String, bool)>),
+    OverlayChildren(Vec<policy::OverlayChildMeta>),
 }
 
 #[derive(Error, Debug)]
@@ -912,8 +912,22 @@ mod tests {
     #[test]
     fn resp_overlay_children_roundtrip() {
         let msg = Resp::OverlayChildren(vec![
-            ("probe_cmd.txt".to_string(), false),
-            ("some_dir".to_string(), true),
+            policy::OverlayChildMeta {
+                name: "probe_cmd.txt".to_string(),
+                is_dir: false,
+                size: 12,
+                creation_time: 133_700_000_000_000_000,
+                last_access_time: 133_700_000_000_000_000,
+                last_write_time: 133_700_000_000_000_000,
+            },
+            policy::OverlayChildMeta {
+                name: "some_dir".to_string(),
+                is_dir: true,
+                size: 0,
+                creation_time: 133_700_000_000_000_000,
+                last_access_time: 133_700_000_000_000_000,
+                last_write_time: 133_700_000_000_000_000,
+            },
         ]);
         let mut buf = Cursor::new(Vec::new());
         write_msg(&mut buf, &msg).unwrap();
@@ -922,8 +936,11 @@ mod tests {
         match dec {
             Resp::OverlayChildren(entries) => {
                 assert_eq!(entries.len(), 2);
-                assert_eq!(entries[0], ("probe_cmd.txt".to_string(), false));
-                assert_eq!(entries[1], ("some_dir".to_string(), true));
+                assert_eq!(entries[0].name, "probe_cmd.txt");
+                assert!(!entries[0].is_dir);
+                assert_eq!(entries[0].size, 12);
+                assert_eq!(entries[1].name, "some_dir");
+                assert!(entries[1].is_dir);
             }
             _ => panic!("wrong variant"),
         }

@@ -98,8 +98,98 @@ const fn dir_info_attr_offset(class: u32) -> Option<usize> {
     }
 }
 
+/// CreationTime/LastAccessTime/LastWriteTime/EndOfFile/AllocationSize field
+/// offsets for directory-info classes that have them — same 1/2/3/37/38
+/// shared prefix as `dir_info_attr_offset`; `FileNamesInformation` (12) has
+/// none of these fields.
+struct DirInfoTimeOffsets {
+    creation_time: usize,
+    last_access_time: usize,
+    last_write_time: usize,
+    end_of_file: usize,
+    allocation_size: usize,
+}
+const fn dir_info_time_offsets(class: u32) -> Option<DirInfoTimeOffsets> {
+    match class {
+        1 | 2 | 3 | 37 | 38 => Some(DirInfoTimeOffsets {
+            creation_time: 0x08,
+            last_access_time: 0x10,
+            last_write_time: 0x18,
+            end_of_file: 0x28,
+            allocation_size: 0x30,
+        }),
+        _ => None,
+    }
+}
+
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+/// NTFS cluster size used to round EndOfFile up to a plausible
+/// AllocationSize — matches the common default cluster size; exactness
+/// doesn't matter here, only "not a suspicious 0 next to a nonzero size".
+const ASSUMED_CLUSTER_SIZE: u64 = 4096;
+
+/// Case-sensitive DOS-style single-segment wildcard match: `*` = any run of
+/// chars (including none), `?` = exactly one char, everything else literal.
+/// Callers fold both `name` and `pattern` to the same case before calling —
+/// this function does no case-folding itself so it stays a pure string op.
+///
+/// Classic greedy-with-backtrack glob algorithm (iterative, O(n*m) worst
+/// case, no recursion — a hostile pattern like `"****...*"` cannot blow the
+/// stack).
+fn filename_matches_pattern(name: &str, pattern: &str) -> bool {
+    let n: Vec<char> = name.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let (mut ni, mut pi) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None; // (pattern_idx_after_star, name_idx_at_star)
+
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            ni += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi + 1, ni));
+            pi += 1;
+        } else if let Some((sp, sn)) = star {
+            pi = sp;
+            ni = sn + 1;
+            star = Some((sp, ni));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Extract an NtQueryDirectoryFile `FileName` search-pattern argument.
+/// Returns `None` for a null pointer, a null `Buffer`, or `Length == 0` —
+/// all of which mean "no filter, every entry matches" per the NT contract,
+/// not a pattern to compare against.
+///
+/// # SAFETY
+/// `p` may be null. If non-null, caller must ensure it points to a valid
+/// `UNICODE_STRING` (guaranteed by ntdll at hook entry) with `Buffer` valid
+/// for `Length` bytes when `Buffer` is non-null.
+unsafe fn extract_search_pattern(p: *const UNICODE_STRING) -> Option<String> {
+    if p.is_null() {
+        return None;
+    }
+    let ustr = &*p;
+    if ustr.Buffer.is_null() {
+        return None;
+    }
+    let char_count = (ustr.Length as usize) / 2;
+    if char_count == 0 {
+        return None;
+    }
+    // SAFETY: from_raw_parts for `char_count` WCHARs from Buffer, bounded by
+    // Length per the NT UNICODE_STRING contract this function documents.
+    let slice = std::slice::from_raw_parts(ustr.Buffer, char_count);
+    Some(String::from_utf16_lossy(slice))
+}
 
 /// Lowercase FileNames of every entry in a (possibly already hide-filtered)
 /// NtQueryDirectoryFile buffer. Used so overlay-only injection never
@@ -173,7 +263,7 @@ unsafe fn append_overlay_entries(
     used_size: usize,
     capacity: usize,
     class: u32,
-    extra: &[(String, bool)],
+    extra: &[policy::OverlayChildMeta],
 ) -> usize {
     let Some((name_len_off, name_off)) = dir_info_name_offsets(class) else {
         return used_size;
@@ -203,8 +293,10 @@ unsafe fn append_overlay_entries(
 
     let mut write_at = used_size;
 
-    for (name, is_dir) in extra {
-        let name_u16: Vec<u16> = name.encode_utf16().collect();
+    let time_offs = dir_info_time_offsets(class);
+
+    for meta in extra {
+        let name_u16: Vec<u16> = meta.name.encode_utf16().collect();
         let name_bytes = name_u16.len() * 2;
         let entry_len = name_off + name_bytes;
         let entry_len_aligned = (entry_len + 7) & !7;
@@ -222,8 +314,20 @@ unsafe fn append_overlay_entries(
         *(entry_ptr as *mut u32) = 0;
         *(entry_ptr.add(name_len_off) as *mut u32) = name_bytes as u32;
         if let Some(attr_off) = dir_info_attr_offset(class) {
-            let attrs = if *is_dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL };
+            let attrs = if meta.is_dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL };
             *(entry_ptr.add(attr_off) as *mut u32) = attrs;
+        }
+        if let Some(ref t) = time_offs {
+            // A live stat of the physical overlay file (or all-zero for a
+            // stale/unreadable index entry — an honest "unknown", not
+            // garbage). Real values here are what stops `dir` showing every
+            // overlay-only file as 0 bytes / 1601-01-01.
+            *(entry_ptr.add(t.creation_time) as *mut u64) = meta.creation_time;
+            *(entry_ptr.add(t.last_access_time) as *mut u64) = meta.last_access_time;
+            *(entry_ptr.add(t.last_write_time) as *mut u64) = meta.last_write_time;
+            *(entry_ptr.add(t.end_of_file) as *mut u64) = meta.size;
+            let alloc = meta.size.div_ceil(ASSUMED_CLUSTER_SIZE) * ASSUMED_CLUSTER_SIZE;
+            *(entry_ptr.add(t.allocation_size) as *mut u64) = alloc;
         }
         let name_dst = entry_ptr.add(name_off) as *mut u16;
         for (j, &u) in name_u16.iter().enumerate() {
@@ -518,6 +622,31 @@ unsafe fn rewrite_entry_case(
 /// # SAFETY
 /// `file_information`/`io_status_block` are the kernel-filled output buffers.
 /// `dir_dos` is the virtual DOS path (may be None when handle resolution fails).
+/// A search-pattern query that matched nothing on the real disk. NT signals
+/// this distinctly from "enumeration exhausted" (`STATUS_NO_MORE_FILES`,
+/// 0x80000006) — only `STATUS_NO_SUCH_FILE` means "the given name/pattern
+/// has zero real matches", which is exactly the case where an overlay-only
+/// match must be synthesized. Gating on this specific code (rather than any
+/// non-zero status) means a genuine end-of-enumeration or an unrelated error
+/// is never misread as "try synthesizing".
+const STATUS_NO_SUCH_FILE: NTSTATUS = 0xC000000Fu32 as NTSTATUS;
+
+/// Resolve the virtual DOS path for the directory being enumerated.
+///
+/// `query_handle_dos_path` calls GetFinalPathNameByHandleW which internally
+/// calls NtQueryInformationFile(FileNormalizedNameInformation, class 48).
+/// The path_info_guard hook normally unmirrors overlay paths back to virtual,
+/// but because anti_rec is ALREADY HELD on this thread (set at the top of
+/// hook_nt_query_directory_file[_ex]), path_info_guard's anti_rec::enter()
+/// returns None and it calls the original without unmasking. As a result
+/// query_handle_dos_path returns the OVERLAY PHYSICAL PATH (lowercase), not
+/// the virtual path — so it must be unmirrored back here, once.
+fn resolve_virtual_dir(dir_dos: Option<&str>) -> Option<String> {
+    let raw = dir_dos?;
+    let sb_root = hooks::SANDBOX_ROOT.get().map(|s| s.as_str());
+    Some(hooks::unmirror_overlay_handle_relative(raw, sb_root).unwrap_or_else(|| raw.to_string()))
+}
+
 unsafe fn process_dir_output(
     file_information: *mut c_void,
     io_status_block: *mut IO_STATUS_BLOCK,
@@ -525,11 +654,62 @@ unsafe fn process_dir_output(
     dir_dos: Option<&str>,
     original_status: NTSTATUS,
     capacity: usize,
+    search_pattern: Option<&str>,
 ) -> NTSTATUS {
+    if io_status_block.is_null() {
+        return original_status;
+    }
+
+    // Single-name (or wildcard) lookup that found nothing real: `dir
+    // <exact-file>` and similar queries pass the target as the FileName
+    // filter. The real syscall fails FAST here — none of the merge logic
+    // below ever runs, because there are no real entries to merge into. If
+    // the pattern matches an overlay-only file, synthesize the whole reply
+    // from scratch; this is the same "ghost file" bug as the listing case,
+    // reached through a different code path.
+    if original_status == STATUS_NO_SUCH_FILE {
+        if file_information.is_null() {
+            return original_status;
+        }
+        let Some(pattern) = search_pattern else {
+            return original_status; // no filter given — genuinely nothing to synthesize
+        };
+        let Some(dir) = resolve_virtual_dir(dir_dos) else {
+            return original_status;
+        };
+        let pattern_lower = pattern.to_ascii_lowercase();
+        let Some(extras) = crate::ipc_client::ipc_overlay_children(&dir) else {
+            return original_status;
+        };
+        let matches: Vec<policy::OverlayChildMeta> = extras.into_iter()
+            .filter(|e| filename_matches_pattern(&e.name.to_ascii_lowercase(), &pattern_lower))
+            .collect();
+        if matches.is_empty() {
+            return original_status;
+        }
+        // SAFETY: file_information is writable for `capacity` bytes (the
+        // caller's original NtQueryDirectoryFile `length` argument) — the
+        // real syscall wrote nothing into it (it failed), so we own the
+        // whole buffer from offset 0.
+        let new_size = append_overlay_entries(
+            file_information as *mut u8, 0, capacity, file_information_class, &matches,
+        );
+        if new_size == 0 {
+            return original_status; // didn't fit / unsupported class
+        }
+        // SAFETY: io_status_block validated non-null above; Information at offset 8 on x64.
+        *((io_status_block as *mut u8).add(8) as *mut usize) = new_size;
+        if hooks::is_trace() {
+            hooks::ipc_log(ipc::LogLevel::Trace,
+                format!("fs_enum_overlay_synthesize dir={dir} pattern={pattern} matched={}", matches.len()));
+        }
+        return 0; // STATUS_SUCCESS
+    }
+
     if original_status != 0 {
         return original_status;
     }
-    if io_status_block.is_null() || file_information.is_null() {
+    if file_information.is_null() {
         return original_status;
     }
     // IoStatusBlock.Information (offset 8 on x64) contains bytes written.
@@ -539,29 +719,7 @@ unsafe fn process_dir_output(
         return original_status;
     }
 
-    // Resolve the virtual DOS path for the directory being enumerated.
-    //
-    // query_handle_dos_path calls GetFinalPathNameByHandleW which internally
-    // calls NtQueryInformationFile(FileNormalizedNameInformation, class 48).
-    // The path_info_guard hook normally unmirrors overlay paths back to virtual,
-    // but because anti_rec is ALREADY HELD on this thread (we set it at the top
-    // of hook_nt_query_directory_file[_ex]), path_info_guard's anti_rec::enter()
-    // returns None and it calls the original without unmasking. As a result
-    // query_handle_dos_path returns the OVERLAY PHYSICAL PATH (lowercase), not
-    // the virtual path.
-    //
-    // Fix: unmirror the overlay-physical path back to virtual here, once.
-    // The virtual path is then used for:
-    //  (a) ipc_whiteouts_under — needs virtual path (policy server keys on it)
-    //  (b) build_case_map — opens virtual path with anti_rec held → NtCreateFile
-    //      bypasses CoW redirect → reads real host disk (original case)
-    let virtual_dir: Option<String> = if let Some(raw) = dir_dos {
-        let sb_root = hooks::SANDBOX_ROOT.get().map(|s| s.as_str());
-        Some(hooks::unmirror_overlay_handle_relative(raw, sb_root)
-            .unwrap_or_else(|| raw.to_string()))
-    } else {
-        None
-    };
+    let virtual_dir: Option<String> = resolve_virtual_dir(dir_dos);
 
     // Build the hide set: `.winrsbox` is always hidden, plus any whiteouted
     // direct children of the directory being enumerated.
@@ -643,7 +801,16 @@ unsafe fn process_dir_output(
                 let present = collect_present_names_lower(
                     file_information as *const u8, info_size, file_information_class,
                 );
-                extras.retain(|(name, _)| !present.contains(&name.to_ascii_lowercase()));
+                // A wildcard/exact FileName filter on this call must apply to
+                // injected entries exactly as it did to the real ones — else
+                // e.g. `dir *.log` (real matches only) would also inject an
+                // unrelated overlay-only `.txt` file that never matched.
+                let pattern_lower = search_pattern.map(|p| p.to_ascii_lowercase());
+                extras.retain(|e| {
+                    !present.contains(&e.name.to_ascii_lowercase())
+                        && pattern_lower.as_deref()
+                            .is_none_or(|pat| filename_matches_pattern(&e.name.to_ascii_lowercase(), pat))
+                });
                 if !extras.is_empty() {
                     // SAFETY: file_information is writable for `capacity` bytes
                     // (the caller's original NtQueryDirectoryFile `length` argument).
@@ -705,6 +872,9 @@ unsafe extern "system" fn hook_nt_query_directory_file(
     );
 
     let dir_dos = crate::fs_metadata_guard::query_handle_dos_path(file_handle);
+    // SAFETY: file_name is the same UNICODE_STRING pointer ntdll passed us;
+    // valid (or null) per the NT contract at hook entry.
+    let search_pattern = extract_search_pattern(file_name);
     process_dir_output(
         file_information,
         io_status_block,
@@ -712,6 +882,7 @@ unsafe extern "system" fn hook_nt_query_directory_file(
         dir_dos.as_deref(),
         status,
         length as usize,
+        search_pattern.as_deref(),
     )
 }
 
@@ -745,6 +916,9 @@ unsafe extern "system" fn hook_nt_query_directory_file_ex(
     );
 
     let dir_dos = crate::fs_metadata_guard::query_handle_dos_path(file_handle);
+    // SAFETY: file_name is the same UNICODE_STRING pointer ntdll passed us;
+    // valid (or null) per the NT contract at hook entry.
+    let search_pattern = extract_search_pattern(file_name);
     process_dir_output(
         file_information,
         io_status_block,
@@ -752,6 +926,7 @@ unsafe extern "system" fn hook_nt_query_directory_file_ex(
         dir_dos.as_deref(),
         status,
         length as usize,
+        search_pattern.as_deref(),
     )
 }
 
@@ -1421,10 +1596,23 @@ mod tests {
         assert!(present.is_empty());
     }
 
+    /// Test-only builder for a zeroed-metadata `OverlayChildMeta` — used by
+    /// tests that only care about name/type presence, not size/times.
+    fn meta(name: &str, is_dir: bool) -> policy::OverlayChildMeta {
+        policy::OverlayChildMeta {
+            name: name.to_string(),
+            is_dir,
+            size: 0,
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+        }
+    }
+
     #[test]
     fn append_overlay_entries_into_empty_buffer() {
         let mut buf = vec![0u8; 256];
-        let extra = vec![("new.txt".to_string(), false)];
+        let extra = vec![meta("new.txt", false)];
         // SAFETY: buf is a writable 256-byte scratch buffer.
         let new_size = unsafe {
             append_overlay_entries(buf.as_mut_ptr(), 0, buf.len(), 1, &extra)
@@ -1439,7 +1627,7 @@ mod tests {
         let mut existing = build_dir_info_buffer(&["a.txt", "b.txt"]);
         let used = existing.len();
         existing.resize(used + 256, 0); // free space for the appended entry
-        let extra = vec![("new.txt".to_string(), false)];
+        let extra = vec![meta("new.txt", false)];
         // SAFETY: existing is writable, sized used+256.
         let new_size = unsafe {
             append_overlay_entries(existing.as_mut_ptr(), used, existing.len(), 1, &extra)
@@ -1454,9 +1642,9 @@ mod tests {
     fn append_overlay_entries_multiple_extras_all_fit() {
         let mut buf = vec![0u8; 512];
         let extra = vec![
-            ("one.txt".to_string(), false),
-            ("two.txt".to_string(), false),
-            ("three.txt".to_string(), false),
+            meta("one.txt", false),
+            meta("two.txt", false),
+            meta("three.txt", false),
         ];
         // SAFETY: buf is a writable 512-byte scratch buffer.
         let new_size = unsafe {
@@ -1483,7 +1671,7 @@ mod tests {
     fn append_overlay_entries_sets_directory_attribute_bit() {
         const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
         let mut buf = vec![0u8; 256];
-        let extra = vec![("subdir".to_string(), true)];
+        let extra = vec![meta("subdir", true)];
         // SAFETY: buf is a writable 256-byte scratch buffer.
         let new_size = unsafe {
             append_overlay_entries(buf.as_mut_ptr(), 0, buf.len(), 1, &extra)
@@ -1499,13 +1687,82 @@ mod tests {
     fn append_overlay_entries_sets_normal_attribute_bit_for_file() {
         const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
         let mut buf = vec![0u8; 256];
-        let extra = vec![("probe.txt".to_string(), false)];
+        let extra = vec![meta("probe.txt", false)];
         // SAFETY: buf is a writable 256-byte scratch buffer.
         let new_size = unsafe {
             append_overlay_entries(buf.as_mut_ptr(), 0, buf.len(), 1, &extra)
         };
         let entries = collect_names_and_attrs(&buf[..new_size]);
         assert_eq!(entries[0].1, FILE_ATTRIBUTE_NORMAL);
+    }
+
+    /// Read (EndOfFile, CreationTime, LastAccessTime, LastWriteTime) from a
+    /// single class-1 entry at buffer offset 0 — test-only helper for
+    /// verifying the metadata-realism fix (previously all-zero placeholders
+    /// showed as 0-byte / 1601-01-01 in `dir`, a stealth-defeating tell a
+    /// live agent flagged against the real bash `ls` view of the same file).
+    fn read_meta_fields(buf: &[u8]) -> (u64, u64, u64, u64) {
+        let field = |off: usize| u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+        (field(0x28), field(0x08), field(0x10), field(0x18))
+    }
+
+    #[test]
+    fn append_overlay_entries_writes_real_size_and_times() {
+        let mut buf = vec![0u8; 256];
+        let extra = vec![policy::OverlayChildMeta {
+            name: "probe.txt".to_string(),
+            is_dir: false,
+            size: 12345,
+            creation_time: 133_700_000_000_000_001,
+            last_access_time: 133_700_000_000_000_002,
+            last_write_time: 133_700_000_000_000_003,
+        }];
+        // SAFETY: buf is a writable 256-byte scratch buffer.
+        let new_size = unsafe {
+            append_overlay_entries(buf.as_mut_ptr(), 0, buf.len(), 1, &extra)
+        };
+        let (end_of_file, ctime, atime, mtime) = read_meta_fields(&buf[..new_size]);
+        assert_eq!(end_of_file, 12345);
+        assert_eq!(ctime, 133_700_000_000_000_001);
+        assert_eq!(atime, 133_700_000_000_000_002);
+        assert_eq!(mtime, 133_700_000_000_000_003);
+    }
+
+    #[test]
+    fn append_overlay_entries_zeroed_meta_still_writes_zero_fields() {
+        // A stale/unreadable overlay path (OverlayChildMeta all-zero per
+        // policy::stat_overlay_phys's documented fallback) must not panic
+        // and must legitimately report zero — this is the honest "we don't
+        // know" case, distinct from silently leaving garbage stack bytes.
+        let mut buf = vec![0xFFu8; 256]; // non-zero sentinel: proves an explicit zero-write happened
+        let extra = vec![meta("stale.txt", false)];
+        // SAFETY: buf is a writable 256-byte scratch buffer.
+        let new_size = unsafe {
+            append_overlay_entries(buf.as_mut_ptr(), 0, buf.len(), 1, &extra)
+        };
+        let (end_of_file, ctime, atime, mtime) = read_meta_fields(&buf[..new_size]);
+        assert_eq!((end_of_file, ctime, atime, mtime), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn append_overlay_entries_class_12_metadata_ignored_no_panic() {
+        // class 12 (FileNamesInformation) has no time/size fields at all —
+        // metadata must be silently skipped, not panic on an out-of-bounds
+        // offset write.
+        let mut buf = vec![0u8; 128];
+        let extra = vec![policy::OverlayChildMeta {
+            name: "new.txt".to_string(),
+            is_dir: false,
+            size: 999,
+            creation_time: 111,
+            last_access_time: 222,
+            last_write_time: 333,
+        }];
+        // SAFETY: buf is a writable 128-byte scratch buffer.
+        let new_size = unsafe {
+            append_overlay_entries(buf.as_mut_ptr(), 0, buf.len(), 12, &extra)
+        };
+        assert!(new_size > 0);
     }
 
     #[test]
@@ -1516,7 +1773,7 @@ mod tests {
         // name must be dropped, not overflow the buffer.
         let mut buf = vec![0xAAu8; 0x60]; // 0xAA sentinel: detects OOB writes past capacity
         let capacity = 0x50;
-        let extra = vec![("a.txt".to_string(), false), ("this_one_does_not_fit.txt".to_string(), false)];
+        let extra = vec![meta("a.txt", false), meta("this_one_does_not_fit.txt", false)];
         // SAFETY: buf is 0x60 bytes; we pass capacity=0x50 as the hard limit.
         let new_size = unsafe {
             append_overlay_entries(buf.as_mut_ptr(), 0, capacity, 1, &extra)
@@ -1532,7 +1789,7 @@ mod tests {
     #[test]
     fn append_overlay_entries_unsupported_class_is_noop() {
         let mut buf = vec![0u8; 256];
-        let extra = vec![("new.txt".to_string(), false)];
+        let extra = vec![meta("new.txt", false)];
         // SAFETY: buf is writable; class 999 is unhandled.
         let new_size = unsafe {
             append_overlay_entries(buf.as_mut_ptr(), 0, buf.len(), 999, &extra)
@@ -1544,7 +1801,7 @@ mod tests {
     fn append_overlay_entries_class_12_no_attribute_field() {
         // class 12: FileNamesInformation — 0x0C header, no FileAttributes field.
         let mut buf = vec![0u8; 128];
-        let extra = vec![("new.txt".to_string(), false)];
+        let extra = vec![meta("new.txt", false)];
         // SAFETY: buf is a writable 128-byte scratch buffer.
         let new_size = unsafe {
             append_overlay_entries(buf.as_mut_ptr(), 0, buf.len(), 12, &extra)
@@ -1563,5 +1820,105 @@ mod tests {
             name.push(char::from_u32(u16::from_le_bytes([buf[off], buf[off+1]]) as u32).unwrap_or('?'));
         }
         assert_eq!(name, "new.txt");
+    }
+
+    // ── search-pattern matching (single-file lookup ghost-file fix) ────────
+    //
+    // `dir <exact-file>` and similar single-name lookups pass the target
+    // name as NtQueryDirectoryFile's FileName filter. When the real disk has
+    // no match, the real syscall fails (STATUS_NO_SUCH_FILE) BEFORE our
+    // merge code ever runs (process_dir_output bails on non-zero status) —
+    // so an overlay-only file that `dir /a` (unfiltered) already lists
+    // showed "File Not Found" for a single-name query. These two functions
+    // let process_dir_output recognize that case and synthesize a response.
+
+    #[test]
+    fn filename_matches_pattern_exact_match() {
+        assert!(filename_matches_pattern("probe.txt", "probe.txt"));
+    }
+
+    #[test]
+    fn filename_matches_pattern_exact_mismatch() {
+        assert!(!filename_matches_pattern("probe.txt", "other.txt"));
+    }
+
+    #[test]
+    fn filename_matches_pattern_star_matches_everything() {
+        assert!(filename_matches_pattern("anything.exe", "*"));
+        assert!(filename_matches_pattern("", "*"));
+    }
+
+    #[test]
+    fn filename_matches_pattern_star_suffix() {
+        assert!(filename_matches_pattern("probe.txt", "*.txt"));
+        assert!(!filename_matches_pattern("probe.log", "*.txt"));
+    }
+
+    #[test]
+    fn filename_matches_pattern_star_prefix() {
+        assert!(filename_matches_pattern("probe.txt", "probe*"));
+        assert!(!filename_matches_pattern("other.txt", "probe*"));
+    }
+
+    #[test]
+    fn filename_matches_pattern_question_mark_matches_one_char() {
+        assert!(filename_matches_pattern("probe2.txt", "probe?.txt"));
+        assert!(!filename_matches_pattern("probe22.txt", "probe?.txt"));
+        assert!(!filename_matches_pattern("probe.txt", "probe?.txt"));
+    }
+
+    #[test]
+    fn filename_matches_pattern_multiple_stars() {
+        assert!(filename_matches_pattern("pr_ob_e.txt", "pr*ob*.txt"));
+    }
+
+    #[test]
+    fn filename_matches_pattern_empty_pattern_only_matches_empty_name() {
+        assert!(filename_matches_pattern("", ""));
+        assert!(!filename_matches_pattern("probe.txt", ""));
+    }
+
+    /// Build a synthetic UNICODE_STRING backed by `storage` (must outlive the
+    /// returned struct — test-only helper).
+    fn build_unicode_string(storage: &mut Vec<u16>) -> UNICODE_STRING {
+        UNICODE_STRING {
+            Length: (storage.len() * 2) as u16,
+            MaximumLength: (storage.len() * 2) as u16,
+            Buffer: storage.as_mut_ptr(),
+        }
+    }
+
+    #[test]
+    fn extract_search_pattern_null_pointer_is_none() {
+        // SAFETY: passing a genuinely null pointer is exactly the contract being tested.
+        let result = unsafe { extract_search_pattern(std::ptr::null()) };
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_search_pattern_null_buffer_is_none() {
+        let ustr = UNICODE_STRING { Length: 0, MaximumLength: 0, Buffer: std::ptr::null_mut() };
+        // SAFETY: ustr is a valid stack UNICODE_STRING with a null Buffer.
+        let result = unsafe { extract_search_pattern(&ustr as *const UNICODE_STRING) };
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_search_pattern_zero_length_is_none() {
+        let mut storage: Vec<u16> = "probe.txt".encode_utf16().collect();
+        let mut ustr = build_unicode_string(&mut storage);
+        ustr.Length = 0; // present buffer, but zero-length filter = "match all"
+        // SAFETY: ustr is a valid stack UNICODE_STRING backed by `storage`.
+        let result = unsafe { extract_search_pattern(&ustr as *const UNICODE_STRING) };
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_search_pattern_decodes_valid_string() {
+        let mut storage: Vec<u16> = "probe.txt".encode_utf16().collect();
+        let ustr = build_unicode_string(&mut storage);
+        // SAFETY: ustr is a valid stack UNICODE_STRING backed by `storage`.
+        let result = unsafe { extract_search_pattern(&ustr as *const UNICODE_STRING) };
+        assert_eq!(result, Some("probe.txt".to_string()));
     }
 }

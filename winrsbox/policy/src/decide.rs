@@ -31,6 +31,45 @@ pub struct TracedDecision {
     pub chain: Vec<ConsideredRule>,
 }
 
+/// One overlay-only direct child of a directory, as returned by
+/// `Policy::overlay_children` — everything the enum-hook needs to
+/// synthesize a plausible `NtQueryDirectoryFile` record (name, type, size,
+/// times).
+///
+/// `size`/`*_time` are a live stat of the physical overlay path. A missing
+/// or unreadable path (stale index entry) defaults every field to zero
+/// rather than erroring — enumeration must never break because of one bad
+/// entry. `*_time` fields are raw Windows FILETIME (100ns intervals since
+/// 1601-01-01), matching `std::os::windows::fs::MetadataExt` verbatim — no
+/// conversion needed before writing them into a `FILE_DIRECTORY_INFORMATION`-
+/// family record's `LARGE_INTEGER` fields.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OverlayChildMeta {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub creation_time: u64,
+    pub last_access_time: u64,
+    pub last_write_time: u64,
+}
+
+/// Stat a physical overlay path, returning `(is_dir, size, creation_time,
+/// last_access_time, last_write_time)`. A missing/unreadable path defaults
+/// every field to zero — see `OverlayChildMeta` doc comment.
+fn stat_overlay_phys(overlay_phys: &str) -> (bool, u64, u64, u64, u64) {
+    use std::os::windows::fs::MetadataExt;
+    match std::fs::metadata(overlay_phys) {
+        Ok(md) => (
+            md.is_dir(),
+            if md.is_dir() { 0 } else { md.file_size() },
+            md.creation_time(),
+            md.last_access_time(),
+            md.last_write_time(),
+        ),
+        Err(_) => (false, 0, 0, 0, 0),
+    }
+}
+
 // ── Snapshot ──────────────────────────────────────────────────────────────
 
 pub(crate) struct SnapshotRule {
@@ -407,21 +446,17 @@ impl Policy {
         out
     }
 
-    /// Return `(basename, is_dir)` pairs for ALL overlay entries (OVERLAY_IDX)
-    /// that are direct children of `dir`, regardless of whether an
-    /// OVERLAY_CASE record exists (unlike `overlay_children_with_case`, which
-    /// only reports entries with a recorded original-case basename).
+    /// Return metadata for ALL overlay entries (OVERLAY_IDX) that are direct
+    /// children of `dir`, regardless of whether an OVERLAY_CASE record exists
+    /// (unlike `overlay_children_with_case`, which only reports entries with
+    /// a recorded original-case basename).
     ///
     /// Used by the enum-hook to inject overlay-only files/directories into a
     /// real directory's listing — the merge `physical_overlay_path`'s doc
     /// comment defers to enumeration for "passthrough directory with sparse
     /// overlay children" (a CoW write outside `project_root` into a
     /// directory that also exists on the real disk).
-    ///
-    /// `is_dir` reflects a live stat of the physical overlay path; a missing
-    /// or unreadable path defaults to `false` rather than erroring, since a
-    /// stale index entry must not break enumeration.
-    pub fn overlay_children(&self, dir: &str) -> Vec<(String, bool)> {
+    pub fn overlay_children(&self, dir: &str) -> Vec<OverlayChildMeta> {
         let dir_lower = ensure_lower(dir);
         let dir_trimmed = dir_lower.trim_end_matches('\\');
         if dir_trimmed.is_empty() {
@@ -446,12 +481,15 @@ impl Policy {
                 continue;
             }
             let overlay_phys = entry.1.value();
-            let is_dir = std::fs::metadata(overlay_phys).map(|m| m.is_dir()).unwrap_or(false);
+            let (is_dir, size, creation_time, last_access_time, last_write_time) =
+                stat_overlay_phys(overlay_phys);
             let name = case.as_ref()
                 .and_then(|t| t.get(key).ok().flatten())
                 .map(|v| v.value().to_owned())
                 .unwrap_or_else(|| rest.to_owned());
-            out.push((name, is_dir));
+            out.push(OverlayChildMeta {
+                name, is_dir, size, creation_time, last_access_time, last_write_time,
+            });
         }
         out
     }

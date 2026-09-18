@@ -499,7 +499,7 @@ pub(crate) fn ipc_overlay_children_with_case(dir: &str) -> Option<Vec<(String, S
 /// the enum-hook to inject overlay-only entries into a real directory's
 /// listing (see `dir_filter::append_overlay_entries`). Returns `None` on IPC
 /// failure; caller treats that as an empty set (no injection, not a hang).
-pub(crate) fn ipc_overlay_children(dir: &str) -> Option<Vec<(String, bool)>> {
+pub(crate) fn ipc_overlay_children(dir: &str) -> Option<Vec<policy::OverlayChildMeta>> {
     ensure_ipc_and(|opt| {
         match try_send(opt, &ipc::Req::OverlayChildren { dir: dir.to_owned() }) {
             Some(ipc::Resp::OverlayChildren(entries)) => Some(entries),
