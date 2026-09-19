@@ -210,17 +210,21 @@ unsafe fn collect_present_names_lower(buf: *const u8, size: usize, class: u32) -
     while cur < size {
         let avail = size - cur;
         if avail < name_len_off + 4 { break; }
-        // SAFETY: NextEntryOffset @ 0, FileNameLength @ name_len_off — guarded by avail.
-        let next_off = *(buf.add(cur) as *const u32) as usize;
-        let name_len = *(buf.add(cur + name_len_off) as *const u32) as usize;
+        // SAFETY: NextEntryOffset @ 0, FileNameLength @ name_len_off — guarded
+        // by avail; read unaligned because `buf`'s base alignment is
+        // caller-controlled (this buffer comes from sandboxed user code).
+        let next_off = (buf.add(cur) as *const u32).read_unaligned() as usize;
+        let name_len = (buf.add(cur + name_len_off) as *const u32).read_unaligned() as usize;
         if name_len >= 2 && name_off + name_len <= avail {
-            // SAFETY: FileName @ name_off, `chars` u16s — bounded by the check above.
+            // SAFETY: FileName @ name_off, `chars` u16s — bounded by the check
+            // above; each WCHAR is read unaligned for the same reason.
             let name_ptr = buf.add(cur + name_off) as *const u16;
             let chars = name_len / 2;
-            let name_slice = std::slice::from_raw_parts(name_ptr, chars);
-            let lower: String = std::char::decode_utf16(name_slice.iter().copied())
+            let lower: String = (0..chars)
+                .map(|i| name_ptr.add(i).read_unaligned())
+                .flat_map(|u| std::char::decode_utf16(std::iter::once(u)))
                 .map(|r| r.unwrap_or('\u{FFFD}'))
-                .flat_map(|c| c.to_ascii_lowercase().to_string().chars().collect::<Vec<_>>())
+                .map(|c| c.to_ascii_lowercase())
                 .collect();
             out.insert(lower);
         }
@@ -281,8 +285,9 @@ unsafe fn append_overlay_entries(
         loop {
             let avail = used_size - cur;
             if avail < 4 { break; }
-            // SAFETY: NextEntryOffset @ 0 — guarded by avail >= 4.
-            let next_off = *(buf.add(cur) as *const u32) as usize;
+            // SAFETY: NextEntryOffset @ 0 — guarded by avail >= 4; read
+            // unaligned because `buf`'s base alignment is caller-controlled.
+            let next_off = (buf.add(cur) as *const u32).read_unaligned() as usize;
             if next_off == 0 || next_off > avail {
                 prev_start = Some(cur);
                 break;
@@ -291,7 +296,18 @@ unsafe fn append_overlay_entries(
         }
     }
 
-    let mut write_at = used_size;
+    // Round the append point up to an 8-byte boundary. The kernel reports
+    // IoStatusBlock.Information as "offset of the last entry + that entry's
+    // actual length" — with NO trailing alignment padding — so `used_size`
+    // is routinely NOT a multiple of 8. Appending straight at `used_size`
+    // would (a) start a record on a misaligned address, which is UB for the
+    // field writes below AND is caught at runtime by Rust's alignment check
+    // in debug builds, and (b) violate the NT contract that every
+    // directory-info record sits on an 8-byte boundary (consumers read the
+    // LARGE_INTEGER time/size fields as aligned u64s; on ARM64 that faults).
+    // The gap bytes are never walked: the previous tail's NextEntryOffset is
+    // patched to point directly at the aligned start.
+    let mut write_at = (used_size + 7) & !7;
 
     let time_offs = dir_info_time_offsets(class);
 
@@ -309,25 +325,29 @@ unsafe fn append_overlay_entries(
         // Zero the header: this region (past used_size) is caller-owned
         // scratch space, not guaranteed zeroed by the kernel.
         std::ptr::write_bytes(entry_ptr, 0, entry_len_aligned);
+        // Every field write goes through `write_unaligned`: `buf` itself is
+        // caller-provided memory with no alignment guarantee, so a plain
+        // `*(ptr as *mut uN) = v` would be UB (and aborts under Rust's debug
+        // alignment check) whenever the caller hands us an odd base address.
         // NextEntryOffset = 0 — this entry is the new tail until (if) the
         // next extra gets linked after it below.
-        *(entry_ptr as *mut u32) = 0;
-        *(entry_ptr.add(name_len_off) as *mut u32) = name_bytes as u32;
+        (entry_ptr as *mut u32).write_unaligned(0);
+        (entry_ptr.add(name_len_off) as *mut u32).write_unaligned(name_bytes as u32);
         if let Some(attr_off) = dir_info_attr_offset(class) {
             let attrs = if meta.is_dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL };
-            *(entry_ptr.add(attr_off) as *mut u32) = attrs;
+            (entry_ptr.add(attr_off) as *mut u32).write_unaligned(attrs);
         }
         if let Some(ref t) = time_offs {
             // A live stat of the physical overlay file (or all-zero for a
             // stale/unreadable index entry — an honest "unknown", not
             // garbage). Real values here are what stops `dir` showing every
             // overlay-only file as 0 bytes / 1601-01-01.
-            *(entry_ptr.add(t.creation_time) as *mut u64) = meta.creation_time;
-            *(entry_ptr.add(t.last_access_time) as *mut u64) = meta.last_access_time;
-            *(entry_ptr.add(t.last_write_time) as *mut u64) = meta.last_write_time;
-            *(entry_ptr.add(t.end_of_file) as *mut u64) = meta.size;
+            (entry_ptr.add(t.creation_time) as *mut u64).write_unaligned(meta.creation_time);
+            (entry_ptr.add(t.last_access_time) as *mut u64).write_unaligned(meta.last_access_time);
+            (entry_ptr.add(t.last_write_time) as *mut u64).write_unaligned(meta.last_write_time);
+            (entry_ptr.add(t.end_of_file) as *mut u64).write_unaligned(meta.size);
             let alloc = meta.size.div_ceil(ASSUMED_CLUSTER_SIZE) * ASSUMED_CLUSTER_SIZE;
-            *(entry_ptr.add(t.allocation_size) as *mut u64) = alloc;
+            (entry_ptr.add(t.allocation_size) as *mut u64).write_unaligned(alloc);
         }
         let name_dst = entry_ptr.add(name_off) as *mut u16;
         for (j, &u) in name_u16.iter().enumerate() {
@@ -336,7 +356,7 @@ unsafe fn append_overlay_entries(
 
         // Link the previous tail (real or previously-appended) to this entry.
         if let Some(prev) = prev_start {
-            *(buf.add(prev) as *mut u32) = (write_at - prev) as u32;
+            (buf.add(prev) as *mut u32).write_unaligned((write_at - prev) as u32);
         }
 
         prev_start = Some(write_at);
@@ -1607,6 +1627,34 @@ mod tests {
             last_access_time: 0,
             last_write_time: 0,
         }
+    }
+
+    /// REGRESSION: the kernel reports IoStatusBlock.Information as "offset of
+    /// the last entry + that entry's actual length" — with NO trailing
+    /// alignment padding — so `used_size` is routinely NOT a multiple of 8.
+    /// Appending straight at that offset started a record on a misaligned
+    /// address: UB for the u32/u64 field writes, caught at runtime by Rust's
+    /// debug alignment check ("misaligned pointer dereference", aborting the
+    /// process with STATUS_STACK_BUFFER_OVERRUN), and a violation of the NT
+    /// contract that every record sits on an 8-byte boundary. The append
+    /// point is now rounded up; the chain stays walkable across the gap.
+    #[test]
+    fn append_overlay_entries_after_unaligned_used_size() {
+        let mut buf = build_dir_info_buffer(&["a.txt"]);
+        // 0x40 header + 10 name bytes = 0x4A — what a real kernel reports,
+        // vs the 0x50 our test helper pads every entry to.
+        let unaligned_used = 0x4A;
+        buf.resize(1024, 0);
+        buf[0..4].copy_from_slice(&0u32.to_le_bytes()); // single entry = terminator
+        let extra = vec![meta("injected.txt", false)];
+        // SAFETY: buf is a writable 1024-byte scratch buffer.
+        let new_size = unsafe {
+            append_overlay_entries(buf.as_mut_ptr(), unaligned_used, buf.len(), 1, &extra)
+        };
+        assert_eq!(new_size % 8, 0, "new used size must stay 8-byte aligned");
+        let names = collect_names(&buf[..new_size]);
+        assert_eq!(names, vec!["a.txt".to_string(), "injected.txt".to_string()],
+            "the appended record must be reachable across the alignment gap");
     }
 
     #[test]
