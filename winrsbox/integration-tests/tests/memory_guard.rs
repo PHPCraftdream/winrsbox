@@ -27,40 +27,8 @@ use std::process::Command;
 /// `Some(5)` (the clean-deny contract) and must assert this instead.
 const EXIT_FAIL_STOP: i32 = 0xC000_0005_u32 as i32;
 
-/// Resolve the workspace target dir, respecting `CARGO_TARGET_DIR`
-/// (set when the workspace uses a non-default target dir) and falling
-/// back to `<workspace>/target` for the standard in-tree layout.
-fn target_dir() -> PathBuf {
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let workspace_root = Path::new(manifest).parent().unwrap();
-    std::env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| workspace_root.join("target"))
-}
-
-fn find_binary(name: &str) -> PathBuf {
-    let target_dir = target_dir();
-    // Try release first, then debug
-    for profile in ["release", "debug"] {
-        let p = target_dir.join(profile).join(format!("{name}.exe"));
-        if p.exists() {
-            return p;
-        }
-    }
-    panic!("{name}.exe not found in target/release or target/debug — build first");
-}
-
-fn find_launcher() -> PathBuf { find_binary("winrsbox") }
-fn find_hook_dll() -> PathBuf {
-    let target_dir = target_dir();
-    for profile in ["release", "debug"] {
-        let p = target_dir.join(profile).join("hook.dll");
-        if p.exists() {
-            return p;
-        }
-    }
-    panic!("hook.dll not found");
-}
+mod common;
+use common::{find_binary, find_hook_dll, find_launcher, target_dir};
 
 struct TestEnv {
     project_root: PathBuf,
@@ -279,9 +247,32 @@ fn strict_kills_foreign_alloc_rwx() {
     let r = run_payload("escape_foreign_alloc_rwx", "full");
     assert!(!r.status.success(),
         "escape_foreign_alloc_rwx should be blocked (proc_guard) or killed (memory_guard)\nstderr: {}", r.stderr);
-    // If we got a violation, it should be Allocate. If empty, proc_guard denied at OpenProcess.
+
+    // What this test actually asserts: the payload never reaches its
+    // objective. It prints this line only after the foreign RWX allocation
+    // returns, so its absence is the proof — stronger than matching on which
+    // gate fired.
+    assert!(
+        !r.stderr.contains("NtAllocateVirtualMemory returned"),
+        "payload reached the foreign RWX allocation — it must be stopped before that\nstderr: {}",
+        r.stderr,
+    );
+
+    // Which gate stops it is a diagnostic detail and legitimately varies:
+    //   * empty   — proc_guard denied NtOpenProcess on the non-owned PID, so
+    //               no memory operation ever happened;
+    //   * Write   — `run_payload` sets FS_SANDBOX_NO_TRACK for these payloads
+    //               so the spawned child counts as external. CreateProcessW
+    //               writes the process-parameter block into that child itself,
+    //               which is then a cross-process write into a process the
+    //               sandbox does not own — the audit's fail-stop terminates
+    //               there, BEFORE the payload gets to allocate. Strictly more
+    //               containment than the old content-scan, which let that
+    //               write through (it carries no syscall opcodes) and only
+    //               caught the attack one step later;
+    //   * Allocate — the original gate, still correct when the write passes.
     let v = r.read_violations();
-    assert!(v.is_empty() || v.contains("Allocate"),
+    assert!(v.is_empty() || v.contains("Allocate") || v.contains("Write"),
         "unexpected violation kind: {}\nstderr: {}", v, r.stderr);
 }
 

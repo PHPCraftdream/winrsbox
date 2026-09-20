@@ -21,40 +21,8 @@ use serial_test::serial;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Resolve the workspace target dir, respecting `CARGO_TARGET_DIR`
-/// (set when the workspace uses a non-default target dir) and falling
-/// back to `<workspace>/target` for the standard in-tree layout.
-fn target_dir() -> PathBuf {
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let workspace_root = Path::new(manifest).parent().unwrap();
-    std::env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| workspace_root.join("target"))
-}
-
-fn find_binary(name: &str) -> PathBuf {
-    let target_dir = target_dir();
-    for profile in ["release", "debug"] {
-        let p = target_dir.join(profile).join(format!("{name}.exe"));
-        if p.exists() {
-            return p;
-        }
-    }
-    panic!("{name}.exe not found in target/release or target/debug — build first");
-}
-
-fn find_launcher() -> PathBuf { find_binary("winrsbox") }
-
-fn find_hook_dll() -> PathBuf {
-    let target_dir = target_dir();
-    for profile in ["release", "debug"] {
-        let p = target_dir.join(profile).join("hook.dll");
-        if p.exists() {
-            return p;
-        }
-    }
-    panic!("hook.dll not found");
-}
+mod common;
+use common::{find_binary, find_hook_dll, find_launcher, target_dir};
 
 struct TestEnv {
     base: PathBuf,
