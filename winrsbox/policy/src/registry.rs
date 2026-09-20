@@ -67,7 +67,7 @@ impl RegSnapshot {
                 }
                 if let Some(ref exe_pattern) = when.exe {
                     match exe_lower {
-                        Some(exe) if path::pattern_matches_exact(exe_pattern, exe) => {}
+                        Some(exe) if path::pattern_matches_exact(&crate::ensure_lower(exe_pattern), exe) => {}
                         _ => continue,
                     }
                 }
@@ -145,7 +145,7 @@ impl RegistryPolicy {
 
         // Check mock
         if let Some(vname) = value_name {
-            let mock_path = format!("{lower_key}\\{}", vname.to_lowercase());
+            let mock_path = format!("{lower_key}\\{}", crate::ensure_lower(vname));
             if let Some(payload) = snap.mocks.get(&mock_path) {
                 if let Ok(val) = serde_json::from_slice::<reg::RegValue>(payload) {
                     return RegDecision { mode: Mode::Mock, overlay_value: None, mock_value: Some(val) };
@@ -153,14 +153,17 @@ impl RegistryPolicy {
             }
         }
 
-        // Check overlay (for reads — return overlay value if exists)
+        // Check overlay (for reads — return overlay value if exists).
+        // The tombstone is consulted on EVERY lookup shape: a key-level
+        // lookup (value_name == None) must also see a sandbox delete,
+        // otherwise a deleted key reappears when opened/enumerated by key.
         if !write {
+            let ov = self.overlay.lock().unwrap();
+            if ov.is_key_deleted(lower_key) {
+                return RegDecision { mode: Mode::Deny, overlay_value: None, mock_value: None };
+            }
             if let Some(vname) = value_name {
-                let vname_lower = vname.to_lowercase();
-                let ov = self.overlay.lock().unwrap();
-                if ov.is_key_deleted(lower_key) {
-                    return RegDecision { mode: Mode::Deny, overlay_value: None, mock_value: None };
-                }
+                let vname_lower = crate::ensure_lower(vname);
                 if let Some(entry) = ov.get(lower_key, &vname_lower) {
                     match entry {
                         reg::RegEntry::Value(v) => {
@@ -189,23 +192,23 @@ impl RegistryPolicy {
     }
 
     pub fn write_to_overlay(&self, key_path: &str, value_name: &str, value: reg::RegValue) -> Result<(), String> {
-        let lower_key = key_path.to_lowercase();
-        let lower_name = value_name.to_lowercase();
+        let lower_key = crate::ensure_lower(key_path);
+        let lower_name = crate::ensure_lower(value_name);
         self.overlay.lock().unwrap().set(&lower_key, &lower_name, value)?;
         self.cache.clear();
         Ok(())
     }
 
     pub fn delete_value_in_overlay(&self, key_path: &str, value_name: &str) -> Result<(), String> {
-        let lower_key = key_path.to_lowercase();
-        let lower_name = value_name.to_lowercase();
+        let lower_key = crate::ensure_lower(key_path);
+        let lower_name = crate::ensure_lower(value_name);
         self.overlay.lock().unwrap().delete_value(&lower_key, &lower_name)?;
         self.cache.clear();
         Ok(())
     }
 
     pub fn delete_key_in_overlay(&self, key_path: &str) -> Result<(), String> {
-        self.overlay.lock().unwrap().delete_key(&key_path.to_lowercase())?;
+        self.overlay.lock().unwrap().delete_key(&crate::ensure_lower(key_path))?;
         self.cache.clear();
         Ok(())
     }
@@ -339,5 +342,66 @@ mod tests {
         ).unwrap();
         let d2 = rp.decide(r"hklm\test", Some("val"), false);
         assert_eq!(d2.mode, Mode::Cow);
+    }
+
+    #[test]
+    fn reg_delete_key_returns_deny_key_level_lookup() {
+        let (_dir, rp) = make_reg_policy();
+        rp.delete_key_in_overlay(r"hklm\test\sub").unwrap();
+        // Key-level shape (value_name = None): the tombstone must be seen
+        // here too, not only when a value name is supplied.
+        let d = rp.decide(r"hklm\test\sub", None, false);
+        assert_eq!(d.mode, Mode::Deny);
+    }
+
+    #[test]
+    fn reg_key_level_lookup_without_tombstone_falls_to_rules() {
+        let (_dir, rp) = make_reg_policy();
+        // No tombstone: a key-level read must still fall through to the
+        // rule match (default passthrough), i.e. the hoisted check must
+        // not over-deny.
+        let d = rp.decide(r"hklm\software\foo", None, false);
+        assert_eq!(d.mode, Mode::Passthrough);
+    }
+    #[test]
+    fn reg_overlay_non_ascii_write_then_read_roundtrip() {
+        let (_dir, rp) = make_reg_policy();
+        rp.write_to_overlay(
+            "hklm\\software\\Klas\u{0130}r", "De\u{011f}er",
+            reg::RegValue { typ: reg::RegType::Sz, data: reg::RegData::String("x".into()) },
+        ).unwrap();
+        let d = rp.decide("hklm\\software\\Klas\u{0130}r", Some("de\u{011f}er"), false);
+        assert_eq!(d.mode, Mode::Cow);
+        let val = d.overlay_value.unwrap();
+        assert_eq!(val.data, reg::RegData::String("x".into()));
+    }
+
+    #[test]
+    fn reg_delete_key_non_ascii_roundtrip() {
+        let (_dir, rp) = make_reg_policy();
+        rp.delete_key_in_overlay("hklm\\Klas\u{0130}r").unwrap();
+        let d = rp.decide("hklm\\Klas\u{0130}r", Some("anything"), false);
+        assert_eq!(d.mode, Mode::Deny);
+    }
+
+    #[test]
+    fn reg_rule_exe_scoped_matches_lowercased_exe() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("policy.redb");
+        let workreg = dir.path().join("workreg");
+        std::fs::create_dir_all(&workreg).unwrap();
+        let rdb = redb::Database::create(&db_path).unwrap();
+        { let txn = rdb.begin_write().unwrap(); txn.open_table(db::REG_RULES).unwrap(); txn.open_table(db::REG_MOCKS).unwrap(); txn.commit().unwrap(); }
+        let db = Arc::new(rdb);
+        db::reg_rule_upsert(&db, &db::RuleRow {
+            id: "deny-locked-exe".into(),
+            prefix: r"hklm\locked".into(),
+            mode_read: db::RuleMode::Deny,
+            mode_write: db::RuleMode::Deny,
+            when: Some(db::WhenFilter { depth: None, exe: Some(r"C:\Tools\MyApp.EXE".into()) }),
+        }).unwrap();
+        let rp = RegistryPolicy::open(db, workreg).unwrap();
+        let d = rp.decide_with_context(r"hklm\locked\val", None, true, None, Some(r"c:\tools\myapp.exe"));
+        assert_eq!(d.mode, Mode::Deny);
     }
 }

@@ -183,7 +183,7 @@ impl Snapshot {
                 }
                 if let Some(ref exe_pattern) = when.exe {
                     match exe_lower {
-                        Some(exe) if path::pattern_matches_exact(exe_pattern, exe) => {}
+                        Some(exe) if path::pattern_matches_exact(&ensure_lower(exe_pattern), exe) => {}
                         _ => continue,
                     }
                 }
@@ -317,7 +317,18 @@ fn physical_overlay_path(lower: &str, layout: &path::OverlayLayout) -> Option<Pa
 /// Both inputs MUST already be normalized to the same casefold (lowercase)
 /// and use `\` separators. An empty root refuses to match (defense against
 /// misconfiguration where an unset root would otherwise match every path).
+/// A path that still contains `.`/`..` segments is refused (returns false) —
+/// callers fold first via `path::fold_dos_dots`.
 pub(crate) fn path_contained_in(path_lower: &str, root_lower: &str) -> bool {
+    // Fail-closed backstop (audit Critical #1): a path still carrying a
+    // `.`/`..` segment was never folded (see `path::fold_dos_dots`) — refuse
+    // to call it contained rather than prefix-matching a string the kernel
+    // will resolve differently. Mirrors the rename guard's dots-only
+    // rejection (fs_metadata_guard::dest_is_escape) so the create-side and
+    // rename-side containment cannot drift apart.
+    if path_lower.split(|c| c == '\\' || c == '/').any(|seg| seg == "." || seg == "..") {
+        return false;
+    }
     let root = root_lower.trim_end_matches('\\');
     if root.is_empty() {
         return false;
@@ -347,11 +358,18 @@ impl Policy {
         depth: Option<u8>,
         exe_lower: Option<&str>,
     ) -> Decision {
-        let key = cache_key(dos_path, write_access, depth, exe_lower);
+        // Fold `.`/`..` lexically BEFORE the decision (audit Critical #1):
+        // containment is a prefix test, and `d:\<root>\..\..\x` prefix-matches
+        // the root when left unfolded while the kernel resolves it outside.
+        // After folding, the path policy decides on is the path the kernel
+        // will act on.
+        let lower = ensure_lower(dos_path);
+        let folded = path::fold_dos_dots(&lower);
+        let key = cache_key(&folded, write_access, depth, exe_lower);
         if let Some(d) = self.inner.cache.get(&key) {
             return (*d).clone();
         }
-        let d = self.compute(dos_path, write_access, depth, exe_lower);
+        let d = self.compute(&folded, write_access, depth, exe_lower);
         self.inner.cache.insert(key, Arc::new(d.clone()));
         d
     }
@@ -364,7 +382,7 @@ impl Policy {
             // `d:\foo`) so the index key matches the lookup path used in
             // `compute`. Without this, a directory created with a trailing
             // separator disappears from later readers.
-            let lower = orig.to_lowercase();
+            let lower = ensure_lower(orig);
             let key = trim_trailing_sep(&lower);
             t.insert(key, overlay)?;
         }
@@ -376,6 +394,59 @@ impl Policy {
         // For safety, we clear the entire cache on overlay recording (rare event).
         self.inner.cache.clear();
         Ok(())
+    }
+
+    /// Server-side validation of a guest-supplied `Req::RecordOverlay`
+    /// (audit 2026-09-19 Critical #2). A legitimate hook can only ever name
+    /// the destination the sandbox itself would have chosen: `overlay` must
+    /// equal `mirror(orig)` — either the same-volume overlay-layout mirror or
+    /// the mock-dirs mirror (mock-dir Cow decisions record there) — and live
+    /// inside the corresponding launcher-owned root.
+    ///
+    /// The root-containment gate is checked first and fails closed on empty
+    /// values, unfolded `.`/`..` segments and sibling-prefix lookalikes
+    /// (`<root>evil\...`); the identity check against both canonical mirrors
+    /// is the binding rule. Everything else is an escape attempt, not a
+    /// mistake, and must be rejected before it reaches `OVERLAY_IDX`.
+    pub fn validate_record_overlay(&self, orig: &str, overlay: &str) -> bool {
+        let guest = ensure_lower(overlay);
+        let guest_trim = trim_trailing_sep(&guest);
+        if guest_trim.is_empty() {
+            return false;
+        }
+        // Fail closed on unfolded dot segments (see `path_contained_in`):
+        // containment is a prefix test and the kernel resolves `..` outside it.
+        if guest_trim.split(|c| c == '\\' || c == '/').any(|seg| seg == "." || seg == "..") {
+            return false;
+        }
+
+        // Containment in launcher-owned territory: the published overlay
+        // roots and the mock-dirs root.
+        let overlay_roots = self.inner.overlay_layout.all_roots().map(|(_, r)| {
+            trim_trailing_sep(&ensure_lower(&r.to_string_lossy())).to_owned()
+        });
+        let mock_root = trim_trailing_sep(
+            &ensure_lower(&self.inner.mock_dirs_root.to_string_lossy()),
+        )
+        .to_owned();
+        let contained = overlay_roots
+            .chain(std::iter::once(mock_root))
+            .any(|root| !root.is_empty() && path_contained_in(guest_trim, &root));
+        if !contained {
+            return false;
+        }
+
+        // Identity: the value must be exactly the destination the sandbox
+        // itself would choose for `orig`.
+        let key_lower = ensure_lower(orig);
+        let key = trim_trailing_sep(&key_lower);
+        let overlay_mirror =
+            path::mirror_into_overlay_layout(key, &self.inner.overlay_layout);
+        let mock_mirror = path::mirror_into_overlay(key, &self.inner.mock_dirs_root);
+        let matches_mirror = [&overlay_mirror, &mock_mirror].into_iter().any(|m| {
+            guest_trim == trim_trailing_sep(&ensure_lower(&m.to_string_lossy()))
+        });
+        matches_mirror
     }
 
     /// Record the original-case basename for an overlay entry.
@@ -667,7 +738,8 @@ impl Policy {
         exe_lower: Option<&str>,
     ) -> TracedDecision {
         let lower_raw = ensure_lower(dos_path);
-        let lower_owned: String = trim_trailing_sep(&lower_raw).to_string();
+        let lower_owned: String =
+            path::fold_dos_dots(trim_trailing_sep(&lower_raw)).into_owned();
         let lower: &str = &lower_owned;
 
         // project_root always passthrough
@@ -688,7 +760,18 @@ impl Policy {
         // — Hidden is a policy::Mode only the hook layer consumes), but with an
         // empty chain and no rule so `why` shows no rule drove the decision.
         // The authoritative Mode::Hidden outcome is produced by `compute`.
-        if self.is_whiteouted(dos_path) && !self.has_overlay(&lower) {
+        //
+        // The check runs on the FOLDED path (not the raw caller string) and
+        // honours compute's full revive condition — a whiteout whose overlay
+        // entry is indexed OR physically materialized is a revived path and
+        // falls through to the normal flow. Checking the raw string or the
+        // index alone made `why` report a whiteout the engine had already
+        // superseded (audit 2026-09-19 Low: decide_traced diverges from
+        // compute).
+        let idx_hit = self.has_overlay(&lower);
+        let phys_hit = !idx_hit
+            && physical_overlay_path(&lower, &self.inner.overlay_layout).is_some();
+        if self.is_whiteouted(&lower) && !(idx_hit || phys_hit) {
             return TracedDecision {
                 decision: db::RuleMode::Passthrough,
                 target_path: None,
@@ -793,7 +876,7 @@ impl Policy {
                     }
                 }
                 if let Some(ref exe_pattern) = when.exe {
-                    if exe_lower.is_none() || !path::pattern_matches_exact(exe_pattern, exe_lower.unwrap()) {
+                    if exe_lower.is_none() || !path::pattern_matches_exact(&ensure_lower(exe_pattern), exe_lower.unwrap()) {
                         chain.push(ConsideredRule {
                             id: row.id.clone(),
                             prefix: pattern.to_owned(),
@@ -832,21 +915,47 @@ impl Policy {
         // default is absent the fallback is the hard-coded (Passthrough, Cow)
         // pair from `compute`.
         let matched = best.map(|(_, r)| r).or(default_row);
-        let (decision, rule_id, rule_prefix) = match &matched {
+        let (mut decision, rule_id, rule_prefix) = match &matched {
             Some(row) => {
                 let mode = if write_access { row.mode_write } else { row.mode_read };
                 (mode, Some(row.id.clone()), best_prefix.clone().or_else(|| Some(String::new())))
             }
+            // No rule and no default: `compute` isolates an external write
+            // into the overlay (Cow) and lets reads pass. Reporting plain
+            // Passthrough for the write here made `why` explain a real-disk
+            // write where the engine actually redirects into the overlay
+            // (audit 2026-09-19 Low: decide_traced diverges from compute).
+            None if write_access => (db::RuleMode::Cow, None, None),
             None => (db::RuleMode::Passthrough, None, None),
         };
 
-        let target_path = match decision {
+        let mut target_path = match decision {
             db::RuleMode::Deny => None,
             db::RuleMode::Passthrough => None,
             db::RuleMode::Cow | db::RuleMode::Redirect => {
                 Some(path::mirror_into_overlay_layout(&lower, &self.inner.overlay_layout))
             }
         };
+
+        // Read-through: compute's Passthrough arm redirects a READ into the
+        // overlay when the path was already CoW'd there — OVERLAY_IDX hit
+        // first, then the physical mirror tree. Mirror both or `why` reports
+        // a real-disk read for a path the engine actually serves from the
+        // overlay.
+        if matches!(decision, db::RuleMode::Passthrough) && !write_access {
+            let idx_overlay: Option<PathBuf> = txn
+                .open_table(db::OVERLAY_IDX)
+                .ok()
+                .and_then(|t| t.get(&*lower).ok().flatten())
+                .map(|v| PathBuf::from(v.value()));
+            if let Some(ov) = idx_overlay {
+                decision = db::RuleMode::Cow;
+                target_path = Some(ov);
+            } else if let Some(ov) = physical_overlay_path(&lower, &self.inner.overlay_layout) {
+                decision = db::RuleMode::Cow;
+                target_path = Some(ov);
+            }
+        }
 
         TracedDecision {
             decision,
@@ -1045,7 +1154,23 @@ impl Policy {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_key, path_contained_in};
+    use super::{cache_key, path_contained_in, db, Mode, PathBuf, Policy};
+
+    /// Build a real Policy exactly like lib.rs tests do: fresh redb db,
+    /// sandbox/mock-dirs/project dirs inside one tempfile::TempDir. The TempDir
+    /// is returned so it stays alive (it deletes itself on drop).
+    fn make_policy() -> (tempfile::TempDir, Policy) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("policy.redb");
+        let sandbox = dir.path().join("sb");
+        let mock_dirs = dir.path().join("md");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(&mock_dirs).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+        (dir, p)
+    }
 
     #[test]
     fn path_contained_exact_match() {
@@ -1148,5 +1273,262 @@ mod tests {
             }
         }
         assert!(keys.len() >= 400, "expected ~500 unique keys, got {}", keys.len());
+    }
+
+    // ── Dot-fold decide regression tests (audit Critical #1) ───────────────
+
+    #[test]
+    fn decide_dotdot_escape_write_is_cow_not_passthrough() {
+        let (_dir, p) = make_policy();
+        // Same crate → may read the pub(crate) field directly.
+        let root = p.inner.project_root_lower.clone();
+        // THE regression: unfixed, `d:\<root>\..\..\outside.exe` prefix-matches
+        // the root and is classified Passthrough, while the kernel resolves the
+        // `..` segments and creates the file on the real disk outside the
+        // sandbox. After the lexical fold it must be isolated (Cow).
+        let escape = format!(r"{}\..\..\outside.exe", root);
+        let d = p.decide(&escape, true);
+        assert_ne!(d.mode, Mode::Passthrough, "dotdot escape must NOT be Passthrough (audit Critical #1)");
+        assert_eq!(d.mode, Mode::Cow);
+        let ov = d.overlay.as_ref().expect("Cow decision must carry an overlay path");
+        assert!(!ov.to_string_lossy().contains(".."), "overlay path {ov:?} must not contain '..'");
+    }
+
+    #[test]
+    fn decide_dotdot_inside_root_still_passthrough() {
+        let (_dir, p) = make_policy();
+        let root = p.inner.project_root_lower.clone();
+        // Legitimate callers with `..` inside the root keep working.
+        let inside = format!(r"{}\sub\..\file.txt", root);
+        let d = p.decide(&inside, true);
+        assert_eq!(d.mode, Mode::Passthrough);
+    }
+
+    #[test]
+    fn decide_curdir_inside_root_still_passthrough() {
+        let (_dir, p) = make_policy();
+        let root = p.inner.project_root_lower.clone();
+        let inside = format!(r"{}\.\file.txt", root);
+        let d = p.decide(&inside, true);
+        assert_eq!(d.mode, Mode::Passthrough);
+    }
+
+    #[test]
+    fn decide_dotdot_sibling_after_root_is_cow() {
+        let (_dir, p) = make_policy();
+        let root = p.inner.project_root_lower.clone();
+        // `<root>\..\sibling.txt` resolves to root's parent → outside → Cow.
+        let sibling = format!(r"{}\..\sibling.txt", root);
+        let d = p.decide(&sibling, true);
+        assert_eq!(d.mode, Mode::Cow);
+    }
+
+    #[test]
+    fn path_contained_refuses_unfolded_dot_segments() {
+        // Fail-closed backstop: unfolded `.`/`..` segments are refused.
+        assert!(!path_contained_in(r"c:\proj\..\..\x", r"c:\proj"));
+        assert!(!path_contained_in(r"c:\proj\sub\..\f", r"c:\proj"));
+        assert!(!path_contained_in(r"c:/proj/../x", r"c:\proj"));
+        // Pinned positive: the boundary logic is unchanged for clean paths.
+        assert!(path_contained_in(r"c:\proj\sub", r"c:\proj"));
+    }
+
+    // ── ASCII-only case-fold consistency (ensure_lower vs to_lowercase) ─────
+    //
+    // The hook side folds every path with to_ascii_lowercase(); kernel
+    // canonicalization is ASCII-only too (see ensure_lower). Any policy-key
+    // writer that Unicode-folds instead produces keys that a non-ASCII path
+    // (e.g. U+0130 İ) can never read back — a containment-relevant
+    // inconsistency. These tests pin the policy side to the canonical fold.
+
+    #[test]
+    fn overlay_index_non_ascii_write_then_read_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("policy.redb");
+        let sandbox = dir.path().join("sb");
+        let mock_dirs = dir.path().join("md");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(&mock_dirs).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+
+        let orig = "d:\\ext\\Klas\u{0130}r\\DOSYA.txt";
+        let target = r"d:\sb\ov\target.bin";
+        p.record_overlay(orig, target).unwrap();
+
+        let d = p.decide(orig, false);
+        assert_eq!(d.mode, Mode::Cow);
+        assert_eq!(d.overlay, Some(PathBuf::from(target)));
+    }
+
+    #[test]
+    fn decide_exe_scoped_rule_matches_lowercased_exe() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("policy.redb");
+        let sandbox = dir.path().join("sb");
+        let mock_dirs = dir.path().join("md");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(&mock_dirs).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        {
+            let rdb = redb::Database::create(&db_path).unwrap();
+            { let txn = rdb.begin_write().unwrap(); txn.open_table(db::RULES).unwrap(); txn.commit().unwrap(); }
+            db::rule_upsert(&rdb, &db::RuleRow {
+                id: "deny-locked".into(),
+                prefix: r"d:\locked".into(),
+                mode_read: db::RuleMode::Deny,
+                mode_write: db::RuleMode::Deny,
+                when: Some(db::WhenFilter { depth: None, exe: Some(r"C:\Tools\MyApp.EXE".into()) }),
+            }).unwrap();
+        } // drop the raw handle before the Policy opens the same file
+
+        let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+        let d = p.decide_with_context(r"d:\locked\f.txt", true, None, Some(r"c:\tools\myapp.exe"));
+        assert_eq!(d.mode, Mode::Deny);
+    }
+
+    // ── RecordOverlay wire validation (audit Critical #2) ──────────────────
+
+    #[test]
+    fn validate_record_overlay_accepts_canonical_mirror() {
+        let (_dir, p) = make_policy();
+        let orig = r"d:\proj\f.txt";
+        let mirror =
+            crate::path::mirror_into_overlay_layout(orig, &p.inner.overlay_layout);
+        let mirror_str = mirror.to_string_lossy().into_owned();
+        assert!(p.validate_record_overlay(orig, &mirror_str));
+        // Case-insensitive: the hook sends the root in its original case.
+        assert!(p.validate_record_overlay(orig, &mirror_str.to_ascii_uppercase()));
+        // Trailing separator tolerated (key-normalization parity).
+        assert!(p.validate_record_overlay(orig, &format!("{mirror_str}\\")));
+        // The accepted value round-trips into a Cow read decision.
+        p.record_overlay(orig, &mirror_str).unwrap();
+        let d = p.decide(orig, false);
+        assert_eq!(d.mode, Mode::Cow);
+        assert_eq!(d.overlay, Some(mirror));
+    }
+
+    #[test]
+    fn validate_record_overlay_accepts_mock_dirs_mirror() {
+        let (_dir, p) = make_policy();
+        let orig = r"d:\proj\f.txt";
+        let mock_mirror = crate::path::mirror_into_overlay(orig, &p.inner.mock_dirs_root);
+        let mock_str = mock_mirror.to_string_lossy().into_owned();
+        assert!(p.validate_record_overlay(orig, &mock_str));
+        // Identity is per-orig: the same value for another path is rejected.
+        assert!(!p.validate_record_overlay(r"d:\proj\g.txt", &mock_str));
+    }
+
+    #[test]
+    fn validate_record_overlay_rejects_outside_roots() {
+        let (_dir, p) = make_policy();
+        let orig = r"d:\proj\f.txt";
+        // The audit PoC: a real user-profile persistence location.
+        let poc = r"C:\Users\victim\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\pwn.bat";
+        assert!(!p.validate_record_overlay(orig, poc));
+        // Sibling-prefix lookalike of the sandbox root.
+        let sb = p.inner.overlay_layout.primary();
+        let sib = format!("{}evil\\x.txt", sb.to_string_lossy());
+        assert!(!p.validate_record_overlay(orig, &sib));
+        // Empty value.
+        assert!(!p.validate_record_overlay(orig, ""));
+    }
+
+    #[test]
+    fn validate_record_overlay_rejects_in_root_wrong_mirror() {
+        let (_dir, p) = make_policy();
+        let orig = r"d:\proj\f.txt";
+        let sb = p.inner.overlay_layout.primary();
+        // Inside the sandbox but NOT the mirror of orig (wrong name).
+        let wrong = sb.join("proj").join("other.txt");
+        assert!(!p.validate_record_overlay(orig, &wrong.to_string_lossy()));
+        // Dot-segment smuggling at the root boundary.
+        let dots = sb.join("..").join("escape.bat");
+        assert!(!p.validate_record_overlay(orig, &dots.to_string_lossy()));
+    }
+
+    #[test]
+    fn project_root_with_turkish_dotted_i_is_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("policy.redb");
+        let sandbox = dir.path().join("sb");
+        let mock_dirs = dir.path().join("md");
+        let project = dir.path().join(format!("Proj\u{0130}ct"));
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(&mock_dirs).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project.clone()).unwrap();
+
+        let root_display = project.to_str().unwrap();
+        let d = p.decide(&format!(r"{}\alt\dosya.txt", root_display), true);
+        assert_eq!(d.mode, Mode::Passthrough);
+    }
+
+    // ── decide_traced must mirror compute (audit 2026-09-19 Low) ──────────────
+
+    #[test]
+    fn decide_traced_write_fallback_is_cow_like_compute() {
+        let (_dir, p) = make_policy();
+        // Outside project_root, no explicit rule and no default rule.
+        let path = r"c:\elsewhere\newfile.txt";
+        let live = p.decide(path, true);
+        assert!(
+            matches!(live.mode, Mode::Cow),
+            "compute must isolate an external write (precondition)"
+        );
+        let traced = p.decide_traced(path, true, None, None);
+        assert!(
+            matches!(traced.decision, db::RuleMode::Cow),
+            "with no rule and no default, compute isolates the write (Cow); the trace must report the same decision, not Passthrough"
+        );
+        assert!(
+            traced.target_path.is_some(),
+            "traced Cow must carry the overlay target like compute's Cow"
+        );
+    }
+
+    #[test]
+    fn decide_traced_read_through_reports_cow_like_compute() {
+        let (_dir, p) = make_policy();
+        // Simulate a previously CoW'd file: an OVERLAY_IDX entry orig -> overlay.
+        let orig = r"c:\elsewhere\config.json";
+        p.record_overlay(orig, r"c:\sb-overlay\elsewhere\config.json")
+            .unwrap();
+        let live = p.decide(orig, false);
+        assert!(
+            matches!(live.mode, Mode::Cow),
+            "compute's read-through must serve the overlay copy (precondition)"
+        );
+        let traced = p.decide_traced(orig, false, None, None);
+        assert!(
+            matches!(traced.decision, db::RuleMode::Cow),
+            "trace must mirror compute's read-through: an indexed read is Cow, not Passthrough"
+        );
+    }
+
+    #[test]
+    fn decide_traced_whiteout_revived_by_physical_overlay_agrees_with_compute() {
+        let (dir, p) = make_policy();
+        let orig = r"c:\elsewhere\gone.txt";
+        p.record_whiteout(orig).unwrap();
+        // Materialize the physical mirror exactly as mirror_into_overlay_layout
+        // would: <sandbox_root>\<rest> (Path-1, drive implicit in the root).
+        let phys = dir.path().join("sb").join("elsewhere").join("gone.txt");
+        std::fs::create_dir_all(phys.parent().unwrap()).unwrap();
+        std::fs::write(&phys, b"x").unwrap();
+
+        let live = p.decide(orig, false);
+        assert!(
+            matches!(live.mode, Mode::Cow),
+            "compute must treat the physically-revived path as live Cow (precondition)"
+        );
+        let traced = p.decide_traced(orig, false, None, None);
+        assert!(
+            matches!(traced.decision, db::RuleMode::Cow),
+            "trace must not report a whiteout the engine already superseded by a physical overlay file"
+        );
     }
 }

@@ -7,9 +7,19 @@ pub enum DeviceKind {
     Socket,
     Console,
     Null,
+    /// Network redirector targets: UNC shares (`\??\UNC\server\share\…` maps
+    /// to `unc\…`), the MUP (Multiple UNC Provider), LanmanRedirector (SMB)
+    /// and WebDavRedirector. A write through these reaches the real
+    /// volume/share via the network redirector, entirely outside the CoW
+    /// overlay and without a `decide()` call (audit P0-03). Reads pass
+    /// through (documented read model); writes are denied by
+    /// `check_device_block`.
+    NetworkPath,
     /// Known read-only system query devices (MountPointManager, IPT, etc.).
-    /// Used by Win32 APIs and .NET BCL for system metadata queries. Allowing
-    /// these is safe — they don't grant filesystem or network escape vectors.
+    /// Used by Win32 APIs and .NET BCL for system metadata queries. Reads
+    /// are safe — they don't grant filesystem or network escape vectors.
+    /// WRITE access is denied by `check_device_block`; keep that
+    /// enforcement in sync with this contract.
     SystemQuery,
     Unknown,
 }
@@ -24,6 +34,15 @@ pub fn nt_to_device_path(raw: &[u16]) -> Option<String> {
     }
     if let Some(rest) = lower.strip_prefix(r"\\.\") {
         return Some(format!(r"device\{rest}"));
+    }
+    if lower.starts_with(r"\\?\") {
+        // Extended DOS prefix — a DOS path, not a device namespace.
+        return None;
+    }
+    if lower.starts_with(r"\\") {
+        // Raw Win32 UNC form `\\server\share\…` — map into the `unc\`
+        // namespace so it classifies as DeviceKind::NetworkPath (P0-03).
+        return Some(format!(r"unc\{}", &lower[2..]));
     }
     if lower.starts_with(r"\device\") {
         return Some(lower.to_owned());
@@ -48,6 +67,25 @@ pub fn classify_device(path: &str) -> DeviceKind {
     // Raw partition / volume bitmap access.
     if lower.contains(r"device\harddisk") && !lower.contains("harddiskvolume") {
         return DeviceKind::Unknown;
+    }
+
+    // === Network redirector paths (P0-03) ===
+    // A UNC write reaches the REAL volume/share through the network
+    // redirector, entirely outside the CoW overlay, with no decide() call.
+    // Classify explicitly so check_device_block can deny writes instead of
+    // letting these fall through to SystemQuery (which used to mean
+    // "carry on" in practice).
+    // `\??\UNC\server\share\…` maps to `unc\server\share\…` (and the raw
+    // `\\server\share\…` form maps there too — see nt_to_device_path).
+    if lower == "unc" || lower.starts_with(r"unc\") { return DeviceKind::NetworkPath; }
+    // MUP (Multiple UNC Provider) routes every UNC open; LanmanRedirector is
+    // the SMB redirector (including drive-mapped `\;C:000…\server\share`
+    // spellings); WebDavRedirector serves WebDAV shares.
+    if is_device_name(&lower, "mup")
+        || is_device_name(&lower, "lanmanredirector")
+        || is_device_name(&lower, "webdavredirector")
+    {
+        return DeviceKind::NetworkPath;
     }
 
     if lower.starts_with(r"device\harddiskvolume") { return DeviceKind::HarddiskVolume; }
@@ -87,15 +125,17 @@ pub fn classify_device(path: &str) -> DeviceKind {
     {
         return DeviceKind::Unknown;
     }
-    // Default: SystemQuery (read OK, write denied).
+    // Default: SystemQuery (read OK, write DENIED — enforced by
+    // check_device_block, which denies opens carrying write intent for this
+    // class; do not weaken one side without the other).
     // Modern GUI/UWP/Node processes open many internal device handles during
-    // startup (CMNotify, DeviceApi, Lanmanredirector, UWP services). Denying
-    // all unknown devices by default broke notepad and node — the actual
-    // escape vectors are covered by other layers: CoW for files, WFP for
-    // network, ALPC guard for COM/RPC, dangerous-pipe list, raw-disk blocks,
-    // and credential-surface blocks (KsecDD/CNG) above. SystemQuery permits
-    // read access (mount queries, device info) and denies writes through
-    // unrecognized device handles.
+    // startup (CMNotify, DeviceApi, UWP services). Denying all access to
+    // unknown devices by default broke notepad and node — the actual escape
+    // vectors are covered by other layers: CoW for files, WFP for network,
+    // ALPC guard for COM/RPC, dangerous-pipe list, raw-disk blocks,
+    // credential-surface blocks (KsecDD/CNG) and the NetworkPath class above.
+    // SystemQuery permits read access (mount queries, device info); writes
+    // through unrecognized device handles are denied.
     DeviceKind::SystemQuery
 }
 
@@ -341,5 +381,69 @@ mod tests {
         assert!(!is_dangerous_pipe(r"\device\namedpipe\myappbrowser"));
         assert!(!is_dangerous_pipe(r"\device\namedpipe\samr_app_data"));
         assert!(!is_dangerous_pipe(r"pipe\some-browser-helper"));
+    }
+
+    // ── P0-03: UNC / redirector classification ─────────────────────────────
+
+    #[test]
+    fn nt_to_device_unc_admin_share() {
+        // Win32 `\\localhost\c$\…` arrives as `\??\UNC\localhost\c$\…`.
+        let raw: Vec<u16> = r"\??\UNC\localhost\c$\Users\Public\evil.exe".encode_utf16().collect();
+        assert_eq!(
+            nt_to_device_path(&raw),
+            Some(r"unc\localhost\c$\users\public\evil.exe".into())
+        );
+    }
+
+    #[test]
+    fn nt_to_device_raw_unc_form() {
+        // A caller may pass the Win32 `\\server\share` spelling verbatim.
+        let raw: Vec<u16> = r"\\server\share\dir\file.txt".encode_utf16().collect();
+        assert_eq!(nt_to_device_path(&raw), Some(r"unc\server\share\dir\file.txt".into()));
+    }
+
+    #[test]
+    fn nt_to_device_extended_dos_prefix_stays_none() {
+        // `\\?\C:\foo` is a DOS path, not a device — must stay None (guard
+        // against the raw-`\\` UNC arm swallowing it).
+        let raw: Vec<u16> = r"\\?\C:\foo".encode_utf16().collect();
+        assert_eq!(nt_to_device_path(&raw), None);
+    }
+
+    #[test]
+    fn classify_unc_is_network_path() {
+        assert_eq!(
+            classify_device(r"unc\localhost\c$\users\public\evil.exe"),
+            DeviceKind::NetworkPath
+        );
+        assert_eq!(classify_device(r"unc\127.0.0.1\c$\x"), DeviceKind::NetworkPath);
+        // The UNC device itself, opened bare.
+        assert_eq!(classify_device("unc"), DeviceKind::NetworkPath);
+        // A UNC-carried pipe path must classify as NetworkPath, not NamedPipe.
+        assert_eq!(classify_device(r"unc\server\pipe\svcctl"), DeviceKind::NetworkPath);
+    }
+
+    #[test]
+    fn classify_redirector_devices_are_network_path() {
+        assert_eq!(classify_device(r"\device\mup"), DeviceKind::NetworkPath);
+        assert_eq!(classify_device(r"device\mup\server\share"), DeviceKind::NetworkPath);
+        assert_eq!(
+            classify_device(r"\device\lanmanredirector\;c:000000000001\server\share"),
+            DeviceKind::NetworkPath
+        );
+        assert_eq!(
+            classify_device(r"device\webdavredirector\server\dav\file.txt"),
+            DeviceKind::NetworkPath
+        );
+    }
+
+    #[test]
+    fn classify_dos_path_still_not_network() {
+        // Sanity: unrelated classes are unchanged by the NetworkPath addition.
+        assert_eq!(classify_device(r"\device\cldflt"), DeviceKind::SystemQuery);
+        assert_eq!(
+            classify_device(r"\device\harddiskvolume1\foo"),
+            DeviceKind::HarddiskVolume
+        );
     }
 }

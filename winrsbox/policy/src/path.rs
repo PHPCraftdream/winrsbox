@@ -97,6 +97,193 @@ pub fn dos_to_nt(dos: &str) -> Vec<u16> {
     v
 }
 
+/// Lexically fold `.` and `..` segments in a lowercase DOS path WITHOUT
+/// touching the filesystem — a `canonicalize()` syscall here would be both a
+/// TOCTOU and a recursion hazard inside a hook. This mirrors what Win32's
+/// `RtlDosPathNameToNtPathName` does for every normal Win32 caller before the
+/// path reaches the kernel, so after folding, the path the policy decides on
+/// is the path the kernel will act on. (Kernel-side resolution differs from a
+/// lexical fold only when an intermediate segment is a reparse point; that
+/// pre-existing traversal class is defended separately by denying reparse-
+/// point creation in the metadata guard.)
+///
+/// Anchor: a leading drive prefix (`x:`) or a leading `\`. A bare relative
+/// name has no defined root to clamp against and is returned unchanged.
+/// `.` segments are dropped; `..` pops one segment, clamped at the anchor
+/// (the kernel clamps at the volume root the same way). Empty interior
+/// segments are collapsed. `/` is treated as a separator (the NT object
+/// manager accepts it as one) and normalized to `\` in rewritten output.
+/// Leading anchor and a single trailing separator are preserved verbatim.
+///
+/// Returns `Cow::Borrowed` unchanged when the path contains no `.`/`..`
+/// segment and no interior empty segment (hot path — no allocation).
+pub fn fold_dos_dots(dos: &str) -> std::borrow::Cow<'_, str> {
+    let is_sep = |c: char| c == '\\' || c == '/';
+
+    // Fast path: no `.`/`..` segment and no interior empty segment (the
+    // leading anchor and a single trailing separator are not "interior")
+    // → borrow, no allocation.
+    let mut needs_fold = false;
+    {
+        let mut it = dos.split(is_sep).peekable();
+        let mut idx = 0usize;
+        while let Some(seg) = it.next() {
+            let is_last = it.peek().is_none();
+            if seg == "." || seg == ".." {
+                needs_fold = true;
+                break;
+            }
+            if seg.is_empty() && idx > 0 && !is_last {
+                needs_fold = true;
+                break;
+            }
+            idx += 1;
+        }
+    }
+    if !needs_fold {
+        return std::borrow::Cow::Borrowed(dos);
+    }
+
+    // Anchor: `<letter>:` + optional separator, or a bare leading separator —
+    // preserved verbatim. Anything else is a bare relative name with no
+    // defined root to clamp against → returned unchanged.
+    let b = dos.as_bytes();
+    let anchor_len = if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+        if b.len() >= 3 && (b[2] == b'\\' || b[2] == b'/') { 3 } else { 2 }
+    } else if b.first() == Some(&b'\\') || b.first() == Some(&b'/') {
+        1
+    } else {
+        return std::borrow::Cow::Borrowed(dos);
+    };
+
+    let trailing = dos.ends_with(is_sep);
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in dos[anchor_len..].split(is_sep) {
+        match seg {
+            "" => {}  // empty interior segment — collapse
+            "." => {} // current-dir segment — drop
+            ".." => {
+                // Pop one segment; clamped at the anchor when the stack is
+                // empty (the kernel clamps at the volume root the same way).
+                let _ = stack.pop();
+            }
+            s => stack.push(s),
+        }
+    }
+
+    let mut out = String::with_capacity(dos.len());
+    out.push_str(&dos[..anchor_len]);
+    for s in &stack {
+        if !out.ends_with(is_sep) {
+            out.push('\\');
+        }
+        out.push_str(s);
+    }
+    if trailing && !out.ends_with(is_sep) {
+        out.push('\\');
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// UTF-16 twin of [`fold_dos_dots`] for NT-form paths (`\??\C:\…`,
+/// `\\?\C:\…`, `\\.\C:\…`). Folds `.`/`..` segments lexically, preserving the
+/// NT prefix - including the `<letter>:` drive, which `..` cannot pop,
+/// mirroring the kernel's clamp at the volume root - and every non-folded
+/// byte (case, non-ASCII UTF-16 units) verbatim, so the result still
+/// round-trips through `nt_to_dos_lower`.
+/// Paths without one of those prefixes are returned unchanged (Borrowed) — a
+/// lexical fold of an unanchored path has no defined root to clamp against.
+/// Same fold rules as `fold_dos_dots`: `.` dropped, `..` pops clamped at the
+/// prefix anchor, interior empty segments collapsed, `/` treated as a
+/// separator and normalized to `\` in rewritten output.
+pub fn fold_nt_dots(raw: &[u16]) -> std::borrow::Cow<'_, [u16]> {
+    // Recognized 4-unit NT prefixes (mirrors `strip_nt_prefix`):
+    // `\??\` = [0x5C,0x3F,0x3F,0x5C], `\\?\` = [0x5C,0x5C,0x3F,0x5C],
+    // `\\.\` = [0x5C,0x5C,0x2E,0x5C].
+    let has_nt_prefix = raw.len() > 4
+        && ((raw[0] == 0x5C && raw[1] == 0x3F && raw[2] == 0x3F && raw[3] == 0x5C)
+            || (raw[0] == 0x5C && raw[1] == 0x5C && raw[2] == 0x3F && raw[3] == 0x5C)
+            || (raw[0] == 0x5C && raw[1] == 0x5C && raw[2] == 0x2E && raw[3] == 0x5C));
+    if !has_nt_prefix {
+        // Unanchored — no defined root to clamp against → unchanged.
+        return std::borrow::Cow::Borrowed(raw);
+    }
+
+    const SEP: u16 = 0x5C; // '\'
+    const FSLASH: u16 = 0x2F; // '/'
+    const DOT: u16 = 0x2E; // '.'
+    let is_sep = |&u: &u16| u == SEP || u == FSLASH;
+
+    // Fast path: no `.`/`..` segment and no interior empty segment → borrow.
+    // (The empty segment at idx 0 belongs to the prefix's leading `\`.)
+    let mut needs_fold = false;
+    {
+        let mut it = raw.split(is_sep).peekable();
+        let mut idx = 0usize;
+        while let Some(seg) = it.next() {
+            let is_last = it.peek().is_none();
+            match seg {
+                [DOT] | [DOT, DOT] => {
+                    needs_fold = true;
+                    break;
+                }
+                [] if idx > 0 && !is_last => {
+                    needs_fold = true;
+                    break;
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+    }
+    if !needs_fold {
+        return std::borrow::Cow::Borrowed(raw);
+    }
+
+    // Anchor length: the 4-unit NT prefix plus the `<letter>:` drive prefix
+    // and its following separator when present. The drive must NOT be
+    // poppable by `..` -- the kernel clamps at the volume root, exactly like
+    // `fold_dos_dots` clamps at `x:`. (Popping it would turn
+    // `\??\C:\a\..\..\b` into `\??\b` instead of `\??\C:\b`.)
+    let mut anchor = 4usize;
+    if raw.len() >= 6 && matches!(raw[4], 0x41..=0x5A | 0x61..=0x7A) && raw[5] == 0x3A {
+        if raw.len() >= 7 && is_sep(&raw[6]) {
+            anchor = 7;
+        } else {
+            // Drive-relative NT form (`\??\C:proj\..`) resolves against the
+            // per-process current directory of that drive -- no defined
+            // lexical anchor, so leave it unchanged.
+            return std::borrow::Cow::Borrowed(raw);
+        }
+    }
+
+    let trailing = matches!(raw.last(), Some(&u) if u == SEP || u == FSLASH);
+    let mut stack: Vec<&[u16]> = Vec::new();
+    for seg in raw[anchor..].split(is_sep) {
+        match seg {
+            [] | [DOT] => {} // empty interior segment / current-dir — collapse
+            [DOT, DOT] => {
+                // Pop one segment; clamped at the prefix+drive anchor.
+                let _ = stack.pop();
+            }
+            s => stack.push(s),
+        }
+    }
+
+    let mut out: Vec<u16> = Vec::with_capacity(raw.len());
+    out.extend_from_slice(&raw[..anchor]);
+    for s in &stack {
+        if !matches!(out.last(), Some(&u) if u == SEP || u == FSLASH) {
+            out.push(SEP);
+        }
+        out.extend_from_slice(s);
+    }
+    if trailing && !matches!(out.last(), Some(&u) if u == SEP || u == FSLASH) {
+        out.push(SEP);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// C:\Users\x\foo.txt + sandbox_root → <root>\C\Users\x\foo.txt
 ///
 /// Only `Normal` path components are pushed onto `root`. Any `..`, absolute
@@ -1068,6 +1255,155 @@ mod conv_tests {
         // Without lowercase flag — A and C stay uppercase
         let out_no_lower = u16_slice_to_ascii_lower(&input, false);
         assert_eq!(out_no_lower, "Ab\u{1F600}Cd");
+    }
+
+    // ── fold_dos_dots ──────────────────────────────────────────────────────
+
+    #[test]
+    fn fold_dos_basic() {
+        assert_eq!(fold_dos_dots(r"c:\proj\sub\..\file.txt"), r"c:\proj\file.txt");
+    }
+
+    #[test]
+    fn fold_dos_multi_dotdot() {
+        assert_eq!(fold_dos_dots(r"c:\proj\..\..\outside.exe"), r"c:\outside.exe");
+    }
+
+    #[test]
+    fn fold_dos_clamped_at_root() {
+        // `..` past the volume root clamps at the anchor, like the kernel does.
+        assert_eq!(fold_dos_dots(r"c:\..\..\x"), r"c:\x");
+        assert_eq!(fold_dos_dots(r"\..\..\..\y"), r"\y");
+    }
+
+    #[test]
+    fn fold_dos_curdir_dropped() {
+        assert_eq!(fold_dos_dots(r"c:\proj\.\x"), r"c:\proj\x");
+        assert_eq!(fold_dos_dots(r"c:\proj\.\.\file.txt"), r"c:\proj\file.txt");
+    }
+
+    #[test]
+    fn fold_dos_forward_slash_normalized() {
+        // `/` is accepted as a separator and normalized to `\` in rewritten output.
+        assert_eq!(fold_dos_dots(r"c:\proj/..\..\x"), r"c:\x");
+        assert_eq!(fold_dos_dots(r"c:\a/b/../c"), r"c:\a\c");
+    }
+
+    #[test]
+    fn fold_dos_drive_anchor_preserved() {
+        // The leading `x:` anchor is preserved verbatim, including its case.
+        assert_eq!(fold_dos_dots(r"D:\x\..\y"), r"D:\y");
+        assert_eq!(fold_dos_dots(r"c:\proj\sub\..\file.txt"), r"c:\proj\file.txt");
+    }
+
+    #[test]
+    fn fold_dos_empty_interior_segments_collapsed() {
+        assert_eq!(fold_dos_dots(r"c:\a\\b\..\c"), r"c:\a\c");
+    }
+
+    #[test]
+    fn fold_dos_borrowed_fast_path() {
+        // No `.`/`..` segment, no interior empty segment → Borrowed, no alloc.
+        let r = fold_dos_dots(r"c:\proj\");
+        assert!(matches!(r, std::borrow::Cow::Borrowed(_)));
+        let r = fold_dos_dots(r"c:\a\b\c.txt");
+        assert!(matches!(r, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn fold_dos_relative_path_unchanged() {
+        // A bare relative name has no anchor to clamp against → unchanged.
+        let r = fold_dos_dots(r"relative\path");
+        assert!(matches!(r, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(r, r"relative\path");
+        // Even with dots — folding an unanchored path is undefined → unchanged.
+        let r = fold_dos_dots(r"relative\..\x");
+        assert!(matches!(r, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(r, r"relative\..\x");
+    }
+
+    #[test]
+    fn fold_dos_trailing_separator_preserved() {
+        assert_eq!(fold_dos_dots(r"c:\proj\sub\..\"), r"c:\proj\");
+        assert_eq!(fold_dos_dots(r"c:\proj\sub\..\file"), r"c:\proj\file");
+    }
+
+    // ── fold_nt_dots ───────────────────────────────────────────────────────
+
+    #[test]
+    fn fold_nt_basic() {
+        let raw: Vec<u16> = r"\??\C:\proj\..\..\payload.exe".encode_utf16().collect();
+        let out = fold_nt_dots(&raw);
+        let expected: Vec<u16> = r"\??\C:\payload.exe".encode_utf16().collect();
+        assert_eq!(&*out, &expected[..]);
+    }
+
+    #[test]
+    fn fold_nt_extended_and_device_prefixes() {
+        let raw: Vec<u16> = r"\\?\C:\a\.\b".encode_utf16().collect();
+        let expected: Vec<u16> = r"\\?\C:\a\b".encode_utf16().collect();
+        assert_eq!(&*fold_nt_dots(&raw), &expected[..]);
+
+        let raw: Vec<u16> = r"\??\C:\..\..\x".encode_utf16().collect();
+        let expected: Vec<u16> = r"\??\C:\x".encode_utf16().collect();
+        assert_eq!(&*fold_nt_dots(&raw), &expected[..]);
+    }
+
+    #[test]
+    fn fold_nt_unrecognized_prefix_unchanged() {
+        // \Device\... style paths have no NT drive prefix → Borrowed unchanged.
+        let raw: Vec<u16> = r"\Device\HarddiskVolume1\x".encode_utf16().collect();
+        let r = fold_nt_dots(&raw);
+        assert!(matches!(r, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(&*r, &raw[..]);
+    }
+
+    #[test]
+    fn fold_nt_case_and_surrogate_pair_preserved() {
+        // U+1F600 (😀) = surrogate pair 0xD83D 0xDE00; uppercase C: must stay
+        // uppercase — every non-folded unit passes through verbatim.
+        let mut raw: Vec<u16> = r"\??\C:\a\".encode_utf16().collect();
+        raw.extend_from_slice(&[0xD83D, 0xDE00]);
+        raw.extend(r"\sub\..\file".encode_utf16());
+        let out = fold_nt_dots(&raw);
+        let mut expected: Vec<u16> = r"\??\C:\a\".encode_utf16().collect();
+        expected.extend_from_slice(&[0xD83D, 0xDE00]);
+        expected.extend(r"\file".encode_utf16());
+        assert_eq!(&*out, &expected[..]);
+    }
+
+    #[test]
+    fn fold_nt_forward_slash_normalized() {
+        let raw: Vec<u16> = r"\??\C:\a/b\..\c".encode_utf16().collect();
+        let expected: Vec<u16> = r"\??\C:\a\c".encode_utf16().collect();
+        assert_eq!(&*fold_nt_dots(&raw), &expected[..]);
+    }
+
+    #[test]
+    fn fold_nt_borrowed_fast_path() {
+        let raw: Vec<u16> = r"\??\C:\a\b".encode_utf16().collect();
+        let r = fold_nt_dots(&raw);
+        assert!(matches!(r, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn fold_nt_trailing_separator_preserved() {
+        let raw: Vec<u16> = r"\??\C:\a\..\".encode_utf16().collect();
+        let expected: Vec<u16> = r"\??\C:\".encode_utf16().collect();
+        assert_eq!(&*fold_nt_dots(&raw), &expected[..]);
+    }
+
+    #[test]
+    fn fold_dos_and_nt_agree() {
+        // Cross-check: folding a DOS string and its \??\-prefixed UTF-16
+        // encoding yields the same tail once the 4-unit prefix is stripped.
+        let dos = r"c:\proj\sub\..\file.txt";
+        let folded_dos = fold_dos_dots(dos);
+        let mut raw: Vec<u16> = vec![0x5C, 0x3F, 0x3F, 0x5C]; // \??\
+        raw.extend(dos.encode_utf16());
+        let folded_nt = fold_nt_dots(&raw);
+        let nt_tail = String::from_utf16(&folded_nt[4..]).unwrap();
+        assert_eq!(&*folded_dos, nt_tail.as_str());
     }
 
     // proptest demo: any DOS path that survives nt_to_dos round-trips through

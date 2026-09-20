@@ -36,7 +36,7 @@ impl RegOverlay {
             Err(_) => return Ok(()),
         };
         for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_lowercase();
+            let name = crate::ensure_lower(&entry.file_name().to_string_lossy()).into_owned();
             let path = entry.path();
 
             if path.is_file() && name == "values.json" {

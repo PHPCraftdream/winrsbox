@@ -59,7 +59,7 @@ pub enum PolicyError {
     Io(#[from] std::io::Error),
 }
 
-pub(crate) fn ensure_lower(s: &str) -> std::borrow::Cow<'_, str> {
+pub fn ensure_lower(s: &str) -> std::borrow::Cow<'_, str> {
     // ASCII-only fold matches what the kernel uses (RtlDowncaseUnicodeString
     // for ASCII chars) AND every hook-side path comparison. Unicode
     // to_lowercase() would fold U+0130 to "i\u{307}", diverging from

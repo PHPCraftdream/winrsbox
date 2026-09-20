@@ -232,7 +232,7 @@ pub fn parse_values_json(raw: &str) -> Result<rustc_hash::FxHashMap<String, RegE
     let map = obj.as_object().ok_or("expected JSON object")?;
     let mut result = rustc_hash::FxHashMap::default();
     for (key, val) in map {
-        let name = key.to_lowercase();
+        let name = crate::ensure_lower(key).into_owned();
         if let Some(typ_str) = val.get("type").and_then(|v| v.as_str()) {
             if typ_str == "DELETED" {
                 result.insert(name, RegEntry::Deleted);
@@ -265,7 +265,7 @@ pub fn serialize_values_json(values: &rustc_hash::FxHashMap<String, RegEntry>) -
 pub fn nt_to_friendly(raw: &[u16]) -> Option<String> {
     let s = String::from_utf16_lossy(raw);
     let s = s.trim_end_matches('\0');
-    let lower = s.to_lowercase();
+    let lower = crate::ensure_lower(s).into_owned();
 
     let stripped = lower.strip_prefix(r"\registry\")?;
 

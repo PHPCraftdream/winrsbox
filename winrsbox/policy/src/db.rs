@@ -188,9 +188,13 @@ pub fn apply_config(db: &redb::Database, cfg: &Config) -> Result<(), crate::Poli
         for rule in &cfg.rules {
             let mr = parse_mode(rule.read.as_deref().unwrap_or("passthrough"), default_read);
             let mw = parse_mode(rule.write.as_deref().unwrap_or("cow"), default_write);
-            let prefix_lower = rule.prefix.to_lowercase();
+            let prefix_lower = crate::ensure_lower(&rule.prefix).into_owned();
             let id = generate_id("rule", &[&prefix_lower]);
-            let row = RuleRow { id, prefix: prefix_lower.clone(), mode_read: mr, mode_write: mw, when: rule.when.clone() };
+            let when = rule.when.clone().map(|mut w| {
+                if let Some(ref e) = w.exe { w.exe = Some(crate::ensure_lower(e).into_owned()); }
+                w
+            });
+            let row = RuleRow { id, prefix: prefix_lower.clone(), mode_read: mr, mode_write: mw, when };
             let enc = bincode::serde::encode_to_vec(&row, bincode::config::standard())
                 .map_err(|e| crate::PolicyError::Ktav(format!("serialize: {e}")))?;
             rules.insert(prefix_lower.as_str(), enc.as_slice())?;
@@ -198,12 +202,12 @@ pub fn apply_config(db: &redb::Database, cfg: &Config) -> Result<(), crate::Poli
 
         for mock in &cfg.mocks {
             let payload = mock.content_inline.as_deref().unwrap_or("").as_bytes().to_vec();
-            let key = mock.path.to_lowercase();
+            let key = crate::ensure_lower(&mock.path).into_owned();
             mocks.insert(key.as_str(), payload.as_slice())?;
         }
 
         for md in &cfg.mock_dirs {
-            let key = md.prefix.to_lowercase();
+            let key = crate::ensure_lower(&md.prefix).into_owned();
             mock_dirs.insert(key.as_str(), ())?;
         }
     }
@@ -250,7 +254,7 @@ pub fn best_rule_match_full(
                 }
             }
             if let Some(ref exe_pattern) = when.exe {
-                if exe_lower.is_none() || !pattern_matches_exact(exe_pattern, exe_lower.unwrap()) {
+                if exe_lower.is_none() || !pattern_matches_exact(&crate::ensure_lower(exe_pattern), exe_lower.unwrap()) {
                     continue;
                 }
             }
@@ -327,8 +331,13 @@ pub fn matched_mock_dir(txn: &redb::ReadTransaction, lower_path: &str) -> Option
 // ── CRUD operations ────────────────────────────────────────────────────────
 
 pub fn rule_upsert(db: &redb::Database, row: &RuleRow) -> Result<(), crate::PolicyError> {
-    let prefix_lower = row.prefix.to_lowercase();
-    let enc = bincode::serde::encode_to_vec(row, bincode::config::standard())
+    let prefix_lower = crate::ensure_lower(&row.prefix).into_owned();
+    let mut stored = row.clone();
+    stored.prefix = prefix_lower.clone();
+    if let Some(ref mut w) = stored.when {
+        if let Some(ref e) = w.exe { w.exe = Some(crate::ensure_lower(e).into_owned()); }
+    }
+    let enc = bincode::serde::encode_to_vec(&stored, bincode::config::standard())
         .map_err(|e| crate::PolicyError::Ktav(format!("serialize: {e}")))?;
     let txn = db.begin_write()?;
     {
@@ -364,7 +373,7 @@ pub fn rule_remove_by_id(db: &redb::Database, id: &str) -> Result<bool, crate::P
 }
 
 pub fn rule_remove_by_prefix(db: &redb::Database, prefix: &str) -> Result<bool, crate::PolicyError> {
-    let key = prefix.to_lowercase();
+    let key = crate::ensure_lower(prefix).into_owned();
     let txn = db.begin_write()?;
     let removed = {
         let mut table = txn.open_table(RULES)?;
@@ -406,7 +415,7 @@ pub fn rule_clear(db: &redb::Database) -> Result<(), crate::PolicyError> {
 }
 
 pub fn mock_upsert(db: &redb::Database, _id: &str, path: &str, payload: &[u8]) -> Result<(), crate::PolicyError> {
-    let key = path.to_lowercase();
+    let key = crate::ensure_lower(path).into_owned();
     let txn = db.begin_write()?;
     {
         let mut table = txn.open_table(MOCKS)?;
@@ -424,7 +433,7 @@ pub fn mock_remove_by_id(_db: &redb::Database, _id: &str) -> Result<bool, crate:
 }
 
 pub fn mock_remove_by_path(db: &redb::Database, path: &str) -> Result<bool, crate::PolicyError> {
-    let key = path.to_lowercase();
+    let key = crate::ensure_lower(path).into_owned();
     let txn = db.begin_write()?;
     let removed = {
         let mut table = txn.open_table(MOCKS)?;
@@ -447,7 +456,7 @@ pub fn mock_list(db: &redb::Database) -> Result<Vec<(String, Vec<u8>)>, crate::P
 }
 
 pub fn mockdir_upsert(db: &redb::Database, prefix: &str) -> Result<(), crate::PolicyError> {
-    let key = prefix.to_lowercase();
+    let key = crate::ensure_lower(prefix).into_owned();
     let txn = db.begin_write()?;
     {
         let mut table = txn.open_table(MOCK_DIRS)?;
@@ -458,7 +467,7 @@ pub fn mockdir_upsert(db: &redb::Database, prefix: &str) -> Result<(), crate::Po
 }
 
 pub fn mockdir_remove_by_prefix(db: &redb::Database, prefix: &str) -> Result<bool, crate::PolicyError> {
-    let key = prefix.to_lowercase();
+    let key = crate::ensure_lower(prefix).into_owned();
     let txn = db.begin_write()?;
     let removed = {
         let mut table = txn.open_table(MOCK_DIRS)?;
@@ -1077,15 +1086,120 @@ rules: [
         let rule = best_rule_match(&txn, r"c:\test\file", None, None).unwrap();
         assert!(matches!(rule.mode_read, RuleMode::Deny));
     }
+
+    // ── canonical case-fold (ASCII) tests ──────────────────────────────────
+
+    #[test]
+    fn when_exe_filter_mixed_case_pattern_matches_lowered_exe() {
+        let (_dir, db) = make_db_with_rules_and_when(&[
+            (r"c:\locked", RuleMode::Deny, RuleMode::Deny,
+             Some(WhenFilter { depth: None, exe: Some(r"C:\Tools\MyApp.EXE".into()) })),
+        ]);
+        let txn = db.begin_read().unwrap();
+        // Stored pattern is raw mixed case; the read-side fold must make it
+        // match the already-lowered exe.
+        let rule = best_rule_match(&txn, r"c:\locked\f.txt", None, Some(r"c:\tools\myapp.exe")).unwrap();
+        assert!(matches!(rule.mode_read, RuleMode::Deny));
+    }
+
+    #[test]
+    fn apply_config_folds_rule_prefix_and_when_exe() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.redb");
+        let db = redb::Database::create(&db_path).unwrap();
+        {
+            let txn = db.begin_write().unwrap();
+            {
+                txn.open_table(RULES).unwrap();
+                txn.open_table(MOCKS).unwrap();
+                txn.open_table(MOCK_DIRS).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let cfg = Config {
+            sandbox_root: None,
+            defaults: Defaults::default(),
+            rules: vec![RuleEntry {
+                prefix: "C:\\Klas\u{0130}r".into(),
+                read: Some("deny".into()),
+                write: None,
+                when: Some(WhenFilter { depth: None, exe: Some(r"C:\Tools\APP.EXE".into()) }),
+            }],
+            mocks: vec![],
+            mock_dirs: vec![],
+            log_level: None,
+        };
+        apply_config(&db, &cfg).unwrap();
+
+        let txn = db.begin_read().unwrap();
+        // Old behavior fails: prefix stored Unicode-folded (İ → i + U+0307)
+        // while the lookup path is ASCII-folded (İ unchanged), and the raw
+        // when.exe never matched the lowered exe.
+        let rule = best_rule_match(&txn, "c:\\klas\u{0130}r\\f", None, Some(r"c:\tools\app.exe")).unwrap();
+        assert!(matches!(rule.mode_read, RuleMode::Deny));
+    }
+
+    #[test]
+    fn rule_upsert_folds_prefix_and_when_exe_at_choke_point() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.redb");
+        let db = redb::Database::create(&db_path).unwrap();
+        {
+            let txn = db.begin_write().unwrap();
+            txn.open_table(RULES).unwrap();
+            txn.commit().unwrap();
+        }
+        let row = RuleRow {
+            id: "rule-test".into(),
+            prefix: r"d:\Locked".into(),
+            mode_read: RuleMode::Deny,
+            mode_write: RuleMode::Deny,
+            when: Some(WhenFilter { depth: None, exe: Some(r"C:\Tools\MyApp.EXE".into()) }),
+        };
+        rule_upsert(&db, &row).unwrap();
+
+        let txn = db.begin_read().unwrap();
+        let t = txn.open_table(RULES).unwrap();
+        assert!(t.get("d:\\locked").unwrap().is_some());
+        assert!(t.get("d:\\Locked").unwrap().is_none());
+        let stored = decode_rule(t.get("d:\\locked").unwrap().unwrap().value()).unwrap();
+        assert_eq!(stored.prefix, "d:\\locked");
+        assert_eq!(stored.when.as_ref().unwrap().exe.as_deref(), Some("c:\\tools\\myapp.exe"));
+    }
+
+    #[test]
+    fn reg_mock_upsert_folds_non_ascii_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.redb");
+        let db = redb::Database::create(&db_path).unwrap();
+        {
+            let txn = db.begin_write().unwrap();
+            txn.open_table(REG_MOCKS).unwrap();
+            txn.commit().unwrap();
+        }
+        reg_mock_upsert(&db, "hklm\\soft\\Klas\u{0130}r\\Val", b"x").unwrap();
+
+        let txn = db.begin_read().unwrap();
+        let t = txn.open_table(REG_MOCKS).unwrap();
+        assert!(t.get("hklm\\soft\\klas\u{0130}r\\val").unwrap().is_some());
+        assert!(t.get("hklm\\soft\\Klas\u{0130}r\\Val").unwrap().is_none());
+    }
 }
 
 // ─── Registry CRUD ───────────────────────────────────────────────────────────
 
 pub fn reg_rule_upsert(db: &redb::Database, row: &RuleRow) -> Result<(), crate::PolicyError> {
-    let enc = bincode::serde::encode_to_vec(row, bincode::config::standard())
+    let prefix_lower = crate::ensure_lower(&row.prefix).into_owned();
+    let mut stored = row.clone();
+    stored.prefix = prefix_lower.clone();
+    if let Some(ref mut w) = stored.when {
+        if let Some(ref e) = w.exe { w.exe = Some(crate::ensure_lower(e).into_owned()); }
+    }
+    let enc = bincode::serde::encode_to_vec(&stored, bincode::config::standard())
         .map_err(|e| crate::PolicyError::Ktav(format!("serialize: {e}")))?;
     let txn = db.begin_write()?;
-    { let mut t = txn.open_table(REG_RULES)?; t.insert(row.prefix.as_str(), enc.as_slice())?; }
+    { let mut t = txn.open_table(REG_RULES)?; t.insert(stored.prefix.as_str(), enc.as_slice())?; }
     txn.commit()?;
     Ok(())
 }
@@ -1132,16 +1246,18 @@ pub fn reg_rule_clear(db: &redb::Database) -> Result<(), crate::PolicyError> {
 }
 
 pub fn reg_mock_upsert(db: &redb::Database, path: &str, payload: &[u8]) -> Result<(), crate::PolicyError> {
+    let key = crate::ensure_lower(path).into_owned();
     let txn = db.begin_write()?;
-    { let mut t = txn.open_table(REG_MOCKS)?; t.insert(path, payload)?; }
+    { let mut t = txn.open_table(REG_MOCKS)?; t.insert(key.as_str(), payload)?; }
     txn.commit()?;
     Ok(())
 }
 
 pub fn reg_mock_remove(db: &redb::Database, path: &str) -> Result<bool, crate::PolicyError> {
+    let key = crate::ensure_lower(path).into_owned();
     let txn = db.begin_write()?;
     let removed;
-    { let mut t = txn.open_table(REG_MOCKS)?; removed = t.remove(path)?.is_some(); }
+    { let mut t = txn.open_table(REG_MOCKS)?; removed = t.remove(key.as_str())?.is_some(); }
     txn.commit()?;
     Ok(removed)
 }
