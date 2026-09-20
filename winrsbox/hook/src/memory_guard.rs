@@ -1106,13 +1106,53 @@ fn write_local_fallback(
 /// policy-identical by construction and the decision stays unit-testable
 /// without killing the test process. The caller reads BaseAddress/RegionSize
 /// for the violation report only after this returns true.
-fn alloc_decision_kill_required(process_handle: HANDLE, protect: u32) -> bool {
+/// True while this thread is inside the shared hook window (`anti_rec`).
+///
+/// The allocation hooks keep their own TLS re-entry counter
+/// (`alloc_anti_rec_*`), which deliberately does not see that window — so
+/// they used to apply the kill decision to the hook's OWN allocations. The
+/// install path is the case that matters: `install_hooks` holds `anti_rec`
+/// across every guard's `enable()`, and `memory_guard::install` runs first,
+/// so every detour installed after it allocates an RWX trampoline through an
+/// already-armed allocation hook. Under `--guard static` that is a
+/// self-RWX-direct allocation, and hook.dll terminated its own process during
+/// DllMain — init never signalled, the launcher killed the child, and NO
+/// target could start under `static`, JIT or not.
+///
+/// This is the same property the protect/write hooks already have (they pass
+/// through entirely when `anti_rec` is held) and it grants a guest nothing:
+/// only our own code ever enters the window, and the window's invariant 1
+/// forbids running guest code inside it.
+fn in_trusted_hook_window() -> bool {
+    crate::anti_rec::in_hook()
+}
+
+/// THE gate both allocation hooks apply, so they stay policy-identical by
+/// construction (same reason the decision below is shared). Reads the
+/// thread's window state and hands it to the pure decision.
+fn alloc_kill_gate(process_handle: HANDLE, protect: u32) -> bool {
+    alloc_decision_kill_required(process_handle, protect, in_trusted_hook_window())
+}
+
+fn alloc_decision_kill_required(
+    process_handle: HANDLE,
+    protect: u32,
+    in_trusted_window: bool,
+) -> bool {
     if is_current_process(process_handle) {
         // Self RWX-direct allocation: the content-scan-evading JIT/shellcode
         // pattern. Blunt-killed ONLY in static (hard containment). In
         // full/scan it's allowed so RWX-direct JIT (node/V8) works; the
         // W^X JIT path is still content-scanned at NtProtect->exec time.
-        is_rwx(protect) && !allow_rwx() && is_static_mode()
+        //
+        // `in_trusted_window` excuses exactly one caller: ourselves. Detour
+        // trampolines are allocated RWX while `install_hooks` holds
+        // `anti_rec` across every guard's `enable()`, and memory_guard
+        // installs first — so in static mode hook.dll used to terminate its
+        // own process during DllMain and no target could start at all. The
+        // exemption is deliberately confined to THIS branch: a foreign-process
+        // allocation stays a kill regardless of the window (see below).
+        is_rwx(protect) && !allow_rwx() && is_static_mode() && !in_trusted_window
     } else {
         // Foreign-process allocation: executable memory in a process we do
         // not own is the injection primitive itself.
@@ -1156,7 +1196,7 @@ unsafe extern "system" fn hook_nt_allocate_virtual_memory(
     let result = (|| {
         // Shared decision (also applied by hook_nt_allocate_virtual_memory_ex
         // below) — one gate for both alloc entry points.
-        if alloc_decision_kill_required(process_handle, protect) {
+        if alloc_kill_gate(process_handle, protect) {
             let size = if region_size.is_null() { 0 } else { *region_size as u64 };
             let addr = if base_address.is_null() { 0 } else { *base_address as u64 };
             report_and_terminate(ipc::AllocKind::Allocate, protect, size, addr);
@@ -1205,7 +1245,7 @@ unsafe extern "system" fn hook_nt_allocate_virtual_memory_ex(
         // NtAllocateVirtualMemory hook by construction. The extended-
         // parameter array does not participate: the kill classes (foreign
         // exec / static-mode self RWX) depend only on handle + protect.
-        if alloc_decision_kill_required(process_handle, protect) {
+        if alloc_kill_gate(process_handle, protect) {
             let size = if region_size.is_null() { 0 } else { *region_size as u64 };
             let addr = if base_address.is_null() { 0 } else { *base_address as u64 };
             report_and_terminate(ipc::AllocKind::Allocate, protect, size, addr);
@@ -2568,11 +2608,11 @@ mod tests {
         // foreign, non-owned process — exactly what the Ex sibling must
         // catch (pre-fix this call rode the unhooked Ex export).
         assert!(
-            alloc_decision_kill_required(h, PAGE_EXECUTE_READWRITE),
+            alloc_decision_kill_required(h, PAGE_EXECUTE_READWRITE, false),
             "foreign exec allocation must be a kill decision"
         );
         assert!(
-            alloc_decision_kill_required(h, PAGE_EXECUTE),
+            alloc_decision_kill_required(h, PAGE_EXECUTE, false),
             "foreign PAGE_EXECUTE allocation must be a kill decision"
         );
         // SAFETY: handle from OpenProcess above.
@@ -2583,7 +2623,7 @@ mod tests {
     fn alloc_decision_foreign_non_exec_allowed() {
         let h = foreign_process_handle();
         assert!(
-            !alloc_decision_kill_required(h, PAGE_READWRITE),
+            !alloc_decision_kill_required(h, PAGE_READWRITE, false),
             "foreign non-executable allocation must pass"
         );
         // SAFETY: handle from OpenProcess above.
@@ -2602,16 +2642,72 @@ mod tests {
         // SAFETY: GetCurrentProcess always returns the pseudo handle.
         let cur = unsafe { winapi::um::processthreadsapi::GetCurrentProcess() };
         assert!(
-            alloc_decision_kill_required(cur, PAGE_EXECUTE_READWRITE),
+            alloc_decision_kill_required(cur, PAGE_EXECUTE_READWRITE, false),
             "self RWX-direct must be a kill decision in static mode"
         );
         // Documented escape hatch: the ALLOW_RWX snapshot permits it.
         test_set_allow_rwx(true);
         assert!(
-            !alloc_decision_kill_required(cur, PAGE_EXECUTE_READWRITE),
+            !alloc_decision_kill_required(cur, PAGE_EXECUTE_READWRITE, false),
             "allow_rwx must suppress the self-RWX kill"
         );
         test_set_allow_rwx(false);
+    }
+
+    /// Regression: under `--guard static`, hook.dll terminated its own
+    /// process during DllMain. `install_hooks` installs memory_guard FIRST
+    /// and holds `anti_rec` across every later guard's `enable()`; each of
+    /// those allocates an RWX trampoline, which the already-armed allocation
+    /// hook scored as a self-RWX-direct allocation. Init never signalled and
+    /// the launcher killed the child, so NO target could start under
+    /// `static` — `node.exe` and `cmd.exe` alike, i.e. not a JIT issue.
+    ///
+    /// The decision itself must not change; only the gate the hooks apply.
+    #[test]
+    fn install_window_suppresses_static_self_rwx_kill() {
+        let _lock = env_lock();
+        GUARD_MODE.set("static".to_string()).ok();
+        test_set_allow_rwx(false);
+        // SAFETY: GetCurrentProcess always returns the pseudo handle.
+        let cur = unsafe { winapi::um::processthreadsapi::GetCurrentProcess() };
+
+        // Outside the window nothing is softened: a guest RWX-direct
+        // allocation in static mode is still a kill.
+        assert!(!in_trusted_hook_window());
+        assert!(
+            alloc_kill_gate(cur, PAGE_EXECUTE_READWRITE),
+            "guest self-RWX in static must still be killed"
+        );
+
+        // Inside the install window the same allocation is ours.
+        let window = crate::anti_rec::enter().expect("window must be free here");
+        assert!(in_trusted_hook_window());
+        assert!(
+            !alloc_kill_gate(cur, PAGE_EXECUTE_READWRITE),
+            "detour trampolines allocated during install must not be killed"
+        );
+        // The underlying decision is untouched — only the gate differs.
+        assert!(alloc_decision_kill_required(cur, PAGE_EXECUTE_READWRITE, false));
+
+        drop(window);
+        assert!(!in_trusted_hook_window());
+        assert!(alloc_kill_gate(cur, PAGE_EXECUTE_READWRITE));
+    }
+
+    /// The window must not blanket-suppress the foreign-process class: an
+    /// executable allocation in a process we do not own is the injection
+    /// primitive and is killed at every guard level.
+    #[test]
+    fn install_window_does_not_suppress_foreign_exec_kill() {
+        let h = foreign_process_handle();
+        let window = crate::anti_rec::enter().expect("window must be free here");
+        assert!(
+            alloc_kill_gate(h, PAGE_EXECUTE_READWRITE),
+            "foreign exec allocation must be killed even inside the window"
+        );
+        drop(window);
+        // SAFETY: handle from OpenProcess above.
+        unsafe { winapi::um::handleapi::CloseHandle(h) };
     }
 
     #[test]
@@ -2620,7 +2716,7 @@ mod tests {
         // path — never a kill decision in any mode.
         // SAFETY: GetCurrentProcess always returns the pseudo handle.
         let cur = unsafe { winapi::um::processthreadsapi::GetCurrentProcess() };
-        assert!(!alloc_decision_kill_required(cur, PAGE_READWRITE));
+        assert!(!alloc_decision_kill_required(cur, PAGE_READWRITE, false));
 
         // A REAL handle to our own process resolves through GetProcessId and
         // takes the same self branch (guards the handle-comparison path).
@@ -2634,7 +2730,7 @@ mod tests {
         };
         if !h.is_null() {
             assert!(is_current_process(h));
-            assert!(!alloc_decision_kill_required(h, PAGE_READWRITE));
+            assert!(!alloc_decision_kill_required(h, PAGE_READWRITE, false));
             // SAFETY: handle from OpenProcess above.
             unsafe { winapi::um::handleapi::CloseHandle(h) };
         }

@@ -81,6 +81,16 @@ impl Drop for Guard {
 /// System DLLs called from the window (ntdll/kernelbase, and the loader
 /// running system DllMains for install-time LoadLibraryW) are the same
 /// trusted system class every guard allow-lists elsewhere.
+/// True when this thread is already inside a hook window, without entering
+/// one. Lets a guard that keeps its own re-entry counter (memory_guard's
+/// allocation path) still honour the shared window — notably the install
+/// window, which `install_hooks` holds open across every guard's `enable()`.
+pub fn in_hook() -> bool {
+    // SAFETY: `slot()` is a valid TlsAlloc slot; TlsGetValue is safe from any
+    // thread and returns NULL when the slot is unset.
+    unsafe { !TlsGetValue(slot()).is_null() }
+}
+
 pub fn enter() -> Option<Guard> {
     let s = slot();
     // SAFETY: `s` is a valid TlsAlloc slot; TlsGetValue is safe to call from
@@ -115,6 +125,33 @@ mod tests {
         reset();
         let _g = enter().unwrap();
         assert!(enter().is_none());
+    }
+
+    /// `in_hook` must report the window without consuming it — memory_guard's
+    /// allocation hooks call it to honour the install window while keeping
+    /// their own re-entry counter. A version that entered the window would
+    /// suppress the very hook that asked.
+    #[test]
+    fn in_hook_observes_window_without_consuming_it() {
+        reset();
+        assert!(!in_hook(), "no window held");
+        let _g = enter().unwrap();
+        assert!(in_hook(), "window held");
+        // Still held after observing: the observation took nothing.
+        assert!(in_hook());
+        // And the window is genuinely still the one we hold.
+        assert!(enter().is_none());
+    }
+
+    /// Dropping the guard closes the window `in_hook` reports.
+    #[test]
+    fn in_hook_clears_after_guard_drop() {
+        reset();
+        {
+            let _g = enter().unwrap();
+            assert!(in_hook());
+        }
+        assert!(!in_hook());
     }
 
     #[test]
