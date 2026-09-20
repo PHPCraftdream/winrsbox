@@ -70,6 +70,23 @@ pub(crate) const DEFAULT_CONFIG_KTAV: &str = "\
 ## Reads pass through to the real filesystem; writes are Copy-on-Write
 ## into <state_dir>/workdir/. Add `rules` entries to deny or mock paths.
 ##
+## Network containment — OFF by default.
+##
+## Unset (the default) means the sandbox does not touch the network at all:
+## no WFP filter is registered and the `connect` hook is not installed, so a
+## sandboxed program's traffic is indistinguishable from running it directly.
+## It already connects from its own process with its own image — nothing was
+## ever proxied through winrsbox — and with no filters registered the sandbox
+## leaves no trace in the system's network configuration either.
+##
+## The trade: a sandboxed process can reach anything you can, including
+## RFC1918 hosts and SMB shares. Filesystem, registry, process and memory
+## containment are unaffected. Set `guarded` to turn on the RFC1918 / private
+## IPv6 / SMB egress filters and the per-connection netrule checks.
+## `--block-localhost` and any configured `netrule` imply `guarded`, so those
+## never sit inert.
+## network: guarded
+
 ## Verbose JSONL logging for this sandbox folder (uncomment to enable).
 ## Values: error / warn / info / trace. CLI `--log-level` overrides this
 ## if explicitly set; otherwise this value wins over the built-in `info`.

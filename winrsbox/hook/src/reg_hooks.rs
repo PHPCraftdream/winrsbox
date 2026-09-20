@@ -323,6 +323,29 @@ fn log_silent_ok_downgrade(syscall: &str, friendly_key: &str, value_name: Option
     });
 }
 
+/// Record that a deny-prefix key was opened read-only instead of refused.
+///
+/// The launcher already emitted a `RegDecide` deny for this key: it decides
+/// on the key path alone and never sees `DesiredAccess`. Without this line an
+/// investigator reading the log would conclude the call was refused, when in
+/// fact the hook forwarded it to `NtOpenKey`. Trace level — this is the
+/// normal, expected path for `dnsapi` and friends, not an incident.
+fn log_open_existing_only(friendly_key: &str, desired_access: u32) {
+    if !crate::ipc_client::is_trace() {
+        return;
+    }
+    // SAFETY: GetCurrentProcessId is always safe; no pointers involved.
+    let pid = unsafe { winapi::um::processthreadsapi::GetCurrentProcessId() };
+    let _ = crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+        pid,
+        level: ipc::LogLevel::Trace,
+        msg: format!(
+            "reg_deny_prefix_opened_read_only: key={friendly_key} \
+             da=0x{desired_access:x} (routed to NtOpenKey; no key created)",
+        ),
+    });
+}
+
 /// Log a fail-closed denial caused by inability to resolve a registry WRITE
 /// target to a friendly key path. Cheap no-op if tracing is off.
 fn log_resolve_failed(syscall: &str) {
@@ -420,16 +443,71 @@ pub(crate) fn nt_create_key_is_write_access(desired_access: u32) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CreateKeyAction {
     Proceed,
+    /// Forward to `NtOpenKey` instead of `NtCreateKey`: open the key if it
+    /// already exists, never create it. Used for a read-only mask under a
+    /// deny prefix — see [`nt_create_key_action`].
+    OpenExistingOnly,
     Deny,
 }
 
+/// What [`hook_nt_create_key`] must do for a given access mask + policy mode.
+///
+/// `Mode::Deny` + read-only mask is the interesting case. Denying it outright
+/// broke name resolution: `dnsapi` reads the DNS server list from
+/// `HKLM\System\CurrentControlSet\Services\Tcpip\Parameters` via
+/// `RegCreateKeyEx(KEY_READ)`, and that whole subtree is deny-listed because
+/// `\system\currentcontrolset\services` is a service-registration
+/// persistence vector. The result was `ENOTFOUND` for every lookup inside
+/// the sandbox — network unusable by default.
+///
+/// Simply proceeding is not an option either: `NtCreateKey` is create-or-open
+/// and CREATES the key whatever the mask says, which is the mutation the deny
+/// list exists to stop (audit 2026-09-19, Medium).
+///
+/// `OpenExistingOnly` resolves the conflict instead of trading one bug for the
+/// other: forward to `NtOpenKey`, which opens an existing key and returns
+/// `OBJECT_NAME_NOT_FOUND` rather than creating anything. Reading a
+/// persistence key is not a mutation, and a read-only handle cannot become
+/// one — any later call asking for write rights consults policy again and is
+/// denied.
 pub(crate) fn nt_create_key_action(desired_access: u32, mode: policy::Mode) -> CreateKeyAction {
     match mode {
-        policy::Mode::Deny => CreateKeyAction::Deny,
+        policy::Mode::Deny if nt_create_key_is_write_access(desired_access) => {
+            CreateKeyAction::Deny
+        }
+        policy::Mode::Deny => CreateKeyAction::OpenExistingOnly,
         policy::Mode::Cow if nt_create_key_is_write_access(desired_access) => CreateKeyAction::Deny,
         _ => CreateKeyAction::Proceed,
     }
 }
+
+/// `ntdll!NtOpenKey`. This crate does not hook it, so the pointer is the real
+/// syscall stub: calling it introduces no detour re-entry.
+type FnNtOpenKey = unsafe extern "system" fn(
+    *mut HANDLE,            // KeyHandle
+    u32,                    // DesiredAccess
+    *mut OBJECT_ATTRIBUTES, // ObjectAttributes
+) -> NTSTATUS;
+
+static NT_OPEN_KEY: OnceLock<Option<FnNtOpenKey>> = OnceLock::new();
+
+fn nt_open_key() -> Option<FnNtOpenKey> {
+    *NT_OPEN_KEY.get_or_init(|| {
+        // SAFETY: `ntdll_export` walks the loaded ntdll export directory (the
+        //         same resolution every install site here uses); the returned
+        //         address is then transmuted to NtOpenKey's documented ABI
+        //         (KeyHandle, DesiredAccess, ObjectAttributes).
+        unsafe {
+            crate::hooks::ntdll_export("NtOpenKey\0".as_bytes())
+                .map(|addr| std::mem::transmute::<usize, FnNtOpenKey>(addr as usize))
+        }
+    })
+}
+
+/// `REG_OPENED_EXISTING_KEY` — what `NtCreateKey` reports in `Disposition`
+/// when it opened rather than created. The `OpenExistingOnly` path can only
+/// ever have opened, so callers that read `Disposition` see the truth.
+const REG_OPENED_EXISTING_KEY: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Hook handlers
@@ -468,20 +546,47 @@ unsafe extern "system" fn hook_nt_create_key(
         let mode = check_write_mode(&friendly, None);
         // Mode is Clone, not Copy — clone so we can still inspect `mode`
         // below to tell the deny-policy deny apart from the Cow downgrade.
-        if let CreateKeyAction::Deny = nt_create_key_action(desired_access, mode.clone()) {
-            if matches!(mode, policy::Mode::Cow) {
-                // Deny came from the silent_ok downgrade (Cow + write-intent):
-                // log it so it shows up in violations.jsonl.
-                log_silent_ok_downgrade(
-                    &format!("NtCreateKey(da=0x{desired_access:x})"),
-                    &friendly,
-                    None,
-                );
+        match nt_create_key_action(desired_access, mode.clone()) {
+            CreateKeyAction::Deny => {
+                if matches!(mode, policy::Mode::Cow) {
+                    // Deny came from the silent_ok downgrade (Cow + write-intent):
+                    // log it so it shows up in violations.jsonl.
+                    log_silent_ok_downgrade(
+                        &format!("NtCreateKey(da=0x{desired_access:x})"),
+                        &friendly,
+                        None,
+                    );
+                }
+                if !key_handle.is_null() {
+                    *key_handle = std::ptr::null_mut();
+                }
+                return STATUS_ACCESS_DENIED;
             }
-            if !key_handle.is_null() {
-                *key_handle = std::ptr::null_mut();
+            CreateKeyAction::OpenExistingOnly => {
+                // The launcher logged this as a deny — it decides on the key
+                // path alone and cannot see the access mask. Record what
+                // actually happened so the audit trail is not a lie.
+                log_open_existing_only(&friendly, desired_access);
+                // Read-only mask under a deny prefix: open if it exists,
+                // never create. Without a resolvable NtOpenKey we cannot
+                // honour "open but do not create", so fail closed rather
+                // than fall through to the creating syscall.
+                let Some(open) = nt_open_key() else {
+                    if !key_handle.is_null() {
+                        *key_handle = std::ptr::null_mut();
+                    }
+                    return STATUS_ACCESS_DENIED;
+                };
+                // SAFETY: same out-handle / ObjectAttributes the caller
+                //         passed to NtCreateKey; NtOpenKey takes the identical
+                //         first three parameters.
+                let status = open(key_handle, desired_access, object_attributes);
+                if status >= 0 && !disposition.is_null() {
+                    *disposition = REG_OPENED_EXISTING_KEY;
+                }
+                return status;
             }
-            return STATUS_ACCESS_DENIED;
+            CreateKeyAction::Proceed => {}
         }
     } else {
         // Audit CRITICAL fix: a None here previously fell through to
@@ -1464,21 +1569,51 @@ mod tests {
     // created-vs-opened after the key already exists — the decision has to
     // happen before the call.
 
+    /// A read-only mask under a deny prefix must neither create the key (the
+    /// audit finding) nor be refused outright (which broke DNS). It is
+    /// routed to `NtOpenKey`: existing key opens, missing key returns
+    /// OBJECT_NAME_NOT_FOUND, nothing is ever created.
     #[test]
-    fn create_key_deny_prefix_denied_even_with_key_read() {
+    fn create_key_deny_prefix_read_only_opens_without_creating() {
         use access_masks::*;
-        // The audit repro shape: create-or-open with KEY_READ against a
-        // deny rule. Old behaviour: early-bypass → key created for real.
         assert_eq!(
             nt_create_key_action(KEY_READ, policy::Mode::Deny),
-            CreateKeyAction::Deny,
+            CreateKeyAction::OpenExistingOnly,
         );
         assert_eq!(
             nt_create_key_action(KEY_QUERY_VALUE, policy::Mode::Deny),
-            CreateKeyAction::Deny,
+            CreateKeyAction::OpenExistingOnly,
         );
         assert_eq!(
             nt_create_key_action(0, policy::Mode::Deny),
+            CreateKeyAction::OpenExistingOnly,
+        );
+        // The property the audit cared about is still held: whatever this
+        // path does, it is never the creating syscall.
+        assert_ne!(
+            nt_create_key_action(KEY_READ, policy::Mode::Deny),
+            CreateKeyAction::Proceed,
+        );
+    }
+
+    /// The concrete regression: `dnsapi` reads the DNS server list from
+    /// `…\Services\Tcpip\Parameters` with `RegCreateKeyEx(KEY_READ)`, and
+    /// that subtree is deny-listed as a service-registration vector.
+    /// Refusing it made every lookup inside the sandbox return ENOTFOUND.
+    #[test]
+    fn dns_configuration_key_is_readable_under_the_services_deny() {
+        use access_masks::*;
+        // Exactly the masks RegCreateKeyEx(KEY_READ) and RegOpenKeyEx use.
+        for mask in [KEY_READ, KEY_QUERY_VALUE] {
+            assert_eq!(
+                nt_create_key_action(mask, policy::Mode::Deny),
+                CreateKeyAction::OpenExistingOnly,
+                "read-only mask 0x{mask:x} must stay readable or DNS breaks",
+            );
+        }
+        // …while registering a service under the same prefix stays denied.
+        assert_eq!(
+            nt_create_key_action(KEY_WRITE, policy::Mode::Deny),
             CreateKeyAction::Deny,
         );
     }

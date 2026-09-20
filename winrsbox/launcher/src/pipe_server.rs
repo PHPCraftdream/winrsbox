@@ -1765,7 +1765,14 @@ fn handle_connection(
                     && is_env_value_allowed(value_name.as_deref());
 
                 let (mode, value_json) = if write && is_persistence && !env_allowed {
-                    eprintln!("[reg] DENY {key_path} value={value_name:?}");
+                    // Console only on request — the JSONL `reg_decide` event a
+                    // few lines below is the permanent record. A deny-listed
+                    // key touched in a loop (dnsapi re-reads Tcpip\Parameters)
+                    // produced hundreds of identical lines over the guest's
+                    // own output.
+                    if jsonl_log::console_verbose() {
+                        eprintln!("[reg] DENY {key_path} value={value_name:?}");
+                    }
                     (policy::Mode::Deny, None)
                 } else {
                     // Layer 2 (DB-backed + overlay merge): RegistryPolicy consults

@@ -129,12 +129,33 @@ work — they are listed here so an upgrade is not a surprise.
   undo that — which is out of scope above, along with every other
   already-elevated escape.
 
+## Network containment is off by default
+
+**Out of the box winrsbox does not contain the network.** Unless the
+per-folder `sandbox.ktav` says `network: guarded`, no WFP filter is
+registered and the `connect` hook is not installed. A sandboxed process can
+therefore reach anything the invoking user can reach, including RFC1918 hosts
+and SMB shares. Filesystem, registry, process and memory containment are
+unaffected by this setting.
+
+This is a deliberate default, not an oversight. With it off, a sandboxed
+program's traffic is indistinguishable from running that program directly:
+the hook never proxied anything — it only ever allowed or refused, and the
+connection is made by the guest's own process under its own image — and with
+no filters registered the sandbox leaves no trace in the system's network
+configuration. Turning it on is one line in the ktav; `--block-localhost` and
+any configured `netrule` imply it, so a configured rule never sits inert.
+
+If you are running genuinely untrusted code and care about lateral movement,
+set `network: guarded`. The rest of this section describes what you get when
+you do.
+
 ## What the kernel network filters do and do not cover
 
-winrsbox installs WFP filters (RFC1918 and private-IPv6 egress, SMB ports
-445/139) that the kernel enforces, so a direct syscall cannot bypass them.
-Their scope is narrower than "the sandbox", and the boundary is worth stating
-because it is invisible at runtime:
+With `network: guarded`, winrsbox installs WFP filters (RFC1918 and
+private-IPv6 egress, SMB ports 445/139) that the kernel enforces, so a direct
+syscall cannot bypass them. Their scope is narrower than "the sandbox", and
+the boundary is worth stating because it is invisible at runtime:
 
 - **Every filter is bound to one image** via `FWPM_CONDITION_ALE_APP_ID`, an
   exact match on the NT device path of the process image. A filter whose app

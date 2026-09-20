@@ -132,6 +132,16 @@ struct Cli {
     #[arg(long = "trace")]
     trace: bool,
 
+    /// Print sandbox diagnostics to the console.
+    ///
+    /// Off by default: the console belongs to the sandboxed program, and a
+    /// run that emits hundreds of `[reg] DENY` lines buries its output. This
+    /// changes NOTHING about what is recorded — every gated message is
+    /// written to `sandbox.log.jsonl` either way, so the audit trail is the
+    /// same whether or not you pass this. `--trace` implies it.
+    #[arg(short = 'v', long = "verbose")]
+    verbose: bool,
+
     /// JSONL log verbosity: error (violations only), warn (denies), info
     /// (default), trace (all decides + every hook log). Lower levels include
     /// higher ones. Precedence: this CLI flag > `log_level: ...` in the
@@ -255,6 +265,29 @@ fn is_nested_invocation() -> bool {
 /// assert every argument survives the handoff — a regression where only the
 /// executable reached the child (e.g. dropping `target[1..]`) would otherwise
 /// silently turn `cmd.exe /c "echo X"` into an interactive `cmd.exe`.
+/// The hook categories to disable, given the operator's `--disable-hooks` and
+/// whether network containment is on.
+///
+/// Network off means the `connect` detour is never installed, so the guest's
+/// socket path is byte-for-byte the unsandboxed one and nothing in the system
+/// attributes its traffic to winrsbox. Reusing the existing disable-hooks
+/// channel rather than adding a second switch keeps one mechanism to reason
+/// about — and makes the composition testable, which matters because a
+/// mistake here fails silently: the hook would simply install and start
+/// enforcing (or not) with no error anywhere.
+fn disable_hooks_categories(cli_categories: Option<&str>, net_guarded: bool) -> String {
+    let mut cats: Vec<String> = cli_categories
+        .unwrap_or_default()
+        .split(',')
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if !net_guarded && !cats.iter().any(|c| c == "net") {
+        cats.push("net".to_string());
+    }
+    cats.join(",")
+}
+
 fn build_delegation_command(target: &[String]) -> std::process::Command {
     // clap's `target` field has `required_unless_present = "init"`, and we
     // only enter the nested branch when `!cli.target.is_empty()`, so
@@ -567,10 +600,28 @@ async fn run() -> Result<()> {
     // and avoids plumbing a Config getter through Policy. ktav fields that
     // policy didn't recognise are ignored on its side; ours are ignored on
     // its side too — both views deserialize the same file independently.
-    let ktav_log_level: Option<String> = std::fs::read_to_string(&cfg_path)
+    let ktav_cfg: Option<policy::db::Config> = std::fs::read_to_string(&cfg_path)
         .ok()
-        .and_then(|src| ktav::from_str::<policy::db::Config>(&src).ok())
-        .and_then(|c| c.log_level);
+        .and_then(|src| ktav::from_str::<policy::db::Config>(&src).ok());
+    let ktav_log_level: Option<String> = ktav_cfg.as_ref().and_then(|c| c.log_level.clone());
+
+    // Network containment is OFF unless the ktav says `network: guarded`.
+    // Off means the sandbox does not touch the network at all: no WFP filter
+    // is registered and the `connect` hook is not installed, so a sandboxed
+    // program's traffic is indistinguishable from running it directly — it
+    // already connects from its own process with its own image (nothing was
+    // ever proxied through the launcher), and with no filters registered the
+    // sandbox leaves no trace in the system's network configuration either.
+    //
+    // The CLI network flags imply it rather than silently doing nothing: a
+    // `--block-localhost` that quietly had no effect is the same class of
+    // silent failure as the unscoped WFP filters fixed earlier today.
+    let net_guarded = ktav_cfg.as_ref().map(|c| c.network_guarded()).unwrap_or(false)
+        || cli.block_localhost
+        // Configured network rules imply it too. Leaving them inert would be
+        // the worst outcome: an operator who ran `winrsbox netrule add` sees
+        // rules in `netrule list` and reasonably believes they are enforced.
+        || policy::db::net_rule_list(&policy.db()).map(|r| !r.is_empty()).unwrap_or(false);
     // `--trace` is a blanket "show me everything" switch: it also raises the
     // JSONL/console verbosity to trace, on top of the FS_SANDBOX_TRACE gate
     // it sets for hook.dll below. Without this, `--trace` would enable
@@ -588,6 +639,12 @@ async fn run() -> Result<()> {
         cfg_path.parent().unwrap().join("sandbox.log.jsonl"),
         &effective_log_level,
     );
+    // Console diagnostics are opt-in and deliberately independent of the FILE
+    // log level: `log_level: trace` in the ktav gives a full on-disk audit
+    // trail without turning the terminal into a firehose. `--trace` still
+    // implies console output, since it is documented as the blanket
+    // show-me-everything switch.
+    jsonl_log::set_console_log(cli.verbose || cli.trace);
 
     // Hot-stats: aggregates access patterns, flushed to disk at most once per 5s.
     let hot_stats = HotStats::new();
@@ -673,8 +730,13 @@ async fn run() -> Result<()> {
     if cli.allow_rwx {
         std::env::set_var("FS_SANDBOX_ALLOW_RWX", "1");
     }
-    if let Some(ref cats) = cli.disable_hooks {
-        std::env::set_var("FS_SANDBOX_DISABLE_HOOKS", cats);
+    // Network containment off → tell the hook to skip the `net` category, so
+    // `connect` is never detoured and the guest's socket path is byte-for-byte
+    // the unsandboxed one. Reuses the existing, already-tested disable-hooks
+    // mechanism rather than inventing a second switch.
+    let disable_hooks_effective = disable_hooks_categories(cli.disable_hooks.as_deref(), net_guarded);
+    if !disable_hooks_effective.is_empty() {
+        std::env::set_var("FS_SANDBOX_DISABLE_HOOKS", &disable_hooks_effective);
     }
     // Hook-side trace gate. Triggered by EITHER the explicit `--trace` CLI
     // flag, OR an `effective_log_level == "trace"` (from CLI `--log-level` or
@@ -724,7 +786,7 @@ async fn run() -> Result<()> {
             GuardLevel::Static => "static".into(),
         },
         allow_rwx: cli.allow_rwx,
-        disable_hooks: cli.disable_hooks.clone().unwrap_or_default(),
+        disable_hooks: disable_hooks_effective.clone(),
     };
     let (_session_section, section_name) = winrsbox::session_section::publish(&session_cfg)
         .context("publish session config section")?;
@@ -777,10 +839,12 @@ async fn run() -> Result<()> {
         };
         // stderr for the same reason as the exit summary below: launcher
         // diagnostics must not land in the target's stdout.
-        eprintln!(
-            "[sandbox] guard: static (hard containment) — {}{mitigation_note}",
-            winrsbox::trust::advisory_notice(&trust)
-        );
+        if jsonl_log::console_verbose() {
+            eprintln!(
+                "[sandbox] guard: static (hard containment) — {}{mitigation_note}",
+                winrsbox::trust::advisory_notice(&trust)
+            );
+        }
     }
 
     // Before the target exists: Ctrl+C in a shared console reaches the
@@ -873,7 +937,9 @@ async fn run() -> Result<()> {
             e == "bat" || e == "cmd"
         })
         .unwrap_or(false);
-    if target_is_script && cli.guard != GuardLevel::None {
+    if net_guarded && target_is_script && cli.guard != GuardLevel::None
+        && jsonl_log::console_verbose()
+    {
         eprintln!(
             "[sandbox] WFP: no kernel network filters for a .bat/.cmd target — the root \
              process is cmd.exe, so APP_ID scoping cannot bind to '{}'. Hook-level network \
@@ -881,7 +947,10 @@ async fn run() -> Result<()> {
             target_args[0],
         );
     }
-    let _wfp = if cli.guard != GuardLevel::None && !target_is_script {
+    // `net_guarded` first: with network containment off the engine is never
+    // opened, so not one `winrsbox-block-*` filter is registered and the
+    // sandbox leaves no trace in the system's network configuration.
+    let _wfp = if net_guarded && cli.guard != GuardLevel::None && !target_is_script {
         match winrsbox::wfp::WfpEngine::open() {
             Ok(mut engine) => {
                 let target_path = std::path::Path::new(&target_args[0]);
@@ -1098,7 +1167,9 @@ async fn run() -> Result<()> {
     // stderr, not stdout: this is the launcher talking about itself, and the
     // target's stdout belongs to the target. On stdout it corrupted every
     // piped or redirected run — `winrsbox cx > out.txt` ended with a sandbox
-    // summary glued to the program's own output.
+    // summary glued to the program's own output. Opt-in as well: the same
+    // numbers are in the JSONL `exit` event written a few lines below.
+    if jsonl_log::console_verbose() {
     eprintln!(
         "\n[sandbox] exit={exit_code}  decide={} redirect={} deny={} mock={} cow={} violations={viol} etw={etw_sandbox}/{etw_total}",
         s.decide.load(Ordering::Relaxed),
@@ -1107,6 +1178,7 @@ async fn run() -> Result<()> {
         s.mock_.load(Ordering::Relaxed),
         s.cow.load(Ordering::Relaxed),
     );
+    }
 
     // Final logs and stats
     jsonl_log::log_immediate(jsonl_log::Event::exit(
@@ -1121,6 +1193,41 @@ async fn run() -> Result<()> {
     // The pipe-accept loop keeps a spawn_blocking thread blocked on ConnectNamedPipe;
     // if we let the runtime drop normally it waits 30 s for that thread to finish.
     std::process::exit(exit_code as i32);
+}
+
+#[cfg(test)]
+mod network_opt_in_tests {
+    use super::disable_hooks_categories;
+
+    /// Network containment is off by default, and "off" has to reach the
+    /// hook — otherwise the `connect` detour installs anyway and the guest's
+    /// traffic is no longer indistinguishable from running it unsandboxed.
+    #[test]
+    fn net_hook_is_disabled_when_network_is_not_guarded() {
+        assert_eq!(disable_hooks_categories(None, false), "net");
+        assert_eq!(disable_hooks_categories(Some(""), false), "net");
+    }
+
+    /// With guarding on, nothing is added — the detour installs.
+    #[test]
+    fn net_hook_stays_enabled_when_guarded() {
+        assert_eq!(disable_hooks_categories(None, true), "");
+        assert_eq!(disable_hooks_categories(Some("reg"), true), "reg");
+    }
+
+    /// The operator's own `--disable-hooks` list survives, and `net` is not
+    /// duplicated when they already asked for it.
+    #[test]
+    fn operator_categories_are_preserved_and_net_not_duplicated() {
+        assert_eq!(disable_hooks_categories(Some("reg,ui"), false), "reg,ui,net");
+        assert_eq!(disable_hooks_categories(Some("net"), false), "net");
+        assert_eq!(disable_hooks_categories(Some("net,reg"), false), "net,reg");
+        // Whitespace and case in the operator's list must not defeat the
+        // duplicate check.
+        assert_eq!(disable_hooks_categories(Some(" NET , reg "), false), "net,reg");
+        // Empty entries from sloppy input are dropped rather than passed on.
+        assert_eq!(disable_hooks_categories(Some("reg,,"), true), "reg");
+    }
 }
 
 #[cfg(test)]

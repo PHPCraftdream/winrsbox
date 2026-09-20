@@ -65,6 +65,34 @@ pub struct Config {
     /// Values: error / warn / info / trace. Defaults to "info" if unset.
     #[serde(default)]
     pub log_level: Option<String>,
+    /// Network containment. `guarded` turns it on; anything else (including
+    /// the default, unset) means the sandbox does not touch the network at
+    /// all — no WFP filters are registered and the `connect` hook is not
+    /// installed.
+    ///
+    /// Off by default on purpose. When it is off, a sandboxed program's
+    /// traffic is indistinguishable from running that program directly: it
+    /// already connects from its own process with its own image (the hook
+    /// never proxied anything), and with no filters registered the sandbox
+    /// leaves no trace in the system's network configuration either.
+    ///
+    /// The trade is explicit and documented in SECURITY.md: with this unset,
+    /// a sandboxed process can reach anything the user can, including RFC1918
+    /// hosts and SMB shares. Filesystem, registry, process and memory
+    /// containment are unaffected.
+    #[serde(default)]
+    pub network: Option<String>,
+}
+
+impl Config {
+    /// True when `network: guarded` is set. Compared ASCII-case-insensitively;
+    /// every other value, including absent, means "do not touch the network".
+    pub fn network_guarded(&self) -> bool {
+        self.network
+            .as_deref()
+            .map(|v| v.trim().eq_ignore_ascii_case("guarded"))
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -888,6 +916,7 @@ rules: [
             mocks: vec![],
             mock_dirs: vec![],
             log_level: None,
+            network: None,
         };
         apply_config(&db, &cfg1).unwrap();
 
@@ -898,6 +927,7 @@ rules: [
             mocks: vec![],
             mock_dirs: vec![],
             log_level: None,
+            network: None,
         };
         apply_config(&db, &cfg2).unwrap();
 
@@ -933,6 +963,7 @@ rules: [
             mocks: vec![MockEntry { path: r"c:\mock.txt".into(), content_inline: Some("hello".into()) }],
             mock_dirs: vec![],
             log_level: None,
+            network: None,
         };
         apply_config(&db, &cfg).unwrap();
 
@@ -1129,6 +1160,7 @@ rules: [
             mocks: vec![],
             mock_dirs: vec![],
             log_level: None,
+            network: None,
         };
         apply_config(&db, &cfg).unwrap();
 

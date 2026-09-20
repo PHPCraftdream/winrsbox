@@ -42,14 +42,29 @@ fn level_enabled(level: LogLevel) -> bool {
     level as u8 <= LOG_LEVEL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Whether routine per-event console chatter (hello/child/spawn_attempt/...)
-/// should print to stdout. These events always persist to the JSONL
-/// regardless — this only gates the human-facing console, which stays quiet
-/// by default so it doesn't drown out the sandboxed target's own output.
-/// Mirrors the file log level: only `trace` (`--trace` / `--log-level
-/// trace`) turns it on.
+static CONSOLE_LOG: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Turn human-facing console diagnostics on. Set once from the CLI.
+pub fn set_console_log(on: bool) {
+    CONSOLE_LOG.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether sandbox diagnostics should be printed to the console.
+///
+/// Off by default, and deliberately decoupled from the FILE log level. The
+/// console belongs to the sandboxed program: a run that emits hundreds of
+/// `[reg] DENY` lines buries the program's own output and makes the sandbox
+/// unusable for anything interactive. Everything gated by this still goes to
+/// `sandbox.log.jsonl` unconditionally, so quiet is not the same as blind —
+/// gate a message here only when the JSONL already records it.
+///
+/// `--verbose` turns it on. `--trace` does too, because it is documented as
+/// the blanket "show me everything" switch; a `log_level: trace` in the ktav
+/// does NOT, so a persistent file-level audit trail no longer drags console
+/// spam along with it.
 pub fn console_verbose() -> bool {
-    level_enabled(LogLevel::Trace)
+    CONSOLE_LOG.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn log(event: Event) {
