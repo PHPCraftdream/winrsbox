@@ -1065,49 +1065,82 @@ fn strip_nt_dos_prefix(lower: &str) -> Option<&str> {
     None
 }
 
-/// Returns Some(STATUS_ACCESS_DENIED) if the raw NT path in `attrs` targets
-/// a device the sandbox must not open in the requested direction:
+/// What the device classification says about an open whose path the policy
+/// pipeline could not resolve to a DOS path.
+///
+/// Three-valued on purpose. The caller's fail-closed rule for an unresolvable
+/// write ("deny — it would reach the real disk outside the overlay") is right
+/// for filesystem-shaped targets and wrong for devices that have no
+/// filesystem behind them at all. Collapsing `PassThrough` into "no verdict"
+/// is what denied every named-pipe and console open carrying write access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeviceVerdict {
+    /// Refuse the open outright, in either direction.
+    Deny(NTSTATUS),
+    /// A non-filesystem device the sandbox deliberately passes through:
+    /// named pipes, sockets, the console and NUL. A write to one of these
+    /// cannot reach the real filesystem, so the caller's dead-end write deny
+    /// must NOT apply. This is what `CreatePipe`, `child_process.spawn` and
+    /// every console TTY open depend on.
+    PassThrough,
+    /// No device verdict — either not a device path at all, or a filesystem
+    /// volume device (`\Device\HarddiskVolumeN\…`), which is exactly the raw
+    /// form the dead-end deny exists to stop. The caller's own rules apply.
+    Unhandled,
+}
+
+/// Classify the raw NT path in `attrs` for an open in the requested direction:
 /// - hard blocks (shadowcopy, physicaldrive, raw harddisk, dangerous pipe,
-///   credential surfaces) — denied regardless of direction;
+///   credential surfaces) — `Deny` regardless of direction;
 /// - UNC/network-redirector targets (`DeviceKind::NetworkPath`, P0-03) and
-///   unrecognized system devices (`DeviceKind::SystemQuery`) — denied when
+///   unrecognized system devices (`DeviceKind::SystemQuery`) — `Deny` when
 ///   `write` is set. A write here would reach the real disk/volume/share
 ///   outside the CoW overlay with no `decide()` call; reads keep the
 ///   documented pass-through ("reads outside project_root hit the real
-///   disk").
-/// None otherwise → caller may call the original Nt* function.
+///   disk");
+/// - named pipes, sockets, console and NUL — `PassThrough` in both
+///   directions;
+/// - volume devices and non-device paths — `Unhandled`.
 ///
 /// SAFETY: `attrs` must be valid per NT calling convention.
-pub(crate) unsafe fn check_device_block(
+pub(crate) unsafe fn classify_device_open(
     attrs: *const OBJECT_ATTRIBUTES,
     write: bool,
-) -> Option<NTSTATUS> {
-    let dev_path = extract_raw_nt_path(attrs)?;
+) -> DeviceVerdict {
+    let Some(dev_path) = extract_raw_nt_path(attrs) else {
+        return DeviceVerdict::Unhandled;
+    };
     let utf16: Vec<u16> = dev_path.encode_utf16().collect();
-    let device = policy::dev::nt_to_device_path(&utf16)?;
+    let Some(device) = policy::dev::nt_to_device_path(&utf16) else {
+        return DeviceVerdict::Unhandled;
+    };
     let kind = policy::dev::classify_device(&device);
     // Exhaustive on DeviceKind — a future variant must decide explicitly
     // here rather than silently inherit "carry on".
-    let deny = match kind {
-        policy::dev::DeviceKind::Unknown => true,
-        policy::dev::DeviceKind::NetworkPath | policy::dev::DeviceKind::SystemQuery => write,
-        policy::dev::DeviceKind::HarddiskVolume
-        | policy::dev::DeviceKind::NamedPipe
+    let verdict = match kind {
+        policy::dev::DeviceKind::Unknown => DeviceVerdict::Deny(STATUS_ACCESS_DENIED),
+        policy::dev::DeviceKind::NetworkPath | policy::dev::DeviceKind::SystemQuery => {
+            if write {
+                DeviceVerdict::Deny(STATUS_ACCESS_DENIED)
+            } else {
+                DeviceVerdict::Unhandled
+            }
+        }
+        policy::dev::DeviceKind::NamedPipe
         | policy::dev::DeviceKind::Socket
         | policy::dev::DeviceKind::Console
-        | policy::dev::DeviceKind::Null => false,
+        | policy::dev::DeviceKind::Null => DeviceVerdict::PassThrough,
+        // A volume device is filesystem-shaped: it must stay subject to the
+        // caller's dead-end deny, which is the whole point of that rule.
+        policy::dev::DeviceKind::HarddiskVolume => DeviceVerdict::Unhandled,
     };
-    if deny {
-        if is_trace() {
-            ipc_log(
-                ipc::LogLevel::Trace,
-                format!("DENY device: {dev_path} kind={kind:?} write={write}"),
-            );
-        }
-        Some(STATUS_ACCESS_DENIED)
-    } else {
-        None
+    if matches!(verdict, DeviceVerdict::Deny(_)) && is_trace() {
+        ipc_log(
+            ipc::LogLevel::Trace,
+            format!("DENY device: {dev_path} kind={kind:?} write={write}"),
+        );
     }
+    verdict
 }
 
 /// Returns true if the path in `attrs` refers to a filesystem volume device
@@ -1206,14 +1239,38 @@ pub(crate) fn prepare_overlay(decision: &Decision) -> Option<String> {
     // Launcher-published roots: per-drive list first, legacy single root as
     // fallback (same resolution as every other overlay-root consumer in this
     // crate). Both are launcher-authored. Empty → fail closed below.
-    let roots: Vec<&str> = match crate::ipc_client::OVERLAY_ROOTS.get() {
-        Some(list) if !list.is_empty() => list.iter().map(|s| s.as_str()).collect(),
-        _ => match SANDBOX_ROOT.get() {
-            Some(s) => vec![s.as_str()],
-            None => Vec::new(),
-        },
-    };
+    let roots_lower = overlay_roots_lower(
+        crate::ipc_client::OVERLAY_ROOTS.get(),
+        SANDBOX_ROOT.get().map(|s| s.as_str()),
+    );
+    let roots: Vec<&str> = roots_lower.iter().map(|s| s.as_str()).collect();
     prepare_overlay_in_roots(decision, &roots)
+}
+
+/// Resolve the allowed overlay roots and ASCII-fold them.
+///
+/// The fold is not cosmetic. The launcher publishes each root with its
+/// on-disk case (`D:\dev\…`), while `prepare_overlay_in_roots` compares a
+/// destination that has already been lowercased. Without folding the root,
+/// `d:\…` never prefix-matched `D:\…`, so EVERY copy-on-write write outside
+/// `project_root` was refused with STATUS_ACCESS_DENIED — on any volume whose
+/// path is not already lowercase, which is the normal case. The sandbox's
+/// core feature was inoperative and the failure was silent apart from a
+/// `prepare_overlay_reject` line.
+///
+/// Every other consumer of `OVERLAY_ROOTS` in this crate already folds the
+/// root locally for the same reason (`is_overlay_root_ancestor`,
+/// `is_self_overlay_workdir_access`, the unmirror helper in
+/// `overlay_to_virtual_dos`). Split out as a pure function so the fold is
+/// testable without the OnceLock globals.
+fn overlay_roots_lower(published: Option<&Vec<String>>, sandbox_root: Option<&str>) -> Vec<String> {
+    match published {
+        Some(list) if !list.is_empty() => list.iter().map(|s| s.to_ascii_lowercase()).collect(),
+        // Legacy single-root fallback.
+        _ => sandbox_root
+            .map(|s| vec![s.to_ascii_lowercase()])
+            .unwrap_or_default(),
+    }
 }
 
 /// Core of `prepare_overlay` with the allowed roots injected (test seam — the
@@ -2977,6 +3034,59 @@ mod tests {
         // Empty root list / empty destination fail closed.
         assert!(!overlay_dest_in_roots(r"c:\state\workdir\f.txt", &[]));
         assert!(!overlay_dest_in_roots("", &roots));
+    }
+
+    /// Regression: the launcher publishes overlay roots with their on-disk
+    /// case, and `prepare_overlay_in_roots` compares an already-lowercased
+    /// destination. Without folding the root, `d:\…` never prefix-matched
+    /// `D:\…` and EVERY CoW write outside `project_root` was refused —
+    /// observed as `EPERM` in the guest plus a `prepare_overlay_reject` line
+    /// naming a destination that was plainly inside the root.
+    ///
+    /// The test above could not catch this: it hands `overlay_dest_in_roots`
+    /// a root that is already lowercase, so it never exercises the fold.
+    #[test]
+    fn overlay_roots_are_case_folded_before_matching() {
+        let published = vec![
+            r"D:\dev\rust\winrsbox\.winrsbox\proj\workdir".to_string(),
+            r"C:\Users\Someone\AppData\Local\.winrsbox\proj\workdir".to_string(),
+        ];
+        let folded = overlay_roots_lower(Some(&published), None);
+        assert_eq!(folded[0], r"d:\dev\rust\winrsbox\.winrsbox\proj\workdir");
+        assert_eq!(folded[1], r"c:\users\someone\appdata\local\.winrsbox\proj\workdir");
+
+        // The whole point: a lowercased destination under a mixed-case root
+        // must be accepted.
+        let roots: Vec<&str> = folded.iter().map(|s| s.as_str()).collect();
+        assert!(overlay_dest_in_roots(
+            r"d:\dev\rust\winrsbox\.winrsbox\proj\workdir\dev\project\out.txt",
+            &roots,
+        ));
+        assert!(overlay_dest_in_roots(
+            r"c:\users\someone\appdata\local\.winrsbox\proj\workdir\windows\f.txt",
+            &roots,
+        ));
+        // Folding must not weaken the sibling-lookalike refusal.
+        assert!(!overlay_dest_in_roots(
+            r"d:\dev\rust\winrsbox\.winrsbox\proj\workdirevil\out.txt",
+            &roots,
+        ));
+    }
+
+    /// The legacy single-root fallback is folded too, and an absent root
+    /// list stays empty so `prepare_overlay_in_roots` fails closed.
+    #[test]
+    fn overlay_roots_fallback_is_folded_and_empty_stays_empty() {
+        assert_eq!(
+            overlay_roots_lower(None, Some(r"D:\Proj\.winrsbox\S\workdir")),
+            vec![r"d:\proj\.winrsbox\s\workdir".to_string()],
+        );
+        // An empty published list falls back rather than yielding an empty root.
+        assert_eq!(
+            overlay_roots_lower(Some(&vec![]), Some(r"D:\Proj\W")),
+            vec![r"d:\proj\w".to_string()],
+        );
+        assert!(overlay_roots_lower(None, None).is_empty());
     }
 
     // ── path-normalization tests ────────────────────────────────────────────

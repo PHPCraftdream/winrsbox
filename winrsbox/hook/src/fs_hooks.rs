@@ -13,7 +13,7 @@ use policy::Mode;
 use crate::anti_rec;
 use crate::hooked_attrs::HookedAttrs;
 use crate::hooks::{
-    check_path_traversal, check_device_block, decide, resolve_for_hook,
+    check_path_traversal, classify_device_open, DeviceVerdict, decide, resolve_for_hook,
     is_write_access, materialize_mock_overlay,
     prepare_overlay, set_io_status, ipc_record_overlay, ipc_record_overlay_case,
     extract_nt_basename, nt_call_original,
@@ -217,11 +217,15 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
         // and the CoW overlay entirely (UNC shares, raw device namespaces).
         let write_intent =
             dead_end_write_intent(desired_access, Some(create_disposition), create_options);
-        if let Some(status) = check_device_block(object_attributes as *const _, write_intent) {
+        let device = classify_device_open(object_attributes as *const _, write_intent);
+        if let DeviceVerdict::Deny(status) = device {
             set_io_status(io_status_block, status);
             return status;
         }
-        if write_intent {
+        // A named pipe / socket / console / NUL open has no filesystem behind
+        // it, so the dead-end write deny below must not apply: denying it is
+        // what broke `CreatePipe`, `child_process.spawn` and every TTY open.
+        if write_intent && device != DeviceVerdict::PassThrough {
             if is_trace() {
                 // Keep the sharper forensic label for raw volume-device targets.
                 let kind = if crate::hooks::is_fs_device_path(object_attributes as *const _) {
@@ -606,11 +610,13 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
     let Some((dos, pre_resolved)) = resolve_for_hook(object_attributes as *const _) else {
         // Fail closed (P0-03) — same contract as the NtCreateFile dead-end.
         let write_intent = dead_end_write_intent(desired_access, None, open_options);
-        if let Some(status) = check_device_block(object_attributes as *const _, write_intent) {
+        let device = classify_device_open(object_attributes as *const _, write_intent);
+        if let DeviceVerdict::Deny(status) = device {
             set_io_status(io_status_block, status);
             return status;
         }
-        if write_intent {
+        // Non-filesystem devices pass through — see the NtCreateFile twin.
+        if write_intent && device != DeviceVerdict::PassThrough {
             if is_trace() {
                 let kind = if crate::hooks::is_fs_device_path(object_attributes as *const _) {
                     "device_volume"
@@ -1260,8 +1266,8 @@ pub(crate)")
         assert!(!dead_end_write_intent(0, None, 0));
     }
 
-    /// Calls `check_device_block` on an NT path; returns its verdict.
-    fn device_block_for(path: &str, write: bool) -> Option<NTSTATUS> {
+    /// Calls `classify_device_open` on an NT path; returns its verdict.
+    fn device_block_for(path: &str, write: bool) -> DeviceVerdict {
         use ntapi::winapi::shared::ntdef::UNICODE_STRING;
         let buf: Vec<u16> = path.encode_utf16().collect();
         let len_bytes = (buf.len() * 2) as u16;
@@ -1279,8 +1285,10 @@ pub(crate)")
             SecurityQualityOfService: std::ptr::null_mut(),
         };
         // SAFETY: us/oa/buf are valid locals for the duration of the call.
-        unsafe { crate::hooks::check_device_block(&oa as *const OBJECT_ATTRIBUTES, write) }
+        unsafe { crate::hooks::classify_device_open(&oa as *const OBJECT_ATTRIBUTES, write) }
     }
+
+    const DENIED: DeviceVerdict = DeviceVerdict::Deny(STATUS_ACCESS_DENIED);
 
     #[test]
     fn check_device_block_denies_unc_write() {
@@ -1289,41 +1297,89 @@ pub(crate)")
         // redirector, outside the CoW overlay.
         assert_eq!(
             device_block_for(r"\??\UNC\localhost\c$\Users\Public\evil.exe", true),
-            Some(STATUS_ACCESS_DENIED)
+            DENIED
         );
         // Raw Win32 UNC spelling classifies the same.
         assert_eq!(
             device_block_for(r"\\localhost\c$\Users\Public\evil.exe", true),
-            Some(STATUS_ACCESS_DENIED)
+            DENIED
         );
     }
 
     #[test]
     fn check_device_block_allows_unc_read() {
-        // Reads keep the documented pass-through behaviour.
+        // Reads keep the documented pass-through behaviour. `Unhandled`, not
+        // `PassThrough`: a UNC read is still a filesystem read and the
+        // caller's own logic owns it.
         assert_eq!(
             device_block_for(r"\??\UNC\localhost\c$\Users\Public\evil.exe", false),
-            None
+            DeviceVerdict::Unhandled
         );
     }
 
     #[test]
     fn check_device_block_enforces_systemquery_write_deny() {
         // The SystemQuery contract is "read OK, write denied" — CldFlt is the
-        // canonical SystemQuery member. Before the P0-03 fix this returned
-        // None (carry on) for writes too.
-        assert_eq!(device_block_for(r"\device\cldflt", true), Some(STATUS_ACCESS_DENIED));
-        assert_eq!(device_block_for(r"\device\cldflt", false), None);
+        // canonical SystemQuery member. Before the P0-03 fix this carried on
+        // for writes too.
+        assert_eq!(device_block_for(r"\device\cldflt", true), DENIED);
+        assert_eq!(device_block_for(r"\device\cldflt", false), DeviceVerdict::Unhandled);
     }
 
     #[test]
     fn check_device_block_keeps_hard_blocks_and_volume_reads() {
         // Hard blocks deny regardless of direction.
-        assert_eq!(
-            device_block_for(r"\device\physicaldrive0", false),
-            Some(STATUS_ACCESS_DENIED)
-        );
+        assert_eq!(device_block_for(r"\device\physicaldrive0", false), DENIED);
         // Ordinary volume reads still pass the device gate.
-        assert_eq!(device_block_for(r"\device\harddiskvolume2\foo", false), None);
+        assert_eq!(
+            device_block_for(r"\device\harddiskvolume2\foo", false),
+            DeviceVerdict::Unhandled
+        );
+    }
+
+    /// A volume device must NOT become `PassThrough`: the dead-end write deny
+    /// is exactly what stops `\Device\HarddiskVolumeN\…` writes from reaching
+    /// the real disk without a `decide()` call.
+    #[test]
+    fn volume_device_write_stays_subject_to_dead_end_deny() {
+        assert_eq!(
+            device_block_for(r"\device\harddiskvolume2\foo", true),
+            DeviceVerdict::Unhandled
+        );
+    }
+
+    /// Regression: every one of these carries write access and resolves to no
+    /// DOS path, so the dead-end deny used to refuse it — which took out
+    /// `CreatePipe`, `child_process.spawn` and every console TTY open, at
+    /// EVERY guard level including `none`. Observed as
+    /// `spawnSync ... EPERM` from node with `fs_block_unresolved_write` in the
+    /// trace. None of these has a filesystem behind it.
+    #[test]
+    fn non_filesystem_devices_pass_through_writes() {
+        // libuv's own pipe naming, verbatim from the failing trace.
+        assert_eq!(
+            device_block_for(r"\??\pipe\uv\18446744073709551615-50184", true),
+            DeviceVerdict::PassThrough
+        );
+        assert_eq!(
+            device_block_for(r"\Device\NamedPipe\some-ipc-channel", true),
+            DeviceVerdict::PassThrough
+        );
+        // Console: the TTY handles crossterm and libuv open read/write.
+        assert_eq!(device_block_for(r"\??\CONOUT$", true), DeviceVerdict::PassThrough);
+        assert_eq!(device_block_for(r"\??\CONIN$", true), DeviceVerdict::PassThrough);
+        assert_eq!(device_block_for(r"\Device\ConDrv\Output", true), DeviceVerdict::PassThrough);
+        // NUL and sockets.
+        assert_eq!(device_block_for(r"\??\NUL", true), DeviceVerdict::PassThrough);
+        assert_eq!(device_block_for(r"\Device\Afd\Endpoint", true), DeviceVerdict::PassThrough);
+    }
+
+    /// The pass-through above must not reopen the dangerous-pipe hole: those
+    /// classify as `Unknown` and stay denied in both directions.
+    #[test]
+    fn dangerous_pipes_stay_denied_despite_pass_through() {
+        assert_eq!(device_block_for(r"\??\pipe\svcctl", true), DENIED);
+        assert_eq!(device_block_for(r"\??\pipe\svcctl", false), DENIED);
+        assert_eq!(device_block_for(r"\??\pipe\atsvc", true), DENIED);
     }
 }
