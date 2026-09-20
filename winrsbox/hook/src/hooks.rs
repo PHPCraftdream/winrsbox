@@ -2594,6 +2594,13 @@ fn apply_mitigations(guard: &str) {
 /// Must be called on DLL_PROCESS_DETACH only. Errors are ignored because
 /// the process is tearing down.
 pub unsafe fn uninstall_hooks() {
+    // MUST come first. Every uninstall() below restores an original prologue
+    // via VirtualProtect(RWX) on a critical module's code page — the exact
+    // shape of the unhook attempt memory_guard's P0-01 check terminates on.
+    // Opening the teardown window here (rather than inside
+    // memory_guard::uninstall, which used to be 12th in this list) is what
+    // keeps the process alive long enough to report its own exit code.
+    crate::memory_guard::begin_teardown();
     crate::system_guard::uninstall();
     crate::shell_guard::uninstall();
     crate::service_guard::uninstall();

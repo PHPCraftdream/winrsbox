@@ -662,6 +662,25 @@ fn overlaps_critical_exec(addr: *const c_void, size: usize) -> bool {
 static DETOUR_WATCH: std::sync::Mutex<Vec<(usize, [u8; 2])>> = std::sync::Mutex::new(Vec::new());
 static MEMGUARD_UNINSTALLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// True once `begin_teardown` has run, i.e. we are inside DLL_PROCESS_DETACH
+/// and every remaining `GenericDetour::disable()` is OUR OWN restoration of
+/// the original prologue bytes.
+///
+/// Teardown is indistinguishable from an unhook attempt by inspection alone —
+/// both make a critical module's executable page writable and put the
+/// original bytes back. The install window is discriminated by `anti_rec`
+/// (hooks.rs holds it across every `enable()`); the teardown window has no
+/// such carrier, because `uninstall_hooks` runs from the loader, not from
+/// inside a hook. This flag is that carrier.
+///
+/// It does not widen what a guest can do. Reaching the teardown path at all
+/// means reaching DLL_PROCESS_DETACH, and `uninstall_hooks` disables every
+/// detour there regardless of this flag — a guest that can trigger the
+/// teardown has already won, with or without the check below.
+fn teardown_in_progress() -> bool {
+    MEMGUARD_UNINSTALLING.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// True when a detour's current bytes no longer match its post-install
 /// snapshot. An unreadable target counts as tampered (fail closed).
 fn detour_bytes_tampered(expected: [u8; 2], current: Option<[u8; 2]>) -> bool {
@@ -710,7 +729,7 @@ fn read_code_bytes(addr: usize) -> Option<[u8; 2]> {
 /// mismatch. Called after an allowed operation that overlapped critical-module
 /// executable pages. The reported target address is the tampered detour site.
 fn verify_detours_or_die(kind: ipc::AllocKind, protect: u32, region_size: u64) {
-    if MEMGUARD_UNINSTALLING.load(std::sync::atomic::Ordering::Acquire) {
+    if teardown_in_progress() {
         return;
     }
     let tampered = {
@@ -1263,7 +1282,7 @@ unsafe extern "system" fn hook_nt_protect_virtual_memory(
         let addr = *base_address;
         if !addr.is_null() {
             let size = if region_size.is_null() { 0 } else { *region_size };
-            if overlaps_critical_exec(addr, size) {
+            if !teardown_in_progress() && overlaps_critical_exec(addr, size) {
                 match critical_range_response(true, grants_write(new_protect)) {
                     CriticalRangeResponse::Terminate => {
                         report_and_terminate(
@@ -1534,6 +1553,7 @@ unsafe extern "system" fn hook_nt_write_virtual_memory(
     if is_current_process(process_handle) {
         if !base_address.is_null()
             && bytes_to_write > 0
+            && !teardown_in_progress()
             && overlaps_critical_exec(base_address, bytes_to_write)
         {
             report_and_terminate(
@@ -1836,16 +1856,42 @@ pub unsafe fn install(
     Ok(())
 }
 
+/// Open the teardown window and silence the two enforcement detours that
+/// would otherwise fire on the teardown itself.
+///
+/// MUST be the first thing `uninstall_hooks` does, before ANY guard's
+/// `uninstall()`. Every `GenericDetour::disable()` restores the original
+/// prologue through `VirtualProtect(PAGE_EXECUTE_READWRITE)` on a critical
+/// module's code page — which is exactly the unhook primitive the P0-01
+/// check terminates on. With the flag set only inside `memory_guard::uninstall`
+/// (12th in the teardown order), the eleven guards torn down before it each
+/// tripped that check and killed the process during DLL_PROCESS_DETACH: every
+/// target under `--guard scan`/`full` exited 0xC0000005 instead of its own
+/// exit code, losing buffered stdout with it.
+///
+/// `HOOK_PROTECT` and `HOOK_WRITE_MEM` are disabled here rather than left to
+/// the flag alone, so the teardown window is as short as possible: after this
+/// returns, the remaining teardown is not observed at all.
+///
+/// # SAFETY
+/// Must be called from DLL_PROCESS_DETACH only. Idempotent.
+pub unsafe fn begin_teardown() {
+    MEMGUARD_UNINSTALLING.store(true, std::sync::atomic::Ordering::Release);
+    // These two disables are themselves critical-module writes; they are
+    // covered by the flag stored above, not by their own detours.
+    if let Some(h) = HOOK_PROTECT.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_WRITE_MEM.get() { let _ = h.disable(); }
+}
+
 /// Disable memory guard hooks.
 ///
 /// # SAFETY
 /// Must be called from DLL_PROCESS_DETACH only.
 pub unsafe fn uninstall() {
-    // Disable hook-integrity verification FIRST: the detour teardown below
-    // VirtualProtects ntdll stub pages back to writable to restore original
-    // bytes, and GenericDetour::disable() must not trip the unhook check or
-    // the post-op prologue verification during DLL_PROCESS_DETACH.
-    MEMGUARD_UNINSTALLING.store(true, std::sync::atomic::Ordering::Release);
+    // Idempotent — `uninstall_hooks` already opened the window before the
+    // first guard was torn down. Repeated here so a direct caller of
+    // `uninstall()` is still safe.
+    begin_teardown();
     if let Some(h) = HOOK_NT_UNMAP_VIEW.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_WRITE_MEM.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_MAP_VIEW.get() { let _ = h.disable(); }
