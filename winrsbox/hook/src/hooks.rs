@@ -403,26 +403,39 @@ pub(crate) unsafe fn resolve_for_hook(
         return None;
     }
     let obj = &*attrs;
-    if obj.ObjectName.is_null() {
+    // An absent or empty ObjectName is not automatically unresolvable: paired
+    // with a RootDirectory it names the directory that handle already points
+    // at. That is the shape Rust's `remove_dir_all` uses — it reopens the
+    // directory relative to its parent with FILE_DELETE_ON_CLOSE and an empty
+    // name — so treating it as unresolvable sent every such delete into the
+    // fail-closed dead end and returned ACCESS_DENIED. Observed as
+    // `WARNING: failed to clean up stale arg0 temp dirs: Access is denied`
+    // from a sandboxed codex, with `fs_block_unresolved_write` in the trace.
+    let name_slice: &[u16] = if obj.ObjectName.is_null() {
+        &[]
+    } else {
+        let ustr = &*obj.ObjectName;
+        let char_count = (ustr.Length / 2) as usize;
+        if char_count == 0 {
+            &[]
+        } else if ustr.Buffer.is_null() {
+            // P2-01: `Length > 0` with a NULL Buffer is trivially constructible
+            // by the (untrusted) caller of NtCreateFile/NtOpenFile.
+            // `from_raw_parts` with a null pointer and a non-zero length is UB;
+            // bare NT would return STATUS_INVALID_PARAMETER. Fail closed: no
+            // DOS path can be derived, the caller passes through /
+            // device-blocks as for any other unresolvable path.
+            return None;
+        } else {
+            // SAFETY: Buffer is non-null (checked above) and valid for at least
+            // Length bytes per the NT UNICODE_STRING contract.
+            std::slice::from_raw_parts(ustr.Buffer, char_count)
+        }
+    };
+    // With no name AND no directory handle there is nothing to resolve.
+    if name_slice.is_empty() && obj.RootDirectory.is_null() {
         return None;
     }
-    let ustr = &*obj.ObjectName;
-    let char_count = (ustr.Length / 2) as usize;
-    if char_count == 0 {
-        return None;
-    }
-    if ustr.Buffer.is_null() {
-        // P2-01: `Length > 0` with a NULL Buffer is trivially constructible by
-        // the (untrusted) caller of NtCreateFile/NtOpenFile. `from_raw_parts`
-        // with a null pointer and a non-zero length is UB; bare NT would
-        // return STATUS_INVALID_PARAMETER. Fail closed: no DOS path can be
-        // derived, the caller passes through / device-blocks as for any other
-        // unresolvable path.
-        return None;
-    }
-    // SAFETY: Buffer is non-null (checked above) and valid for at least
-    // Length bytes per the NT UNICODE_STRING contract.
-    let name_slice = std::slice::from_raw_parts(ustr.Buffer, char_count);
 
     if !obj.RootDirectory.is_null() {
         // Resolve the directory handle ONCE; the resulting absolute NT path is
@@ -440,8 +453,13 @@ pub(crate) unsafe fn resolve_for_hook(
         // land on the real filesystem instead of the overlay.
         let base = device_path_to_dos_nt(&base).unwrap_or(base);
         let mut full: Vec<u16> = base;
-        full.push(b'\\' as u16);
-        full.extend_from_slice(name_slice);
+        // Empty name → the target IS the handle's own directory; appending a
+        // separator would produce a trailing-backslash path that resolves
+        // differently.
+        if !name_slice.is_empty() {
+            full.push(b'\\' as u16);
+            full.extend_from_slice(name_slice);
+        }
         // Fold `.`/`..` lexically BEFORE the policy decision AND before the
         // kernel passthrough (audit Critical #1): `full` is handed to
         // copy_passthrough_inner verbatim (pre_resolved), so folding here
@@ -3826,6 +3844,110 @@ mod hooks_core_security_tests {
         };
         let got = unsafe { resolve_for_hook(&attrs) };
         assert!(got.is_none(), "NULL Buffer must resolve to None, got {got:?}");
+    }
+
+    /// An empty ObjectName paired with a RootDirectory names the directory
+    /// that handle already points at. Rust's `remove_dir_all` uses exactly
+    /// this shape — it reopens the directory relative to its parent with
+    /// FILE_DELETE_ON_CLOSE and an empty name — and treating it as
+    /// unresolvable pushed every such delete into the fail-closed dead end.
+    /// A sandboxed `codex` reported it as
+    /// `WARNING: failed to clean up stale arg0 temp dirs: Access is denied`,
+    /// with a single `fs_block_unresolved_write` in the trace and no path to
+    /// identify it by.
+    #[test]
+    fn empty_name_with_root_directory_resolves_to_that_directory() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let dir = std::env::temp_dir().join("winrsbox-emptyname-probe");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create probe dir");
+
+        // A directory handle needs FILE_FLAG_BACKUP_SEMANTICS.
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: `wide` is a NUL-terminated path; all other arguments are
+        //         the documented constants for opening a directory handle.
+        let handle = unsafe {
+            winapi::um::fileapi::CreateFileW(
+                wide.as_ptr(),
+                winapi::um::winnt::GENERIC_READ,
+                winapi::um::winnt::FILE_SHARE_READ
+                    | winapi::um::winnt::FILE_SHARE_WRITE
+                    | winapi::um::winnt::FILE_SHARE_DELETE,
+                std::ptr::null_mut(),
+                winapi::um::fileapi::OPEN_EXISTING,
+                0x0200_0000, // FILE_FLAG_BACKUP_SEMANTICS — required for a directory handle
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(
+            handle != winapi::um::handleapi::INVALID_HANDLE_VALUE,
+            "could not open a directory handle for the probe",
+        );
+
+        // Length 0 / Buffer null — the empty-name form.
+        let ustr = UNICODE_STRING {
+            Length: 0,
+            MaximumLength: 0,
+            Buffer: std::ptr::null_mut(),
+        };
+        let attrs = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: handle as *mut _,
+            ObjectName: &ustr as *const UNICODE_STRING as *mut UNICODE_STRING,
+            Attributes: 0,
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
+        };
+        let got = unsafe { resolve_for_hook(&attrs) };
+        // SAFETY: handle came from CreateFileW above and is not used after.
+        unsafe { winapi::um::handleapi::CloseHandle(handle) };
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (dos, pre_resolved) = got.expect(
+            "empty name + RootDirectory must resolve to the handle's own \
+             directory, not fall into the unresolvable dead end",
+        );
+        let want = dir.to_string_lossy().to_ascii_lowercase();
+        assert_eq!(dos, want, "resolved path must be the directory itself");
+        // Relative opens carry the pre-resolved NT path for the kernel.
+        assert!(pre_resolved.is_some(), "relative open must carry pre_resolved");
+        assert!(
+            !dos.ends_with('\\'),
+            "no separator may be appended for an empty name: {dos}",
+        );
+    }
+
+    /// The empty-name carve-out must not become a blanket bypass: with no
+    /// name AND no directory handle there is nothing to resolve, and the
+    /// caller's fail-closed dead end must still apply.
+    #[test]
+    fn empty_name_without_root_directory_stays_unresolvable() {
+        let ustr = UNICODE_STRING {
+            Length: 0,
+            MaximumLength: 0,
+            Buffer: std::ptr::null_mut(),
+        };
+        let attrs = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: std::ptr::null_mut(),
+            ObjectName: &ustr as *const UNICODE_STRING as *mut UNICODE_STRING,
+            Attributes: 0,
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
+        };
+        assert!(unsafe { resolve_for_hook(&attrs) }.is_none());
+
+        // Same for a NULL ObjectName with no handle.
+        let attrs_null = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: std::ptr::null_mut(),
+            ObjectName: std::ptr::null_mut(),
+            Attributes: 0,
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
+        };
+        assert!(unsafe { resolve_for_hook(&attrs_null) }.is_none());
     }
 
     // ── P1-01: child scan gate + pipeline ──────────────────────────────────

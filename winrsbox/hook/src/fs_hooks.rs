@@ -233,7 +233,16 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
                 } else {
                     "unresolved"
                 };
-                ipc_log(ipc::LogLevel::Trace, format!("fs_block_{kind}_write").into());
+                // Name the path. Without it this line says only "something
+                // was refused", which is useless when a real program reports
+                // a bare "Access is denied" and the operator has to work out
+                // which of its many opens we stopped.
+                let raw = crate::hooks::extract_raw_nt_path(object_attributes as *const _)
+                    .unwrap_or_else(|| "<unresolved>".to_string());
+                ipc_log(
+                    ipc::LogLevel::Trace,
+                    format!("fs_block_{kind}_write raw={raw}").into(),
+                );
             }
             set_io_status(io_status_block, STATUS_ACCESS_DENIED);
             return STATUS_ACCESS_DENIED;
@@ -623,7 +632,16 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
                 } else {
                     "unresolved"
                 };
-                ipc_log(ipc::LogLevel::Trace, format!("fs_block_{kind}_write").into());
+                // Name the path. Without it this line says only "something
+                // was refused", which is useless when a real program reports
+                // a bare "Access is denied" and the operator has to work out
+                // which of its many opens we stopped.
+                let raw = crate::hooks::extract_raw_nt_path(object_attributes as *const _)
+                    .unwrap_or_else(|| "<unresolved>".to_string());
+                ipc_log(
+                    ipc::LogLevel::Trace,
+                    format!("fs_block_{kind}_write raw={raw}").into(),
+                );
             }
             set_io_status(io_status_block, STATUS_ACCESS_DENIED);
             return STATUS_ACCESS_DENIED;
