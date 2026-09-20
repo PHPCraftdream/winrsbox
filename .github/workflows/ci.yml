@@ -34,10 +34,21 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-targets
 
-      # Library/unit tests only — the integration-tests bins are escape PoCs that
-      # require a built sandbox + Go helpers at runtime and are not cargo tests.
+      # `--lib --bins`, not `--lib`. The launcher's own logic — target
+      # resolution, console ownership, the Ctrl+C decision table, the child
+      # drain — lives in the BIN target (`launcher/src/main.rs` and its
+      # modules), so `--lib` alone silently skipped 123 tests of it.
+      #
+      # Still excluded: `winrsbox/integration-tests/tests/*.rs`. Those ARE
+      # cargo tests (~123, including 90 that drive a real sandbox and assert
+      # containment), and they are the ones that would have caught the
+      # copy-on-write, pipe/console, `--guard static` and exit-code
+      # regressions this CI stayed green through. They need a built launcher
+      # + hook.dll and roughly three minutes of live process launching, so
+      # enabling them here is a deliberate decision, not a cleanup. Until
+      # then, understand that a green tick covers unit-level logic only.
       - name: Test
-        run: cargo test --workspace --lib
+        run: cargo test --workspace --lib --bins
 
       # Lint visibility (warnings are not denied: the tree has known, accepted
       # style warnings). Fails only on clippy errors / compile errors.
