@@ -443,6 +443,128 @@ fn enforce_native_x64(child_handle: HANDLE, child_pid: u32) -> Result<()> {
     Ok(())
 }
 
+/// Default `PATHEXT` when the variable is absent from the environment, in
+/// Windows' own order. Only the four forms `CreateProcessW` can actually
+/// start are listed: `.COM`/`.EXE` are images, `.BAT`/`.CMD` are rewritten to
+/// `%COMSPEC% /c` by kernel32 itself. The rest of Windows' stock list
+/// (`.VBS`, `.JS`, `.WSF`, `.MSC`, …) is handled by ShellExecute's
+/// association lookup, not by `CreateProcessW`, and running those through a
+/// script host is not something the sandbox should do implicitly.
+const LAUNCHABLE_EXTS: &[&str] = &[".COM", ".EXE", ".BAT", ".CMD"];
+
+/// Resolve `arg0` to a full image path the way a shell would.
+///
+/// `CreateProcessW` performs its own search, but it only ever appends `.exe`
+/// to an extensionless name — it does not expand `PATHEXT`. So `winrsbox cx`,
+/// where `cx` is a `cx.bat` on `PATH`, failed with
+/// `The system cannot find the file specified. (0x80070002)`.
+///
+/// The search itself is not reimplemented here: `SearchPathW` IS the
+/// primitive `CreateProcessW` uses, with the same directory order (the
+/// caller's image dir, the current directory, System32, System, Windows,
+/// then `PATH`). The only thing added is the loop over `PATHEXT` entries,
+/// which is precisely the step `CreateProcessW` omits and `cmd.exe` performs.
+///
+/// Resolving up front — always, not only as a fallback after a failed launch
+/// — matters beyond `cx`. `target_args[0]` is consumed raw by
+/// `trust::verify_signature`, `inject::pre_launch_scan`, the WFP
+/// `app_id_from_path` and the root `ProcInfo` entry. With a bare name such as
+/// `winrsbox node`, `app_id_from_path` cannot canonicalize it and
+/// `wfp::add_filter` correctly refuses to install an unscoped filter — so the
+/// RFC1918 egress block was silently never applied. One substitution fixes
+/// all of them.
+///
+/// A name that already carries a launchable extension, or any path
+/// containing a separator, is resolved in a single call with no extension
+/// appended — mirroring `CreateProcessW`'s own rule. An extensionless name is
+/// never resolved with `ext = NULL`: on this machine that would find the
+/// extensionless `cx` shell script sitting next to `cx.bat`, which is not a
+/// Windows executable at all.
+pub(crate) fn resolve_target(arg0: &str) -> Result<String> {
+    let has_launchable_ext = std::path::Path::new(arg0)
+        .extension()
+        .map(|e| {
+            let dotted = format!(".{}", e.to_string_lossy());
+            LAUNCHABLE_EXTS.iter().any(|x| x.eq_ignore_ascii_case(&dotted))
+        })
+        .unwrap_or(false);
+
+    if has_launchable_ext {
+        if let Some(found) = search_path(arg0, None) {
+            return Ok(found);
+        }
+    } else {
+        let pathext = std::env::var("PATHEXT").unwrap_or_default();
+        let exts: Vec<String> = if pathext.trim().is_empty() {
+            LAUNCHABLE_EXTS.iter().map(|s| s.to_string()).collect()
+        } else {
+            pathext
+                .split(';')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        };
+        for ext in &exts {
+            if let Some(found) = search_path(arg0, Some(ext)) {
+                return Ok(found);
+            }
+        }
+    }
+
+    // An explicit path that does not resolve is a different mistake from a
+    // bare name that is not on PATH; say which one happened.
+    let looks_like_path = arg0.contains('\\') || arg0.contains('/') || arg0.contains(':');
+    if looks_like_path {
+        anyhow::bail!("target '{arg0}' does not exist");
+    }
+    anyhow::bail!(
+        "target '{arg0}' not found on PATH (searched PATHEXT: {})",
+        std::env::var("PATHEXT").unwrap_or_else(|_| LAUNCHABLE_EXTS.join(";")),
+    );
+}
+
+/// One `SearchPathW` probe. `ext` is appended only when the name has no
+/// extension of its own (Windows' rule, enforced by the caller).
+fn search_path(name: &str, ext: Option<&str>) -> Option<String> {
+    use windows::Win32::Storage::FileSystem::SearchPathW;
+
+    let name_w: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    let ext_w: Option<Vec<u16>> = ext.map(|e| e.encode_utf16().chain(Some(0)).collect());
+
+    // Query the required length first, then fill: a path may exceed MAX_PATH.
+    // SAFETY: both strings are NUL-terminated UTF-16; a zero-length buffer
+    //         with a null pointer is the documented "how much do I need" form.
+    let needed = unsafe {
+        SearchPathW(
+            PCWSTR::null(),
+            PCWSTR(name_w.as_ptr()),
+            ext_w.as_ref().map(|e| PCWSTR(e.as_ptr())).unwrap_or(PCWSTR::null()),
+            None,
+            None,
+        )
+    };
+    if needed == 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; needed as usize + 1];
+    // SAFETY: buf is `needed + 1` UTF-16 units, at least what the call above
+    //         asked for; the same NUL-terminated inputs are reused.
+    let written = unsafe {
+        SearchPathW(
+            PCWSTR::null(),
+            PCWSTR(name_w.as_ptr()),
+            ext_w.as_ref().map(|e| PCWSTR(e.as_ptr())).unwrap_or(PCWSTR::null()),
+            Some(&mut buf),
+            None,
+        )
+    };
+    if written == 0 || written as usize > buf.len() {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..written as usize]))
+}
+
 /// Build a Windows command line string from an argument list.
 /// Follows Microsoft CommandLineToArgvW escaping rules.
 /// Iterates chars, not bytes: the result is encoded to UTF-16 for
@@ -1093,5 +1215,116 @@ mod tests {
             "\"say \\\"hi\\\"\\\\\"",
             "embedded quotes + trailing backslash escaping unchanged"
         );
+    }
+
+    // --- resolve_target: PATHEXT expansion CreateProcessW does not do ---
+
+    /// `PATH`/`PATHEXT` are process-wide, so these tests must not overlap —
+    /// with each other or with anything else reading them. Poison-tolerant:
+    /// a panic in one test must not cascade into "all the rest failed too".
+    fn path_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The original report: `winrsbox cx` died with
+    /// `CreateProcessW failed: The system cannot find the file specified.
+    /// (0x80070002)` because `CreateProcessW` appends only `.exe` to a bare
+    /// name. A `.bat` on PATH must resolve to its full path; kernel32 then
+    /// rewrites it to `%COMSPEC% /c` on its own.
+    #[test]
+    fn resolve_target_expands_pathext_for_a_bare_batch_name() {
+        let _lock = path_env_lock();
+        let dir = std::env::temp_dir().join("winrsbox-resolve-bat");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bat = dir.join("wrs_probe_shim.bat");
+        std::fs::write(&bat, "@echo off\r\n").unwrap();
+
+        let saved_path = std::env::var("PATH").unwrap_or_default();
+        let saved_ext = std::env::var("PATHEXT").ok();
+        std::env::set_var("PATH", format!("{};{saved_path}", dir.display()));
+        std::env::set_var("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+
+        let resolved = resolve_target("wrs_probe_shim");
+
+        std::env::set_var("PATH", &saved_path);
+        match saved_ext {
+            Some(v) => std::env::set_var("PATHEXT", v),
+            None => std::env::remove_var("PATHEXT"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let resolved = resolved.expect("bare .bat name must resolve via PATHEXT");
+        assert!(
+            resolved.to_ascii_lowercase().ends_with("wrs_probe_shim.bat"),
+            "expected the .bat, got {resolved}",
+        );
+        assert!(
+            std::path::Path::new(&resolved).is_absolute(),
+            "resolution must yield a full path (WFP app_id / pre-scan need it), got {resolved}",
+        );
+    }
+
+    /// A bare `.exe` name must resolve to a full path too. This is the case
+    /// that silently cost containment: `wfp::app_id_from_path` cannot
+    /// canonicalize a bare name, so `add_filter` refused to install the
+    /// RFC1918 egress filters and `winrsbox node` simply ran without them.
+    #[test]
+    fn resolve_target_yields_full_path_for_a_bare_exe_name() {
+        let _lock = path_env_lock();
+        let resolved = resolve_target("cmd").expect("cmd must resolve — it is in System32");
+        let lower = resolved.to_ascii_lowercase();
+        assert!(lower.ends_with("cmd.exe"), "expected cmd.exe, got {resolved}");
+        assert!(std::path::Path::new(&resolved).is_absolute());
+        assert!(
+            std::fs::canonicalize(&resolved).is_ok(),
+            "the resolved path must canonicalize — that is exactly what app_id_from_path does",
+        );
+    }
+
+    /// A name that already carries a launchable extension resolves without
+    /// another extension being appended (CreateProcessW's own rule).
+    #[test]
+    fn resolve_target_keeps_an_explicit_extension() {
+        let _lock = path_env_lock();
+        let resolved = resolve_target("cmd.exe").expect("cmd.exe must resolve");
+        let lower = resolved.to_ascii_lowercase();
+        assert!(lower.ends_with("cmd.exe"), "got {resolved}");
+        assert!(!lower.ends_with("cmd.exe.exe"), "extension must not be appended twice");
+    }
+
+    /// An absolute path is returned as itself, not re-searched on PATH.
+    #[test]
+    fn resolve_target_accepts_an_absolute_path() {
+        let _lock = path_env_lock();
+        let dir = std::env::temp_dir().join("winrsbox-resolve-abs");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bat = dir.join("wrs_probe_abs.cmd");
+        std::fs::write(&bat, "@echo off\r\n").unwrap();
+
+        let resolved = resolve_target(bat.to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let resolved = resolved.expect("an existing absolute path must resolve");
+        assert!(resolved.to_ascii_lowercase().ends_with("wrs_probe_abs.cmd"));
+    }
+
+    /// Failure must name the target and say where it was looked for, instead
+    /// of surfacing the raw `0x80070002` from deep inside CreateProcessW.
+    #[test]
+    fn resolve_target_reports_a_missing_target_usefully() {
+        let _lock = path_env_lock();
+        let err = resolve_target("winrsbox-no-such-command-xyzzy")
+            .expect_err("a nonexistent bare name must not resolve")
+            .to_string();
+        assert!(err.contains("winrsbox-no-such-command-xyzzy"), "err: {err}");
+        assert!(err.contains("PATH"), "err must say where it searched: {err}");
+
+        let err = resolve_target(r"C:\winrsbox\no\such\path\nope.exe")
+            .expect_err("a nonexistent explicit path must not resolve")
+            .to_string();
+        assert!(err.contains("does not exist"), "err: {err}");
     }
 }

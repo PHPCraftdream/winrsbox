@@ -444,6 +444,21 @@ async fn run() -> Result<()> {
     // CLI subcommands (rule/why/export/...) are routed earlier in main() and
     // never reach here, so they keep working inside a sandbox for policy
     // inspection. `--init` / `--help` are also exempt.
+    // Resolve the target to a full image path ONCE, before anything consumes
+    // it. `CreateProcessW` only ever appends `.exe` to a bare name, so
+    // `winrsbox cx` (a `cx.bat` on PATH) failed with 0x80070002; and five
+    // separate consumers below — the nested-delegation command,
+    // `trust::verify_signature`, `inject::pre_launch_scan`, the WFP
+    // `app_id_from_path` and the root `ProcInfo` entry — each took the raw
+    // string and silently degraded on it. The WFP case was the dangerous
+    // one: a bare name cannot be canonicalized, so `add_filter` refused to
+    // install the (correctly) app-scoped RFC1918 egress block and the
+    // sandbox simply had no such filter.
+    let mut cli = cli;
+    if !cli.init && !cli.target.is_empty() {
+        cli.target[0] = sandbox::resolve_target(&cli.target[0])?;
+    }
+
     if !cli.init && !cli.target.is_empty() && is_nested_invocation() {
         eprintln!(
             "[sandbox] nested invocation detected — delegating <{}> to the outer sandbox",
