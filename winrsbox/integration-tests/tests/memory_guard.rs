@@ -10,9 +10,15 @@
 // sandbox instances (WFP filter collision, pipe name collision, etc.).
 // - Clean payloads: always run to completion
 //
-// Requires: cargo build -p integration-tests --bins --release
-//           cargo build -p winrsbox --release
-//           cargo build -p hook --release
+// Requires a prior `cargo build --workspace` with the SAME profile these
+// tests are compiled for — `cargo test` alone does not refresh
+// target/<profile>/winrsbox.exe (it builds the bin as a test harness into
+// deps/), so without it the suite launches the previous launcher. The
+// artifact lookup in tests/common/mod.rs enforces this rather than letting
+// it pass quietly; see the note there for what that silence once cost.
+//
+//     cargo build --workspace            &&  cargo test -p integration-tests
+//     cargo build --workspace --release  &&  cargo test -p integration-tests --release
 
 use serial_test::serial;
 use std::path::{Path, PathBuf};

@@ -22,6 +22,13 @@
 //! back to the other one, and refuse to run against an artifact older than
 //! the sources. A loud failure telling the operator to rebuild is always
 //! better than a green run that proves nothing.
+//!
+//! Practical consequence, and the reason the staleness check earns its keep:
+//! `cargo test` does NOT refresh `target/<profile>/winrsbox.exe`. It compiles
+//! the bin target as a test harness into `deps/`, which leaves the standalone
+//! executable these tests launch at whatever the last `cargo build` produced.
+//! Run `cargo build --workspace` first, or the suite is testing the previous
+//! launcher — silently, before this check existed.
 
 #![allow(dead_code)]
 
