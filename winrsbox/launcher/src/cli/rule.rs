@@ -68,12 +68,12 @@ fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     let prefix = find_arg(args, "--prefix=")
         .or_else(|| find_arg(args, "--prefix="))
         .ok_or_else(|| anyhow::anyhow!("rule add: --prefix is required"))?;
-    let prefix_lower = prefix.to_lowercase();
+    let prefix_lower = policy::ensure_lower(prefix).into_owned();
 
     let read_mode = find_arg(args, "--read=").map(parse_mode).transpose()?.unwrap_or(RuleMode::Passthrough);
     let write_mode = find_arg(args, "--write=").map(parse_mode).transpose()?.unwrap_or(RuleMode::Cow);
     let depth = find_arg(args, "--depth=").map(|s| s.parse::<u8>()).transpose()?;
-    let exe = find_arg(args, "--exe=").map(String::from);
+    let exe = find_arg(args, "--exe=").map(|s| policy::ensure_lower(&s).into_owned());
     let explicit_id = find_arg(args, "--id=").map(String::from);
 
     let id = explicit_id.unwrap_or_else(|| crate::cli::id::generate_id("rule", &[&prefix_lower]));
@@ -344,5 +344,28 @@ mod tests {
         let when = rules[0].when.as_ref().unwrap();
         assert_eq!(when.depth, Some(2));
         assert_eq!(when.exe.as_deref(), Some("myapp.exe"));
+    }
+
+    #[test]
+    fn rule_add_folds_prefix_and_exe() {
+        let dir = tempfile::tempdir().unwrap();
+        let args: Vec<String> = [
+            "add",
+            "--prefix=C:\\Klas\u{0130}r\\Locked",
+            "--write=deny",
+            "--exe=C:\\Tools\\MyApp.EXE",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        run(&args, dir.path()).unwrap();
+        let db = super::super::open_db(dir.path()).unwrap();
+        let rules = db::rule_list(&db).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].prefix, "c:\\klas\u{0130}r\\locked");
+        assert_eq!(
+            rules[0].when.as_ref().unwrap().exe.as_deref(),
+            Some("c:\\tools\\myapp.exe")
+        );
     }
 }

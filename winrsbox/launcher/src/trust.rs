@@ -3,6 +3,17 @@
 // Uses WinVerifyTrust to check if an executable is signed by a publisher
 // whose cert chain roots in Windows' Trusted Root CA store.
 // NO hardcoded publisher list — Windows decides what is trusted.
+//
+// DECISION (audit 2026-09-19): the verdict is ADVISORY ONLY. Nothing in the
+// launcher refuses to launch or to inject based on `TrustLevel`; it exists
+// so the operator can see what they are running (see `advisory_notice`).
+// Enforcement was considered and rejected: the sandbox's core workload is
+// unsigned open-source toolchains (cargo, node, python), dev builds ship an
+// unsigned hook.dll, and `TrustLevel::Error` covers transient verification
+// failures — a hard gate would refuse nearly every legitimate launch. The
+// sandbox's OWN artifacts are authenticated out-of-band by the
+// staged-artifact digest manifest (sandbox.rs `verify_staged_artifacts`),
+// which is the property trust enforcement would actually have protected.
 
 use std::collections::HashMap;
 use std::os::windows::ffi::OsStrExt;
@@ -53,6 +64,18 @@ impl std::fmt::Display for TrustLevel {
             TrustLevel::Error(e) => write!(f, "error: {e}"),
         }
     }
+}
+
+/// The launcher-facing rendering of a trust verdict. It must state —
+/// unmistakably — that the verdict is informational: it neither allows nor
+/// blocks anything. main.rs prints this whenever it reports a target's
+/// trust status; the test below pins the disclaimer so the notice cannot
+/// silently drift into reading like an enforcement decision.
+pub fn advisory_notice(trust: &TrustLevel) -> String {
+    format!(
+        "signature check: {trust} — INFORMATIONAL ONLY, not enforced \
+         (this verdict neither allows nor blocks the launch)"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -420,5 +443,31 @@ mod tests {
     fn cache_key_for_missing_file() {
         let key = cache_key(Path::new(r"C:\nonexistent\file.exe"));
         assert!(key.is_none());
+    }
+
+    #[test]
+    fn advisory_notice_pins_trust_as_informational_only() {
+        // Pins the audit decision that the signature verdict is advisory:
+        // every notice must carry an explicit "informational / not
+        // enforced" disclaimer, whatever the verdict is. If you ever make
+        // the launcher enforce this verdict, remove advisory_notice
+        // together with this test — do not reword it into something
+        // ambiguous.
+        let verdicts = [
+            TrustLevel::Signed { publisher: "Example Corp".into() },
+            TrustLevel::TrustedPath,
+            TrustLevel::SignedUntrustedRoot,
+            TrustLevel::Unsigned,
+            TrustLevel::Error("0x80092003".into()),
+        ];
+        for t in &verdicts {
+            let notice = advisory_notice(t).to_lowercase();
+            assert!(
+                notice.contains("informational only")
+                    && notice.contains("not enforced"),
+                "notice for {t:?} must state the verdict is informational
+                 and not enforced: {notice}"
+            );
+        }
     }
 }

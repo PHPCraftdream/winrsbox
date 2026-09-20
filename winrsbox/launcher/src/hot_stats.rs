@@ -14,6 +14,17 @@ pub const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// How many top paths to keep in the snapshot.
 pub const TOP_N: usize = 50;
 
+/// Audit (2026-09-19, Medium): the per-path maps were insert-only, so a
+/// long session touching unbounded distinct paths (temp files, cache
+/// fragments, web hosts) grew them without limit. These bounds cap each
+/// map; the stats are purely diagnostic (only `snapshot()` reads them, for
+/// the hot-stats.json report), so dropping cold entries changes no
+/// sandbox decision — `Totals` counters are untouched.
+pub const MAX_TRACKED_PATHS: usize = 8192;
+
+/// After an eviction pass, this many hottest entries are kept.
+pub const EVICT_KEEP_TOP: usize = 4096;
+
 #[derive(Default)]
 pub struct HotStats {
     /// Per-path access counters. Keyed by lowercased DOS path.
@@ -71,6 +82,8 @@ impl HotStats {
         } else {
             counters.reads.fetch_add(1, Ordering::Relaxed);
         }
+        drop(map);
+        Self::evict_if_over_capacity(&self.fs_paths);
     }
 
     pub fn record_reg(&self, key_path: &str, write: bool, denied: bool) {
@@ -90,6 +103,8 @@ impl HotStats {
         } else {
             counters.reads.fetch_add(1, Ordering::Relaxed);
         }
+        drop(map);
+        Self::evict_if_over_capacity(&self.reg_keys);
     }
 
     pub fn record_net(&self, host: &str, denied: bool) {
@@ -107,6 +122,34 @@ impl HotStats {
         } else {
             counters.reads.fetch_add(1, Ordering::Relaxed);
         }
+        drop(map);
+        Self::evict_if_over_capacity(&self.net_hosts);
+    }
+
+    /// If the map grew past MAX_TRACKED_PATHS, keep only the
+    /// EVICT_KEEP_TOP hottest entries (by reads+writes+denies, ties broken
+    /// deterministically by key). Called after each record; the `len()`
+    /// check makes the sort cost amortise to once per ~(MAX-KEEP) inserts.
+    fn evict_if_over_capacity(map: &papaya::HashMap<Arc<str>, PathCounters>) {
+        if map.len() < MAX_TRACKED_PATHS {
+            return;
+        }
+        let pinned = map.pin();
+        let mut scored: Vec<(Arc<str>, u64)> = pinned
+            .iter()
+            .map(|(k, v)| {
+                let total =
+                    v.reads.load(Ordering::Relaxed)
+                        + v.writes.load(Ordering::Relaxed)
+                        + v.denies.load(Ordering::Relaxed);
+                (k.clone(), total)
+            })
+            .collect();
+        scored.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        scored.truncate(EVICT_KEEP_TOP);
+        let keep: std::collections::HashSet<Arc<str>> =
+            scored.into_iter().map(|(k, _)| k).collect();
+        pinned.retain(|k, _| keep.contains(k));
     }
 
     /// Build a JSON-serializable snapshot of current state.
@@ -304,6 +347,74 @@ mod tests {
         assert!(!f.maybe_flush(), "second flush within 5s should be throttled");
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+
+    /// The maps must not grow without bound: flooding distinct fs paths
+    /// past the capacity must trigger eviction and keep the map capped.
+    /// (Old behaviour: insert-only, len would be MAX_TRACKED_PATHS + 2000.)
+    #[test]
+    fn fs_paths_bounded_under_distinct_key_flood() {
+        let s = HotStats::new();
+        let n = MAX_TRACKED_PATHS + 2000;
+        for i in 0..n {
+            s.record_fs(&format!("c:\\flood\\{i}.tmp"), false, false);
+        }
+        assert!(
+            s.fs_paths.len() <= MAX_TRACKED_PATHS,
+            "fs_paths len {} exceeded cap {MAX_TRACKED_PATHS}",
+            s.fs_paths.len()
+        );
+    }
+
+    /// Same bound must hold for the registry map (shared eviction path).
+    #[test]
+    fn reg_keys_bounded_under_distinct_key_flood() {
+        let s = HotStats::new();
+        let n = MAX_TRACKED_PATHS + 500;
+        for i in 0..n {
+            s.record_reg(&format!("HKCU\\Software\\Flood\\{i}"), true, false);
+        }
+        assert!(
+            s.reg_keys.len() <= MAX_TRACKED_PATHS,
+            "reg_keys len {} exceeded cap {MAX_TRACKED_PATHS}",
+            s.reg_keys.len()
+        );
+    }
+
+    /// Eviction must keep the HOT entries: a heavily-accessed path survives
+    /// a flood of cold single-access paths.
+    #[test]
+    fn hot_entries_survive_eviction() {
+        let s = HotStats::new();
+        for _ in 0..1000 {
+            s.record_fs("c:\\hot\\database.db", false, false);
+        }
+        let n = MAX_TRACKED_PATHS + 1000;
+        for i in 0..n {
+            s.record_fs(&format!("c:\\cold\\{i}.tmp"), false, false);
+        }
+        let snap = s.snapshot();
+        let entry = snap
+            .fs_top
+            .iter()
+            .find(|e| e.path == "c:\\hot\\database.db")
+            .expect("hot entry must survive eviction");
+        assert_eq!(entry.reads, 1000);
+    }
+
+    /// Eviction is diagnostics-only: the global Totals counters must be
+    /// unaffected by how many per-path entries were dropped.
+    #[test]
+    fn totals_survive_eviction() {
+        let s = HotStats::new();
+        let n = MAX_TRACKED_PATHS + 1000;
+        for i in 0..n {
+            s.record_fs(&format!("c:\\x\\{i}.tmp"), false, false);
+        }
+        let snap = s.snapshot();
+        let counted: u64 = snap.fs_top.iter().map(|e| e.reads + e.writes + e.denies).sum();
+        assert!(counted > 0);
     }
 
     #[test]

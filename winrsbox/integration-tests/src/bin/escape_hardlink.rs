@@ -13,7 +13,16 @@ fn main() {
     unsafe {
         let h = winapi::um::fileapi::CreateFileW(
             src_wide.as_ptr(),
-            0x10000000, // GENERIC_ALL
+            // MAXIMUM_ALLOWED, not GENERIC_ALL. GENERIC_ALL maps to
+            // FILE_ALL_ACCESS (incl. WRITE_OWNER/WRITE_DAC), which the
+            // filesystem refuses on an ordinary temp file on some machines —
+            // the open then fails with ERROR_ACCESS_DENIED *before* the
+            // hardlink is ever attempted, and the payload exits 2 without
+            // exercising what this test exists to exercise. Verified: with
+            // GENERIC_ALL this payload fails identically with no sandbox at
+            // all. MAXIMUM_ALLOWED grants whatever the caller is actually
+            // entitled to, which is all the link operation needs.
+            0x02000000, // MAXIMUM_ALLOWED
             0x07,
             std::ptr::null_mut(),
             3, // OPEN_EXISTING

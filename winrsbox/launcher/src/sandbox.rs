@@ -117,6 +117,26 @@ rules: [
         read: passthrough
         write: passthrough
     }
+    ## Deny writes to winrsbox's own installed artifacts (launcher exe/DLL in
+    ## the package dir, the package dir itself, npm PATH shims) so a sandboxed
+    ## process cannot overwrite the code the launcher is about to inject.
+    ## Rule precedence is most-literal-chars wins, so these longer carve-outs
+    ## override the broader npm passthrough above; reads stay passthrough.
+    {
+        prefix: C:\\Users\\**\\AppData\\Roaming\\npm\\node_modules\\winrsbox
+        read: passthrough
+        write: deny
+    }
+    {
+        prefix: C:\\Users\\**\\AppData\\Roaming\\npm\\winrsbox*
+        read: passthrough
+        write: deny
+    }
+    {
+        prefix: C:\\Users\\**\\.npm\\node_modules\\winrsbox
+        read: passthrough
+        write: deny
+    }
     {
         prefix: C:\\Users\\**\\AppData\\Local\\pip
         read: passthrough
@@ -425,6 +445,8 @@ fn enforce_native_x64(child_handle: HANDLE, child_pid: u32) -> Result<()> {
 
 /// Build a Windows command line string from an argument list.
 /// Follows Microsoft CommandLineToArgvW escaping rules.
+/// Iterates chars, not bytes: the result is encoded to UTF-16 for
+/// CreateProcessW, so non-ASCII arguments must survive untouched.
 pub(crate) fn build_cmdline(args: &[String]) -> String {
     fn quote_arg(a: &str) -> String {
         if a.is_empty() {
@@ -435,18 +457,18 @@ pub(crate) fn build_cmdline(args: &[String]) -> String {
         }
         let mut out = String::with_capacity(a.len() + 4);
         out.push('"');
-        let bytes = a.as_bytes();
+        let chars: Vec<char> = a.chars().collect();
         let mut i = 0;
-        while i < bytes.len() {
-            let ch = bytes[i];
-            if ch == b'\\' {
+        while i < chars.len() {
+            let ch = chars[i];
+            if ch == '\\' {
                 let start = i;
-                while i < bytes.len() && bytes[i] == b'\\' { i += 1; }
+                while i < chars.len() && chars[i] == '\\' { i += 1; }
                 let n = i - start;
-                if i == bytes.len() {
+                if i == chars.len() {
                     // Trailing backslashes → double them before closing quote
                     for _ in 0..n * 2 { out.push('\\'); }
-                } else if bytes[i] == b'"' {
+                } else if chars[i] == '"' {
                     // Backslashes before quote → double them + escape the quote
                     for _ in 0..n * 2 { out.push('\\'); }
                     out.push('\\');
@@ -456,12 +478,12 @@ pub(crate) fn build_cmdline(args: &[String]) -> String {
                     // Backslashes not before quote → emit literally
                     for _ in 0..n { out.push('\\'); }
                 }
-            } else if ch == b'"' {
+            } else if ch == '"' {
                 out.push('\\');
                 out.push('"');
                 i += 1;
             } else {
-                out.push(ch as char);
+                out.push(ch);
                 i += 1;
             }
         }
@@ -483,7 +505,167 @@ pub(crate) fn find_hook_dll() -> Result<String> {
         "hook.dll not found at {}",
         dll.display()
     );
-    Ok(dll.to_string_lossy().into_owned())
+    let dll = dll.to_string_lossy().into_owned();
+    // Defense-in-depth before injection: refuse self-installs inside the
+    // guest's project tree (no policy rule can protect them there), then
+    // verify the staged exe/DLL digests against the installer's integrity
+    // manifest so a trojanized artifact becomes a loud refusal instead of a
+    // silent injection of attacker-controlled code.
+    verify_not_inside_guest_project_node_modules(&dll)?;
+    verify_staged_artifacts(&dll)?;
+    Ok(dll)
+}
+
+/// SHA-256 of a file via CNG's one-shot `BCryptHash` (no streaming state to
+/// manage). Used by the staged-artifact integrity check below.
+fn sha256_file(path: &Path) -> Result<[u8; 32]> {
+    use windows::Win32::Security::Cryptography::{
+        BCryptCloseAlgorithmProvider, BCryptHash, BCryptOpenAlgorithmProvider,
+        BCRYPT_ALG_HANDLE, BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS, BCRYPT_SHA256_ALGORITHM,
+    };
+
+    let mut alg = BCRYPT_ALG_HANDLE::default();
+    // SAFETY: alg is a valid out handle pointer; BCRYPT_SHA256_ALGORITHM is a
+    //         static null-terminated wide string; no implementation pin needed.
+    let status = unsafe {
+        BCryptOpenAlgorithmProvider(
+            &mut alg,
+            BCRYPT_SHA256_ALGORITHM,
+            PCWSTR::null(),
+            BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS(0),
+        )
+    };
+    if status.0 < 0 {
+        anyhow::bail!("BCryptOpenAlgorithmProvider failed: 0x{:08X}", status.0);
+    }
+    let data = std::fs::read(path)
+        .with_context(|| format!("read {} for hashing", path.display()))?;
+    let mut out = [0u8; 32];
+    // SAFETY: alg was opened above; out is a valid 32-byte buffer (the
+    //         SHA-256 digest size).
+    let status = unsafe { BCryptHash(alg, None, &data, &mut out) };
+    // SAFETY: alg was opened above and is not used after this point.
+    unsafe { let _ = BCryptCloseAlgorithmProvider(alg, 0); }
+    if status.0 < 0 {
+        anyhow::bail!("BCryptHash failed: 0x{:08X}", status.0);
+    }
+    Ok(out)
+}
+
+/// Lowercase-hex encoding of a 32-byte digest (the manifest's format).
+fn digest_to_hex(d: &[u8; 32]) -> String {
+    d.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Verify the launcher exe and the hook.dll it is about to inject still match
+/// the digests recorded in `integrity.json` next to the exe (written by the
+/// npm installer at deploy time). A MISSING manifest is fine — that is an
+/// unmanaged deployment (e.g. a dev `cargo build`) with nothing to verify.
+/// A present-but-mismatched manifest fails closed: a silently swapped
+/// exe/DLL turns into a loud refusal instead of an injection of
+/// attacker-controlled code.
+fn verify_staged_artifacts_in(exe_path: &Path, dll_path: &Path) -> Result<()> {
+    let manifest_path = exe_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("integrity.json");
+    if !manifest_path.exists() {
+        return Ok(());
+    }
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("read integrity manifest {}", manifest_path.display()))?,
+    )
+    .with_context(|| format!("parse integrity manifest {}", manifest_path.display()))?;
+
+    anyhow::ensure!(
+        manifest.get("algorithm").and_then(|v| v.as_str()) == Some("sha256"),
+        "integrity manifest {} must declare algorithm == \"sha256\"",
+        manifest_path.display()
+    );
+    let files = manifest
+        .get("files")
+        .and_then(|v| v.as_object())
+        .with_context(|| format!("integrity manifest {} has no `files` object", manifest_path.display()))?;
+    let expected = |name: &str| -> Result<String> {
+        let v = files
+            .get(name)
+            .and_then(|v| v.as_str())
+            .with_context(|| format!("integrity manifest files[\"{name}\"] missing or not a string"))?;
+        // Fail closed on anything that is not a 64-char lowercase-hex digest —
+        // a manifest we cannot strictly parse is a manifest we cannot trust.
+        anyhow::ensure!(
+            v.len() == 64 && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "integrity manifest files[\"{name}\"] is not a 64-char lowercase-hex SHA-256 digest"
+        );
+        Ok(v.to_ascii_lowercase())
+    };
+    let want_exe = expected("winrsbox.exe")?;
+    let want_dll = expected("hook.dll")?;
+
+    let actual_exe = digest_to_hex(&sha256_file(exe_path)?);
+    anyhow::ensure!(
+        actual_exe == want_exe,
+        "integrity check FAILED for {}: expected sha256 {}…, actual {}… — \
+         the launcher binary was modified after install; refusing to run",
+        exe_path.display(),
+        &want_exe[..16],
+        &actual_exe[..16]
+    );
+    let actual_dll = digest_to_hex(&sha256_file(dll_path)?);
+    anyhow::ensure!(
+        actual_dll == want_dll,
+        "integrity check FAILED for {}: expected sha256 {}…, actual {}… — \
+         hook.dll was modified after install; refusing to inject it",
+        dll_path.display(),
+        &want_dll[..16],
+        &actual_dll[..16]
+    );
+    Ok(())
+}
+
+/// `verify_staged_artifacts_in` bound to the real launcher exe.
+fn verify_staged_artifacts(dll_path: &str) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    verify_staged_artifacts_in(&exe, Path::new(dll_path))
+}
+
+/// Refuse to run when the launcher itself is installed inside the sandboxed
+/// project's `node_modules`. There the project_root passthrough short-circuits
+/// every policy rule (policy/src/decide.rs compute()), so a guest could
+/// trojanize winrsbox.exe/hook.dll for the NEXT run — no deny rule can fix
+/// that. The only remedy is refusing to launch from such a location.
+fn verify_not_inside_guest_project_node_modules(dll_path: &str) -> Result<()> {
+    // Canonical form for comparison: backslash separators, lowercased,
+    // `\\?\` device prefix stripped (current_exe can return it).
+    let normalize = |p: &Path| -> String {
+        let s = p.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+        s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+    };
+    let exe = std::env::current_exe()?;
+    let exe_dir = match exe.parent() {
+        Some(d) => normalize(d),
+        // No parent dir → cannot be inside anything.
+        None => return Ok(()),
+    };
+    let nm_root = normalize(&std::env::current_dir()?.join("node_modules"));
+    // Containment mirrors policy/src/decide.rs path_contained_in: prefix
+    // match + separator boundary, so `...\node_modules` does not match a
+    // sibling like `...\node_modules_bak`.
+    let contained = exe_dir.starts_with(&nm_root)
+        && (exe_dir.len() == nm_root.len()
+            || exe_dir.as_bytes().get(nm_root.len()) == Some(&b'\\'));
+    anyhow::ensure!(
+        !contained,
+        "refusing to launch: the winrsbox install itself ({}, containing {}) sits inside \
+         the sandboxed project's node_modules, where the guest's project_root passthrough \
+         makes every policy rule moot — a sandboxed process could trojanize winrsbox.exe \
+         for the next run. Run the sandbox from a different directory or install winrsbox \
+         globally.",
+        exe_dir,
+        dll_path
+    );
+    Ok(())
 }
 
 /// Symlink/reparse-safe replacement for `create_dir_all` over an
@@ -698,6 +880,218 @@ mod tests {
         assert!(
             !cfg.rules.iter().any(|r| r.prefix.contains(r"\\")),
             "default config rule prefixes must use single backslashes",
+        );
+    }
+
+    // ── Finding-1 regression: guest must not overwrite the sandbox's own
+    //    hook.dll / launcher artifacts ──────────────────────────────────────
+
+    /// The npm global install drops the launcher + hook.dll into
+    /// `%APPDATA%\\Roaming\\npm\\node_modules\\winrsbox\\native\\`, and the
+    /// default template passes that whole tree through (writable). Without
+    /// the deny carve-outs a sandboxed process can overwrite hook.dll on the
+    /// real disk — the next launch would inject attacker-controlled code
+    /// OUTSIDE the sandbox. This test loads DEFAULT_CONFIG_KTAV into a real
+    /// Policy and pins the deny/passthrough boundary.
+    #[test]
+    fn install_dir_write_denied_despite_npm_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("policy.redb");
+        let sandbox = dir.path().join("sb");
+        let mock_dirs = dir.path().join("md");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(&mock_dirs).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        let p = policy::Policy::open_or_create(
+            &db_path,
+            sandbox,
+            mock_dirs,
+            project,
+        ).unwrap();
+
+        let cfg_path = dir.path().join("cfg.ktav");
+        std::fs::write(&cfg_path, DEFAULT_CONFIG_KTAV).unwrap();
+        p.load_config(&cfg_path).unwrap();
+
+        // The injection target itself: guest writes must be denied...
+        let d = p.decide(r"c:\users\bob\appdata\roaming\npm\node_modules\winrsbox\native\hook.dll", true);
+        assert_eq!(d.mode, policy::Mode::Deny, "guest write to hook.dll must be denied");
+        // ...while reads stay passthrough (the sandbox still runs its own code).
+        let d = p.decide(r"c:\users\bob\appdata\roaming\npm\node_modules\winrsbox\native\hook.dll", false);
+        assert_eq!(d.mode, policy::Mode::Passthrough, "reads of hook.dll must stay passthrough");
+
+        // The carve-out covers the whole package dir, not just native/.
+        let d = p.decide(r"c:\users\bob\appdata\roaming\npm\node_modules\winrsbox\scripts\winrsbox-cli.js", true);
+        assert_eq!(d.mode, policy::Mode::Deny, "guest write to the package dir must be denied");
+
+        // PATH shims next to the package dir (npm also drops winrsbox.cmd there).
+        let d = p.decide(r"c:\users\bob\appdata\roaming\npm\winrsbox.cmd", true);
+        assert_eq!(d.mode, policy::Mode::Deny, "guest write to the PATH shim must be denied");
+
+        // The carve-out is narrow: the rest of the npm tree stays writable.
+        let d = p.decide(r"c:\users\bob\appdata\roaming\npm\docs\readme.md", true);
+        assert_eq!(d.mode, policy::Mode::Passthrough, "unrelated npm paths must stay passthrough");
+
+        // Prefix-variant install location (%USERPROFILE%\\.npm).
+        let d = p.decide(r"c:\users\bob\.npm\node_modules\winrsbox\package.json", true);
+        assert_eq!(d.mode, policy::Mode::Deny, "guest write under .npm install must be denied");
+
+        // Toolchain prefixes stay writable by design (documented choice).
+        let d = p.decide(r"c:\users\bob\.cargo\bin\cargo.exe", true);
+        assert_eq!(d.mode, policy::Mode::Passthrough, ".cargo passthrough is deliberate");
+    }
+
+    // ── Change-2 integrity self-verification ─────────────────────────────────
+
+    /// Write an integrity.json manifest next to the staged exe, using EXACTLY
+    /// the shape the npm installer emits.
+    fn write_integrity_manifest(dir: &Path, exe_digest: &str, dll_digest: &str) {
+        let manifest = serde_json::json!({
+            "version": "0.1.0",
+            "algorithm": "sha256",
+            "files": {
+                "winrsbox.exe": exe_digest,
+                "hook.dll": dll_digest,
+            }
+        });
+        std::fs::write(
+            dir.join("integrity.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn integrity_manifest_accepts_untampered_staged_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("winrsbox.exe");
+        let dll = dir.path().join("hook.dll");
+        std::fs::write(&exe, b"fake-exe-bytes").unwrap();
+        std::fs::write(&dll, b"fake-dll-bytes").unwrap();
+
+        // The oracle here is the hash function vs the comparison logic (tests
+        // 3/4 below are the negative controls), so computing the digests with
+        // the same sha256_file helper is fine.
+        let exe_digest = digest_to_hex(&sha256_file(&exe).unwrap());
+        let dll_digest = digest_to_hex(&sha256_file(&dll).unwrap());
+        write_integrity_manifest(dir.path(), &exe_digest, &dll_digest);
+
+        verify_staged_artifacts_in(&exe, &dll).unwrap();
+    }
+
+    #[test]
+    fn integrity_manifest_rejects_tampered_dll() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("winrsbox.exe");
+        let dll = dir.path().join("hook.dll");
+        std::fs::write(&exe, b"fake-exe-bytes").unwrap();
+        std::fs::write(&dll, b"fake-dll-bytes").unwrap();
+        let exe_digest = digest_to_hex(&sha256_file(&exe).unwrap());
+        let dll_digest = digest_to_hex(&sha256_file(&dll).unwrap());
+        write_integrity_manifest(dir.path(), &exe_digest, &dll_digest);
+
+        // Flip the dll contents AFTER the manifest was written → must refuse.
+        std::fs::write(&dll, b"fake-dll-bytes-TAMPERED").unwrap();
+        assert!(
+            verify_staged_artifacts_in(&exe, &dll).is_err(),
+            "a tampered hook.dll must fail the integrity check"
+        );
+    }
+
+    #[test]
+    fn integrity_manifest_rejects_tampered_exe() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("winrsbox.exe");
+        let dll = dir.path().join("hook.dll");
+        std::fs::write(&exe, b"fake-exe-bytes").unwrap();
+        std::fs::write(&dll, b"fake-dll-bytes").unwrap();
+        let exe_digest = digest_to_hex(&sha256_file(&exe).unwrap());
+        let dll_digest = digest_to_hex(&sha256_file(&dll).unwrap());
+        write_integrity_manifest(dir.path(), &exe_digest, &dll_digest);
+
+        std::fs::write(&exe, b"fake-exe-bytes-TAMPERED").unwrap();
+        assert!(
+            verify_staged_artifacts_in(&exe, &dll).is_err(),
+            "a tampered winrsbox.exe must fail the integrity check"
+        );
+    }
+
+    #[test]
+    fn integrity_manifest_missing_manifest_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("winrsbox.exe");
+        let dll = dir.path().join("hook.dll");
+        std::fs::write(&exe, b"fake-exe-bytes").unwrap();
+        std::fs::write(&dll, b"fake-dll-bytes").unwrap();
+        // No integrity.json → unmanaged deployment, verification is a no-op.
+        assert!(!dir.path().join("integrity.json").exists());
+        verify_staged_artifacts_in(&exe, &dll).unwrap();
+    }
+
+    #[test]
+    fn integrity_manifest_malformed_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("winrsbox.exe");
+        let dll = dir.path().join("hook.dll");
+        std::fs::write(&exe, b"fake-exe-bytes").unwrap();
+        std::fs::write(&dll, b"fake-dll-bytes").unwrap();
+        // Malformed manifest (no `files`, no `algorithm`) → fail closed.
+        std::fs::write(dir.path().join("integrity.json"), "{}").unwrap();
+        assert!(
+            verify_staged_artifacts_in(&exe, &dll).is_err(),
+            "a malformed integrity manifest must fail closed"
+        );
+    }
+
+    // --- build_cmdline: Windows command lines are UTF-16 ---
+
+    /// Non-ASCII arguments must survive build_cmdline intact. The pre-fix
+    /// writer iterated as_bytes() and pushed each byte as a char (Latin-1),
+    /// so any argument that needed quoting (contains a space) and carried
+    /// non-ASCII was corrupted on its way to CreateProcessW. Regression:
+    /// path with spaces + Cyrillic + CJK.
+    #[test]
+    fn build_cmdline_preserves_non_ascii_args() {
+        let arg = "D:\\проект новый\\отчёт финал.txt".to_string();
+        let cmdline = build_cmdline(&[arg.clone()]);
+        // Contains a space -> must be quoted...
+        assert!(
+            cmdline.starts_with("\"") && cmdline.ends_with("\""),
+            "arg must be quoted: {cmdline}"
+        );
+        // ...and the quoted content must be the original, char for char.
+        assert_eq!(
+            &cmdline[1..cmdline.len() - 1],
+            arg,
+            "non-ASCII arg must survive intact"
+        );
+
+        // Multibyte chars adjacent to a backslash run (trailing-backslash case).
+        let arg2 = "D:\\目录 目录\\bin\\".to_string();
+        let cmdline2 = build_cmdline(&[arg2.clone()]);
+        assert_eq!(
+            &cmdline2[1..cmdline2.len() - 1],
+            "D:\\目录 目录\\bin\\\\",
+            "trailing backslash doubled, non-ASCII chars intact"
+        );
+    }
+
+    /// ASCII CommandLineToArgvW escaping must be unchanged by the UTF-8 fix.
+    #[test]
+    fn build_cmdline_ascii_escaping_unchanged() {
+        assert_eq!(build_cmdline(&[String::new()]), "\"\"");
+        assert_eq!(build_cmdline(&["plain".to_string()]), "plain");
+        assert_eq!(
+            build_cmdline(&["a b\\".to_string()]),
+            "\"a b\\\\\"",
+            "trailing ASCII backslash must still be doubled"
+        );
+        assert_eq!(
+            build_cmdline(&["say \"hi\"\\".to_string()]),
+            "\"say \\\"hi\\\"\\\\\"",
+            "embedded quotes + trailing backslash escaping unchanged"
         );
     }
 }

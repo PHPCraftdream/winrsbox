@@ -18,6 +18,15 @@ use serial_test::serial;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Exit code of a payload killed by the escape-class fail-stop
+/// (`hooks::report_and_terminate_escape`, which calls `TerminateProcess`
+/// with `0xC0000005`). Since commit 8c9ddd5 the sandbox no longer lets an
+/// escape-class COM/ALPC broker attempt return an error to the guest — it
+/// terminates the process, so the guest cannot observe the refusal and
+/// retry a different vector. Tests that predate that change asserted
+/// `Some(5)` (the clean-deny contract) and must assert this instead.
+const EXIT_FAIL_STOP: i32 = 0xC000_0005_u32 as i32;
+
 /// Resolve the workspace target dir, respecting `CARGO_TARGET_DIR`
 /// (set when the workspace uses a non-default target dir) and falling
 /// back to `<workspace>/target` for the standard in-tree layout.
@@ -953,16 +962,18 @@ fn strict_blocks_handle_list_inheritance() {
 #[serial]
 fn strict_blocks_com_shell() {
     let r = run_payload("escape_com_shell", "scan");
-    assert_eq!(r.status.code(), Some(5),
-        "Shell.Application CoCreateInstance should be blocked\nstderr: {}", r.stderr);
+    assert_eq!(r.status.code(), Some(EXIT_FAIL_STOP),
+        "Shell.Application CoCreateInstance is escape-class: the payload must be \
+         terminated, not handed an error\nstderr: {}", r.stderr);
 }
 
 #[test]
 #[serial]
 fn strict_blocks_com_wscript() {
     let r = run_payload("escape_com_wscript", "scan");
-    assert_eq!(r.status.code(), Some(5),
-        "WScript.Shell CoCreateInstance should be blocked\nstderr: {}", r.stderr);
+    assert_eq!(r.status.code(), Some(EXIT_FAIL_STOP),
+        "WScript.Shell CoCreateInstance is escape-class: the payload must be \
+         terminated, not handed an error\nstderr: {}", r.stderr);
 }
 
 #[test]
@@ -981,16 +992,18 @@ fn strict_blocks_com_wmi() {
 #[serial]
 fn strict_blocks_com_taskscheduler() {
     let r = run_payload("escape_com_taskscheduler", "scan");
-    assert_eq!(r.status.code(), Some(5),
-        "Schedule.Service CoCreateInstance should be blocked\nstderr: {}", r.stderr);
+    assert_eq!(r.status.code(), Some(EXIT_FAIL_STOP),
+        "Schedule.Service CoCreateInstance is escape-class: the payload must be \
+         terminated, not handed an error\nstderr: {}", r.stderr);
 }
 
 #[test]
 #[serial]
 fn strict_blocks_com_classobject() {
     let r = run_payload("escape_com_classobject", "scan");
-    assert_eq!(r.status.code(), Some(5),
-        "Shell.Application CoGetClassObject should be blocked\nstderr: {}", r.stderr);
+    assert_eq!(r.status.code(), Some(EXIT_FAIL_STOP),
+        "Shell.Application CoGetClassObject is escape-class: the payload must be \
+         terminated, not handed an error\nstderr: {}", r.stderr);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

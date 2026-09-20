@@ -19,9 +19,10 @@ use winrsbox::jsonl_log;
 use std::{
     path::PathBuf,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 
 // ─── Lock-free PID → ProcInfo storage ─────────────────────────────────────────
@@ -30,12 +31,27 @@ use std::{
 pub(crate) struct ProcInfo {
     pub(crate) depth: u8,
     pub(crate) exe_lower: Arc<str>,
+    /// Process creation time as a Windows FILETIME (100ns ticks since 1601)
+    /// packed into a u64, captured from the kernel at insert time. The pipe
+    /// gate re-queries the live PID's creation time and requires an exact
+    /// match, so a recycled PID can never inherit a dead process's trust.
+    /// `0` is the "unknown" sentinel — the gate fail-closes on it.
+    pub(crate) create_time: u64,
 }
 
 static PROC_INFO: std::sync::OnceLock<papaya::HashMap<u32, ProcInfo>> = std::sync::OnceLock::new();
 
 pub(crate) fn global_proc_info() -> &'static papaya::HashMap<u32, ProcInfo> {
     PROC_INFO.get_or_init(papaya::HashMap::new)
+}
+
+/// Creation-time fingerprint of the root sandboxed target, published together
+/// with `root_target_pid` right after CreateProcessW (long before the resumed
+/// child can connect). `0` = not yet published / unknown; the gate fail-closes.
+static ROOT_CREATE_TIME: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn root_create_time() -> u64 {
+    ROOT_CREATE_TIME.load(Ordering::Acquire)
 }
 
 /// winrsbox — runs a target process inside a CoW filesystem sandbox.
@@ -164,7 +180,7 @@ struct Cli {
 use windows::{
     core::PCWSTR,
     Win32::{
-        Foundation::{CloseHandle, HANDLE},
+        Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
         Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG},
         System::Threading::{
             CreateEventW, GetExitCodeProcess, OpenProcess, ResumeThread,
@@ -250,6 +266,101 @@ fn build_delegation_command(target: &[String]) -> std::process::Command {
     // stdio is inherited by default — the outer sandbox captures the spawn
     // via its NtCreateUserProcess hook, so no FS_SANDBOX_* env is needed.
     cmd
+}
+
+// ─── Child-exit drain (scales past MAXIMUM_WAIT_OBJECTS) ─────────────────────────────
+
+/// Hard limit of WaitForMultipleObjects: a call naming more handles than
+/// this fails with WAIT_FAILED instead of waiting.
+const MAXIMUM_WAIT_OBJECTS: usize = 64;
+
+/// Total grace window the launcher gives all sandboxed children to exit
+/// after the root target is gone. Same budget the previous single
+/// WaitForMultipleObjects call used — chunking must not extend it.
+const CHILD_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// The one native call the drain loop is allowed to make. A trait so the
+/// loop's >64-scaling, per-exit observation and pruning are unit-testable
+/// without real process handles (see `child_drain_tests`).
+trait ChildWaitSet {
+    /// Block until at least one handle in `keys` signals, up to
+    /// `timeout_ms`. Returns the index in `keys` of a signalled handle, or
+    /// None on timeout or wait failure.
+    fn wait_any(&mut self, keys: &[isize], timeout_ms: u32) -> Option<usize>;
+}
+
+struct Win32ChildWaitSet;
+
+impl ChildWaitSet for Win32ChildWaitSet {
+    fn wait_any(&mut self, keys: &[isize], timeout_ms: u32) -> Option<usize> {
+        debug_assert!(!keys.is_empty(), "empty wait-set would block forever");
+        debug_assert!(
+            keys.len() <= MAXIMUM_WAIT_OBJECTS,
+            "chunk overflow: {} > {MAXIMUM_WAIT_OBJECTS} - WaitForMultipleObjects would fail",
+            keys.len()
+        );
+        let handles: Vec<HANDLE> = keys.iter().map(|&k| HANDLE(k as *mut _)).collect();
+        // SAFETY: handles are PROCESS_SYNCHRONIZE handles opened via
+        //         OpenProcess at the drain site and still open while this runs.
+        let code = unsafe { WaitForMultipleObjects(&handles, false, timeout_ms) };
+        // WAIT_OBJECT_0 + i names a signalled handle; anything else (timeout,
+        // failure) is "no observation" — the caller's deadline and final
+        // zero-timeout sweep handle the rest.
+        let idx = code.0.wrapping_sub(WAIT_OBJECT_0.0);
+        if (idx as usize) < keys.len() { Some(idx as usize) } else { None }
+    }
+}
+
+/// Wait for every child handle to signal (process exited), observing each
+/// exit the moment it happens: `on_exit` runs per child exactly once, so
+/// exit-pruning is never batched behind the whole set. Handles are waited
+/// on in chunks of at most MAXIMUM_WAIT_OBJECTS — a process tree wider
+/// than 64 children stays fully tracked, which the previous single
+/// bWaitAll=true call silently did not (it failed with WAIT_FAILED and the
+/// grace window never happened). One deadline bounds the TOTAL grace across
+/// all chunks, so chunking cannot extend the window. A final zero-timeout
+/// sweep catches exits landing between the last wait and the deadline.
+/// Handles are NOT closed here — the caller owns them.
+fn wait_and_prune_children<W: ChildWaitSet>(
+    waiter: &mut W,
+    children: &[(u32, isize)],
+    grace: Duration,
+    on_exit: &mut dyn FnMut(u32),
+) {
+    let deadline = Instant::now() + grace;
+    let mut observed = vec![false; children.len()];
+    loop {
+        let pending: Vec<usize> = (0..children.len()).filter(|&i| !observed[i]).collect();
+        if pending.is_empty() {
+            return;
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        let remaining_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
+        let chunk: Vec<isize> = pending
+            .iter()
+            .take(MAXIMUM_WAIT_OBJECTS)
+            .map(|&i| children[i].1)
+            .collect();
+        let Some(idx) = waiter.wait_any(&chunk, remaining_ms) else {
+            break;
+        };
+        let i = pending[idx];
+        observed[i] = true;
+        on_exit(children[i].0);
+    }
+    // Zero-timeout sweep: prune children that exited between the last wait
+    // and the deadline without spending any more wall-clock time.
+    for i in 0..children.len() {
+        if observed[i] {
+            continue;
+        }
+        if waiter.wait_any(&[children[i].1], 0).is_some() {
+            observed[i] = true;
+            on_exit(children[i].0);
+        }
+    }
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -567,11 +678,16 @@ async fn run() -> Result<()> {
         std::env::set_var("FS_SANDBOX_STRICT_CLIPBOARD", "1");
     }
 
-    // Publish a `SessionConfig` snapshot via `Local\WinRsBoxSession` so
-    // hooked descendants whose environment was scrubbed (MSYS2 first-run
-    // helpers in particular) can still discover the pipe name etc. The
-    // returned handle is held for the launcher's whole lifetime — dropping
-    // it would destroy the section and break late-arriving readers.
+    // Publish a `SessionConfig` snapshot under a RANDOM per-session section
+    // name so hooked descendants whose environment was scrubbed (MSYS2
+    // first-run helpers in particular) can still discover the pipe name etc.
+    // The name is not guessable and travels only through the injection
+    // channel: it is exported as FS_SANDBOX_SECTION below (the root target
+    // inherits it via CreateProcessW's environment block), and the spawn hook
+    // patches it into every descendant's environment cross-process before
+    // the child runs. The returned handle is held for the launcher's whole
+    // lifetime — dropping it would destroy the section and break
+    // late-arriving readers.
     let session_cfg = ipc::SessionConfig {
         pipe_name: pipe_name.clone(),
         dll_path: dll_path.clone(),
@@ -595,8 +711,15 @@ async fn run() -> Result<()> {
         allow_rwx: cli.allow_rwx,
         disable_hooks: cli.disable_hooks.clone().unwrap_or_default(),
     };
-    let _session_section = winrsbox::session_section::publish(&session_cfg)
-        .context("publish session config to Local\\WinRsBoxSession")?;
+    let (_session_section, section_name) = winrsbox::session_section::publish(&session_cfg)
+        .context("publish session config section")?;
+    // The name IS the access control: the section exists under this random
+    // name only, so every process that must read the config has to be told
+    // the name through the injection channel. The root target receives it
+    // here, via the inherited environment (authored before any guest code
+    // runs, hence unforgeable at root start — same trust argument as
+    // FS_SANDBOX_PIPE).
+    std::env::set_var("FS_SANDBOX_SECTION", &section_name);
 
     // Create kernel Event for hook.dll init signaling.
     //
@@ -624,13 +747,23 @@ async fn run() -> Result<()> {
     // after it loads).
     let effective_guard = cli.guard;
     if effective_guard == GuardLevel::Static {
+        // The trust verdict is ADVISORY — see trust.rs. It is shown so the
+        // operator knows what they are about to run, and is deliberately NOT
+        // enforced: unsigned OSS toolchains (cargo/node/python) are the
+        // sandbox's normal workload and hook.dll itself is unsigned in dev
+        // builds (its integrity is enforced by the digest manifest in
+        // find_hook_dll instead). Do not turn this into a launch gate
+        // without an opt-out for unsigned dev builds.
         let trust = winrsbox::trust::verify_signature(std::path::Path::new(&target_args[0]));
-        if trust.is_trusted() {
-            println!("[sandbox] guard: static (hard containment) — target is {trust}");
+        let mitigation_note = if trust.is_trusted() {
+            ""
         } else {
-            println!("[sandbox] guard: static (hard containment) — target is unsigned; \
-                      JIT and unsigned native extensions (.pyd/.node) will be blocked");
-        }
+            "; JIT and unsigned native extensions (.pyd/.node) will be blocked by mitigation policy"
+        };
+        println!(
+            "[sandbox] guard: static (hard containment) — {}{mitigation_note}",
+            winrsbox::trust::advisory_notice(&trust)
+        );
     }
 
     let proc_info = sandbox::launch_suspended(&project_root, &target_args, effective_guard)?;
@@ -641,6 +774,10 @@ async fn run() -> Result<()> {
     // target stays suspended until then, so no connection can reach the
     // accept loop with this slot still set to 0.
     root_target_pid.store(proc_info.dwProcessId, Ordering::Release);
+    ROOT_CREATE_TIME.store(
+        pipe_server::process_create_time_from_handle(proc_info.hProcess),
+        Ordering::Release,
+    );
 
     // Pre-launch code integrity scan (full/static guard + not skipped).
     // The direct-syscall scan matters most for `full` (which allows JIT and so
@@ -785,7 +922,11 @@ async fn run() -> Result<()> {
         .unwrap_or_default();
     global_proc_info().pin().insert(
         proc_info.dwProcessId,
-        ProcInfo { depth: 0, exe_lower: Arc::from(arg0_lower.as_str()) },
+        ProcInfo {
+            depth: 0,
+            exe_lower: Arc::from(arg0_lower.as_str()),
+            create_time: pipe_server::process_create_time_from_handle(proc_info.hProcess),
+        },
     );
 
     // Resume target main thread.
@@ -858,29 +999,39 @@ async fn run() -> Result<()> {
 
     // Drain registered child PIDs into a deduplicated set and open handles.
     let mut seen = FxHashSet::default();
-    let mut child_handles: Vec<HANDLE> = Vec::new();
+    let mut children: Vec<(u32, isize)> = Vec::new();
     while let Some(pid) = child_pids.pop() {
         if seen.insert(pid) {
             if let Ok(h) = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
-                child_handles.push(h);
+                children.push((pid, h.0 as isize));
+            } else {
+                // OpenProcess failed — the child is already gone and its PID
+                // freed (or otherwise unreopenable); drop the dead child's
+                // tracking entry so it can never be trusted again.
+                global_proc_info().pin().remove(&pid);
             }
         }
     }
 
-    if !child_handles.is_empty() {
-        // Convert HANDLE → isize for Send-safety across .await.
-        let ihandles: Vec<isize> = child_handles.iter().map(|h| h.0 as isize).collect();
+    if !children.is_empty() {
+        // The list can exceed MAXIMUM_WAIT_OBJECTS (64): a process tree wider
+        // than that must still be waited on and pruned. The old single
+        // WaitForMultipleObjects(bWaitAll=true) failed outright past 64
+        // handles (WAIT_FAILED, result discarded) and silently skipped the
+        // whole grace window; the chunked drain below keeps the same 5 s
+        // budget and observes every exit.
+        let wait_list = children.clone();
         tokio::task::spawn_blocking(move || {
-            let handles: Vec<HANDLE> = ihandles.iter().map(|&i| HANDLE(i as *mut _)).collect();
-            // SAFETY: handles are valid PROCESS_SYNCHRONIZE handles from OpenProcess above.
-            // bWaitAll=true: wait for ALL registered children to exit (or hit the timeout).
-            unsafe { WaitForMultipleObjects(&handles, true, 5000) };
+            let mut waiter = Win32ChildWaitSet;
+            wait_and_prune_children(&mut waiter, &wait_list, CHILD_DRAIN_GRACE, &mut |pid| {
+                global_proc_info().pin().remove(&pid);
+            });
         })
         .await
         .unwrap_or_else(|e| eprintln!("[sandbox] child-wait task failed: {e}"));
-        for h in &child_handles {
+        for (_, h) in &children {
             // SAFETY: h is a handle we own from OpenProcess above.
-            unsafe { CloseHandle(*h).ok() };
+            unsafe { CloseHandle(HANDLE(*h as *mut _)).ok() };
         }
     }
 
@@ -925,7 +1076,7 @@ mod proc_info_tests {
     #[test]
     fn insert_and_lookup() {
         let map: papaya::HashMap<u32, ProcInfo> = papaya::HashMap::new();
-        map.pin().insert(100, ProcInfo { depth: 0, exe_lower: Arc::from("c:\\app.exe") });
+        map.pin().insert(100, ProcInfo { depth: 0, exe_lower: Arc::from("c:\\app.exe"), create_time: 0 });
         let info = map.pin().get(&100).cloned().unwrap();
         assert_eq!(info.depth, 0);
         assert_eq!(&*info.exe_lower, "c:\\app.exe");
@@ -940,7 +1091,7 @@ mod proc_info_tests {
     #[test]
     fn remove_entry() {
         let map: papaya::HashMap<u32, ProcInfo> = papaya::HashMap::new();
-        map.pin().insert(200, ProcInfo { depth: 1, exe_lower: Arc::from("child.exe") });
+        map.pin().insert(200, ProcInfo { depth: 1, exe_lower: Arc::from("child.exe"), create_time: 0 });
         assert!(map.pin().remove(&200).is_some());
         assert!(map.pin().get(&200).is_none());
     }
@@ -957,6 +1108,7 @@ mod proc_info_tests {
                 m.pin().insert(pid, ProcInfo {
                     depth: i as u8,
                     exe_lower: Arc::from(format!("proc_{i}.exe").leak() as &str),
+                    create_time: 0,
                 });
                 assert!(m.pin().get(&pid).is_some());
             }));
@@ -974,11 +1126,11 @@ mod proc_info_tests {
     fn depth_chain_root_child_grandchild() {
         let map: papaya::HashMap<u32, ProcInfo> = papaya::HashMap::new();
         // Root
-        map.pin().insert(10, ProcInfo { depth: 0, exe_lower: Arc::from("root.exe") });
+        map.pin().insert(10, ProcInfo { depth: 0, exe_lower: Arc::from("root.exe"), create_time: 0 });
         // Child
-        map.pin().insert(20, ProcInfo { depth: 1, exe_lower: Arc::from("child.exe") });
+        map.pin().insert(20, ProcInfo { depth: 1, exe_lower: Arc::from("child.exe"), create_time: 0 });
         // Grandchild
-        map.pin().insert(30, ProcInfo { depth: 2, exe_lower: Arc::from("grandchild.exe") });
+        map.pin().insert(30, ProcInfo { depth: 2, exe_lower: Arc::from("grandchild.exe"), create_time: 0 });
 
         assert_eq!(map.pin().get(&10).unwrap().depth, 0);
         assert_eq!(map.pin().get(&20).unwrap().depth, 1);
@@ -988,8 +1140,8 @@ mod proc_info_tests {
     #[test]
     fn overwrite_updates_value() {
         let map: papaya::HashMap<u32, ProcInfo> = papaya::HashMap::new();
-        map.pin().insert(50, ProcInfo { depth: 0, exe_lower: Arc::from("old.exe") });
-        map.pin().insert(50, ProcInfo { depth: 1, exe_lower: Arc::from("new.exe") });
+        map.pin().insert(50, ProcInfo { depth: 0, exe_lower: Arc::from("old.exe"), create_time: 0 });
+        map.pin().insert(50, ProcInfo { depth: 1, exe_lower: Arc::from("new.exe"), create_time: 0 });
         let info = map.pin().get(&50).cloned().unwrap();
         assert_eq!(info.depth, 1);
         assert_eq!(&*info.exe_lower, "new.exe");
@@ -1107,6 +1259,25 @@ mod nested_detection_tests {
 
     use super::is_nested_invocation;
 
+    /// Serializes the tests in this module against each other.
+    ///
+    /// The doc comment above states they must not run in parallel, but stating
+    /// it did not enforce it: `cargo test` runs them on separate threads of one
+    /// process, and the environment is process-wide. One test would set
+    /// `FS_SANDBOX_PIPE` while another removed it, and whichever asserted second
+    /// failed — observed as an intermittent failure of
+    /// `not_nested_when_pipe_unset` or `empty_string_still_counts_as_nested`,
+    /// depending on which thread lost the race. Each test now holds this lock
+    /// for its whole body, so the set/assert/restore sequence is atomic with
+    /// respect to its siblings.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the lock, ignoring poisoning: a panic in one test must not cascade
+    /// into spurious failures of the others, which would hide the real one.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// RAII guard that restores `FS_SANDBOX_PIPE` to its prior state on drop.
     struct PipeGuard(Option<std::ffi::OsString>);
     impl PipeGuard {
@@ -1125,6 +1296,7 @@ mod nested_detection_tests {
 
     #[test]
     fn detects_nested_when_pipe_set() {
+        let _lock = env_lock();
         let _g = PipeGuard::capture();
         std::env::set_var("FS_SANDBOX_PIPE", r"\\.\pipe\fs-sandbox-99999");
         assert!(is_nested_invocation(), "FS_SANDBOX_PIPE set ⇒ nested");
@@ -1132,6 +1304,7 @@ mod nested_detection_tests {
 
     #[test]
     fn not_nested_when_pipe_unset() {
+        let _lock = env_lock();
         let _g = PipeGuard::capture();
         std::env::remove_var("FS_SANDBOX_PIPE");
         assert!(!is_nested_invocation(), "FS_SANDBOX_PIPE unset ⇒ not nested");
@@ -1143,6 +1316,7 @@ mod nested_detection_tests {
     /// not "non-empty ⇒ nested", so an empty string still counts.
     #[test]
     fn empty_string_still_counts_as_nested() {
+        let _lock = env_lock();
         let _g = PipeGuard::capture();
         std::env::set_var("FS_SANDBOX_PIPE", "");
         assert!(is_nested_invocation(), "presence (not value) ⇒ nested");
@@ -1334,5 +1508,159 @@ mod cli_target_parsing_tests {
         assert_eq!(cmd.get_program(), std::ffi::OsStr::new("cmd.exe"));
         let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
         assert_eq!(args, ["/c", "echo DELEGATED_ARG_OK"]);
+    }
+}
+
+#[cfg(test)]
+mod child_drain_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Fake wait-set standing in for WaitForMultipleObjects: any key marked
+    /// as exited signals immediately at its position; otherwise the call
+    /// "times out" (None), exactly like the real API returning
+    /// WAIT_TIMEOUT / WAIT_FAILED. Every call's chunk size is recorded so
+    /// the tests can pin the MAXIMUM_WAIT_OBJECTS bound.
+    struct FakeWaitSet {
+        exited: HashSet<isize>,
+        chunk_sizes: Vec<usize>,
+    }
+
+    impl FakeWaitSet {
+        fn new(exited: &[isize]) -> Self {
+            Self { exited: exited.iter().copied().collect(), chunk_sizes: Vec::new() }
+        }
+    }
+
+    impl ChildWaitSet for FakeWaitSet {
+        fn wait_any(&mut self, keys: &[isize], _timeout_ms: u32) -> Option<usize> {
+            self.chunk_sizes.push(keys.len());
+            keys.iter().position(|k| self.exited.contains(k))
+        }
+    }
+
+    fn kids(count: u32) -> Vec<(u32, isize)> {
+        (0..count).map(|i| (1000 + i, i as isize)).collect()
+    }
+
+    /// THE containment regression: a tree wider than MAXIMUM_WAIT_OBJECTS
+    /// must still be waited on in full and every exit observed. The old
+    /// single WaitForMultipleObjects(bWaitAll=true) call failed outright
+    /// past 64 handles and observed nothing.
+    #[test]
+    fn more_than_64_children_all_waited_and_observed() {
+        let children = kids(100); // > MAXIMUM_WAIT_OBJECTS
+        let exited: Vec<isize> = children.iter().map(|(_, h)| *h).collect();
+        let mut ws = FakeWaitSet::new(&exited);
+        let mut pruned: Vec<u32> = Vec::new();
+        wait_and_prune_children(&mut ws, &children, CHILD_DRAIN_GRACE, &mut |pid| {
+            pruned.push(pid);
+        });
+
+        // every child observed exactly once
+        assert_eq!(pruned.len(), children.len());
+        let mut sorted = pruned.clone();
+        sorted.sort_unstable();
+        let mut want: Vec<u32> = children.iter().map(|(p, _)| *p).collect();
+        want.sort_unstable();
+        assert_eq!(sorted, want);
+
+        // and no single native wait ever exceeded the 64-handle limit
+        assert!(
+            ws.chunk_sizes.iter().all(|&n| n <= MAXIMUM_WAIT_OBJECTS),
+            "chunk sizes exceeded MAXIMUM_WAIT_OBJECTS: {:?}",
+            ws.chunk_sizes
+        );
+        assert!(
+            ws.chunk_sizes.iter().any(|&n| n == MAXIMUM_WAIT_OBJECTS),
+            "expected at least one full chunk of {MAXIMUM_WAIT_OBJECTS}"
+        );
+    }
+
+    /// Partial exits: only the exited child is observed (here via the wait
+    /// loop, because it sits inside the first chunk); the rest stay
+    /// unobserved and the deadline ends the drain instead of hanging.
+    #[test]
+    fn partial_exits_observe_only_the_exited_child() {
+        let children = kids(10);
+        let mut ws = FakeWaitSet::new(&[7]); // handle 7 == pid 1007 exited
+        let mut pruned: Vec<u32> = Vec::new();
+        wait_and_prune_children(&mut ws, &children, CHILD_DRAIN_GRACE, &mut |pid| {
+            pruned.push(pid);
+        });
+        assert_eq!(pruned, vec![1007]);
+    }
+
+    /// Exits landing after the wait loop gave up are still caught by the
+    /// final zero-timeout sweep (no extra wall-clock spent).
+    #[test]
+    fn sweep_catches_exit_outside_the_wait_chunk() {
+        let children = kids(10);
+        // handle 7 is in the first chunk, so make a later one exit instead:
+        // fake that never signals inside wait_any, but does on a 0-timeout
+        // call (the sweep) for handle 9.
+        let mut ws = NeverSignals { sweep_exits: vec![9] };
+        let mut pruned: Vec<u32> = Vec::new();
+        wait_and_prune_children(&mut ws, &children, CHILD_DRAIN_GRACE, &mut |pid| {
+            pruned.push(pid);
+        });
+        assert_eq!(pruned, vec![1009]);
+    }
+
+    /// Fake that always times out in the wait loop, but reports handle 9
+    /// exited when polled with a zero timeout (the sweep's shape).
+    struct NeverSignals {
+        sweep_exits: Vec<isize>,
+    }
+    impl ChildWaitSet for NeverSignals {
+        fn wait_any(&mut self, keys: &[isize], timeout_ms: u32) -> Option<usize> {
+            if timeout_ms == 0 {
+                return keys.iter().position(|k| self.sweep_exits.contains(k));
+            }
+            None
+        }
+    }
+
+    /// Empty input is a no-op and never calls the native wait with an empty
+    /// set (real WaitForMultipleObjects with nCount=0 is UB).
+    #[test]
+    fn empty_child_list_makes_no_wait_calls() {
+        let mut ws = FakeWaitSet::new(&[]);
+        let mut pruned: Vec<u32> = Vec::new();
+        wait_and_prune_children(&mut ws, &[], CHILD_DRAIN_GRACE, &mut |pid| {
+            pruned.push(pid);
+        });
+        assert!(pruned.is_empty());
+        assert!(ws.chunk_sizes.is_empty());
+    }
+
+    /// The real Win32ChildWaitSet maps a signalled handle to the right
+    /// index (here: the promptly-exiting child at index 1, while the child
+    /// at index 0 is still alive) and honours the timeout on a live handle.
+    #[test]
+    fn win32_waitset_reports_signalled_index_and_times_out() {
+        use std::os::windows::io::AsRawHandle;
+
+        let mut fast = std::process::Command::new("cmd")
+            .args(["/c", "exit 0"])
+            .spawn()
+            .expect("spawn cmd");
+        let mut slow = std::process::Command::new("ping")
+            .args(["-n", "2", "127.0.0.1"])
+            .spawn()
+            .expect("spawn ping");
+        let fast_h = fast.as_raw_handle() as isize;
+        let slow_h = slow.as_raw_handle() as isize;
+
+        let mut ws = Win32ChildWaitSet;
+        // fast is at index 1 and exits immediately; slow lives ~1s.
+        let got = ws.wait_any(&[slow_h, fast_h], 10_000);
+        assert_eq!(got, Some(1), "expected index 1 (the exiting child)");
+        // a live process must time out, not be misreported as signalled
+        let got = ws.wait_any(&[slow_h], 200);
+        assert_eq!(got, None, "live child must not be reported as exited");
+
+        fast.wait().unwrap();
+        slow.wait().unwrap();
     }
 }

@@ -147,24 +147,20 @@ pub(crate) fn log_pre_launch_violation(
     target_exe: &str,
     hits: &[policy::scan::SyscallHit],
 ) {
-    use std::io::Write;
-    let hit_json: Vec<String> = hits
-        .iter()
-        .map(|h| format!("[\"0x{:x}\",\"{}\"]", h.offset, h.kind))
-        .collect();
-    let line = format!(
-        "{{\"kind\":\"PreLaunchViolation\",\"target_pid\":{target_pid},\"target_exe\":\"{}\",\"hit_count\":{},\"hits\":[{}]}}\n",
-        target_exe.replace('\\', "\\\\").replace('"', "\\\""),
-        hits.len(),
-        hit_json.join(","),
-    );
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-    {
-        let _ = f.write_all(line.as_bytes());
-    }
+    // serde_json escapes control characters, so a hostile target path
+    // cannot forge extra records in violations.log (same fix as the
+    // pipe-side violation writers; audit 2026-09-19).
+    let record = serde_json::json!({
+        "kind": "PreLaunchViolation",
+        "target_pid": target_pid,
+        "target_exe": target_exe,
+        "hit_count": hits.len(),
+        "hits": hits
+            .iter()
+            .map(|h| serde_json::json!([format!("0x{:x}", h.offset), h.kind.to_string()]))
+            .collect::<Vec<_>>(),
+    });
+    crate::pipe_server::append_violation_record(log_path, record);
 }
 
 /// Get the image base address of the main executable in the target process.
@@ -245,4 +241,44 @@ pub(crate) fn read_remote_memory(process: HANDLE, addr: usize, buf: &mut [u8]) -
         anyhow::bail!("short read: {read} of {}", buf.len());
     }
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pre-launch record lands in the same violations.log audit trail
+    /// as the pipe-side violation records; a hostile target path must not
+    /// be able to forge extra records there (audit 2026-09-19).
+    #[test]
+    fn pre_launch_record_cannot_be_forged_by_hostile_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let vlog = dir.path().join("violations.log");
+        let hostile = "c:\\evil\" \n {\"pid\":666,\"kind\":\"PreLaunchViolation\"}\r\n\\";
+        let hits = vec![
+            policy::scan::SyscallHit {
+                offset: 0x1400,
+                kind: policy::scan::SyscallKind::Syscall,
+            },
+            policy::scan::SyscallHit {
+                offset: 0x1600,
+                kind: policy::scan::SyscallKind::Int2e,
+            },
+        ];
+        log_pre_launch_violation(&vlog, 42, hostile, &hits);
+
+        let raw = std::fs::read_to_string(&vlog).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 1, "one record must be one line: {raw}");
+        let parsed: serde_json::Value = serde_json::from_str(lines[0])
+            .expect("the record must be one complete JSON object");
+        assert_eq!(parsed["target_pid"], 42);
+        assert_eq!(
+            parsed["target_exe"], hostile,
+            "hostile path must round-trip exactly, not forge a record"
+        );
+        assert_eq!(parsed["hit_count"], 2);
+        assert_eq!(parsed["hits"][0][0], "0x1400");
+        assert_eq!(parsed["hits"][0][1], "syscall");
+        assert_eq!(parsed["hits"][1][1], "int 2eh");
+    }
 }
