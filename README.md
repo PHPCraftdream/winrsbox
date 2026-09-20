@@ -215,7 +215,7 @@ when: {
 ## How it works
 
 1. The launcher spawns the target process with a DLL injected via `CreateProcess` + `CREATE_SUSPENDED`.
-2. The injected DLL hooks ntdll filesystem syscalls (`NtCreateFile`, `NtWriteFile`, `NtDeleteFile`, etc.) in-process.
+2. The injected DLL hooks ntdll filesystem syscalls in-process. Interception happens at the point a path is *named* — `NtCreateFile`, `NtOpenFile`, `NtDeleteFile`, `NtQueryAttributesFile`, `NtQueryDirectoryFile`, `NtSetInformationFile` (rename/link/disposition) — not at the point bytes are written: once an open has been redirected into the overlay, the resulting handle already points at the copy, so `NtWriteFile` itself needs no hook.
 3. Every hooked call is forwarded over an IPC pipe back to the launcher, which evaluates policy and decides allow/redirect/block.
 4. Redirected writes go to a CoW overlay directory; the target process sees a merged view. Child processes inherit the same hooks automatically.
 

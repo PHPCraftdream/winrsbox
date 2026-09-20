@@ -45,3 +45,6 @@ desktop.ini
 *.old
 *.tmp
 *~
+
+# /wrush task worktrees — always created here, in-tree
+/worktrees/

@@ -65,6 +65,69 @@ Out of scope:
 - Known, documented limitations (see the README and `--guard` help text), e.g.
   WMI being unavailable under `scan`/`full` (use `--guard none` for WMI-dependent
   tools).
+- **Writes to UNC / network-redirector paths are refused, not redirected.** The
+  CoW overlay is keyed by DOS paths, so a write to `\\server\share\...`,
+  `\\localhost\c$\...`, a mapped network drive or a WebDAV share has no
+  representable overlay destination. Rather than let such a write reach the real
+  target outside the sandbox, it is denied with `STATUS_ACCESS_DENIED`. Reads
+  keep the documented pass-through. The same fail-closed rule applies to any
+  path the policy cannot resolve to a DOS form, including unrecognized device
+  namespaces.
+
+## Behaviour changes from the hardening pass
+
+Closing the audit findings turned several silent fall-throughs into refusals.
+Each is intentional and fail-closed, but each can stop something that used to
+work — they are listed here so an upgrade is not a surprise.
+
+- **A cross-process `WriteProcessMemory` into a process the sandbox does not
+  own terminates the caller.** It used to be content-scanned for syscall
+  opcodes, which only ever caught the payload shapes it knew. Injection into
+  the launcher's own children is unaffected.
+- **An unresolvable call stack is treated as untrusted, not as "system".**
+  A stack walk that fails in a legitimate context therefore terminates the
+  process instead of granting it system trust.
+- **Under `--guard full` / `static`, a spawned child whose image cannot be
+  scanned is terminated**, not only one where a direct syscall is found.
+  Otherwise a spawner could deny itself `VM_READ` to skip the scan.
+- **`ShellExecute` verbs are allow-listed.** `runas`, `explore`, `find` and any
+  verb not on the list are refused; `open`, `edit`, `print` and the default
+  (NULL/empty) verb still work.
+- **`NtCreateKey` under a deny-listed registry prefix is refused even with
+  `KEY_READ`**, because the call creates the key regardless of the requested
+  access. Read-only creation under CoW prefixes is unchanged.
+- **An open that requests only `FILE_WRITE_ATTRIBUTES` (or `GENERIC_ALL`, or
+  `FILE_WRITE_EA`) now counts as a write.** Outside `project_root` that means a
+  timestamp-only touch of a large file triggers one full CoW copy, and
+  attribute-write opens of directories fail with `OBJECT_NAME_NOT_FOUND`
+  instead of mutating the real directory.
+- **Asynchronous directory enumeration completes synchronously.** The hook must
+  see the finished buffer to filter it, so a query that returned
+  `STATUS_PENDING` now blocks until completion and returns the final status.
+- **Writes into the sandbox's own installed directory are denied** even where
+  the surrounding rule grants passthrough, and the launcher verifies the
+  staged binaries against the installer's integrity manifest before injecting.
+- **Policy keys are folded ASCII-only.** Entries written before this change
+  under Unicode-folded, cased non-ASCII keys stop resolving: overlay reads fall
+  back to the real file (no data loss; the next write re-copies), but mocks and
+  rules whose prefix contains cased non-ASCII characters must be re-added.
+- **The session config section is randomly named per session and read-only.**
+  It no longer lives at a fixed `Local\WinRsBoxSession` name; the name is
+  generated from the system CSPRNG and delivered to each process through the
+  injection channel (patched into the suspended child's environment block
+  before any guest code runs, so env-scrubbed children are covered too). RNG
+  failure fails the launch rather than falling back to a guessable name, and
+  the launcher refuses to publish into a section it did not create.
+
+  Residual, stated plainly: a sandboxed process can read the name out of its
+  own environment and open the section **for reading** — it runs as the same
+  user, and the hook lives inside it, so no secret held there is secret from
+  it. What it cannot do is rewrite the config: the DACL denies
+  `SECTION_MAP_WRITE` to everyone and an `OWNER_RIGHTS` ACE suppresses the
+  owner's implicit `WRITE_DAC`, so the guest cannot grant itself write either.
+  A guest that has already obtained Administrator rights can take ownership and
+  undo that — which is out of scope above, along with every other
+  already-elevated escape.
 
 ## Disclosure process
 
