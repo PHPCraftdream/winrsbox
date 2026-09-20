@@ -394,26 +394,53 @@ impl WfpEngine {
         Ok(filter_id)
     }
 
-    /// Add a BLOCK filter for outbound IPv6 connections to a CIDR range.
-    pub fn block_outbound_cidr_v6(&mut self, cidr: &CidrV6) -> Result<u64> {
+    /// Add a BLOCK filter for outbound IPv6 connections from `app_path` to a
+    /// CIDR range.
+    ///
+    /// `app_path` is not optional. Without the `ALE_APP_ID` condition this
+    /// filter matched EVERY process on the machine, so for as long as any
+    /// sandbox was running the whole host lost connectivity to the private
+    /// IPv6 ranges — a sandbox silently reconfiguring the operator's network.
+    /// The v4 twin has always been scoped; this one was not.
+    pub fn block_outbound_cidr_v6(&mut self, app_path: &Path, cidr: &CidrV6) -> Result<u64> {
         use windows::Wdk::NetworkManagement::WindowsFilteringPlatform::FwpmFilterAdd0;
         use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
+
+        // Same contract as `add_filter`: an unusable app id aborts the add.
+        // Never fall back to an unscoped filter.
+        let mut app_id = app_id_from_path(app_path)?;
+        let mut app_blob = FWP_BYTE_BLOB {
+            size: app_id.len() as u32,
+            data: app_id.as_mut_ptr(),
+        };
 
         let addr_mask = FWP_V6_ADDR_AND_MASK {
             addr: cidr.addr,
             prefixLength: cidr.prefix,
         };
 
-        let mut conditions = [FWPM_FILTER_CONDITION0 {
-            fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
-            matchType: FWP_MATCH_EQUAL,
-            conditionValue: FWP_CONDITION_VALUE0 {
-                r#type: FWP_V6_ADDR_MASK,
-                Anonymous: FWP_CONDITION_VALUE0_0 {
-                    v6AddrMask: &addr_mask as *const _ as *mut _,
+        let mut conditions = [
+            FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_ALE_APP_ID,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_BYTE_BLOB_TYPE,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        byteBlob: &mut app_blob,
+                    },
                 },
             },
-        }];
+            FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_V6_ADDR_MASK,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        v6AddrMask: &addr_mask as *const _ as *mut _,
+                    },
+                },
+            },
+        ];
 
         let name_wide: Vec<u16> = format!("winrsbox-block-v6-cidr\0")
             .encode_utf16().collect();
@@ -429,7 +456,7 @@ impl WfpEngine {
             action: FWPM_ACTION0 { r#type: FWP_ACTION_BLOCK, ..Default::default() },
             flags: FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
             filterCondition: conditions.as_mut_ptr(),
-            numFilterConditions: 1,
+            numFilterConditions: conditions.len() as u32,
             weight: FWP_VALUE0 {
                 r#type: FWP_UINT8,
                 Anonymous: FWP_VALUE0_0 { uint8: 10 },
@@ -450,18 +477,38 @@ impl WfpEngine {
     }
 
     /// Block all outbound TCP connections to a specific port.
-    pub fn block_outbound_port(&mut self, port: u16) -> Result<u64> {
+    pub fn block_outbound_port(&mut self, app_path: &Path, port: u16) -> Result<u64> {
         use windows::Wdk::NetworkManagement::WindowsFilteringPlatform::FwpmFilterAdd0;
         use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 
-        let mut conditions = [FWPM_FILTER_CONDITION0 {
-            fieldKey: FWPM_CONDITION_IP_REMOTE_PORT,
-            matchType: FWP_MATCH_EQUAL,
-            conditionValue: FWP_CONDITION_VALUE0 {
-                r#type: FWP_UINT16,
-                Anonymous: FWP_CONDITION_VALUE0_0 { uint16: port },
+        // Same contract as `add_filter`: an unusable app id aborts the add.
+        // Never fall back to an unscoped filter.
+        let mut app_id = app_id_from_path(app_path)?;
+        let mut app_blob = FWP_BYTE_BLOB {
+            size: app_id.len() as u32,
+            data: app_id.as_mut_ptr(),
+        };
+
+        let mut conditions = [
+            FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_ALE_APP_ID,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_BYTE_BLOB_TYPE,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        byteBlob: &mut app_blob,
+                    },
+                },
             },
-        }];
+            FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_IP_REMOTE_PORT,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_UINT16,
+                    Anonymous: FWP_CONDITION_VALUE0_0 { uint16: port },
+                },
+            },
+        ];
 
         let name_wide: Vec<u16> = format!("winrsbox-block-port-{port}\0")
             .encode_utf16().collect();
@@ -479,7 +526,7 @@ impl WfpEngine {
             action: FWPM_ACTION0 { r#type: FWP_ACTION_BLOCK, ..Default::default() },
             flags: FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
             filterCondition: conditions.as_mut_ptr(),
-            numFilterConditions: 1,
+            numFilterConditions: conditions.len() as u32,
             weight: FWP_VALUE0 {
                 r#type: FWP_UINT8,
                 Anonymous: FWP_VALUE0_0 { uint8: 10 },
@@ -499,18 +546,38 @@ impl WfpEngine {
     }
 
     /// Block all outbound TCP connections to a specific port (IPv6).
-    pub fn block_outbound_port_v6(&mut self, port: u16) -> Result<u64> {
+    pub fn block_outbound_port_v6(&mut self, app_path: &Path, port: u16) -> Result<u64> {
         use windows::Wdk::NetworkManagement::WindowsFilteringPlatform::FwpmFilterAdd0;
         use windows::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 
-        let mut conditions = [FWPM_FILTER_CONDITION0 {
-            fieldKey: FWPM_CONDITION_IP_REMOTE_PORT,
-            matchType: FWP_MATCH_EQUAL,
-            conditionValue: FWP_CONDITION_VALUE0 {
-                r#type: FWP_UINT16,
-                Anonymous: FWP_CONDITION_VALUE0_0 { uint16: port },
+        // Same contract as `add_filter`: an unusable app id aborts the add.
+        // Never fall back to an unscoped filter.
+        let mut app_id = app_id_from_path(app_path)?;
+        let mut app_blob = FWP_BYTE_BLOB {
+            size: app_id.len() as u32,
+            data: app_id.as_mut_ptr(),
+        };
+
+        let mut conditions = [
+            FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_ALE_APP_ID,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_BYTE_BLOB_TYPE,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        byteBlob: &mut app_blob,
+                    },
+                },
             },
-        }];
+            FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_IP_REMOTE_PORT,
+                matchType: FWP_MATCH_EQUAL,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_UINT16,
+                    Anonymous: FWP_CONDITION_VALUE0_0 { uint16: port },
+                },
+            },
+        ];
 
         let name_wide: Vec<u16> = format!("winrsbox-block-v6-port-{port}\0")
             .encode_utf16().collect();
@@ -528,7 +595,7 @@ impl WfpEngine {
             action: FWPM_ACTION0 { r#type: FWP_ACTION_BLOCK, ..Default::default() },
             flags: FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
             filterCondition: conditions.as_mut_ptr(),
-            numFilterConditions: 1,
+            numFilterConditions: conditions.len() as u32,
             weight: FWP_VALUE0 {
                 r#type: FWP_UINT8,
                 Anonymous: FWP_VALUE0_0 { uint8: 10 },
@@ -789,5 +856,36 @@ mod tests {
         // Dynamic-session objects die with the engine session, so dropping
         // here is the cleanup path; nothing persists beyond this process.
         drop(engine);
+    }
+
+    /// Every containment filter must be bound to the sandboxed image.
+    ///
+    /// `block_outbound_cidr_v6`, `block_outbound_port` and
+    /// `block_outbound_port_v6` were each built with a single condition and no
+    /// `FWPM_CONDITION_ALE_APP_ID`, so they matched EVERY process on the
+    /// machine: while any sandbox ran, the whole host lost SMB egress on
+    /// 445/139 and connectivity to the private IPv6 ranges. A sandbox must
+    /// not reconfigure the operator's network.
+    ///
+    /// Source-level because building a filter needs a live WFP engine and
+    /// elevation-dependent state; the property to protect is structural — a
+    /// new `block_outbound_*` helper added without an `app_path` parameter is
+    /// the regression, and it is visible in the signature.
+    #[test]
+    fn every_block_filter_is_scoped_to_an_app_path() {
+        let src = include_str!("wfp.rs");
+        let mut unscoped: Vec<&str> = Vec::new();
+        for line in src.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("pub fn block_outbound_") else { continue };
+            // `app_path: &Path` is what carries the APP_ID condition.
+            if !rest.contains("app_path: &Path") {
+                unscoped.push(line);
+            }
+        }
+        assert!(
+            unscoped.is_empty(),
+            "these filter helpers take no app_path, so they would match every              process on the machine: {unscoped:#?}",
+        );
     }
 }

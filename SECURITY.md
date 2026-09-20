@@ -129,6 +129,28 @@ work — they are listed here so an upgrade is not a surprise.
   undo that — which is out of scope above, along with every other
   already-elevated escape.
 
+## What the kernel network filters do and do not cover
+
+winrsbox installs WFP filters (RFC1918 and private-IPv6 egress, SMB ports
+445/139) that the kernel enforces, so a direct syscall cannot bypass them.
+Their scope is narrower than "the sandbox", and the boundary is worth stating
+because it is invisible at runtime:
+
+- **Every filter is bound to one image** via `FWPM_CONDITION_ALE_APP_ID`, an
+  exact match on the NT device path of the process image. A filter whose app
+  id cannot be built is never installed — an unscoped filter would apply to
+  every process on the machine, which is a worse outcome than no filter.
+- **Only the root target is covered.** Children the sandboxed process spawns
+  run under a different image and are not matched by these filters. Network
+  containment for the whole tree rests on the in-process hooks, with WFP as
+  defence in depth for the root.
+- **A `.bat` / `.cmd` target gets no WFP filters at all**, and the launcher
+  says so on stderr. Such a target has no image of its own: kernel32 rewrites
+  it to `%COMSPEC% /c <script>`, so the root process is `cmd.exe` and the
+  script is an argument. Binding an app id to the script path would install
+  filters that match no process, and binding to `cmd.exe` would look like
+  coverage while the program that actually opens sockets runs as its child.
+
 ## Disclosure process
 
 1. Acknowledgement of your report as soon as we can, typically within a few days.

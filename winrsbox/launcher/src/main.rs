@@ -855,7 +855,33 @@ async fn run() -> Result<()> {
     )?;
 
     // WFP kernel-level network filtering (best-effort — needs fwpuclnt.dll).
-    let _wfp = if cli.guard != GuardLevel::None {
+    //
+    // Every filter is scoped by `FWPM_CONDITION_ALE_APP_ID`, an exact match on
+    // the image the kernel records for a process. A `.bat`/`.cmd` target has
+    // no such image: kernel32 rewrites it to `%COMSPEC% /c <script>`, so the
+    // root process is cmd.exe and the script is merely an argument. An app id
+    // built from the script path would therefore match no process at all —
+    // filters would install successfully and silently do nothing. Refuse
+    // instead, in the same spirit as `add_filter` refusing an unverifiable
+    // path, and say so once. (Scoping to cmd.exe instead would be worse: it
+    // would look like coverage while the program that actually opens sockets
+    // runs as its child, which APP_ID scoping never reaches either way.)
+    let target_is_script = std::path::Path::new(&target_args[0])
+        .extension()
+        .map(|e| {
+            let e = e.to_string_lossy().to_ascii_lowercase();
+            e == "bat" || e == "cmd"
+        })
+        .unwrap_or(false);
+    if target_is_script && cli.guard != GuardLevel::None {
+        eprintln!(
+            "[sandbox] WFP: no kernel network filters for a .bat/.cmd target — the root \
+             process is cmd.exe, so APP_ID scoping cannot bind to '{}'. Hook-level network \
+             policy still applies.",
+            target_args[0],
+        );
+    }
+    let _wfp = if cli.guard != GuardLevel::None && !target_is_script {
         match winrsbox::wfp::WfpEngine::open() {
             Ok(mut engine) => {
                 let target_path = std::path::Path::new(&target_args[0]);
@@ -871,7 +897,7 @@ async fn run() -> Result<()> {
                 // Block lateral movement to IPv6 private/local ranges
                 for cidr_str in winrsbox::wfp::IPV6_PRIVATE {
                     if let Some(cidr) = winrsbox::wfp::CidrV6::parse(cidr_str) {
-                        match engine.block_outbound_cidr_v6(&cidr) {
+                        match engine.block_outbound_cidr_v6(target_path, &cidr) {
                             Ok(_) => {}
                             Err(e) => eprintln!("[sandbox] WFP v6 filter {cidr_str} failed: {e}"),
                         }
@@ -889,10 +915,10 @@ async fn run() -> Result<()> {
                 // Block SMB/NetBIOS egress (IPv4 + IPv6) — prevents DFS UNC
                 // exfiltration to remote servers.
                 for port in winrsbox::wfp::SMB_PORTS {
-                    if let Err(e) = engine.block_outbound_port(*port) {
+                    if let Err(e) = engine.block_outbound_port(target_path, *port) {
                         eprintln!("[sandbox] WFP SMB block port {port} (v4) failed: {e}");
                     }
-                    if let Err(e) = engine.block_outbound_port_v6(*port) {
+                    if let Err(e) = engine.block_outbound_port_v6(target_path, *port) {
                         eprintln!("[sandbox] WFP SMB block port {port} (v6) failed: {e}");
                     }
                 }
