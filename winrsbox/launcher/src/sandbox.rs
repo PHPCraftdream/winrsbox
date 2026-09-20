@@ -206,11 +206,47 @@ regrules: [
 ]
 ";
 
-/// Hide the console window unconditionally unless -d is set. Called once at
-/// startup before any other output. When stdio is piped (no console attached)
-/// GetConsoleWindow returns NULL and this is a no-op.
+/// Whether hiding the console window is ours to do, given how many processes
+/// are attached to it.
+///
+/// `GetConsoleProcessList` counts every process attached to this console.
+/// Exactly one means the console was created for us — a shortcut, an Explorer
+/// double-click, `start`, `CREATE_NEW_CONSOLE` — and hiding it hides only our
+/// own window. Two or more means we inherited the console of whoever launched
+/// us, and hiding it would make the OPERATOR'S terminal disappear.
+///
+/// That is not hypothetical: the launcher is a console-subsystem binary, so
+/// `winrsbox cx` from a `cmd.exe` prompt shares that prompt's console and
+/// `ShowWindow(SW_HIDE)` hid the user's own window. Under Windows Terminal it
+/// happens to be harmless — `GetConsoleWindow` returns a hidden pseudo-console
+/// placeholder owned by the PTY host — which is exactly why the bug could sit
+/// unnoticed. Visibility is therefore NOT a usable discriminator; the process
+/// count is.
+///
+/// Zero (or a failed call) means no console at all: nothing to hide.
+fn hide_console_allowed(attached_process_count: u32) -> bool {
+    attached_process_count == 1
+}
+
+/// Number of processes attached to this console, or 0 when there is none.
+fn console_process_count() -> u32 {
+    // SAFETY: the documented two-step — call with a small buffer to learn the
+    //         required count. The return value is the count, not a status; a
+    //         count larger than the buffer means "buffer too small", which is
+    //         still the answer we want. No console → 0.
+    unsafe {
+        let mut buf = [0u32; 8];
+        windows::Win32::System::Console::GetConsoleProcessList(&mut buf)
+    }
+}
+
+/// Hide the console window unless `-d` is set — but only when the console is
+/// ours alone. Called once at startup before any other output.
 pub(crate) fn maybe_hide_console(debug: bool) {
     if debug {
+        return;
+    }
+    if !hide_console_allowed(console_process_count()) {
         return;
     }
     // SAFETY: GetConsoleWindow and ShowWindow have no documented preconditions
@@ -221,6 +257,52 @@ pub(crate) fn maybe_hide_console(debug: bool) {
         if !hwnd.is_invalid() {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
+    }
+}
+
+/// Console control-event handler: swallow interactive interrupts so the
+/// SANDBOXED process gets to decide what they mean.
+///
+/// The launcher shares its console with the target and neither asks for
+/// `CREATE_NEW_PROCESS_GROUP`, so conhost delivers Ctrl+C and Ctrl+Break to
+/// both. Without a handler the launcher took the default action and died —
+/// and because the Job Object carries `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`,
+/// its dying closed the job and the kernel killed the entire sandboxed tree.
+/// For an interactive agent that is fatal: in `codex` and `claude` Ctrl+C
+/// means "interrupt this turn", not "quit", so the first interrupt destroyed
+/// the session.
+///
+/// Returning TRUE says "handled" and does nothing else. The target received
+/// the same event directly from conhost and reacts however it likes; if it
+/// chooses to exit, the normal wait path below observes that and propagates
+/// its exit code verbatim. The launcher must never substitute its own.
+///
+/// Close/logoff/shutdown are NOT swallowed: the operator is ending the
+/// session, the target gets the event too, and the system terminates us
+/// after the handler returns (a few seconds at most). Returning FALSE there
+/// lets the default teardown run, which closes the job and reaps the tree —
+/// the correct outcome, and the one that must not be delayed.
+unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> windows::core::BOOL {
+    use windows::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+    if ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT {
+        true.into()
+    } else {
+        false.into()
+    }
+}
+
+/// Install [`console_ctrl_handler`]. Must run before the target is launched,
+/// so no interrupt window exists where the old lethal default still applies.
+/// Best-effort: with no console attached there is nothing to register and
+/// nothing to protect against.
+pub(crate) fn install_console_ctrl_handler() {
+    // SAFETY: the handler is a plain `extern "system"` fn with no state; the
+    //         documented registration call, `add = TRUE`.
+    unsafe {
+        let _ = windows::Win32::System::Console::SetConsoleCtrlHandler(
+            Some(console_ctrl_handler),
+            true,
+        );
     }
 }
 
@@ -1215,6 +1297,46 @@ mod tests {
             "\"say \\\"hi\\\"\\\\\"",
             "embedded quotes + trailing backslash escaping unchanged"
         );
+    }
+
+    // --- console ownership ---
+
+    /// Hiding the console is only ours to do when nothing else is attached.
+    /// The launcher is a console-subsystem binary, so started from a `cmd.exe`
+    /// prompt it shares that prompt's console — and the old unconditional
+    /// `ShowWindow(SW_HIDE)` hid the OPERATOR'S window.
+    #[test]
+    fn console_is_hidden_only_when_we_are_the_sole_attached_process() {
+        // Launched from a shell: the shell plus us. Never hide.
+        assert!(!hide_console_allowed(2), "inherited console must not be hidden");
+        // Deeper chains (shell -> wrapper -> launcher) are inherited too.
+        assert!(!hide_console_allowed(3));
+        assert!(!hide_console_allowed(17));
+        // Our own console (Explorer / shortcut / CREATE_NEW_CONSOLE): hide it.
+        assert!(hide_console_allowed(1));
+        // No console at all — GetConsoleProcessList yields 0; nothing to hide.
+        assert!(!hide_console_allowed(0));
+    }
+
+    /// Ctrl+C and Ctrl+Break are swallowed so the sandboxed program decides
+    /// what they mean; the launcher staying alive is what keeps the Job
+    /// Object — and therefore the whole process tree — from being torn down.
+    /// Close/logoff/shutdown are NOT swallowed: the operator is ending the
+    /// session and the default teardown must run.
+    #[test]
+    fn ctrl_handler_swallows_interrupts_but_not_session_end() {
+        use windows::Win32::System::Console::{
+            CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT,
+            CTRL_SHUTDOWN_EVENT,
+        };
+        // SAFETY: the handler is a pure function of its argument — no state,
+        //         no pointers, safe to call directly.
+        let handled = |e: u32| unsafe { console_ctrl_handler(e).as_bool() };
+        assert!(handled(CTRL_C_EVENT), "Ctrl+C must not kill the launcher");
+        assert!(handled(CTRL_BREAK_EVENT), "Ctrl+Break must not kill the launcher");
+        assert!(!handled(CTRL_CLOSE_EVENT), "console close must tear the session down");
+        assert!(!handled(CTRL_LOGOFF_EVENT));
+        assert!(!handled(CTRL_SHUTDOWN_EVENT));
     }
 
     // --- resolve_target: PATHEXT expansion CreateProcessW does not do ---

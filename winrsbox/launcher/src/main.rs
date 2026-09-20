@@ -775,11 +775,20 @@ async fn run() -> Result<()> {
         } else {
             "; JIT and unsigned native extensions (.pyd/.node) will be blocked by mitigation policy"
         };
-        println!(
+        // stderr for the same reason as the exit summary below: launcher
+        // diagnostics must not land in the target's stdout.
+        eprintln!(
             "[sandbox] guard: static (hard containment) — {}{mitigation_note}",
             winrsbox::trust::advisory_notice(&trust)
         );
     }
+
+    // Before the target exists: Ctrl+C in a shared console reaches the
+    // launcher too, and the launcher dying closes a job marked
+    // KILL_ON_JOB_CLOSE, which kills the whole sandboxed tree. Interactive
+    // agents use Ctrl+C to interrupt a turn, so that turned the first
+    // interrupt into "session destroyed".
+    sandbox::install_console_ctrl_handler();
 
     let proc_info = sandbox::launch_suspended(&project_root, &target_args, effective_guard)?;
 
@@ -1060,7 +1069,11 @@ async fn run() -> Result<()> {
     let s = &stats;
     let viol = s.violations.load(Ordering::Relaxed);
     let (etw_total, etw_sandbox) = winrsbox::etw_listener::stats();
-    println!(
+    // stderr, not stdout: this is the launcher talking about itself, and the
+    // target's stdout belongs to the target. On stdout it corrupted every
+    // piped or redirected run — `winrsbox cx > out.txt` ended with a sandbox
+    // summary glued to the program's own output.
+    eprintln!(
         "\n[sandbox] exit={exit_code}  decide={} redirect={} deny={} mock={} cow={} violations={viol} etw={etw_sandbox}/{etw_total}",
         s.decide.load(Ordering::Relaxed),
         s.redirect.load(Ordering::Relaxed),
