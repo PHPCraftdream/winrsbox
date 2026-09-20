@@ -34,6 +34,8 @@ winapi     = { version = "0.3", features = [
     "winuser",
     "errhandlingapi",
     "winver",
+    "stringapiset", # MultiByteToWideChar — shell_guard ANSI hook (ShellExecuteA)
+    "winnls",       # CP_ACP code-page id for the same conversion
 ] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 once_cell  = "1"

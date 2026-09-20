@@ -61,6 +61,15 @@ static HOOK_SEND_MESSAGE_W:    OnceLock<GenericDetour<FnSendMessageW>>    = Once
 static HOOK_SEND_MESSAGE_A:    OnceLock<GenericDetour<FnSendMessageA>>    = OnceLock::new();
 static HOOK_EXIT_WINDOWS_EX:   OnceLock<GenericDetour<FnExitWindowsEx>>   = OnceLock::new();
 
+// win32u!NtUserSendInput — the syscall-stub sibling of user32!SendInput
+// (audit 2026-09-19 High). Since Win10 1809 user32!SendInput forwards to
+// win32u, and win32u.dll EXPORTS NtUserSendInput, so a caller can reach the
+// same input-synthesis syscall without touching our user32 patch. The
+// win32u module is NOT ntdll — resolution goes through LoadLibraryW like
+// the user32 installs below. Same kill-on-call policy as SendInput.
+type FnNtUserSendInput = unsafe extern "system" fn(UINT, *mut INPUT, i32) -> UINT;
+static HOOK_NT_USER_SEND_INPUT: OnceLock<GenericDetour<FnNtUserSendInput>> = OnceLock::new();
+
 /// Returns true when `hwnd` is a window owned by a process **other** than us.
 /// For cross-process HWNDs we deny PostMessage/SendMessage. Own-process
 /// windows still work normally.
@@ -103,6 +112,7 @@ fn report_and_kill(api: &str) -> ! {
 // SAFETY: Called by detour2 dispatcher with user32!SendInput ABI.
 unsafe extern "system" fn hook_send_input(n: UINT, inputs: *mut INPUT, sz: i32) -> UINT {
     let Some(_g) = anti_rec::enter() else {
+// Detour-absent: unwrap-abort kept on purpose — UINT family; fail-closed would be 0 ("no events inserted"), a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnSendInput ABI.
         return HOOK_SEND_INPUT.get().unwrap().call(n, inputs, sz);
     };
@@ -113,6 +123,7 @@ unsafe extern "system" fn hook_send_input(n: UINT, inputs: *mut INPUT, sz: i32) 
 // SAFETY: Called by detour2 dispatcher with user32!keybd_event ABI.
 unsafe extern "system" fn hook_keybd_event(b: u8, s: u8, f: DWORD, ex: usize) {
     let Some(_g) = anti_rec::enter() else {
+// Detour-absent: unwrap-abort kept on purpose — void family; fail-closed would be an early `return`, a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnKeybdEvent ABI.
         HOOK_KEYBD_EVENT.get().unwrap().call(b, s, f, ex);
         return;
@@ -124,6 +135,7 @@ unsafe extern "system" fn hook_keybd_event(b: u8, s: u8, f: DWORD, ex: usize) {
 // SAFETY: Called by detour2 dispatcher with user32!mouse_event ABI.
 unsafe extern "system" fn hook_mouse_event(f: DWORD, x: DWORD, y: DWORD, d: DWORD, ex: usize) {
     let Some(_g) = anti_rec::enter() else {
+// Detour-absent: unwrap-abort kept on purpose — void family; fail-closed would be an early `return`, a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnMouseEvent ABI.
         HOOK_MOUSE_EVENT.get().unwrap().call(f, x, y, d, ex);
         return;
@@ -135,6 +147,7 @@ unsafe extern "system" fn hook_mouse_event(f: DWORD, x: DWORD, y: DWORD, d: DWOR
 // SAFETY: Called by detour2 dispatcher with user32!BlockInput ABI.
 unsafe extern "system" fn hook_block_input(fblock: BOOL) -> BOOL {
     let Some(_g) = anti_rec::enter() else {
+// Detour-absent: unwrap-abort kept on purpose — BOOL family; fail-closed would be FALSE, a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnBlockInput ABI.
         return HOOK_BLOCK_INPUT.get().unwrap().call(fblock);
     };
@@ -145,11 +158,25 @@ unsafe extern "system" fn hook_block_input(fblock: BOOL) -> BOOL {
 // SAFETY: Called by detour2 dispatcher with user32!SetCursorPos ABI.
 unsafe extern "system" fn hook_set_cursor_pos(x: i32, y: i32) -> BOOL {
     let Some(_g) = anti_rec::enter() else {
+// Detour-absent: unwrap-abort kept on purpose — BOOL family; fail-closed would be FALSE, a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnSetCursorPos ABI.
         return HOOK_SET_CURSOR_POS.get().unwrap().call(x, y);
     };
     let _ = _g;
     report_and_kill("SetCursorPos")
+}
+
+// SAFETY: Called by detour2 dispatcher with win32u!NtUserSendInput ABI.
+// Same signature as user32!SendInput (UINT, PINPUT, int) — identical
+// input-synthesis primitive one stub lower.
+unsafe extern "system" fn hook_nt_user_send_input(n: UINT, inputs: *mut INPUT, sz: i32) -> UINT {
+    let Some(_g) = anti_rec::enter() else {
+// Detour-absent: unwrap-abort kept on purpose — UINT family; fail-closed would be 0 ("no events inserted"), a per-API decision (see nt_call_original in hooks.rs).
+        // SAFETY: detour2 trampoline matches FnNtUserSendInput ABI.
+        return HOOK_NT_USER_SEND_INPUT.get().unwrap().call(n, inputs, sz);
+    };
+    let _ = _g;
+    report_and_kill("NtUserSendInput")
 }
 
 // ── Cross-window / clipboard soft-deny ─────────────────────────────────────
@@ -162,9 +189,11 @@ unsafe extern "system" fn hook_set_cursor_pos(x: i32, y: i32) -> BOOL {
 // SAFETY: Called by detour2 dispatcher with user32!FindWindowW ABI.
 unsafe extern "system" fn hook_find_window_w(class: LPCWSTR, name: LPCWSTR) -> HWND {
     let Some(_g) = anti_rec::enter() else {
+// Detour-absent: unwrap-abort kept on purpose — HWND family; fail-closed would be NULL, a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnFindWindowW ABI.
         return HOOK_FIND_WINDOW_W.get().unwrap().call(class, name);
     };
+// Detour-absent: unwrap-abort kept on purpose — HWND family; fail-closed would be NULL, a per-API decision (see nt_call_original in hooks.rs).
     // SAFETY: detour2 trampoline matches FnFindWindowW ABI; same args passed through.
     let hwnd = HOOK_FIND_WINDOW_W.get().unwrap().call(class, name);
     if is_foreign_hwnd(hwnd) {
@@ -177,9 +206,11 @@ unsafe extern "system" fn hook_find_window_w(class: LPCWSTR, name: LPCWSTR) -> H
 // SAFETY: Called by detour2 dispatcher with user32!FindWindowA ABI.
 unsafe extern "system" fn hook_find_window_a(class: LPCSTR, name: LPCSTR) -> HWND {
     let Some(_g) = anti_rec::enter() else {
+// Detour-absent: unwrap-abort kept on purpose — HWND family; fail-closed would be NULL, a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnFindWindowA ABI.
         return HOOK_FIND_WINDOW_A.get().unwrap().call(class, name);
     };
+// Detour-absent: unwrap-abort kept on purpose — HWND family; fail-closed would be NULL, a per-API decision (see nt_call_original in hooks.rs).
     // SAFETY: detour2 trampoline matches FnFindWindowA ABI; same args passed through.
     let hwnd = HOOK_FIND_WINDOW_A.get().unwrap().call(class, name);
     if is_foreign_hwnd(hwnd) {
@@ -194,9 +225,11 @@ unsafe extern "system" fn hook_find_window_ex_w(
     parent: HWND, child: HWND, class: LPCWSTR, name: LPCWSTR,
 ) -> HWND {
     let Some(_g) = anti_rec::enter() else {
+// Detour-absent: unwrap-abort kept on purpose — HWND family; fail-closed would be NULL, a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnFindWindowExW ABI.
         return HOOK_FIND_WINDOW_EX_W.get().unwrap().call(parent, child, class, name);
     };
+// Detour-absent: unwrap-abort kept on purpose — HWND family; fail-closed would be NULL, a per-API decision (see nt_call_original in hooks.rs).
     // SAFETY: detour2 trampoline matches FnFindWindowExW ABI; same args passed through.
     let hwnd = HOOK_FIND_WINDOW_EX_W.get().unwrap().call(parent, child, class, name);
     if is_foreign_hwnd(hwnd) {
@@ -211,9 +244,11 @@ unsafe extern "system" fn hook_find_window_ex_a(
     parent: HWND, child: HWND, class: LPCSTR, name: LPCSTR,
 ) -> HWND {
     let Some(_g) = anti_rec::enter() else {
+// Detour-absent: unwrap-abort kept on purpose — HWND family; fail-closed would be NULL, a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnFindWindowExA ABI.
         return HOOK_FIND_WINDOW_EX_A.get().unwrap().call(parent, child, class, name);
     };
+// Detour-absent: unwrap-abort kept on purpose — HWND family; fail-closed would be NULL, a per-API decision (see nt_call_original in hooks.rs).
     // SAFETY: detour2 trampoline matches FnFindWindowExA ABI; same args passed through.
     let hwnd = HOOK_FIND_WINDOW_EX_A.get().unwrap().call(parent, child, class, name);
     if is_foreign_hwnd(hwnd) {
@@ -231,6 +266,7 @@ unsafe extern "system" fn hook_find_window_ex_a(
 //     without altering behaviour.
 unsafe extern "system" fn hook_open_clipboard(hwnd: HWND) -> BOOL {
     let Some(_g) = anti_rec::enter() else {
+// Detour-absent: unwrap-abort kept on purpose — BOOL family; fail-closed would be FALSE, a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnOpenClipboard ABI.
         return HOOK_OPEN_CLIPBOARD.get().unwrap().call(hwnd);
     };
@@ -238,6 +274,7 @@ unsafe extern "system" fn hook_open_clipboard(hwnd: HWND) -> BOOL {
         log_soft_deny("OpenClipboard", "denied");
         return 0;
     }
+// Detour-absent: unwrap-abort kept on purpose — BOOL family; fail-closed would be FALSE, a per-API decision (see nt_call_original in hooks.rs).
     // SAFETY: detour2 trampoline matches FnOpenClipboard ABI.
     let ret = HOOK_OPEN_CLIPBOARD.get().unwrap().call(hwnd);
     if is_trace() {
@@ -255,6 +292,7 @@ unsafe extern "system" fn hook_open_clipboard(hwnd: HWND) -> BOOL {
 // SAFETY: Called by detour2 dispatcher with user32!GetClipboardData ABI.
 unsafe extern "system" fn hook_get_clipboard_data(format: UINT) -> HANDLE {
     let Some(_g) = anti_rec::enter() else {
+// Detour-absent: unwrap-abort kept on purpose — HANDLE family; fail-closed would be NULL, a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnGetClipboardData ABI.
         return HOOK_GET_CLIPBOARD.get().unwrap().call(format);
     };
@@ -262,6 +300,7 @@ unsafe extern "system" fn hook_get_clipboard_data(format: UINT) -> HANDLE {
         log_soft_deny("GetClipboardData", "denied");
         return std::ptr::null_mut();
     }
+// Detour-absent: unwrap-abort kept on purpose — HANDLE family; fail-closed would be NULL, a per-API decision (see nt_call_original in hooks.rs).
     // SAFETY: detour2 trampoline matches FnGetClipboardData ABI.
     let ret = HOOK_GET_CLIPBOARD.get().unwrap().call(format);
     if is_trace() {
@@ -302,6 +341,7 @@ unsafe extern "system" fn hook_post_message_w(
     hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM,
 ) -> BOOL {
     let Some(_g) = anti_rec::enter() else {
+// Detour-absent: unwrap-abort kept on purpose — BOOL family; fail-closed would be FALSE, a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnPostMessageW ABI.
         return HOOK_POST_MESSAGE_W.get().unwrap().call(hwnd, msg, wparam, lparam);
     };
@@ -309,6 +349,7 @@ unsafe extern "system" fn hook_post_message_w(
         log_soft_deny("PostMessageW", "foreign HWND");
         return 0;
     }
+// Detour-absent: unwrap-abort kept on purpose — BOOL family; fail-closed would be FALSE, a per-API decision (see nt_call_original in hooks.rs).
     HOOK_POST_MESSAGE_W.get().unwrap().call(hwnd, msg, wparam, lparam)
 }
 
@@ -317,6 +358,7 @@ unsafe extern "system" fn hook_post_message_a(
     hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM,
 ) -> BOOL {
     let Some(_g) = anti_rec::enter() else {
+// Detour-absent: unwrap-abort kept on purpose — BOOL family; fail-closed would be FALSE, a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnPostMessageA ABI.
         return HOOK_POST_MESSAGE_A.get().unwrap().call(hwnd, msg, wparam, lparam);
     };
@@ -324,6 +366,7 @@ unsafe extern "system" fn hook_post_message_a(
         log_soft_deny("PostMessageA", "foreign HWND");
         return 0;
     }
+// Detour-absent: unwrap-abort kept on purpose — BOOL family; fail-closed would be FALSE, a per-API decision (see nt_call_original in hooks.rs).
     HOOK_POST_MESSAGE_A.get().unwrap().call(hwnd, msg, wparam, lparam)
 }
 
@@ -332,6 +375,7 @@ unsafe extern "system" fn hook_send_message_w(
     hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM,
 ) -> isize {
     let Some(_g) = anti_rec::enter() else {
+// Detour-absent: unwrap-abort kept on purpose — LRESULT family; fail-closed would be 0, a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnSendMessageW ABI.
         return HOOK_SEND_MESSAGE_W.get().unwrap().call(hwnd, msg, wparam, lparam);
     };
@@ -339,6 +383,7 @@ unsafe extern "system" fn hook_send_message_w(
         log_soft_deny("SendMessageW", "foreign HWND");
         return 0;
     }
+// Detour-absent: unwrap-abort kept on purpose — LRESULT family; fail-closed would be 0, a per-API decision (see nt_call_original in hooks.rs).
     HOOK_SEND_MESSAGE_W.get().unwrap().call(hwnd, msg, wparam, lparam)
 }
 
@@ -347,6 +392,7 @@ unsafe extern "system" fn hook_send_message_a(
     hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM,
 ) -> isize {
     let Some(_g) = anti_rec::enter() else {
+// Detour-absent: unwrap-abort kept on purpose — LRESULT family; fail-closed would be 0, a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnSendMessageA ABI.
         return HOOK_SEND_MESSAGE_A.get().unwrap().call(hwnd, msg, wparam, lparam);
     };
@@ -354,6 +400,7 @@ unsafe extern "system" fn hook_send_message_a(
         log_soft_deny("SendMessageA", "foreign HWND");
         return 0;
     }
+// Detour-absent: unwrap-abort kept on purpose — LRESULT family; fail-closed would be 0, a per-API decision (see nt_call_original in hooks.rs).
     HOOK_SEND_MESSAGE_A.get().unwrap().call(hwnd, msg, wparam, lparam)
 }
 
@@ -369,6 +416,7 @@ unsafe extern "system" fn hook_send_message_a(
 // makes the failure observable to callers that inspect GetLastError.
 unsafe extern "system" fn hook_exit_windows_ex(flags: UINT, reason: DWORD) -> BOOL {
     let Some(_g) = anti_rec::enter() else {
+// Detour-absent: unwrap-abort kept on purpose — BOOL family; fail-closed would be FALSE, a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnExitWindowsEx ABI.
         return HOOK_EXIT_WINDOWS_EX.get().unwrap().call(flags, reason);
     };
@@ -395,6 +443,26 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
         ($lock:expr, $sym:literal, $hook:ident, $ty:ty) => {{
             let addr = winapi::um::libloaderapi::GetProcAddress(
                 user32, concat!($sym, "\0").as_ptr() as *const _);
+            if !addr.is_null() {
+                // SAFETY: transmute of GetProcAddress result; ABI matches the hook function type $ty.
+                let target: $ty = std::mem::transmute(addr as usize);
+                let hook_ptr: $ty = $hook;
+                if let Ok(detour) = GenericDetour::<$ty>::new(target, hook_ptr) {
+                    $lock.set(detour).ok();
+                    if let Some(d) = $lock.get() {
+                        let _ = d.enable();
+                    }
+                }
+            }
+        }};
+    }
+
+    // Same as `install!` but for a module handle resolved elsewhere
+    // (win32u.dll is not ntdll and not the user32 handle above).
+    macro_rules! install_from {
+        ($mod_:expr, $lock:expr, $sym:literal, $hook:ident, $ty:ty) => {{
+            let addr = winapi::um::libloaderapi::GetProcAddress(
+                $mod_, concat!($sym, "\0").as_ptr() as *const _);
             if !addr.is_null() {
                 // SAFETY: transmute of GetProcAddress result; ABI matches the hook function type $ty.
                 let target: $ty = std::mem::transmute(addr as usize);
@@ -442,6 +510,23 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     install!(HOOK_SEND_MESSAGE_W,   "SendMessageW",     hook_send_message_w,     FnSendMessageW);
     install!(HOOK_SEND_MESSAGE_A,   "SendMessageA",     hook_send_message_a,     FnSendMessageA);
     install!(HOOK_EXIT_WINDOWS_EX,  "ExitWindowsEx",    hook_exit_windows_ex,    FnExitWindowsEx);
+
+    // win32u.dll — audit High sibling closure for SendInput. Present since
+    // Win10 1809; on older builds there is no win32u path to guard, so a
+    // missing module/export is skipped (consistent with the install! macro).
+    let win32u_w: Vec<u16> = "win32u.dll\0".encode_utf16().collect();
+    // SAFETY: LoadLibraryW with a null-terminated wide name; win32u is a
+    // KnownDLL on Win10 1809+ and always loadable.
+    let win32u = winapi::um::libloaderapi::LoadLibraryW(win32u_w.as_ptr());
+    if !win32u.is_null() {
+        install_from!(win32u, HOOK_NT_USER_SEND_INPUT, "NtUserSendInput",
+                      hook_nt_user_send_input, FnNtUserSendInput);
+    } else if is_trace() {
+        ipc_log(
+            ipc::LogLevel::Warn,
+            "ui_guard: win32u.dll not loaded — NtUserSendInput unguarded".into(),
+        );
+    }
     Ok(())
 }
 
@@ -464,4 +549,91 @@ pub unsafe fn uninstall() {
     if let Some(h) = HOOK_SEND_MESSAGE_W.get()   { let _ = h.disable(); }
     if let Some(h) = HOOK_SEND_MESSAGE_A.get()   { let _ = h.disable(); }
     if let Some(h) = HOOK_EXIT_WINDOWS_EX.get()  { let _ = h.disable(); }
+    if let Some(h) = HOOK_NT_USER_SEND_INPUT.get() { let _ = h.disable(); }
+}
+
+/// Exports this module installs detours on. Kept in lockstep with install()
+/// — the sibling-drift check in hooks.rs verifies every name here still
+/// appears as an install literal in this file, and that guarded families
+/// have no unhooked siblings.
+pub(crate) const HOOKED_EXPORTS: &[&str] = &[
+    "SendInput",
+    "keybd_event",
+    "mouse_event",
+    "BlockInput",
+    "SetCursorPos",
+    "FindWindowW",
+    "FindWindowA",
+    "FindWindowExW",
+    "FindWindowExA",
+    "OpenClipboard",
+    "GetClipboardData",
+    "PostMessageW",
+    "PostMessageA",
+    "SendMessageW",
+    "SendMessageA",
+    "ExitWindowsEx",
+    "NtUserSendInput",
+];
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Export-name tripwire for the win32u sibling: win32u!NtUserSendInput
+    /// must resolve on supported hosts (Win10 1809+). A typo in the install
+    /// literal would silently skip the detour (the install macros log-and-
+    /// skip), which is exactly the sibling-drift this module existed to
+    /// close — so the resolution is pinned in CI.
+    #[test]
+    fn win32u_send_input_export_resolves() {
+        let win32u_w: Vec<u16> = "win32u.dll\0".encode_utf16().collect();
+        // SAFETY: LoadLibraryW / GetProcAddress pair over a system DLL.
+        unsafe {
+            let h = winapi::um::libloaderapi::LoadLibraryW(win32u_w.as_ptr());
+            assert!(!h.is_null(), "win32u.dll must load on Win10 1809+");
+            let addr = winapi::um::libloaderapi::GetProcAddress(
+                h, b"NtUserSendInput\0".as_ptr() as *const _,
+            );
+            assert!(!addr.is_null(), "win32u!NtUserSendInput must resolve");
+        }
+    }
+
+    /// Same tripwire for the guarded user32 base of the family.
+    #[test]
+    fn user32_send_input_export_resolves() {
+        let user32_w: Vec<u16> = "user32.dll\0".encode_utf16().collect();
+        // SAFETY: LoadLibraryW / GetProcAddress pair over a system DLL.
+        unsafe {
+            let h = winapi::um::libloaderapi::LoadLibraryW(user32_w.as_ptr());
+            assert!(!h.is_null(), "user32.dll must load");
+            let addr = winapi::um::libloaderapi::GetProcAddress(
+                h, b"SendInput\0".as_ptr() as *const _,
+            );
+            assert!(!addr.is_null(), "user32!SendInput must resolve");
+        }
+    }
+
+    /// The SendInput family policy: both entry points route to the same
+    /// kill path (`report_and_kill`), which must never be driven from a
+    /// unit test (it terminates the process). The kill decision for this
+    /// family is unconditional — AI agents never legitimately synthesize
+    /// input — so the falsifiable assertions here are (a) the win32u
+    /// entry resolves and (b) the hook storage exists and is wired in
+    /// install()/uninstall(), which the sibling-drift check pins.
+    #[test]
+    fn nt_user_send_input_hook_storage_declared() {
+        // Not installed under tests: the OnceLock must be EMPTY here. If
+        // someone ever auto-installs hooks at test time, this flags it —
+        // a populated slot would make the direct-call kill path reachable
+        // from tests.
+        assert!(
+            HOOK_NT_USER_SEND_INPUT.get().is_none(),
+            "win32u hook must not be installed under unit tests"
+        );
+    }
 }

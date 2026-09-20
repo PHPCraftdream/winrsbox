@@ -297,6 +297,7 @@ unsafe extern "system" fn hook_co_create_instance(
     ppv: *mut *mut c_void,
 ) -> i32 {
     let call_original = || {
+// Detour-absent: unwrap-abort kept on purpose — HRESULT family; fail-closed would be a failing HRESULT (e.g. E_ACCESSDENIED), a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnCoCreateInstance ABI.
         HOOK_CO_CREATE_INSTANCE.get().unwrap().call(
             rclsid, p_unk_outer, dw_cls_context, riid, ppv,
@@ -350,6 +351,7 @@ unsafe extern "system" fn hook_co_create_instance_ex(
     p_results: *mut c_void,
 ) -> i32 {
     let call_original = || {
+// Detour-absent: unwrap-abort kept on purpose — HRESULT family; fail-closed would be a failing HRESULT (e.g. E_ACCESSDENIED), a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnCoCreateInstanceEx ABI.
         HOOK_CO_CREATE_INSTANCE_EX.get().unwrap().call(
             clsid, punk_outer, dw_cls_ctx, p_server_info, dw_count, p_results,
@@ -383,6 +385,7 @@ unsafe extern "system" fn hook_co_get_class_object(
     ppv: *mut *mut c_void,
 ) -> i32 {
     let call_original = || {
+// Detour-absent: unwrap-abort kept on purpose — HRESULT family; fail-closed would be a failing HRESULT (e.g. E_ACCESSDENIED), a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnCoGetClassObject ABI.
         HOOK_CO_GET_CLASS_OBJECT.get().unwrap().call(
             rclsid, dw_cls_context, pv_reserved, riid, ppv,
@@ -450,6 +453,7 @@ unsafe extern "system" fn hook_ro_get_activation_factory(
     factory: *mut *mut c_void,
 ) -> i32 {
     let call_original = || {
+// Detour-absent: unwrap-abort kept on purpose — HRESULT family; fail-closed would be a failing HRESULT (e.g. E_ACCESSDENIED), a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnRoGetActivationFactory ABI.
         HOOK_RO_GET_ACTIVATION_FACTORY.get().unwrap().call(
             activatable_class_id, iid, factory,
@@ -487,6 +491,7 @@ unsafe extern "system" fn hook_ro_activate_instance(
     instance: *mut *mut c_void,
 ) -> i32 {
     let call_original = || {
+// Detour-absent: unwrap-abort kept on purpose — HRESULT family; fail-closed would be a failing HRESULT (e.g. E_ACCESSDENIED), a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnRoActivateInstance ABI.
         HOOK_RO_ACTIVATE_INSTANCE.get().unwrap().call(
             activatable_class_id, instance,

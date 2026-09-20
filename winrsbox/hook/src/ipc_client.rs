@@ -121,17 +121,96 @@ pub(crate) fn flush_install_errors() {
 pub(crate) static TRACE_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Whether we have already attempted to load `SessionConfig` from the named
-/// shared section. We try at most once per process to avoid hammering
+/// The session section's name for THIS process, delivered through the
+/// injection channel.
+///
+/// Delivery chain: the launcher generates a random per-session name
+/// (`Local\WinRsBoxSession-{32 hex}`), publishes the section under it, and
+/// exports it as `FS_SANDBOX_SECTION` into the root target's environment
+/// (authored before any guest code runs). Every hooked child is injected by
+/// its parent's spawn hook, which appends the same variable to the child's
+/// environment block cross-process while the child is still suspended — see
+/// `inject::patch_child_env_section`. At DllMain install time this process's
+/// own `FS_SANDBOX_SECTION` is captured here (hooks.rs), and the section
+/// fallback below opens ONLY this name.
+///
+/// There is deliberately NO constant fallback name: any secret the hook can
+/// read the guest can read too, so the old well-known
+/// `Local\WinRsBoxSession` name bought nothing — it handed every process in
+/// the logon session (including the sandboxed guest, which runs as the same
+/// user) a writable config object containing `pipe_name` and `dll_path`.
+/// A process that never received the name through the injection channel now
+/// finds nothing.
+pub(crate) static SESSION_SECTION_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record the injected section name (called once from install_hooks, which
+/// reads `FS_SANDBOX_SECTION` before any hook is enabled). Later callers are
+/// no-ops, matching the other install-time `OnceLock`s.
+pub(crate) fn set_session_section_name(name: String) {
+    let _ = SESSION_SECTION_NAME.set(name);
+}
+
+/// The section name this process received through the injection channel, if
+/// any. `None` ⇒ the section fallback must not open ANYTHING (there is no
+/// name to guess).
+pub(crate) fn session_section_name() -> Option<&'static str> {
+    SESSION_SECTION_NAME.get().map(|s| s.as_str()).filter(|s| !s.is_empty())
+}
+
+/// Whether we have already attempted to load `SessionConfig` from the session
+/// section. We try at most once per process to avoid hammering
 /// `OpenFileMappingW` on every IPC call when the launcher is genuinely gone.
 static SESSION_FALLBACK_TRIED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Read `SessionConfig` from `Local\WinRsBoxSession` (the launcher publishes
-/// it at startup). Used as a fallback when env vars were scrubbed by the
-/// hosted process (e.g. MSYS2 first-run helpers inheriting an empty env).
-/// Returns `Some(())` if at least the pipe name was loaded.
+/// Read `SessionConfig` from the session section named by the injected
+/// `FS_SANDBOX_SECTION` environment variable. Used as a fallback when the
+/// ordinary `FS_SANDBOX_*` variables were scrubbed by the hosted process
+/// (e.g. MSYS2 first-run helpers inheriting an empty env) — the section NAME
+/// itself survives in the env block we patched cross-process before the
+/// process ever ran. Returns `Some(())` if at least the pipe name was loaded.
 pub(crate) fn try_load_session_config_from_section() -> Option<()> {
+    // No injected name ⇒ no attempt. This is the load-bearing difference to
+    // the old behaviour: previously a well-known constant name was opened
+    // here unconditionally, which is exactly what made the section findable
+    // (and writable) by anything in the logon session. Without the injected
+    // name there is nothing to open — the caller falls back to fail-closed.
+    let name = session_section_name()?;
+    let cfg = try_load_session_config_named(name)?;
+    let _pid = unsafe { GetCurrentProcessId() };
+    // Route diagnostics through IPC log (ipc_log) instead of stderr.
+    // eprintln from the hook DLL corrupts PowerShell's
+    // $ErrorActionPreference="Stop" handling: stderr lines from native
+    // commands are wrapped as NativeCommandError exceptions, aborting
+    // installers that spawn sandboxed children. The hook should NEVER
+    // write to the process's stderr.
+    if !cfg.pipe_name.is_empty() {
+        let _ = PIPE_NAME.set(cfg.pipe_name);
+    }
+    if !cfg.dll_path.is_empty() {
+        let _ = DLL_PATH.set(cfg.dll_path);
+    }
+    if !cfg.cwd.is_empty() {
+        let _ = SANDBOX_CWD.set(cfg.cwd);
+    }
+    if !cfg.sandbox_root.is_empty() {
+        let _ = SANDBOX_ROOT.set(cfg.sandbox_root);
+    }
+    if !cfg.overlay_roots.is_empty() {
+        let _ = OVERLAY_ROOTS.set(cfg.overlay_roots);
+    }
+    if cfg.trace {
+        TRACE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Some(())
+}
+
+/// Open the session section by explicit name and decode the `SessionConfig`.
+/// Pure: touches NO global state, so tests can exercise it against a section
+/// with a unique per-process name without poisoning the shared `OnceLock`s
+/// for the rest of the test binary (see the `ensure_pipe_name_loaded` split
+/// below for why that poisoning was a real 7-test flake).
+fn try_load_session_config_named(name: &str) -> Option<ipc::SessionConfig> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use winapi::shared::minwindef::FALSE;
@@ -140,7 +219,7 @@ pub(crate) fn try_load_session_config_from_section() -> Option<()> {
         MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ,
     };
 
-    let name_wide: Vec<u16> = OsStr::new(ipc::SESSION_CONFIG_SECTION_NAME)
+    let name_wide: Vec<u16> = OsStr::new(name)
         .encode_wide()
         .chain(Some(0))
         .collect();
@@ -176,41 +255,15 @@ pub(crate) fn try_load_session_config_from_section() -> Option<()> {
         UnmapViewOfFile(view);
         CloseHandle(h);
     }
-    let cfg = match parsed {
-        Ok(c) => c,
+    match parsed {
+        Ok(c) => Some(c),
         Err(e) => {
             // Silent (see comment above): stderr from hook DLL breaks
             // PowerShell NativeCommandError handling.
             let _ = e;
-            return None;
+            None
         }
-    };
-    let _pid = unsafe { GetCurrentProcessId() };
-    // Route diagnostics through IPC log (ipc_log) instead of stderr.
-    // eprintln from the hook DLL corrupts PowerShell's
-    // $ErrorActionPreference="Stop" handling: stderr lines from native
-    // commands are wrapped as NativeCommandError exceptions, aborting
-    // installers that spawn sandboxed children. The hook should NEVER
-    // write to the process's stderr.
-    if !cfg.pipe_name.is_empty() {
-        let _ = PIPE_NAME.set(cfg.pipe_name);
     }
-    if !cfg.dll_path.is_empty() {
-        let _ = DLL_PATH.set(cfg.dll_path);
-    }
-    if !cfg.cwd.is_empty() {
-        let _ = SANDBOX_CWD.set(cfg.cwd);
-    }
-    if !cfg.sandbox_root.is_empty() {
-        let _ = SANDBOX_ROOT.set(cfg.sandbox_root);
-    }
-    if !cfg.overlay_roots.is_empty() {
-        let _ = OVERLAY_ROOTS.set(cfg.overlay_roots);
-    }
-    if cfg.trace {
-        TRACE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-    Some(())
 }
 
 /// Ensure `PIPE_NAME` is populated, attempting a one-shot fallback to the
@@ -270,6 +323,31 @@ pub(crate) fn cache() -> &'static HookCache {
     CACHE.get_or_init(HookCache::new)
 }
 
+/// Emit an IPC-failure diagnostic on the debug channel (OutputDebugStringW).
+///
+/// The IPC FAILURE path is exactly when diagnosis matters (the launcher is
+/// dead or hung) and exactly when neither existing channel works: `ipc_log`
+/// needs the pipe that just failed, and `eprintln!` writes the HOST
+/// process's stderr — invisible for GUI/redirected children and actively
+/// harmful under PowerShell, whose NativeCommandError handling wraps native
+/// stderr lines as exceptions (see the policy comment in
+/// `try_load_session_config_from_section`). The old code eprintln!'d on
+/// this path, so the errors vanished exactly when diagnosis mattered
+/// (audit 2026-09-19 Low: host-side eprintln! suppression on the
+/// ipc_client failure path). OutputDebugStringW is the Windows-native
+/// channel for precisely this case: it survives launcher death, never
+/// touches the guest's console, and is visible in DebugView or any
+/// attached debugger.
+pub(crate) fn fail_log(msg: &str) {
+    let pid = unsafe { GetCurrentProcessId() };
+    let wide: Vec<u16> = format!("[hook/{pid}] {msg}").encode_utf16().chain(Some(0)).collect();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 buffer for the duration of
+    // the call; OutputDebugStringW only reads it.
+    unsafe {
+        winapi::um::debugapi::OutputDebugStringW(wide.as_ptr());
+    }
+}
+
 pub(crate) fn ensure_ipc_and<R>(f: impl FnOnce(&mut Option<ipc::SyncClient>) -> R) -> Option<R> {
     let mut first_hello = false;
     // Recover PIPE_NAME from the session section if env vars are missing
@@ -286,15 +364,13 @@ pub(crate) fn ensure_ipc_and<R>(f: impl FnOnce(&mut Option<ipc::SyncClient>) -> 
         if opt.is_none() {
             match PIPE_NAME.get() {
                 None => {
-                    let pid = unsafe { GetCurrentProcessId() };
-                    eprintln!("[hook/{pid}] IPC unavailable: PIPE_NAME not set");
+                    fail_log("IPC unavailable: PIPE_NAME not set");
                 }
                 Some(name) => {
                     match ipc::SyncClient::connect(name) {
                         Ok(c) => *opt = Some(c),
                         Err(e) => {
-                            let pid = unsafe { GetCurrentProcessId() };
-                            eprintln!("[hook/{pid}] IPC connect failed: {e}");
+                            fail_log(&format!("IPC connect failed: {e}"));
                         }
                     }
                     // Always re-send Hello on every new connection — the
@@ -316,7 +392,7 @@ pub(crate) fn ensure_ipc_and<R>(f: impl FnOnce(&mut Option<ipc::SyncClient>) -> 
                                 }
                             }
                             Err(e) => {
-                                eprintln!("[hook/{pid}] IPC hello send failed: {e}");
+                                fail_log(&format!("IPC hello send failed: {e}"));
                                 *opt = None;
                             }
                         }
@@ -350,8 +426,7 @@ pub(crate) fn try_send(opt: &mut Option<ipc::SyncClient>, req: &ipc::Req) -> Opt
     match client.send(req) {
         Ok(resp) => Some(resp),
         Err(e) => {
-            let pid = unsafe { GetCurrentProcessId() };
-            eprintln!("[hook/{pid}] IPC send error: {e}");
+            fail_log(&format!("IPC send error: {e}"));
             *opt = None;
             None
         }
@@ -367,8 +442,7 @@ pub(crate) fn ipc_decide(dos_lower: &str, write: bool) -> Decision {
         match try_send(opt, &req) {
             Some(ipc::Resp::Decision(d)) => Some(d),
             Some(other) => {
-                let pid = unsafe { GetCurrentProcessId() };
-                eprintln!("[hook/{pid}] IPC decide: wrong response variant: {other:?}");
+                fail_log(&format!("IPC decide: wrong response variant: {other:?}"));
                 None
             }
             None => None,
@@ -382,13 +456,12 @@ pub(crate) fn ipc_decide(dos_lower: &str, write: bool) -> Decision {
         }
         _ => {
             let n = IPC_CONSECUTIVE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            eprintln!("[hook] IPC decide failure #{n}/{IPC_FAIL_THRESHOLD}");
+            fail_log(&format!("IPC decide failure #{n}/{IPC_FAIL_THRESHOLD}"));
             if n >= IPC_FAIL_THRESHOLD {
-                eprintln!(
-                    "[hook] CRITICAL: {} consecutive IPC failures — \
-                     sandbox launcher dead/hung, self-terminating",
-                    n,
-                );
+                fail_log(&format!(
+                    "CRITICAL: {n} consecutive IPC failures —
+                     sandbox launcher dead/hung, self-terminating"
+                ));
                 unsafe {
                     winapi::um::processthreadsapi::TerminateProcess(
                         winapi::um::processthreadsapi::GetCurrentProcess(),
@@ -563,6 +636,24 @@ pub(crate) fn get_own_exe_path() -> String {
 mod ipc_threshold_tests {
     use super::*;
 
+    /// Audit 2026-09-19 Low: the IPC failure paths used `eprintln!`, whose
+    /// output is invisible (GUI/redirected host process) or actively
+    /// harmful (PowerShell NativeCommandError) and never reaches the
+    /// launcher's log. Fail-path diagnostics MUST go through `fail_log`
+    /// (OutputDebugStringW) — pin the whole module stderr-free.
+    #[test]
+    fn fail_paths_use_debug_channel_not_stderr() {
+        let src = include_str!("ipc_client.rs");
+        assert!(
+            !src.contains(concat!("eprintln!", "(")),
+            "ipc_client must not write the host process's stderr: use fail_log (OutputDebugStringW) for fail-path diagnostics"
+        );
+        assert!(
+            src.contains("OutputDebugStringW"),
+            "fail_log must route through the debug channel"
+        );
+    }
+
     #[test]
     fn fail_threshold_pinned() {
         // P1-3 fail-closed contract: the hooked process self-terminates
@@ -649,5 +740,180 @@ mod ipc_threshold_tests {
             "try_send MUST clear opt on send Err so the next call reconnects \
              (regression #61: without this the hook accumulated 8 \
              consecutive failures and self-terminated)");
+    }
+}
+
+#[cfg(test)]
+mod session_section_tests {
+    use super::*;
+
+    fn unique_section_name(tag: &str) -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        format!(
+            r"Local\WinRsBoxSessionHookTest-{}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
+            tag
+        )
+    }
+
+    fn unique_cfg() -> ipc::SessionConfig {
+        ipc::SessionConfig {
+            pipe_name: format!(r"\\.\pipe\winrsbox-hook-section-test-{}", std::process::id()),
+            dll_path: r"D:\bin\hook.dll".into(),
+            cwd: r"D:\sandbox".into(),
+            sandbox_root: r"D:\sandbox_root".into(),
+            overlay_roots: vec![],
+            trace: false,
+            guard: "full".into(),
+            allow_rwx: false,
+            disable_hooks: String::new(),
+        }
+    }
+
+    /// RAII owner for the section object created by `publish_for_test`;
+    /// closing the last handle destroys the object so nothing leaks into
+    /// the ambient `Local\` namespace after the test.
+    struct SectionHandle(winapi::shared::ntdef::HANDLE);
+
+    impl Drop for SectionHandle {
+        fn drop(&mut self) {
+            // SAFETY: handle came from CreateFileMappingW, closed exactly once.
+            unsafe { winapi::um::handleapi::CloseHandle(self.0) };
+        }
+    }
+
+    /// Create a section under `name` and write `bytes` into it. Unique
+    /// per-process names keep this free of ambient-state coupling: a second
+    /// `cargo test` in a sibling worktree can never collide.
+    fn publish_for_test(name: &str, bytes: &[u8]) -> SectionHandle {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use winapi::um::memoryapi::{CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_WRITE};
+        use winapi::um::winnt::PAGE_READWRITE;
+        let wide: Vec<u16> = OsStr::new(name).encode_wide().chain(Some(0)).collect();
+        let size = ipc::SESSION_CONFIG_SECTION_SIZE;
+        // SAFETY: pagefile-backed section (INVALID_HANDLE_VALUE); wide is a
+        //         null-terminated UTF-16 name; size fits u32.
+        let h = unsafe {
+            CreateFileMappingW(
+                winapi::um::handleapi::INVALID_HANDLE_VALUE,
+                std::ptr::null_mut(),
+                PAGE_READWRITE,
+                0,
+                size as u32,
+                wide.as_ptr(),
+            )
+        };
+        assert!(!h.is_null(), "CreateFileMappingW failed for {name}");
+        // SAFETY: h is the valid handle returned above; the view covers
+        //         `size` bytes and bytes.len() <= size by the ipc encoder.
+        unsafe {
+            let view = MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, size);
+            assert!(!view.is_null(), "MapViewOfFile failed");
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), view as *mut u8, bytes.len());
+            UnmapViewOfFile(view);
+        }
+        SectionHandle(h)
+    }
+
+    /// A name that does not exist must yield None without touching any
+    /// global. (The pre-fix behaviour opened the well-known constant
+    /// unconditionally and could read a LIVE launcher's config, poisoning
+    /// PIPE_NAME / OVERLAY_ROOTS for the whole test binary.)
+    #[test]
+    fn missing_section_yields_none_and_touches_no_globals() {
+        let name = unique_section_name("missing");
+        assert!(try_load_session_config_named(&name).is_none());
+        assert!(PIPE_NAME.get().is_none(), "a failed lookup must not set PIPE_NAME");
+        assert!(
+            session_section_name().is_none(),
+            "no injected name in the test binary ⇒ no section name"
+        );
+    }
+
+    /// Round-trip through the exact reader the hook uses at install time.
+    #[test]
+    fn named_section_roundtrip() {
+        let name = unique_section_name("roundtrip");
+        let cfg = unique_cfg();
+        let bytes = cfg.to_section_bytes().expect("config must encode");
+        let _owner = publish_for_test(&name, &bytes);
+        let got = try_load_session_config_named(&name).expect("config must decode");
+        assert_eq!(got.pipe_name, cfg.pipe_name);
+        assert_eq!(got.dll_path, cfg.dll_path);
+        assert_eq!(got.overlay_roots, cfg.overlay_roots);
+        assert!(!got.trace);
+    }
+
+    /// The guess-resistance core: with NO injected name, the install-time
+    /// entry point must not open ANY section. Against the old behaviour this
+    /// function opened `ipc::SESSION_CONFIG_SECTION_NAME` unconditionally —
+    /// this test pins that a process which never received the name through
+    /// the injection channel cannot even attempt a guess.
+    #[test]
+    fn no_injected_name_means_no_section_attempt() {
+        assert!(session_section_name().is_none());
+        assert_eq!(try_load_session_config_from_section(), None);
+        assert!(PIPE_NAME.get().is_none());
+    }
+
+    /// Pin: the runtime (non-test) part of this module must not reference
+    /// the retired legacy constant. Reintroducing a constant-name fallback
+    /// (the exact defect this change removes) fails here.
+    #[test]
+    fn module_never_references_the_legacy_constant() {
+        let src = include_str!("ipc_client.rs");
+        let runtime = &src[..src.find("#[cfg(test)]").expect("test module anchor")];
+        assert!(
+            !runtime.contains("SESSION_CONFIG_SECTION_NAME"),
+            "the hook must never open a well-known section name; the name can \
+             only come from the injection channel (FS_SANDBOX_SECTION)"
+        );
+    }
+
+    /// The guess-resistance core, made deterministic: even when a section
+    /// DOES exist under the retired well-known constant, a process that
+    /// never received the real session name must not read that decoy as its
+    /// config. Old behaviour opened `ipc::SESSION_CONFIG_SECTION_NAME`
+    /// unconditionally at fallback time, so this decoy would have been
+    /// consumed and PIPE_NAME poisoned with the decoy's pipe name.
+    #[test]
+    fn decoy_under_legacy_constant_is_not_consumed_without_injected_name() {
+        let legacy = ipc::SESSION_CONFIG_SECTION_NAME;
+
+        // Refuse to run against a live object: an old-build launcher may
+        // genuinely own the legacy name on this machine, and writing a decoy
+        // into ITS section is not ours to do. (Probe first, skip if taken.)
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use winapi::shared::minwindef::FALSE;
+        let wide: Vec<u16> = OsStr::new(legacy).encode_wide().chain(Some(0)).collect();
+        // SAFETY: wide is a null-terminated UTF-16 name; read-only probe.
+        let existing = unsafe {
+            winapi::um::memoryapi::OpenFileMappingW(
+                winapi::um::memoryapi::FILE_MAP_READ,
+                FALSE,
+                wide.as_ptr(),
+            )
+        };
+        if !existing.is_null() {
+            // SAFETY: existing is the valid handle just returned above.
+            unsafe { winapi::um::handleapi::CloseHandle(existing) };
+            return;
+        }
+
+        let cfg = unique_cfg();
+        let bytes = cfg.to_section_bytes().expect("config must encode");
+        let _decoy = publish_for_test(legacy, &bytes);
+
+        // The invariant: with NO injected name the fallback must not open
+        // ANY section — the decoy stays unread, PIPE_NAME stays unset.
+        assert_eq!(try_load_session_config_from_section(), None);
+        assert!(
+            PIPE_NAME.get().is_none(),
+            "a legacy-constant decoy must not poison PIPE_NAME when no name was injected"
+        );
     }
 }

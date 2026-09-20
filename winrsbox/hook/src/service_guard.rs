@@ -78,6 +78,7 @@ unsafe extern "system" fn hook_open_sc_manager(
     machine: *const u16, database: *const u16, access: u32,
 ) -> HANDLE {
     let call_original = || {
+// Detour-absent: unwrap-abort kept on purpose — SC_HANDLE family; fail-closed would be a null handle + SetLastError(ERROR_ACCESS_DENIED), exactly like this hook's own deny path above, a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnOpenSCManagerW ABI.
         HOOK_OPEN_SCM.get().unwrap().call(machine, database, access)
     };
@@ -98,6 +99,7 @@ unsafe extern "system" fn hook_open_service(
     scm: HANDLE, name: *const u16, access: u32,
 ) -> HANDLE {
     let call_original = || {
+// Detour-absent: unwrap-abort kept on purpose — SC_HANDLE family; fail-closed would be a null handle + SetLastError(ERROR_ACCESS_DENIED), exactly like this hook's own deny path above, a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 trampoline matches FnOpenServiceW ABI.
         HOOK_OPEN_SERVICE.get().unwrap().call(scm, name, access)
     };

@@ -15,11 +15,12 @@ use std::sync::OnceLock;
 
 use detour2::GenericDetour;
 use ntapi::ntioapi::IO_STATUS_BLOCK;
-use ntapi::winapi::shared::ntdef::{HANDLE, NTSTATUS, UNICODE_STRING};
+use ntapi::winapi::shared::ntdef::{HANDLE, NTSTATUS, OBJECT_ATTRIBUTES, UNICODE_STRING};
 use winapi::ctypes::c_void;
 
 use crate::anti_rec;
 use crate::hooks;
+use crate::hooks::nt_call_original;
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -173,11 +174,21 @@ fn filename_matches_pattern(name: &str, pattern: &str) -> bool {
 /// `p` may be null. If non-null, caller must ensure it points to a valid
 /// `UNICODE_STRING` (guaranteed by ntdll at hook entry) with `Buffer` valid
 /// for `Length` bytes when `Buffer` is non-null.
+///
+/// Alignment is explicitly NOT assumed: `p` and `Buffer` are the hooked
+/// caller's addresses, and a hostile caller controls both. `&*p` would
+/// assert UNICODE_STRING's natural pointer alignment and
+/// `slice::from_raw_parts::<u16>` would assert `Buffer` evenness — so the
+/// header is read field-wise with unaligned loads and each WCHAR is read
+/// unaligned (byte-wise under the hood). Validity for `Length` bytes remains
+/// the caller's obligation, exactly as before.
 unsafe fn extract_search_pattern(p: *const UNICODE_STRING) -> Option<String> {
     if p.is_null() {
         return None;
     }
-    let ustr = &*p;
+    // SAFETY: read_unaligned of a non-null UNICODE_STRING pointer — validity
+    // per the SAFETY contract above, alignment never assumed.
+    let ustr = (p as *const UNICODE_STRING).read_unaligned();
     if ustr.Buffer.is_null() {
         return None;
     }
@@ -185,10 +196,12 @@ unsafe fn extract_search_pattern(p: *const UNICODE_STRING) -> Option<String> {
     if char_count == 0 {
         return None;
     }
-    // SAFETY: from_raw_parts for `char_count` WCHARs from Buffer, bounded by
+    // SAFETY: `char_count` WCHARs read unaligned from Buffer, bounded by
     // Length per the NT UNICODE_STRING contract this function documents.
-    let slice = std::slice::from_raw_parts(ustr.Buffer, char_count);
-    Some(String::from_utf16_lossy(slice))
+    let chars: Vec<u16> = (0..char_count)
+        .map(|i| (ustr.Buffer.cast::<u8>().add(i * 2) as *const u16).read_unaligned())
+        .collect();
+    Some(String::from_utf16_lossy(&chars))
 }
 
 /// Lowercase FileNames of every entry in a (possibly already hide-filtered)
@@ -410,29 +423,37 @@ unsafe fn filter_entries(
         if avail < name_len_off + 4 {
             break;
         }
-        // SAFETY: deref of NextEntryOffset (offset 0) — guarded by avail check.
-        let next_off = *(cur as *const u32) as usize;
-        // SAFETY: deref of FileNameLength at class-specific offset — guarded above.
-        let name_len = *(cur.add(name_len_off) as *const u32) as usize;
+        // SAFETY: NextEntryOffset (offset 0) and FileNameLength (class-
+        // specific offset) are guarded by the avail check above. Both are
+        // read unaligned: `buf`'s base alignment is controlled by the
+        // sandboxed caller, so a record can start at an odd address.
+        let next_off = (cur as *const u32).read_unaligned() as usize;
+        let name_len = (cur.add(name_len_off) as *const u32).read_unaligned() as usize;
         // Inspect the name only when the whole field provably fits in the buffer.
         if name_len >= 2 && name_off + name_len <= avail {
             let name_ptr = cur.add(name_off) as *const u16;
             let chars = name_len / 2;
-            // SAFETY: from_raw_parts for `chars` u16s at FileName offset; the
-            // `name_off + name_len <= avail` guard above bounds the read.
-            let name_slice = std::slice::from_raw_parts(name_ptr, chars);
-            if name_matches_any(name_slice, hide_names) {
+            // The name is read through name_matches_any_unaligned: `name_ptr`
+            // is `chars` u16s into caller-owned memory (bounded by the
+            // `name_off + name_len <= avail` guard above) with no alignment
+            // guarantee, so slice::from_raw_parts would be UB on an odd
+            // record address.
+            if name_matches_any_unaligned(name_ptr, chars, hide_names) {
                 filtered_any = true;
                 if !prev.is_null() {
-                    // Middle/last entry: patch previous to skip this one
-                    let prev_next = *(prev as *const u32) as usize;
+                    // Middle/last entry: patch previous to skip this one.
+                    // Read/write unaligned: `prev` is a record start in the
+                    // caller-aligned buffer, so it can sit at an odd address.
+                    // SAFETY: prev points at a live in-buffer record whose
+                    // NextEntryOffset (offset 0) is guarded by avail >= 4.
+                    let prev_next = (prev as *const u32).read_unaligned() as usize;
                     let new_next = if next_off == 0 {
                         0u32
                     } else {
                         (prev_next + next_off) as u32
                     };
-                    // SAFETY: writing patched NextEntryOffset to previous entry; prev is a valid in-buffer pointer.
-                    *(prev as *mut u32) = new_next;
+                    // SAFETY: same in-buffer record as above.
+                    (prev as *mut u32).write_unaligned(new_next);
                 } else if next_off == 0 {
                     *only_hidden = true;
                     return true;
@@ -466,15 +487,26 @@ unsafe fn filter_entries(
     filtered_any
 }
 
-/// Case-insensitive UTF-16 comparison of an entry's FileName against a list of
-/// names to hide. Short-circuits on first match.
-fn name_matches_any(name: &[u16], hide_names: &[Vec<u16>]) -> bool {
+/// Raw-pointer variant of `name_matches_any`: reads the candidate name
+/// through `name_ptr` with UNALIGNED accesses. Directory-info record buffers
+/// come from sandboxed user code with no base-alignment guarantee, so a
+/// record's FileName can start at an odd address; minting a
+/// `&[u16]` there via slice::from_raw_parts would be UB.
+fn name_matches_any_unaligned(
+    name_ptr: *const u16,
+    chars: usize,
+    hide_names: &[Vec<u16>],
+) -> bool {
     for hide in hide_names {
-        if name.len() != hide.len() {
+        if chars != hide.len() {
             continue;
         }
         let mut all_eq = true;
-        for (&a, &b) in name.iter().zip(hide.iter()) {
+        for (i, &b) in hide.iter().enumerate() {
+            // SAFETY: i < chars == hide.len(), and the caller guarantees
+            // `chars` u16s are readable at name_ptr (bounded by the walk's
+            // `name_off + name_len <= avail` check).
+            let a = unsafe { name_ptr.add(i).read_unaligned() };
             // ASCII case-fold (matches the kernel's RtlDowncaseUnicodeString
             // for ASCII; non-ASCII compared verbatim).
             let af = if (b'A' as u16..=b'Z' as u16).contains(&a) { a + 0x20 } else { a };
@@ -595,19 +627,28 @@ unsafe fn rewrite_entry_case(
         if avail < name_len_off + 4 {
             break;
         }
-        // SAFETY: NextEntryOffset at offset 0, guarded by avail.
-        let next_off = *(cur as *const u32) as usize;
-        // SAFETY: FileNameLength at class-specific offset, guarded by avail.
-        let name_len = *(cur.add(name_len_off) as *const u32) as usize;
+        // SAFETY: NextEntryOffset (offset 0) and FileNameLength (class-
+        // specific offset) are guarded by avail. Both are read unaligned:
+        // the buffer's base alignment is controlled by the sandboxed caller,
+        // so a record can start at an odd address.
+        let next_off = (cur as *const u32).read_unaligned() as usize;
+        let name_len = (cur.add(name_len_off) as *const u32).read_unaligned() as usize;
 
         if name_len >= 2 && name_off + name_len <= avail {
             let name_ptr = cur.add(name_off) as *mut u16;
             let chars = name_len / 2;
-            // SAFETY: from_raw_parts_mut for `chars` u16s; `name_off + name_len <= avail`.
-            let name_slice = std::slice::from_raw_parts(name_ptr, chars);
 
-            // Build the lowercase lookup key.
-            let lower: String = std::char::decode_utf16(name_slice.iter().copied())
+            // Build the lowercase lookup key. Each WCHAR is read unaligned:
+            // `name_ptr` is `chars` u16s into caller-owned memory (bounded by
+            // the `name_off + name_len <= avail` guard above) with no
+            // alignment guarantee, so slice::from_raw_parts would be UB on an
+            // odd record address.
+            let lower: String = (0..chars)
+                .map(|i| {
+                    // SAFETY: i < chars, bounded by the avail check above.
+                    unsafe { name_ptr.add(i).read_unaligned() }
+                })
+                .flat_map(|u| std::char::decode_utf16(std::iter::once(u)))
                 .map(|r| r.unwrap_or('\u{FFFD}'))
                 .flat_map(|c| c.to_ascii_lowercase().to_string().chars().collect::<Vec<_>>())
                 .collect();
@@ -616,9 +657,18 @@ unsafe fn rewrite_entry_case(
                 // Only rewrite when same length (case change only). Length
                 // difference would require structural changes — skip those.
                 if correct.len() == chars {
-                    // SAFETY: from_raw_parts_mut; length matches.
-                    let dst = std::slice::from_raw_parts_mut(name_ptr, chars);
-                    dst.copy_from_slice(correct.as_slice());
+                    // SAFETY: byte-wise copy — memcpy semantics with no
+                    // alignment precondition (u8 is aligned everywhere, and
+                    // ptr::copy_nonoverlapping::<u16> would demand u16
+                    // alignment the odd record address cannot offer), and
+                    // the map's buffer cannot overlap the record buffer.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            correct.as_ptr() as *const u8,
+                            name_ptr as *mut u8,
+                            chars * 2,
+                        );
+                    }
                 }
             }
         }
@@ -651,6 +701,14 @@ unsafe fn rewrite_entry_case(
 /// is never misread as "try synthesizing".
 const STATUS_NO_SUCH_FILE: NTSTATUS = 0xC000000Fu32 as NTSTATUS;
 
+/// The real STATUS_NO_MORE_FILES — error severity (0x8…), "the enumeration is
+/// exhausted". The value this used to hold (0x0000_0104) is STATUS_REPARSE:
+/// success severity, so `NT_SUCCESS(0x104)` is true — callers trusted the
+/// filtered buffer and FindNextFile handed the guest the very record the
+/// filter had removed. STATUS_NO_MORE_ENTRIES (0x8000_001A) is a different
+/// status and must never be substituted here.
+const STATUS_NO_MORE_FILES: NTSTATUS = 0x8000_0006_u32 as NTSTATUS;
+
 /// Resolve the virtual DOS path for the directory being enumerated.
 ///
 /// `query_handle_dos_path` calls GetFinalPathNameByHandleW which internally
@@ -665,6 +723,211 @@ fn resolve_virtual_dir(dir_dos: Option<&str>) -> Option<String> {
     let raw = dir_dos?;
     let sb_root = hooks::SANDBOX_ROOT.get().map(|s| s.as_str());
     Some(hooks::unmirror_overlay_handle_relative(raw, sb_root).unwrap_or_else(|| raw.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Asynchronous-query supervision
+// ---------------------------------------------------------------------------
+
+/// STATUS_PENDING — the original call returned before the kernel filled the
+/// output buffer (the handle was opened for asynchronous I/O). Every other
+/// non-success status either failed the query outright (nothing valid in the
+/// buffer) or is STATUS_NO_SUCH_FILE (handled separately below); only
+/// STATUS_PENDING means "data is still in flight".
+const STATUS_PENDING: NTSTATUS = 0x0000_0103_u32 as NTSTATUS;
+
+/// Returned when a query cannot be supervised at all (our completion event
+/// could not be created). Deliberately an error: an unsupervised async
+/// enumeration would complete later with a raw, unfiltered listing.
+const STATUS_INSUFFICIENT_RESOURCES: NTSTATUS = 0xC000_009A_u32 as NTSTATUS;
+
+type FnNtCreateEvent = unsafe extern "system" fn(
+    *mut HANDLE,             // EventHandle (out)
+    u32,                     // DesiredAccess
+    *mut OBJECT_ATTRIBUTES,  // ObjectAttributes (unnamed event)
+    i32,                     // EventType (0 = NotificationEvent)
+    u8,                      // InitialState (BOOLEAN)
+) -> NTSTATUS;
+type FnNtWaitForSingleObject = unsafe extern "system" fn(
+    HANDLE,                  // Handle
+    u8,                      // Alertable (BOOLEAN) — always FALSE here
+    *mut c_void,             // PLARGE_INTEGER Timeout — null = wait forever
+) -> NTSTATUS;
+type FnNtSetEvent = unsafe extern "system" fn(
+    HANDLE,                  // EventHandle
+    *mut u32,                // PULONG PreviousState (optional)
+) -> NTSTATUS;
+type FnNtClose = unsafe extern "system" fn(HANDLE) -> NTSTATUS;
+
+/// ntdll entry points used to supervise asynchronous directory queries.
+struct EventApi {
+    create_event: FnNtCreateEvent,
+    wait_for_single_object: FnNtWaitForSingleObject,
+    set_event: FnNtSetEvent,
+    close: FnNtClose,
+}
+
+static EVENT_API: OnceLock<EventApi> = OnceLock::new();
+
+/// Resolve the supervision entry points from ntdll.
+///
+/// # SAFETY
+/// Reads ntdll's export table; the resolved addresses are only ever called
+/// through the ABI-correct aliases above.
+unsafe fn resolve_event_api() -> Option<EventApi> {
+    // SAFETY: one transmute per export, pattern-matching install()'s
+    // `transmute(addr as usize)`; each address is a live ntdll export whose
+    // ABI matches the alias it is transmuted to.
+    let create_event: FnNtCreateEvent =
+        std::mem::transmute(hooks::ntdll_export(b"NtCreateEvent\0")? as usize);
+    let wait_for_single_object: FnNtWaitForSingleObject =
+        std::mem::transmute(hooks::ntdll_export(b"NtWaitForSingleObject\0")? as usize);
+    let set_event: FnNtSetEvent =
+        std::mem::transmute(hooks::ntdll_export(b"NtSetEvent\0")? as usize);
+    let close: FnNtClose =
+        std::mem::transmute(hooks::ntdll_export(b"NtClose\0")? as usize);
+    Some(EventApi { create_event, wait_for_single_object, set_event, close })
+}
+
+/// Lazily resolved (once) supervision API. Falls back to resolving in-process
+/// so unit tests — which never run install() — exercise the same primitives
+/// the hooks use.
+fn event_api() -> Option<&'static EventApi> {
+    if let Some(api) = EVENT_API.get() {
+        return Some(api);
+    }
+    // SAFETY: ntdll export-table read; the addresses are only ever called
+    // through the typed aliases in `EventApi`.
+    let api = unsafe { resolve_event_api()? };
+    EVENT_API.set(api).ok();
+    EVENT_API.get()
+}
+
+/// Supervises one `NtQueryDirectoryFile[_Ex]` call whose I/O may complete
+/// asynchronously.
+///
+/// A query issued on a handle opened for asynchronous I/O returns
+/// STATUS_PENDING before the kernel has written anything into the caller's
+/// buffer — if that status reached the caller, the guest would later read a
+/// raw, *unfiltered* listing once the I/O completed. Wrapping the caller's
+/// completion mechanism (event/APC) would need APC trampolines, and refusing
+/// the query pre-call would need per-handle async tracking, so this instead
+/// passes its OWN fresh, initially-non-signaled NotificationEvent to the
+/// original call. On STATUS_PENDING the hook blocks until the supervised I/O
+/// completes, adopts the final IoStatusBlock status, and only then lets
+/// `process_dir_output` filter the buffer; the caller's own event is
+/// signaled in Drop — strictly AFTER filtering — and the substitute event is
+/// closed.
+///
+/// Semantic change (deliberate): asynchronous directory enumeration becomes
+/// synchronous per call. Callers that passed an event still get it set,
+/// callers with an APC still get it queued (delivered later, reading the
+/// already-filtered buffer), and the value returned to the caller is the
+/// final status — never STATUS_PENDING.
+///
+/// Fail-closed: if the substitute event cannot be created, [`Self::new`]
+/// returns None and the hook refuses the query with
+/// STATUS_INSUFFICIENT_RESOURCES rather than running it unsupervised.
+struct DirQuerySupervision {
+    caller_event: HANDLE, // the caller's Event argument (may be null)
+    event: HANDLE,        // our own fresh event handed to the original call
+}
+
+impl DirQuerySupervision {
+    /// Create the substitute completion event. Returns None (fail-closed)
+    /// when the supervision API is unavailable or the event cannot be
+    /// created.
+    fn new(caller_event: HANDLE) -> Option<Self> {
+        let api = event_api()?;
+        // SAFETY: OBJECT_ATTRIBUTES is all-integer/pointer fields, so a
+        // zeroed value is a valid base; Length is set right after, following
+        // InitializeObjectAttributes' convention (unnamed event — ObjectName
+        // stays null).
+        let mut oa: OBJECT_ATTRIBUTES = unsafe { std::mem::zeroed() };
+        oa.Length = std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32;
+        let mut event: HANDLE = std::ptr::null_mut();
+        // SAFETY: api.create_event is the ABI-correct ntdll export; the
+        // out-handle and ObjectAttributes pointers are valid for the call.
+        let status = unsafe {
+            (api.create_event)(
+                &mut event,
+                0x0010_0002, // DesiredAccess: SYNCHRONIZE | EVENT_MODIFY_STATE
+                &mut oa,
+                0, // EventType: NotificationEvent (manual-reset)
+                0, // InitialState: BOOLEAN FALSE (non-signaled)
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        Some(Self { caller_event, event })
+    }
+
+    /// The substitute event to pass to the original call in place of the
+    /// caller's own.
+    fn query_event(&self) -> HANDLE {
+        self.event
+    }
+
+    /// If `status` is STATUS_PENDING, block until the supervised I/O
+    /// completes and return the final status the kernel wrote into
+    /// `io_status_block`; any other status is returned immediately,
+    /// unchanged — the query is already complete.
+    ///
+    /// # SAFETY
+    /// `io_status_block` must be the same pointer the original call was
+    /// given (or null, which is passed through untouched).
+    unsafe fn wait_if_pending(
+        &self,
+        status: NTSTATUS,
+        io_status_block: *mut IO_STATUS_BLOCK,
+    ) -> NTSTATUS {
+        if status != STATUS_PENDING {
+            return status;
+        }
+        if io_status_block.is_null() {
+            // Unreachable through the hooks — the kernel rejects a null IOSB
+            // synchronously — kept so this contract stays null-safe.
+            return status;
+        }
+        loop {
+            // SAFETY: self.event is the valid self-owned event from `new`;
+            // Alertable = FALSE and a null timeout waits forever. Any result
+            // other than STATUS_WAIT_0 (0) is not reachable for a valid
+            // self-owned event with an infinite timeout — keep waiting
+            // rather than return while the kernel may still write the
+            // caller's buffer.
+            let wait = (event_api().expect("event_api resolved by new()").wait_for_single_object)(
+                self.event,
+                0,
+                std::ptr::null_mut(),
+            );
+            if wait == 0 {
+                break;
+            }
+        }
+        // SAFETY: the kernel writes the final status into the IOSB BEFORE
+        // signaling our event, so the wait above orders this read after that
+        // write. The Status union member sits at offset 0. The IOSB is the
+        // hooked caller's, so the read must not assume its alignment.
+        (io_status_block as *const NTSTATUS).read_unaligned()
+    }
+}
+
+impl Drop for DirQuerySupervision {
+    fn drop(&mut self) {
+        // Runs after process_dir_output has filtered the buffer, so the
+        // caller can never observe pre-filter data through a signaled event.
+        let Some(api) = event_api() else { return };
+        // SAFETY: caller_event is the caller's own event handle (null is
+        // skipped) and event is ours from `new`; both are valid here.
+        unsafe {
+            if !self.caller_event.is_null() {
+                (api.set_event)(self.caller_event, std::ptr::null_mut());
+            }
+            (api.close)(self.event);
+        }
+    }
 }
 
 unsafe fn process_dir_output(
@@ -717,8 +980,11 @@ unsafe fn process_dir_output(
         if new_size == 0 {
             return original_status; // didn't fit / unsupported class
         }
-        // SAFETY: io_status_block validated non-null above; Information at offset 8 on x64.
-        *((io_status_block as *mut u8).add(8) as *mut usize) = new_size;
+        // SAFETY: io_status_block validated non-null above; Information sits
+        // at offset 8 on x64 (4-byte Status/Pointer union + 4 pad). The
+        // caller's IO_STATUS_BLOCK only guarantees 4-byte alignment, so the
+        // usize write goes through write_unaligned.
+        ((io_status_block as *mut u8).add(8) as *mut usize).write_unaligned(new_size);
         if hooks::is_trace() {
             hooks::ipc_log(ipc::LogLevel::Trace,
                 format!("fs_enum_overlay_synthesize dir={dir} pattern={pattern} matched={}", matches.len()));
@@ -733,8 +999,10 @@ unsafe fn process_dir_output(
         return original_status;
     }
     // IoStatusBlock.Information (offset 8 on x64) contains bytes written.
-    // SAFETY: io_status_block validated non-null; Information at offset 8 on x64.
-    let info_size = *((io_status_block as *const u8).add(8) as *const usize);
+    // SAFETY: io_status_block validated non-null; Information at offset 8 on
+    // x64. Read unaligned: the caller's IO_STATUS_BLOCK only guarantees
+    // 4-byte alignment, not the 8 a plain usize load assumes.
+    let info_size = ((io_status_block as *const u8).add(8) as *const usize).read_unaligned();
     if info_size == 0 {
         return original_status;
     }
@@ -773,12 +1041,19 @@ unsafe fn process_dir_output(
         &mut only_hidden,
     ) {
         if only_hidden {
-            const STATUS_NO_MORE_FILES: NTSTATUS = 0x0000_0104_u32 as NTSTATUS;
             if hooks::is_trace() {
                 hooks::ipc_log(ipc::LogLevel::Trace,
                     format!("fs_hide_enum: only hidden entries dir={}",
                         virtual_dir.as_deref().unwrap_or("<none>")));
             }
+            // SAFETY: io_status_block validated non-null at the top of this fn;
+            // Information at offset 8 on x64. Zeroed so the stale pre-filter
+            // byte count is no longer readable as a live record via FindNextFile
+            // — nothing valid remains in the buffer when every entry was hidden.
+            // The IOSB is the hooked caller's, so the write must not assume
+            // its alignment (matches the read_unaligned/write_unaligned used
+            // everywhere else in this file for the same field).
+            ((io_status_block as *mut u8).add(8) as *mut usize).write_unaligned(0);
             return STATUS_NO_MORE_FILES;
         }
         if hooks::is_trace() {
@@ -842,8 +1117,11 @@ unsafe fn process_dir_output(
                         &extras,
                     );
                     if new_size > info_size {
-                        // SAFETY: io_status_block validated non-null above; Information at offset 8 on x64.
-                        *((io_status_block as *mut u8).add(8) as *mut usize) = new_size;
+                        // SAFETY: io_status_block validated non-null above; Information
+                        // sits at offset 8 on x64. The caller's IO_STATUS_BLOCK only
+                        // guarantees 4-byte alignment, so the usize write goes through
+                        // write_unaligned.
+                        ((io_status_block as *mut u8).add(8) as *mut usize).write_unaligned(new_size);
                         if hooks::is_trace() {
                             hooks::ipc_log(ipc::LogLevel::Trace,
                                 format!("fs_enum_overlay_merge dir={dir} added={}", extras.len()));
@@ -876,25 +1154,53 @@ unsafe extern "system" fn hook_nt_query_directory_file(
     restart_scan: u8,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
-        // SAFETY: detour2 trampoline matches FnNtQueryDirectoryFile ABI.
-        return HOOK_NT_QUERY_DIRECTORY_FILE.get().unwrap().call(
-            file_handle, event, apc_routine, apc_context, io_status_block,
-            file_information, length, file_information_class,
-            return_single_entry, file_name, restart_scan,
+        return nt_call_original!(
+            &HOOK_NT_QUERY_DIRECTORY_FILE,
+            "NtQueryDirectoryFile",
+            (file_handle, event, apc_routine, apc_context, io_status_block,
+             file_information, length, file_information_class,
+             return_single_entry, file_name, restart_scan)
         );
     };
 
-    // SAFETY: detour2 trampoline matches FnNtQueryDirectoryFile ABI; same args passed through.
-    let status = HOOK_NT_QUERY_DIRECTORY_FILE.get().unwrap().call(
-        file_handle, event, apc_routine, apc_context, io_status_block,
-        file_information, length, file_information_class,
-        return_single_entry, file_name, restart_scan,
+    // Async-supervision gate: a query on a handle opened for asynchronous
+    // I/O used to return STATUS_PENDING here, fell through
+    // process_dir_output's `original_status != 0` early-return, and the
+    // guest later read an unfiltered listing once the I/O completed.
+    // Substitute our own event so completion cannot be observed before
+    // filtering; on STATUS_PENDING block until completion and hand the
+    // filter the final status.
+    let Some(supervision) = DirQuerySupervision::new(event) else {
+        // Fail-closed: never run a query we cannot supervise.
+        if hooks::is_trace() {
+            hooks::ipc_log(ipc::LogLevel::Trace,
+                "fs_enum_async_unsupervised_refused: NtCreateEvent failed".to_string());
+        }
+        return STATUS_INSUFFICIENT_RESOURCES;
+    };
+
+    // SAFETY: detour2 trampoline matches FnNtQueryDirectoryFile ABI; the
+    // caller's Event handle is replaced by supervision.query_event() (see
+    // DirQuerySupervision) — every other argument passes through unchanged.
+    let status = nt_call_original!(
+        &HOOK_NT_QUERY_DIRECTORY_FILE,
+        "NtQueryDirectoryFile",
+        (file_handle, supervision.query_event(), apc_routine, apc_context,
+         io_status_block, file_information, length, file_information_class,
+         return_single_entry, file_name, restart_scan)
     );
+
+    // STATUS_PENDING → block until the kernel completes the I/O, then adopt
+    // the final status so the filter below always sees a completed buffer.
+    let status = supervision.wait_if_pending(status, io_status_block);
 
     let dir_dos = crate::fs_metadata_guard::query_handle_dos_path(file_handle);
     // SAFETY: file_name is the same UNICODE_STRING pointer ntdll passed us;
     // valid (or null) per the NT contract at hook entry.
     let search_pattern = extract_search_pattern(file_name);
+    // `supervision` drops only AFTER the process_dir_output tail expression
+    // below is evaluated: Drop signals the caller's event strictly after the
+    // buffer has been filtered, so pre-filter data is never observable.
     process_dir_output(
         file_information,
         io_status_block,
@@ -920,25 +1226,53 @@ unsafe extern "system" fn hook_nt_query_directory_file_ex(
     file_name: *mut UNICODE_STRING,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
-        // SAFETY: detour2 trampoline matches FnNtQueryDirectoryFileEx ABI.
-        return HOOK_NT_QUERY_DIRECTORY_FILE_EX.get().unwrap().call(
-            file_handle, event, apc_routine, apc_context, io_status_block,
-            file_information, length, file_information_class,
-            query_flags, file_name,
+        return nt_call_original!(
+            &HOOK_NT_QUERY_DIRECTORY_FILE_EX,
+            "NtQueryDirectoryFileEx",
+            (file_handle, event, apc_routine, apc_context, io_status_block,
+             file_information, length, file_information_class,
+             query_flags, file_name)
         );
     };
 
-    // SAFETY: detour2 trampoline matches FnNtQueryDirectoryFileEx ABI.
-    let status = HOOK_NT_QUERY_DIRECTORY_FILE_EX.get().unwrap().call(
-        file_handle, event, apc_routine, apc_context, io_status_block,
-        file_information, length, file_information_class,
-        query_flags, file_name,
+    // Async-supervision gate: a query on a handle opened for asynchronous
+    // I/O used to return STATUS_PENDING here, fell through
+    // process_dir_output's `original_status != 0` early-return, and the
+    // guest later read an unfiltered listing once the I/O completed.
+    // Substitute our own event so completion cannot be observed before
+    // filtering; on STATUS_PENDING block until completion and hand the
+    // filter the final status.
+    let Some(supervision) = DirQuerySupervision::new(event) else {
+        // Fail-closed: never run a query we cannot supervise.
+        if hooks::is_trace() {
+            hooks::ipc_log(ipc::LogLevel::Trace,
+                "fs_enum_async_unsupervised_refused: NtCreateEvent failed".to_string());
+        }
+        return STATUS_INSUFFICIENT_RESOURCES;
+    };
+
+    // SAFETY: detour2 trampoline matches FnNtQueryDirectoryFileEx ABI; the
+    // caller's Event handle is replaced by supervision.query_event() (see
+    // DirQuerySupervision) — every other argument passes through unchanged.
+    let status = nt_call_original!(
+        &HOOK_NT_QUERY_DIRECTORY_FILE_EX,
+        "NtQueryDirectoryFileEx",
+        (file_handle, supervision.query_event(), apc_routine, apc_context,
+         io_status_block, file_information, length, file_information_class,
+         query_flags, file_name)
     );
+
+    // STATUS_PENDING → block until the kernel completes the I/O, then adopt
+    // the final status so the filter below always sees a completed buffer.
+    let status = supervision.wait_if_pending(status, io_status_block);
 
     let dir_dos = crate::fs_metadata_guard::query_handle_dos_path(file_handle);
     // SAFETY: file_name is the same UNICODE_STRING pointer ntdll passed us;
     // valid (or null) per the NT contract at hook entry.
     let search_pattern = extract_search_pattern(file_name);
+    // `supervision` drops only AFTER the process_dir_output tail expression
+    // below is evaluated: Drop signals the caller's event strictly after the
+    // buffer has been filtered, so pre-filter data is never observable.
     process_dir_output(
         file_information,
         io_status_block,
@@ -989,6 +1323,153 @@ pub unsafe fn uninstall() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── more unaligned-read regression (same class as the probes above) ──
+    //
+    // extract_search_pattern reads the caller's UNICODE_STRING search
+    // argument and two paths touch the caller's IO_STATUS_BLOCK (final
+    // status after supervision, Information zeroing when every entry was
+    // hidden). All three bases are hooked-caller addresses with no
+    // alignment guarantee; these probes force them onto odd addresses.
+
+    /// Byte offset within `backing` whose address is ODD.
+    fn odd_offset(backing: &[u8]) -> usize {
+        let off = 1 - (backing.as_ptr() as usize % 2);
+        assert_eq!((backing.as_ptr() as usize + off) % 2, 1, "probe must sit at an odd address");
+        off
+    }
+
+    /// Copy `value`'s bytes to `dst` — any alignment.
+    unsafe fn place_at<T>(dst: *mut u8, value: &T) {
+        std::ptr::copy_nonoverlapping(
+            value as *const T as *const u8,
+            dst,
+            std::mem::size_of::<T>(),
+        );
+    }
+
+    /// UNICODE_STRING header AND WCHAR buffer each placed at an odd address:
+    /// the old `&*p` asserted 8-byte header alignment and
+    /// `from_raw_parts::<u16>(Buffer)` asserted Buffer evenness — both abort.
+    #[test]
+    fn extract_search_pattern_reads_misaligned_header_and_buffer() {
+        let pattern = "*.txt";
+        let wchars: Vec<u16> = pattern.encode_utf16().collect();
+        let mut text_backing = vec![0u8; wchars.len() * 2 + 8];
+        let toff = odd_offset(&text_backing);
+        // SAFETY: u8 view of an aligned Vec<u16> payload of the same length.
+        let wc_bytes = unsafe {
+            std::slice::from_raw_parts(wchars.as_ptr() as *const u8, wchars.len() * 2)
+        };
+        text_backing[toff..toff + wc_bytes.len()].copy_from_slice(wc_bytes);
+
+        let mut header_backing = vec![0u8; std::mem::size_of::<UNICODE_STRING>() + 8];
+        let hoff = odd_offset(&header_backing);
+        let header = UNICODE_STRING {
+            Length: (wchars.len() * 2) as u16,
+            MaximumLength: (wchars.len() * 2 + 2) as u16,
+            // SAFETY: points at the odd window in `text_backing`, valid for
+            // Length bytes; the backing outlives the call below.
+            Buffer: unsafe { text_backing.as_ptr().add(toff) } as *mut u16,
+        };
+        // SAFETY: hoff ≤ 1, struct fits the backing.
+        unsafe { place_at(header_backing.as_mut_ptr().add(hoff), &header) };
+        // SAFETY: the odd header is a byte-identical, live UNICODE_STRING.
+        let result = unsafe {
+            extract_search_pattern(header_backing.as_ptr().add(hoff) as *const UNICODE_STRING)
+        };
+        assert_eq!(result, Some(pattern.to_string()));
+    }
+
+    /// The kernel-mirrored final status must be read out of a misaligned IOSB
+    /// (the hooked caller chose its address) — the old plain
+    /// `*(io_status_block as *const NTSTATUS)` aborted instead.
+    #[test]
+    fn supervised_final_status_is_read_from_misaligned_iosb() {
+        let sup = DirQuerySupervision::new(std::ptr::null_mut())
+            .expect("DirQuerySupervision::new must create a supervision event");
+        let raw_event = sup.query_event();
+        let mut iosb_backing = vec![0u8; std::mem::size_of::<IO_STATUS_BLOCK>() + 8];
+        let ioff = odd_offset(&iosb_backing);
+        // SAFETY: ioff ≤ 1, IO_STATUS_BLOCK fits the backing.
+        let iosb_raw: *mut IO_STATUS_BLOCK =
+            unsafe { iosb_backing.as_mut_ptr().add(ioff) } as *mut IO_STATUS_BLOCK;
+        let iosb_for_thread = SendRaw(iosb_raw);
+        let event_for_thread = SendRaw(raw_event);
+        let handle = std::thread::spawn(move || {
+            // Mirroring the kernel: final IOSB written BEFORE the event.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // SAFETY: iosb_for_thread.0 points at the main thread's backing,
+            // which outlives this thread (joined below); the 4-byte status is
+            // stored byte-wise because the address is odd on purpose.
+            unsafe {
+                let status_bytes = 0xC000_0034_u32.to_le_bytes();
+                std::ptr::copy_nonoverlapping(
+                    status_bytes.as_ptr(),
+                    iosb_for_thread.get() as *mut u8,
+                    4,
+                );
+            }
+            let api = event_api().expect(
+                "event_api must resolve NtCreateEvent, NtWaitForSingleObject, NtSetEvent, NtClose",
+            );
+            // SAFETY: event_for_thread.0 is `sup`'s own event; sup outlives
+            // the join below.
+            unsafe { (api.set_event)(event_for_thread.get(), std::ptr::null_mut()); }
+        });
+        // SAFETY: iosb_raw is the pointer the (simulated) original call was
+        // given; wait_if_pending reads it only after the event fires.
+        let status = unsafe { sup.wait_if_pending(STATUS_PENDING, iosb_raw) };
+        handle.join().expect("supervision helper thread must not panic");
+        assert_eq!(status, 0xC000_0034_u32 as NTSTATUS,
+            "final status must be readable from an odd-address IOSB");
+    }
+
+    /// The only-hidden path zeroes Information in the caller's IOSB — the
+    /// old plain `*((iosb + 8) as *mut usize) = 0` aborted on an odd IOSB.
+    #[test]
+    fn only_hidden_zeroes_information_in_misaligned_iosb() {
+        let built = build_dir_info_buffer(&[".winrsbox"]);
+        let (mut backing, off) = odd_window(&built);
+        assert_eq!((backing.as_ptr() as usize + off) % 2, 1,
+            "probe buffer must start at an odd address");
+        let mut iosb_backing = vec![0u8; std::mem::size_of::<IO_STATUS_BLOCK>() + 8];
+        let ioff = odd_offset(&iosb_backing);
+        // SAFETY: ioff ≤ 1, IO_STATUS_BLOCK fits the backing.
+        let iosb_ptr: *mut IO_STATUS_BLOCK =
+            unsafe { iosb_backing.as_mut_ptr().add(ioff) } as *mut IO_STATUS_BLOCK;
+        // Stale pre-filter byte count at Information (offset 8, x64), written
+        // byte-wise — an aligned usize store would trip the same precondition.
+        // SAFETY: 8 bytes at iosb+8 stay inside the backing.
+        unsafe {
+            let stale = (built.len() as u64).to_le_bytes();
+            std::ptr::copy_nonoverlapping(stale.as_ptr(), (iosb_ptr as *mut u8).add(8), 8);
+        }
+        // SAFETY: buf is a valid writable class-1 buffer at an odd base; the
+        // iosb is the (misaligned) caller IOSB stand-in. dir_dos None keeps
+        // the fn off IPC entirely.
+        let status = unsafe {
+            process_dir_output(
+                backing.as_mut_ptr().add(off) as *mut c_void,
+                iosb_ptr, 1, None, 0, built.len(), None,
+            )
+        };
+        assert_eq!(status, STATUS_NO_MORE_FILES);
+        // SAFETY: read the Information field back byte-wise from the backing.
+        let mut info_bytes = [0u8; 8];
+        unsafe {
+            std::ptr::copy_nonoverlapping((iosb_ptr as *const u8).add(8), info_bytes.as_mut_ptr(), 8);
+        }
+        assert_eq!(usize::from_le_bytes(info_bytes), 0,
+            "stale Information must be zeroed even in a misaligned IOSB");
+    }
+
+    /// Slice-shaped convenience wrapper over `name_matches_any_unaligned`
+    /// (the single production implementation — filter_entries calls the
+    /// raw-pointer variant directly).
+    fn name_matches_any(name: &[u16], hide_names: &[Vec<u16>]) -> bool {
+        name_matches_any_unaligned(name.as_ptr(), name.len(), hide_names)
+    }
 
     /// Build a synthetic FileDirectoryInformation (class 1) buffer with the
     /// given entry names. Each entry is 0x40 + (name_chars*2) bytes; the last
@@ -1968,5 +2449,238 @@ mod tests {
         // SAFETY: ustr is a valid stack UNICODE_STRING backed by `storage`.
         let result = unsafe { extract_search_pattern(&ustr as *const UNICODE_STRING) };
         assert_eq!(result, Some("probe.txt".to_string()));
+    }
+
+    // ── hidden-record leak + async-supervision fixes ───────────────────────
+    //
+    // Two bugs: (1) the only-hidden path returned 0x0000_0104 (STATUS_REPARSE
+    // — success severity) with a stale Information byte count, so FindNextFile
+    // handed the guest the record the filter had just removed; (2) a query on
+    // an async handle returned STATUS_PENDING and the guest later read the
+    // raw, unfiltered listing once the I/O completed.
+
+    /// Test-only `Send` wrapper for raw handles/pointers shared with the
+    /// supervision helper thread. Sound here: the main thread joins before
+    /// any further access, and the kernel-event signal orders the helper's
+    /// IOSB write before the supervised read. Access goes through `get` — a
+    /// raw `.0` field access inside the closure would capture the non-Send
+    /// pointer directly (edition-2021 disjoint capture) and skip the wrapper.
+    struct SendRaw<T>(T);
+    unsafe impl<T> Send for SendRaw<T> {}
+    impl<T: Copy> SendRaw<T> {
+        fn get(&self) -> T {
+            self.0
+        }
+    }
+
+    #[test]
+    fn status_no_more_files_is_the_real_ntstatus() {
+        assert_eq!(STATUS_NO_MORE_FILES, 0x8000_0006_u32 as NTSTATUS);
+        // 0x104 is STATUS_REPARSE, the pre-fix bug value — success severity,
+        // so callers trusted the filtered buffer and the hidden record leaked
+        // through FindNextFile.
+        assert_ne!(STATUS_NO_MORE_FILES, 0x0000_0104_u32 as NTSTATUS);
+        // STATUS_NO_MORE_ENTRIES is a different status.
+        assert_ne!(STATUS_NO_MORE_FILES, 0x8000_001A_u32 as NTSTATUS);
+        assert_ne!(STATUS_NO_MORE_FILES, STATUS_PENDING);
+    }
+
+    #[test]
+    fn process_dir_output_only_hidden_zeroes_information_and_reports_no_more_files() {
+        let mut buf = build_dir_info_buffer(&[".winrsbox"]);
+        let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        iosb.Information = buf.len();
+        // SAFETY: buf is a valid writable class-1 buffer; iosb is a valid
+        // stack IO_STATUS_BLOCK. dir_dos None keeps the fn off IPC entirely;
+        // original_status 0; unhandled-class safe.
+        let status = unsafe {
+            process_dir_output(buf.as_mut_ptr() as *mut c_void, &mut iosb, 1, None, 0, buf.len(), None)
+        };
+        assert_eq!(status, 0x8000_0006_u32 as NTSTATUS);
+        // Stale pre-filter bytes must not be readable as a live record via
+        // FindNextFile.
+        assert_eq!(iosb.Information, 0);
+    }
+
+    #[test]
+    fn event_api_resolves_and_round_trips() {
+        let api = event_api().expect(
+            "event_api must resolve NtCreateEvent, NtWaitForSingleObject, NtSetEvent, NtClose",
+        );
+        // SAFETY: same unnamed-event dance as DirQuerySupervision::new; every
+        // call below uses a freshly created, self-owned event handle. The
+        // event is set BEFORE the wait and a NotificationEvent stays
+        // signaled, so the null (infinite) timeout cannot hang.
+        unsafe {
+            let mut oa: OBJECT_ATTRIBUTES = std::mem::zeroed();
+            oa.Length = std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32;
+            let mut event: HANDLE = std::ptr::null_mut();
+            assert_eq!((api.create_event)(&mut event, 0x0010_0002, &mut oa, 0, 0), 0);
+            assert_eq!((api.set_event)(event, std::ptr::null_mut()), 0);
+            assert_eq!((api.wait_for_single_object)(event, 0, std::ptr::null_mut()), 0);
+            assert_eq!((api.close)(event), 0);
+        }
+    }
+
+    #[test]
+    fn pending_status_is_supervised_to_completion() {
+        let sup = DirQuerySupervision::new(std::ptr::null_mut())
+            .expect("DirQuerySupervision::new must create a supervision event");
+        let raw_event = sup.query_event();
+        let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        let iosb_raw: *mut IO_STATUS_BLOCK = &mut iosb;
+        let iosb_for_thread = SendRaw(iosb_raw);
+        let event_for_thread = SendRaw(raw_event);
+        let handle = std::thread::spawn(move || {
+            // Mirroring the kernel: the final IOSB is written BEFORE the
+            // completion event is signaled.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // SAFETY: iosb_for_thread.0 points at the main thread's `iosb`,
+            // which outlives this thread (joined below) and is not read again
+            // until the event wait orders the read after this write.
+            unsafe { *(iosb_for_thread.get() as *mut NTSTATUS) = 0xC000_0034_u32 as NTSTATUS; };
+            let api = event_api().expect(
+                "event_api must resolve NtCreateEvent, NtWaitForSingleObject, NtSetEvent, NtClose",
+            );
+            // SAFETY: event_for_thread.0 is the supervision event owned by
+            // `sup`, which is still alive while this thread runs (join before
+            // sup drops).
+            unsafe { (api.set_event)(event_for_thread.get(), std::ptr::null_mut()); }
+        });
+        // SAFETY: iosb_raw is the valid local `iosb` above; wait_if_pending
+        // only reads it after the supervised event fires.
+        let status = unsafe { sup.wait_if_pending(STATUS_PENDING, iosb_raw) };
+        handle.join().expect("supervision helper thread must not panic");
+        assert_eq!(status, 0xC000_0034_u32 as NTSTATUS);
+        // Returning STATUS_PENDING unchanged is the pre-fix bug — the guest
+        // then read the unfiltered listing once the I/O completed.
+        assert_ne!(status, STATUS_PENDING);
+    }
+
+    #[test]
+    fn already_final_status_passes_through_unchanged() {
+        let sup = DirQuerySupervision::new(std::ptr::null_mut())
+            .expect("DirQuerySupervision::new must create a supervision event");
+        let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        // SAFETY: iosb is a valid stack IO_STATUS_BLOCK; a non-pending status
+        // must be returned immediately, without any wait.
+        unsafe {
+            assert_eq!(sup.wait_if_pending(0, &mut iosb), 0);
+            let av = 0xC000_0005_u32 as NTSTATUS;
+            assert_eq!(sup.wait_if_pending(av, &mut iosb), av);
+        }
+    }
+
+    // ── unaligned-buffer regression (alignment-UB class, mirrors 9d73d34) ──
+    //
+    // build_dir_info_buffer pads EVERY entry — including the last — so any
+    // buffer it produces is 8-aligned at the base and the tail. Real callers
+    // hand NtQueryDirectoryFile a buffer of their own choosing: the base can
+    // be an odd address, and then every record field sits at an odd address
+    // too. These probes force the record chain onto an odd address; every
+    // field access in the walkers must tolerate it (the old plain aligned
+    // dereferences abort under the debug alignment check with
+    // STATUS_STACK_BUFFER_OVERRUN instead of reading the field).
+
+    /// Copy `buf` into a larger backing allocation so the record chain starts
+    /// at an ODD address regardless of the allocator's base alignment.
+    fn odd_window(buf: &[u8]) -> (Vec<u8>, usize) {
+        let mut backing = vec![0u8; buf.len() + 512];
+        let off = 1 - (backing.as_ptr() as usize % 2);
+        backing[off..off + buf.len()].copy_from_slice(buf);
+        (backing, off)
+    }
+
+    /// Middle-entry hide on an odd buffer base: exercises the NextEntryOffset
+    /// and FileNameLength reads, the unaligned FileName read inside
+    /// name_matches_any_unaligned, and the previous record's NextEntryOffset
+    /// read + patch write — all at misaligned addresses.
+    #[test]
+    fn filter_entries_middle_hide_on_odd_base() {
+        let built = build_dir_info_buffer(&["a.txt", "gone.md", "c.txt"]);
+        let (mut backing, off) = odd_window(&built);
+        assert_eq!(
+            (backing.as_ptr() as usize + off) % 2,
+            1,
+            "probe buffer must start at an odd address",
+        );
+        let mut only_hidden = false;
+        let hide = vec![
+            dot_winrsbox_u16(),
+            "gone.md".encode_utf16().collect::<Vec<u16>>(),
+        ];
+        // SAFETY: backing[off..off+built.len()] is a valid writable class-1
+        // buffer with 512 spare bytes behind it.
+        let filtered = unsafe {
+            filter_entries(
+                backing.as_mut_ptr().add(off),
+                built.len(),
+                1,
+                &hide,
+                &mut only_hidden,
+            )
+        };
+        assert!(filtered);
+        assert!(!only_hidden);
+        let names = collect_names(&backing[off..off + built.len()]);
+        assert_eq!(
+            names,
+            vec!["a.txt".to_string(), "c.txt".to_string()],
+            "middle hide must stay correct on an odd buffer base",
+        );
+    }
+
+    /// First-entry hide on an odd base: the shift path (memmove) driven by
+    /// the odd-address NextEntryOffset read.
+    #[test]
+    fn filter_entries_first_hide_shift_on_odd_base() {
+        let built = build_dir_info_buffer(&["gone.md", "b.txt", "c.txt"]);
+        let (mut backing, off) = odd_window(&built);
+        let mut only_hidden = false;
+        let hide = vec![
+            dot_winrsbox_u16(),
+            "gone.md".encode_utf16().collect::<Vec<u16>>(),
+        ];
+        // SAFETY: backing[off..off+built.len()] is a valid writable class-1
+        // buffer with 512 spare bytes behind it.
+        let filtered = unsafe {
+            filter_entries(
+                backing.as_mut_ptr().add(off),
+                built.len(),
+                1,
+                &hide,
+                &mut only_hidden,
+            )
+        };
+        assert!(filtered);
+        assert!(!only_hidden);
+        let names = collect_names(&backing[off..off + built.len()]);
+        assert_eq!(names, vec!["b.txt".to_string(), "c.txt".to_string()]);
+    }
+
+    /// Case rewrite on an odd buffer base: the unaligned FileName decode and
+    /// the in-place rewrite must both produce the mapped casing byte-exactly.
+    #[test]
+    fn rewrite_entry_case_on_odd_base() {
+        let built = build_dir_info_buffer(&["mixed"]);
+        let (mut backing, off) = odd_window(&built);
+        let mut case_map = HashMap::new();
+        case_map.insert("mixed".to_string(), "MiXeD".encode_utf16().collect::<Vec<u16>>());
+        // SAFETY: backing[off..off+built.len()] is a valid writable class-1
+        // buffer with 512 spare bytes behind it.
+        unsafe {
+            rewrite_entry_case(
+                backing.as_mut_ptr().add(off),
+                built.len(),
+                1,
+                &case_map,
+            );
+        }
+        let names = collect_names(&backing[off..off + built.len()]);
+        assert_eq!(
+            names,
+            vec!["MiXeD".to_string()],
+            "case rewrite must be byte-exact on an odd buffer base",
+        );
     }
 }

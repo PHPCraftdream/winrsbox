@@ -220,23 +220,66 @@ static HOOK_NT_CREATE_USER_PROCESS: OnceLock<GenericDetour<FnNtCreateUserProcess
 // ---------------------------------------------------------------------------
 
 pub const GENERIC_WRITE: u32 = 0x4000_0000;
+pub const GENERIC_ALL: u32 = 0x1000_0000;
 pub const FILE_WRITE_DATA: u32 = 0x0000_0002;
 pub const FILE_APPEND_DATA: u32 = 0x0000_0004;
+pub const FILE_WRITE_EA: u32 = 0x0000_0010;
+pub const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
 pub const DELETE: u32 = 0x0001_0000;
 pub const WRITE_DAC: u32 = 0x0004_0000;
 pub const WRITE_OWNER: u32 = 0x0008_0000;
 
 pub const FILE_CREATE: u32 = 0x0000_0002;
+pub const FILE_OPEN: u32 = 0x0000_0001;
 pub const FILE_OPEN_IF: u32 = 0x0000_0003;
 pub const FILE_OVERWRITE: u32 = 0x0000_0004;
 pub const FILE_OVERWRITE_IF: u32 = 0x0000_0005;
 pub const FILE_SUPERSEDE: u32 = 0x0000_0000;
+/// CreateOptions bit (NOT a desired-access bit): delete when the last
+/// handle closes. It rides in NtCreateFile/NtOpenFile CreateOptions, so it
+/// is consulted directly only by the dead-end classifier; an actual
+/// deletion additionally needs the DELETE access bit, which IS in the
+/// write mask.
+pub const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
 
+/// THE single canonical definition of "this open intends to write".
+///
+/// Consumed by the resolved-path pipeline (hook_nt_create_file,
+/// hook_nt_open_file), the unresolved-path dead end
+/// (fs_hooks::dead_end_write_intent) and the trace logging. Keep exactly
+/// one mask here — the resolved path and the dead end used to keep two
+/// diverging definitions, which is how write-granting bits got classified
+/// as reads on the resolved path.
+///
+/// Bits beyond plain data writes:
+///  - GENERIC_ALL: grants every write right there is. Treating it as a read
+///    let a CreateFileW(..., GENERIC_ALL, ...) open ride the CoW
+///    read-passthrough onto the REAL disk (observed escape: fs_decide
+///    logged write=false mode=Cow for a GENERIC_ALL open).
+///  - FILE_WRITE_ATTRIBUTES: SetFileTime-class metadata mutation of a real
+///    file outside project_root (audit 2026-09-19, Medium).
+///  - FILE_WRITE_EA: extended-attribute mutation.
+///
+/// MAXIMUM_ALLOWED is deliberately NOT a write here: it resolves per-DACL
+/// and is a probe-heavy pattern, so classifying it as a write would
+/// CoW-copy every probed file. The registry classifier
+/// (reg_hooks::nt_create_key_is_write_access) made the opposite trade —
+/// its overlay cost is a redb row, not a full file copy.
 pub fn is_write_access(desired: ACCESS_MASK, disposition: u32) -> bool {
-    let write_bits =
-        GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | WRITE_DAC | WRITE_OWNER;
+    let write_bits = GENERIC_ALL
+        | GENERIC_WRITE
+        | FILE_WRITE_DATA
+        | FILE_APPEND_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | DELETE
+        | WRITE_DAC
+        | WRITE_OWNER;
     desired & write_bits != 0
-        || matches!(disposition, FILE_CREATE | FILE_OPEN_IF | FILE_OVERWRITE | FILE_OVERWRITE_IF | FILE_SUPERSEDE)
+        || matches!(
+            disposition,
+            FILE_CREATE | FILE_OPEN_IF | FILE_OVERWRITE | FILE_OVERWRITE_IF | FILE_SUPERSEDE
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -368,7 +411,17 @@ pub(crate) unsafe fn resolve_for_hook(
     if char_count == 0 {
         return None;
     }
-    // SAFETY: Buffer is valid for at least Length bytes per NT UNICODE_STRING contract.
+    if ustr.Buffer.is_null() {
+        // P2-01: `Length > 0` with a NULL Buffer is trivially constructible by
+        // the (untrusted) caller of NtCreateFile/NtOpenFile. `from_raw_parts`
+        // with a null pointer and a non-zero length is UB; bare NT would
+        // return STATUS_INVALID_PARAMETER. Fail closed: no DOS path can be
+        // derived, the caller passes through / device-blocks as for any other
+        // unresolvable path.
+        return None;
+    }
+    // SAFETY: Buffer is non-null (checked above) and valid for at least
+    // Length bytes per the NT UNICODE_STRING contract.
     let name_slice = std::slice::from_raw_parts(ustr.Buffer, char_count);
 
     if !obj.RootDirectory.is_null() {
@@ -389,6 +442,14 @@ pub(crate) unsafe fn resolve_for_hook(
         let mut full: Vec<u16> = base;
         full.push(b'\\' as u16);
         full.extend_from_slice(name_slice);
+        // Fold `.`/`..` lexically BEFORE the policy decision AND before the
+        // kernel passthrough (audit Critical #1): `full` is handed to
+        // copy_passthrough_inner verbatim (pre_resolved), so folding here
+        // keeps the decided path and the kernel-acted-on path byte-identical
+        // for relative opens. A relative `..\..\payload.exe` used to decide
+        // on the unfolded string (which prefix-matched project_root) while
+        // the kernel resolved the `..` segments outside the sandbox.
+        let full = policy::path::fold_nt_dots(&full);
         let dos = policy::path::nt_to_dos_lower(&full)?;
         // Relative-open whose directory handle was itself a CoW'd overlay file:
         // see `unmirror_overlay_handle_relative` for the rationale. Returns the
@@ -396,11 +457,21 @@ pub(crate) unsafe fn resolve_for_hook(
         // overlay storage (the common non-sandbox case, zero overhead).
         let sb_root = SANDBOX_ROOT.get().map(|s| s.as_str());
         let dos = unmirror_overlay_handle_relative(&dos, sb_root).unwrap_or(dos);
-        return Some((dos, Some(full)));
+        return Some((dos, Some(full.into_owned())));
     }
 
     // Fast path: ObjectName already in absolute NT form (`\??\C:\…`).
-    if let Some(dos) = policy::path::nt_to_dos_lower(name_slice) {
+    // Fold `.`/`..` lexically before deriving the DOS path so the policy
+    // decides on the path the kernel will resolve (audit Critical #1:
+    // `\??\d:\<root>\..\..\payload.exe` used to prefix-match the
+    // root while the kernel created the file outside the sandbox).
+    // `pre_resolved` deliberately stays None: the kernel keeps the ORIGINAL
+    // ObjectName, which the unmirror self-overlay carve-out below requires
+    // (when the caller names the overlay path absolutely, the kernel must
+    // open the REAL overlay path, not the virtual form). Without reparse
+    // points the original resolves to exactly the folded target.
+    let folded = policy::path::fold_nt_dots(name_slice);
+    if let Some(dos) = policy::path::nt_to_dos_lower(&folded) {
         // Self-block guard (class #64 for ABSOLUTE paths, symmetric with the
         // relative-open case at line 321). A sandboxed process that learned
         // its own overlay path via a passthrough query channel (class-9
@@ -447,8 +518,33 @@ pub(crate) unsafe fn resolve_for_hook(
     let cwd = &cwd_buf[..cwd_len];
 
     let abs = join_bare_relative_to_nt(cwd, name_slice);
-    let dos = policy::path::nt_to_dos_lower(&abs)?;
-    Some((dos, Some(abs)))
+    // Fold `.`/`..` lexically: `abs` is also the kernel passthrough path
+    // (pre_resolved = Some), so decision and kernel action stay identical.
+    let abs = policy::path::fold_nt_dots(&abs);
+    let sb_root = SANDBOX_ROOT.get().map(|s| s.as_str());
+    let dos = bare_relative_dos(&abs, sb_root)?;
+    Some((dos, Some(abs.into_owned())))
+}
+
+/// Lowercase-DOS form of a folded absolute NT path for the bare-relative
+/// CWD branch, WITH the overlay-storage unmirror its two sibling branches
+/// (RootDirectory-relative and absolute-path) already apply.
+///
+/// When the process CWD lives inside the overlay storage (the guest cd'd
+/// into an external directory whose CoW copy was materialized there),
+/// `nt_to_dos_lower` yields the REAL overlay path, and the `.winrsbox`
+/// segment of the denylist would self-block every bare-relative open in
+/// that directory — `cmd.exe`'s `>file` redirection resolves against the
+/// kernel CWD with no RootDirectory handle, so exactly this branch handles
+/// it (audit 2026-09-19 Low: bare-relative CWD branch lacks unmirror).
+/// The POLICY decision must see the virtual path; the kernel passthrough
+/// keeps the real overlay path (`pre_resolved`), so the file actually
+/// touched is unchanged.
+/// Pure over its inputs so the unmirror discipline is unit-testable
+/// without touching the process-global `SANDBOX_ROOT`.
+pub(crate) fn bare_relative_dos(abs_nt: &[u16], sb_root: Option<&str>) -> Option<String> {
+    let dos = policy::path::nt_to_dos_lower(abs_nt)?;
+    Some(unmirror_overlay_handle_relative(&dos, sb_root).unwrap_or(dos))
 }
 
 /// Build the absolute NT-form path `\??\<cwd>\<relative>` for a bare-relative
@@ -603,6 +699,13 @@ pub(crate) unsafe fn extract_raw_nt_path(attrs: *const OBJECT_ATTRIBUTES) -> Opt
     let ustr = &*obj.ObjectName;
     let char_count = (ustr.Length / 2) as usize;
     if char_count == 0 { return None; }
+    if ustr.Buffer.is_null() {
+        // P2-01: NULL Buffer with non-zero Length is caller-constructible UB
+        // in from_raw_parts; fail closed (mirrors alpc_guard::classify_port_name).
+        return None;
+    }
+    // SAFETY: Buffer is non-null (checked above) and valid for at least
+    // Length bytes per the NT UNICODE_STRING contract.
     let name_slice = std::slice::from_raw_parts(ustr.Buffer, char_count);
     Some(String::from_utf16_lossy(name_slice))
 }
@@ -677,9 +780,13 @@ pub(crate) fn strip_trailing_dot_space(s: &str) -> Cow<'_, str> {
 ///
 /// Returns `(status, reason)` to deny with, or None to continue. The reason is
 /// a stable label for trace logging. NOTE: parent-dir (`..`) handling is
-/// intentionally NOT here — it is caller-specific (the create path lets the
-/// kernel/NTFS resolve it; the rename guard rejects it for its `starts_with`
-/// containment).
+/// intentionally NOT here — it is caller-specific: the create path folds
+/// `..`/`.` lexically in `resolve_for_hook` (via
+/// `policy::path::fold_nt_dots`) BEFORE the denylist and the policy
+/// decision, so the create side always feeds this denylist an already-
+/// folded path; the rename/hardlink guard rejects dots-only segments up
+/// front (`fs_metadata_guard::dest_is_escape`). Keep the two callers'
+/// treatment aligned when touching either.
 pub(crate) fn canonical_denylist_status(canon: &str) -> Option<(NTSTATUS, &'static str)> {
     // GLOBALROOT alternate namespace bypasses the DOS-form classifier.
     if canon.contains(r"\??\globalroot") || canon.contains(r"\globalroot\") {
@@ -793,6 +900,13 @@ pub(crate) fn canonicalize_for_denylist(s: &str) -> Cow<'_, str> {
 /// etc.) is ASCII; non-ASCII bytes pass through untouched and therefore
 /// cannot collapse into an ASCII denylist match (or escape one) via
 /// Unicode case-fold mismatches with the kernel's `RtlDowncaseUnicodeString`.
+///
+/// Parent-dir (`..`) handling is deliberately NOT part of this raw-path
+/// check: `resolve_for_hook` folds `..`/`.` lexically before the policy
+/// decision (audit Critical #1), and the create/open hooks re-run
+/// `canonical_denylist_status` on the resolved FOLDED DOS path afterwards,
+/// so folding cannot hide a denylist hit that the raw string would have
+/// missed in the other direction.
 ///
 /// SAFETY: `attrs` must be valid per NT calling convention.
 pub(crate) unsafe fn check_path_traversal(attrs: *const OBJECT_ATTRIBUTES, create_options: u32) -> Option<NTSTATUS> {
@@ -951,21 +1065,43 @@ fn strip_nt_dos_prefix(lower: &str) -> Option<&str> {
     None
 }
 
-/// Returns Some(STATUS_ACCESS_DENIED) if the raw NT path in `attrs` is a
-/// hard-blocked device (shadowcopy, physicaldrive, raw harddisk, dangerous
-/// pipe). None otherwise → caller should call the original Nt* function.
+/// Returns Some(STATUS_ACCESS_DENIED) if the raw NT path in `attrs` targets
+/// a device the sandbox must not open in the requested direction:
+/// - hard blocks (shadowcopy, physicaldrive, raw harddisk, dangerous pipe,
+///   credential surfaces) — denied regardless of direction;
+/// - UNC/network-redirector targets (`DeviceKind::NetworkPath`, P0-03) and
+///   unrecognized system devices (`DeviceKind::SystemQuery`) — denied when
+///   `write` is set. A write here would reach the real disk/volume/share
+///   outside the CoW overlay with no `decide()` call; reads keep the
+///   documented pass-through ("reads outside project_root hit the real
+///   disk").
+/// None otherwise → caller may call the original Nt* function.
 ///
 /// SAFETY: `attrs` must be valid per NT calling convention.
-pub(crate) unsafe fn check_device_block(attrs: *const OBJECT_ATTRIBUTES) -> Option<NTSTATUS> {
+pub(crate) unsafe fn check_device_block(
+    attrs: *const OBJECT_ATTRIBUTES,
+    write: bool,
+) -> Option<NTSTATUS> {
     let dev_path = extract_raw_nt_path(attrs)?;
     let utf16: Vec<u16> = dev_path.encode_utf16().collect();
     let device = policy::dev::nt_to_device_path(&utf16)?;
     let kind = policy::dev::classify_device(&device);
-    if matches!(kind, policy::dev::DeviceKind::Unknown) {
+    // Exhaustive on DeviceKind — a future variant must decide explicitly
+    // here rather than silently inherit "carry on".
+    let deny = match kind {
+        policy::dev::DeviceKind::Unknown => true,
+        policy::dev::DeviceKind::NetworkPath | policy::dev::DeviceKind::SystemQuery => write,
+        policy::dev::DeviceKind::HarddiskVolume
+        | policy::dev::DeviceKind::NamedPipe
+        | policy::dev::DeviceKind::Socket
+        | policy::dev::DeviceKind::Console
+        | policy::dev::DeviceKind::Null => false,
+    };
+    if deny {
         if is_trace() {
             ipc_log(
                 ipc::LogLevel::Trace,
-                format!("DENY device: {dev_path} kind={kind:?}"),
+                format!("DENY device: {dev_path} kind={kind:?} write={write}"),
             );
         }
         Some(STATUS_ACCESS_DENIED)
@@ -1011,9 +1147,101 @@ pub(crate) fn needs_short_name_resolve(path: &str) -> bool {
 // CoW helper
 // ---------------------------------------------------------------------------
 
+/// Segment-aware check that an ASCII-lowercased overlay destination lives in
+/// launcher-owned territory: inside one of `roots_lower` (the published
+/// overlay roots, lowercased) or inside the launcher `mock-dirs` directory —
+/// mock-dir Cow decisions legitimately mirror into the `mock-dirs` sibling of
+/// the workdir root, which the session config does not publish separately.
+/// The rest of the launcher state dir grants nothing (a `<state>\workdirevil`
+/// sibling lookalike is refused) and a volume-root parent (`c:\`) grants
+/// nothing.
+///
+/// Refuses: empty destinations, empty roots, sibling-prefix lookalikes
+/// (`<root>evil\...` — segment-anchored matching) and any `.`/`..` segment
+/// in the destination (never folded here — refuse rather than guess what the
+/// kernel would resolve; mirrors the `path_contained_in` backstop on the
+/// policy side).
+pub(crate) fn overlay_dest_in_roots(dest_lower: &str, roots_lower: &[&str]) -> bool {
+    let dest_trim = dest_lower.trim_end_matches(|c| c == '\\' || c == '/');
+    if dest_trim.is_empty() {
+        return false;
+    }
+    if dest_trim.split(|c| c == '\\' || c == '/').any(|seg| seg == "." || seg == "..") {
+        return false;
+    }
+    roots_lower.iter().any(|root| {
+        let root_trim = root.trim_end_matches('\\');
+        if root_trim.is_empty() {
+            return false;
+        }
+        // Direct: destination under the root itself (workdir CoW mirror).
+        if policy::path::pattern_matches_prefix(root_trim, dest_trim) {
+            return true;
+        }
+        // Launcher state dir carve-out — mock-dirs sibling ONLY: mock-dir
+        // Cow decisions mirror into `<state>\mock-dirs\...`, which the session
+        // config does not publish separately. The parent of `c:\workdir` is
+        // `c:\state`; a volume-root parent (`c:\`, no parent of its own)
+        // grants nothing. Allowing the whole state dir would admit sibling
+        // lookalikes (`<state>\workdirevil\...`) — only the mock-dirs
+        // subtree is allowed.
+        let state_path = std::path::Path::new(root_trim)
+            .parent()
+            .map(|p| p.to_path_buf());
+        if let Some(state) = state_path {
+            let state_lossy = state.to_string_lossy();
+            let state_trim = state_lossy.trim_end_matches('\\');
+            if !state_trim.is_empty() && state.parent().is_some() {
+                let mock_root = format!("{state_trim}\\mock-dirs");
+                if policy::path::pattern_matches_prefix(&mock_root, dest_trim) {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+}
+
 pub(crate) fn prepare_overlay(decision: &Decision) -> Option<String> {
+    // Launcher-published roots: per-drive list first, legacy single root as
+    // fallback (same resolution as every other overlay-root consumer in this
+    // crate). Both are launcher-authored. Empty → fail closed below.
+    let roots: Vec<&str> = match crate::ipc_client::OVERLAY_ROOTS.get() {
+        Some(list) if !list.is_empty() => list.iter().map(|s| s.as_str()).collect(),
+        _ => match SANDBOX_ROOT.get() {
+            Some(s) => vec![s.as_str()],
+            None => Vec::new(),
+        },
+    };
+    prepare_overlay_in_roots(decision, &roots)
+}
+
+/// Core of `prepare_overlay` with the allowed roots injected (test seam — the
+/// OnceLock globals cannot be set per-test). `roots` are the lowercased
+/// published overlay roots; an empty slice fail-closes every destination.
+fn prepare_overlay_in_roots(decision: &Decision, roots: &[&str]) -> Option<String> {
     let overlay_path = decision.overlay.as_ref()?;
     let overlay_dos = overlay_path.to_string_lossy().into_owned();
+
+    // Defence in depth (audit 2026-09-19 Critical #2): the launcher validates
+    // RecordOverlay wire requests, but this DLL runs inside the hostile
+    // target — re-check every destination against launcher-owned territory
+    // BEFORE create_dir_all / fs::copy touch the disk. A destination outside
+    // the overlay roots must never be created or written to, whatever
+    // produced it. Fail-closed: callers turn None into STATUS_ACCESS_DENIED.
+    let dest_lower = overlay_dos.to_ascii_lowercase();
+    if !overlay_dest_in_roots(&dest_lower, roots) {
+        ipc_log_violation(ipc::Req::Log {
+            // SAFETY: GetCurrentProcessId is a non-failing Win32 query with no
+            // preconditions (constant pseudo-handle semantics, no pointers).
+            pid: unsafe { GetCurrentProcessId() },
+            level: ipc::LogLevel::Error,
+            msg: format!(
+                "prepare_overlay_reject: overlay destination outside overlay roots: {overlay_dos}"
+            ),
+        });
+        return None;
+    }
 
     if let Some(parent) = overlay_path.parent() {
         // IN_HOOK is true on this thread; filesystem calls here will see IN_HOOK=true
@@ -1337,6 +1565,378 @@ impl Drop for ImagePathOverlayGuard {
 // NtCreateUserProcess hook
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// P1-01: direct-syscall pre-execution scan for spawned children
+//
+// The launcher scans only the ROOT target (launcher/src/main.rs
+// `pre_launch_scan`), so the direct-syscall bypass surface (baked-in
+// `syscall` instructions, SysWhispers/Hell's Gate class) stayed open for
+// every process spawned below the root. This is the in-hook equivalent:
+// scan the child's mapped image before it can run, with the same
+// terminate-on-failure mode the launcher uses.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Guard configuration snapshot + spawn gate (audit 2026-09-19 High)
+// ---------------------------------------------------------------------------
+
+/// Guard configuration captured ONCE at install time (DllMain), before any
+/// guest code has run.
+///
+/// The environment block is guest-writable by construction: a sandboxed
+/// process can `SetEnvironmentVariable` a forged `FS_SANDBOX_*` value into
+/// its own block, and every child it spawns inherits the forgery. Therefore:
+///   * decision code reads ONLY this snapshot and never the environment (a
+///     per-decision env re-read was a live kill switch), and
+///   * `hook_nt_create_user_process` denies any spawn whose inherited
+///     environment carries guard settings that differ from this snapshot,
+///     so a guest can no longer downgrade its children either.
+/// This generalizes the P1-01 `SPAWN_SCAN_GUARD` snapshot (which carried only
+/// the guard level) to every guard input. The values still arrive via the
+/// environment the LAUNCHER authored at CreateProcessW time — written before
+/// any guest code existed, hence unforgeable for the root — and are
+/// re-asserted for every child by the spawn gate below.
+pub(crate) struct GuardEnvSnapshot {
+    pub(crate) guard: String,
+    pub(crate) disabled: String,
+    pub(crate) allow_rwx: bool,
+    /// `FS_SANDBOX_SECTION` — the per-session random shared-section name.
+    /// Guard-relevant because the section carries `pipe_name` and `dll_path`:
+    /// a child booted with a forged name would read attacker-authored config
+    /// from an attacker-created section. Empty string = this process itself
+    /// booted without a name (then ANY inherited value is a forgery).
+    pub(crate) section: String,
+    /// `FS_SANDBOX_NO_TRACK` — makes `process_tracker::mark_spawned` skip the
+    /// child (process_tracker.rs:169). Added to the snapshot and to the spawn
+    /// gate for the same reason as the others: a guard-relevant variable left
+    /// outside the gate is exactly the drift the gate exists to prevent.
+    ///
+    /// Its worst case is milder than the others — an untracked child makes the
+    /// injector's own cross-process writes look foreign to memory_guard, so
+    /// injection fails and the child is terminated before resume, i.e. a guest
+    /// self-DoS rather than an escape. Gated anyway: "fails closed" is not a
+    /// reason to leave a knob reachable from the guest.
+    pub(crate) no_track: bool,
+}
+
+static GUARD_ENV: OnceLock<GuardEnvSnapshot> = OnceLock::new();
+
+/// Hook categories parsed once from the snapshot's `disabled` list, consulted
+/// only through [`hook_category_disabled`] — the environment is never re-read
+/// after install.
+static DISABLED_HOOK_CATS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Install-time category gate. Reads only the install-time snapshot.
+pub(crate) fn hook_category_disabled(cat: &str) -> bool {
+    DISABLED_HOOK_CATS
+        .get()
+        .map(|cats| cats.iter().any(|d| d == cat))
+        .unwrap_or(false)
+}
+
+/// Children are scanned under exactly the guard levels the launcher scans the
+/// root target: `full` and `static` (launcher/src/main.rs:648). Never under
+/// `scan` or `none`.
+fn child_scan_enabled(guard: Option<&str>) -> bool {
+    matches!(guard, Some(g) if g == "full" || g == "static")
+}
+
+/// Upper bound on the environment walk (UTF-16 chars). A legitimate block
+/// stays far below this; a block that runs past it is treated as malformed.
+const MAX_GUARD_ENV_CHARS: usize = 1 << 20;
+
+/// Compare the guard-relevant variables observed in a child's would-be
+/// environment against the trusted install-time snapshot. `Some(reason)` =
+/// mismatch = the spawn must be denied.
+///
+/// Rules (absence is always acceptable — the child's hook then boots with
+/// fail-safe defaults: guard "full", nothing disabled, RWX not allowed):
+///   * FS_SANDBOX_GUARD — must equal the snapshot (case-insensitive);
+///   * FS_SANDBOX_ALLOW_RWX — forbidden unless the snapshot allows RWX.
+///     Presence-only semantics (the hook historically treated existence, not
+///     the value, as "allow"), so ANY value counts as an enable;
+///   * FS_SANDBOX_DISABLE_HOOKS — category set must equal the snapshot's
+///     (case-insensitive, whitespace-tolerant, order-free).
+fn guard_env_mismatch(observed: &[(String, String)], trusted: &GuardEnvSnapshot) -> Option<String> {
+    for (name, value) in observed {
+        match name.to_ascii_lowercase().as_str() {
+            "fs_sandbox_guard" => {
+                if !value.eq_ignore_ascii_case(&trusted.guard) {
+                    return Some(format!(
+                        "FS_SANDBOX_GUARD forged: child would inherit {value:?}, trusted {:?}",
+                        trusted.guard
+                    ));
+                }
+            }
+            "fs_sandbox_allow_rwx" => {
+                if !trusted.allow_rwx {
+                    return Some(format!(
+                        "FS_SANDBOX_ALLOW_RWX forged: child would inherit {value:?}, trusted off"
+                    ));
+                }
+            }
+            "fs_sandbox_no_track" => {
+                if !trusted.no_track {
+                    return Some(format!(
+                        "FS_SANDBOX_NO_TRACK forged: child would inherit {value:?}, trusted off"
+                    ));
+                }
+            }
+            "fs_sandbox_disable_hooks" => {
+                if !disable_categories_equal(value, &trusted.disabled) {
+                    return Some(format!(
+                        "FS_SANDBOX_DISABLE_HOOKS forged: child would inherit {value:?}, trusted {:?}",
+                        trusted.disabled
+                    ));
+                }
+            }
+            "fs_sandbox_section" => {
+                if !value.eq_ignore_ascii_case(&trusted.section) {
+                    return Some(format!(
+                        "FS_SANDBOX_SECTION forged: child would inherit {value:?}, trusted {:?}",
+                        trusted.section
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Set-equality of comma-separated hook categories, case-insensitive and
+/// whitespace-tolerant — mirrors exactly how the snapshot is parsed at
+/// install time, so an equivalent re-spelling of the trusted list passes.
+fn disable_categories_equal(observed: &str, trusted: &str) -> bool {
+    fn parse(raw: &str) -> Vec<String> {
+        let mut cats: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        cats.sort();
+        cats.dedup();
+        cats
+    }
+    parse(observed) == parse(trusted)
+}
+
+/// Full spawn-time gate: walk the environment the child would inherit and
+/// compare its guard variables against our trusted snapshot. `Some(reason)`
+/// = deny the spawn BEFORE the child exists.
+///
+/// The snapshot is captured in install_hooks before any hook is enabled, so
+/// it is always present by the time this hook can run; without it (unit-test
+/// context) there is nothing to vouch for and nothing is denied.
+fn child_guard_env_violation(params: *mut c_void) -> Option<String> {
+    let trusted = GUARD_ENV.get()?;
+    if params.is_null() {
+        // No parameters -> the child inherits no environment at all -> its
+        // hook boots with fail-safe defaults.
+        return None;
+    }
+    let observed = match unsafe { read_guard_env_entries(params) } {
+        None => return None,
+        Some(Ok(entries)) => entries,
+        // A block we cannot read is a block we cannot vouch for — fail closed.
+        Some(Err(reason)) => return Some(reason.to_string()),
+    };
+    guard_env_mismatch(&observed, trusted)
+}
+
+/// Read the guard-relevant entries from
+/// `RTL_USER_PROCESS_PARAMETERS.Environment` (x64 offset 0x80, following the
+/// same fixed-offset convention as the 0x60 ImagePathName reads in
+/// `extract_child_exe`). The parameters live in OUR address space — the
+/// caller (CreateProcessW or raw ntdll use) built them in-process, and the
+/// kernel copies the block into the child during the syscall.
+///
+/// Returns `None` when there is nothing to check (null params / null
+/// Environment pointer, or the parameters header itself unreadable) and
+/// `Some(Err(..))` when an Environment pointer IS set but its block cannot
+/// be walked safely (unreadable, unbounded — the caller fails closed).
+///
+/// # Safety
+/// `params` must point to caller-process memory for the duration of the
+/// call. Every dereference is clamped through `readable_region` first; no
+/// guest-controlled length is followed unclamped.
+unsafe fn read_guard_env_entries(
+    params: *mut c_void,
+) -> Option<Result<Vec<(String, String)>, &'static str>> {
+    const ENVIRONMENT_OFFSET: usize = 0x80;
+    // Clamp the header read itself: a guest hand-crafting params could point
+    // it at a region shorter than 0x88 bytes.
+    let Some((pbase, plen)) = crate::proc_guard::readable_region(params as *const c_void) else {
+        return None;
+    };
+    let poff = params as usize - pbase as usize;
+    if plen.saturating_sub(poff) < ENVIRONMENT_OFFSET + std::mem::size_of::<*const u16>() {
+        return None;
+    }
+    // SAFETY: readable_region confirmed params..params+0x88 is committed and
+    // readable, so the Environment pointer read is in-bounds.
+    let env_ptr = *((params as *const u8).add(ENVIRONMENT_OFFSET) as *const *const u16);
+    if env_ptr.is_null() {
+        return Some(Ok(Vec::new()));
+    }
+    let Some((base, len)) = crate::proc_guard::readable_region(env_ptr as *const c_void) else {
+        return Some(Err("child environment block unreadable"));
+    };
+    let off = env_ptr as usize - base as usize;
+    let avail_chars = len.saturating_sub(off) / 2;
+    // SAFETY: chars is bounded by the readable region returned above.
+    let chars: &[u16] =
+        std::slice::from_raw_parts(env_ptr, avail_chars.min(MAX_GUARD_ENV_CHARS));
+
+    let mut entries = Vec::new();
+    let mut cur = 0usize;
+    while cur < chars.len() {
+        let Some(rel_end) = chars[cur..].iter().position(|&c| c == 0) else {
+            // Region exhausted without a terminator — unbounded block.
+            return Some(Err("child environment block unbounded (no NUL terminator)"));
+        };
+        let entry = &chars[cur..cur + rel_end];
+        cur += rel_end + 1;
+        if entry.is_empty() {
+            break; // double-NUL: end of block
+        }
+        let Some(eq) = entry.iter().position(|&c| c == b'=' as u16) else {
+            continue; // not NAME=VALUE — ignore, same as RTL does
+        };
+        let name = String::from_utf16_lossy(&entry[..eq]).to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "fs_sandbox_guard"
+                | "fs_sandbox_allow_rwx"
+                | "fs_sandbox_disable_hooks"
+                | "fs_sandbox_no_track"
+                | "fs_sandbox_section"
+        ) {
+            let value = String::from_utf16_lossy(&entry[eq + 1..]);
+            entries.push((name, value));
+        }
+    }
+    Some(Ok(entries))
+}
+
+/// Scan the PE image mapped in `proc` for direct `syscall`/`sysenter`/`int 2eh`
+/// instructions (the launcher's `pre_launch_scan` semantics, in-hook).
+///
+/// Errors are described by the returned message but share one caller policy:
+/// the child must not run (fail closed). An image we cannot read is as
+/// unacceptable as one we read and refused — the spawner controls the child
+/// handle's access mask and could otherwise request just enough access for
+/// injection (VM_OPERATION/VM_WRITE) while denying VM_READ to skip the scan.
+fn scan_image_for_direct_syscalls(proc: HANDLE) -> Result<(), String> {
+    #[allow(dead_code)] // reserved fields mirror the kernel struct layout
+    #[repr(C)]
+    struct PROCESS_BASIC_INFORMATION {
+        reserved1: *mut c_void,
+        peb_base_address: *mut c_void,
+        reserved2: [*mut c_void; 2],
+        unique_process_id: usize,
+        reserved3: *mut c_void,
+    }
+
+    type FnNtQueryInformationProcess = unsafe extern "system" fn(
+        HANDLE,
+        u32,         // ProcessInformationClass (0 = ProcessBasicInformation)
+        *mut c_void, // ProcessInformation
+        u32,         // ProcessInformationLength
+        *mut u32,    // ReturnLength
+    ) -> NTSTATUS;
+
+    static QIP: OnceLock<Option<FnNtQueryInformationProcess>> = OnceLock::new();
+    let qip = QIP.get_or_init(|| {
+        // SAFETY: ntdll_export returns the real ntdll export address matching
+        // the FnNtQueryInformationProcess ABI.
+        let addr = unsafe { ntdll_export("NtQueryInformationProcess\0".as_bytes())? };
+        // SAFETY: addr is the real NtQueryInformationProcess export.
+        Some(unsafe { std::mem::transmute(addr as usize) })
+    });
+    let qip_fn = qip.ok_or_else(|| "NtQueryInformationProcess unavailable".to_string())?;
+
+    let mut pbi = std::mem::MaybeUninit::<PROCESS_BASIC_INFORMATION>::uninit();
+    // SAFETY: pbi is valid for size_of writes; proc is a live process handle.
+    let status = unsafe {
+        qip_fn(
+            proc,
+            0,
+            pbi.as_mut_ptr() as *mut c_void,
+            std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if status < 0 {
+        return Err(format!("NtQueryInformationProcess failed: 0x{:08x}", status as u32));
+    }
+    // SAFETY: status >= 0 means the kernel wrote the full struct.
+    let peb_base = unsafe { (*pbi.as_ptr()).peb_base_address } as usize;
+    if peb_base == 0 {
+        return Err("PEB base address is null".into());
+    }
+
+    let mut image_base_bytes = [0u8; 8];
+    read_remote_bytes(proc, peb_base + 0x10, &mut image_base_bytes)?;
+    let image_base = usize::from_le_bytes(image_base_bytes);
+    if image_base == 0 {
+        return Err("image base is null".into());
+    }
+
+    // DOS + NT headers + section table fit in the first page.
+    let mut pe_headers = [0u8; 4096];
+    read_remote_bytes(proc, image_base, &mut pe_headers)?;
+    let text = policy::scan::pe_text_section(&pe_headers)
+        .ok_or_else(|| "no .text section in child image".to_string())?;
+
+    let scan_size = (text.virtual_size as usize).min(64 * 1024 * 1024);
+    if scan_size == 0 {
+        return Ok(());
+    }
+    let text_addr = image_base + text.virtual_address as usize;
+    let mut text_bytes = vec![0u8; scan_size];
+    read_remote_bytes(proc, text_addr, &mut text_bytes)?;
+
+    let hits = policy::scan::find_direct_syscalls(&text_bytes, text_addr as u64);
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let summary: Vec<String> = hits
+        .iter()
+        .take(5)
+        .map(|h| format!("{} @ +0x{:x}", h.kind, h.offset))
+        .collect();
+    Err(format!(
+        "{} direct syscall instruction(s) in child .text ({}, …)",
+        hits.len(),
+        summary.join(", ")
+    ))
+}
+
+/// ReadProcessMemory with a full-length check (short reads are an error).
+fn read_remote_bytes(proc: HANDLE, addr: usize, buf: &mut [u8]) -> Result<(), String> {
+    let mut read: usize = 0;
+    // SAFETY: buf is valid for buf.len() bytes; addr is in the target's
+    // address space (PEB or the mapped image — both committed while the
+    // process exists).
+    let ok = unsafe {
+        winapi::um::memoryapi::ReadProcessMemory(
+            proc,
+            addr as *const c_void,
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len(),
+            &mut read,
+        )
+    };
+    if ok == 0 {
+        return Err(format!("ReadProcessMemory failed at 0x{addr:x}"));
+    }
+    if read != buf.len() {
+        return Err(format!("short read at 0x{addr:x}: {read} of {}", buf.len()));
+    }
+    Ok(())
+}
+
 const THREAD_CREATE_FLAGS_CREATE_SUSPENDED: u32 = 0x0000_0001;
 
 unsafe extern "system" fn hook_nt_create_user_process(
@@ -1353,12 +1953,14 @@ unsafe extern "system" fn hook_nt_create_user_process(
     attribute_list: *mut c_void,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
-        return HOOK_NT_CREATE_USER_PROCESS.get().unwrap().call(
-            process_handle, thread_handle,
-            process_desired_access, thread_desired_access,
-            process_object_attributes, thread_object_attributes,
-            process_flags, thread_flags,
-            process_parameters, create_info, attribute_list,
+        return crate::hooks::nt_call_original!(
+            &HOOK_NT_CREATE_USER_PROCESS,
+            "NtCreateUserProcess",
+            (process_handle, thread_handle,
+             process_desired_access, thread_desired_access,
+             process_object_attributes, thread_object_attributes,
+             process_flags, thread_flags,
+             process_parameters, create_info, attribute_list)
         );
     };
 
@@ -1411,6 +2013,18 @@ unsafe extern "system" fn hook_nt_create_user_process(
     ipc_log(ipc::LogLevel::Info,
         format!("spawn_attempt: parent={parent_pid} target={spawn_target}"));
 
+    // Audit 2026-09-19 High: the environment block is guest-writable. A
+    // sandboxed process can SetEnvironmentVariable a forged guard config and
+    // spawn a child that inherits it — the child's hook.dll would install
+    // with the memory guard disabled. Deny the spawn before the child exists
+    // unless the inherited guard settings match the values WE captured at
+    // our own install.
+    if let Some(reason) = child_guard_env_violation(process_parameters) {
+        ipc_log(ipc::LogLevel::Error,
+            format!("child_env_guard_forged: parent={parent_pid} target={spawn_target}: {reason}; spawn denied"));
+        return STATUS_ACCESS_DENIED;
+    }
+
     // C0 diagnostic: when the target EXE is overlay-managed (the spawn-overlay-
     // redirect case), dump the PS_ATTRIBUTE_LIST entries so we can confirm the
     // PsAttributeImageName record (number 5) is present and read its Value
@@ -1435,12 +2049,14 @@ unsafe extern "system" fn hook_nt_create_user_process(
         ImagePathOverlayGuard::new(process_parameters, create_info, attribute_list)
     };
 
-    let status = HOOK_NT_CREATE_USER_PROCESS.get().unwrap().call(
-        process_handle, thread_handle,
-        process_desired_access, thread_desired_access,
-        process_object_attributes, thread_object_attributes,
-        process_flags, forced_flags,
-        process_parameters, create_info, attribute_list,
+    let status = crate::hooks::nt_call_original!(
+        &HOOK_NT_CREATE_USER_PROCESS,
+        "NtCreateUserProcess",
+        (process_handle, thread_handle,
+         process_desired_access, thread_desired_access,
+         process_object_attributes, thread_object_attributes,
+         process_flags, forced_flags,
+         process_parameters, create_info, attribute_list)
     );
 
     if status < 0 {
@@ -1456,30 +2072,68 @@ unsafe extern "system" fn hook_nt_create_user_process(
         return status;
     }
 
-    // Register with launcher for process-tree tracking.
     // SAFETY: proc_h is a valid process handle returned by NtCreateUserProcess.
     let child_pid = GetProcessId(proc_h);
+
+    // P1-01: scan the child's mapped image for direct syscall instructions
+    // BEFORE it can run. The launcher scans the root target only, so without
+    // this every process below the root keeps the SysWhispers/Hell's Gate
+    // bypass open. Fail closed on BOTH detection and scan failure — terminate,
+    // exactly like the launcher's pre_launch_scan refusal path.
+    if child_scan_enabled(GUARD_ENV.get().map(|g| g.guard.as_str())) {
+        if let Err(reason) = scan_image_for_direct_syscalls(proc_h) {
+            ipc_log(
+                ipc::LogLevel::Error,
+                format!("child pre-launch scan refused pid={child_pid} target={spawn_target}: {reason}; terminating"),
+            );
+            // SAFETY: proc_h is the valid PROCESS handle returned moments ago
+            // by NtCreateUserProcess; TerminateProcess never blocks. Exit code 1
+            // signals "killed by sandbox" to anyone waiting on the process.
+            unsafe { winapi::um::processthreadsapi::TerminateProcess(proc_h, 1) };
+            return status;
+        }
+    }
+
+    // Local authorization record — MUST precede inject_via_apc. memory_guard's
+    // cross-process gates (NtAllocateVirtualMemory / NtProtectVirtualMemory /
+    // NtWriteVirtualMemory) consult process_tracker::is_owned_child(target_pid)
+    // for exactly the writes injection performs into the child: without the
+    // record, inject_via_apc's VirtualAllocEx lands in the foreign-process
+    // branch (terminate-if-executable — one protect-flag refactor away from a
+    // self-terminating parent on every spawn) and WriteProcessMemory loses its
+    // is_owned_child fast path and gets opcode-scanned on every spawn. This is
+    // a purely local table write — no pipe I/O — so it does not widen the
+    // pre-injection window (P0-04 is about the blocking IPC round-trips only).
+    let child_exe = extract_child_exe(process_parameters);
     if child_pid != 0 {
-        let parent_pid = unsafe { GetCurrentProcessId() };
-        ipc_register_child(child_pid);
-        // Send SpawnedChild with child exe path extracted from process parameters.
-        let child_exe = extract_child_exe(process_parameters);
-        // Track this PID as our spawned child so memory_guard/reg_hooks can
-        // distinguish legitimate injection-target operations from external attacks.
         // Capture the creation-time fingerprint from the live handle we already
         // hold (M2: source-capture makes the PID-reuse defense always engage).
         // SAFETY: proc_h is the valid process handle returned by NtCreateUserProcess.
         let create_time = unsafe { crate::process_tracker::create_time_from_handle(proc_h) };
         crate::process_tracker::mark_spawned(child_pid, parent_pid, child_exe.clone(), create_time);
-        ipc_spawned_child(parent_pid, child_pid, child_exe);
     }
 
-    // Inject hook.dll via APC. If injection fails the child process ALREADY
-    // exists (suspended, no user code executed yet) and would escape the
-    // sandbox once resumed. Terminate it before resume — fail closed.
+    // P0-04: inject BEFORE any registration IPC. `ipc_register_child` /
+    // `ipc_spawned_child` are synchronous pipe round-trips; the child and its
+    // suspended main thread are already visible system-wide right after the
+    // syscall, and ResumeThread is not hooked, so any same-user thread could
+    // resume the child mid-registration and run it with no hooks at all.
+    // Injection is the only step that must complete before the child can
+    // safely run — keep the pre-injection window down to the APC queue alone.
+    //
+    // If injection fails the child process ALREADY exists (suspended, no user
+    // code executed yet) and would escape the sandbox once resumed. Terminate
+    // it before resume — fail closed. Registration IPC is skipped for a child
+    // we just killed: bookkeeping for a dead PID tells the launcher nothing it
+    // can act on.
     let mut inject_failed = false;
     if let Some(dll_path) = DLL_PATH.get() {
-        if let Err(e) = inject::inject_via_apc(proc_h, thr_h, dll_path) {
+        if let Err(e) = inject::inject_via_apc(
+            proc_h,
+            thr_h,
+            dll_path,
+            crate::ipc_client::session_section_name(),
+        ) {
             ipc_log(
                 ipc::LogLevel::Error,
                 format!("APC inject failed pid={child_pid}: {e}; terminating sandbox-escape candidate"),
@@ -1490,6 +2144,15 @@ unsafe extern "system" fn hook_nt_create_user_process(
             unsafe { winapi::um::processthreadsapi::TerminateProcess(proc_h, 1) };
             inject_failed = true;
         }
+    }
+
+    // Launcher bookkeeping — the two blocking IPC round-trips — happens AFTER
+    // the APC is queued (P0-04: must not delay injection). Skipped for a child
+    // we just killed: bookkeeping for a dead PID tells the launcher nothing it
+    // can act on.
+    if child_pid != 0 && !inject_failed {
+        ipc_register_child(child_pid);
+        ipc_spawned_child(parent_pid, child_pid, child_exe);
     }
 
     // Resume if the caller did not want a suspended thread — but skip if we
@@ -1519,6 +2182,107 @@ pub(crate) unsafe fn ntdll_export(name: &[u8]) -> Option<*const ()> {
     // SAFETY: name is a valid null-terminated ASCII byte slice.
     let p = GetProcAddress(hmod, name.as_ptr() as *const i8);
     if p.is_null() { None } else { Some(p as *const ()) }
+}
+
+// ---------------------------------------------------------------------------
+// Call-original fail-closed helper
+//
+// Hook bodies reach their original function through
+// `HOOK_X.get().unwrap().call(args)`. If the OnceLock is unset at call time,
+// the `unwrap` panics — inside an `unsafe extern "system"` fn, which cannot
+// unwind — so Rust aborts the whole process with 0xc0000409
+// (STATUS_STACK_BUFFER_OVERRUN), indistinguishable from a real stack-buffer
+// overrun and completely silent. In production a hook body only runs because
+// its detour was installed, so this is believed unreachable there; under
+// `cargo test` no detour is ever installed, and one test reaching this path
+// aborts the entire test binary, taking every other test's result with it.
+// NTSTATUS-returning hooks now fail closed instead (log at Error, return
+// STATUS_ACCESS_DENIED). Other return-type families (HRESULT / BOOL / HANDLE /
+// HINSTANCE / socket i32) intentionally keep `.get().unwrap()` — a fail-closed
+// value for them is a per-API decision; see the comments at those sites.
+// ---------------------------------------------------------------------------
+
+/// A hook body ran while its detour was never installed: the install
+/// sequence for this API is broken (or a hook fired inside the install
+/// window). That must be visible, not silent.
+pub(crate) fn log_detour_absent(hook: &str) {
+    // anti_rec: this runs on passthrough branches where the caller did NOT
+    // hold the guard, and ipc_log does pipe I/O that would otherwise
+    // re-enter the FS hooks.
+    let _g = crate::anti_rec::enter();
+    ipc_log(
+        ipc::LogLevel::Error,
+        format!(
+            "detour_absent: {hook} entered before its detour was installed; failing closed"
+        ),
+    );
+}
+
+/// Fail-closed call-original for NTSTATUS-returning hooks.
+///
+/// Expands to the detour trampoline call when the detour is installed
+/// (behaviour identical to the previous `.get().unwrap().call(...)`), and to
+/// `STATUS_ACCESS_DENIED` plus an Error log when it is not — instead of the
+/// unwrap that panics in a no-unwind context and aborts the process.
+macro_rules! nt_call_original {
+    ($lock:expr, $name:literal, ($($arg:expr),* $(,)?)) => {{
+        match $lock.get() {
+            // SAFETY: detour2 trampoline matches the hooked ABI
+            // (established when the detour was installed and enabled).
+            Some(d) => unsafe { d.call($($arg),*) },
+            None => {
+                $crate::hooks::log_detour_absent($name);
+                $crate::hooks::STATUS_ACCESS_DENIED
+            }
+        }
+    }};
+}
+pub(crate) use nt_call_original;
+
+#[cfg(test)]
+mod nt_call_original_tests {
+    // NOTE: `cargo build` never compiles this module — only `cargo test` does.
+    use super::*;
+
+    type FnDummy = unsafe extern "system" fn(u32) -> NTSTATUS;
+
+    // A plain, detourable stub playing the role of the ntdll export: the
+    // trampoline built by GenericDetour::new copies its prologue, so calling
+    // through `call()` executes THIS function with the passed argument.
+    unsafe extern "system" fn dummy_original(x: u32) -> NTSTATUS {
+        (0xC000_0001u32.wrapping_add(x)) as NTSTATUS
+    }
+
+    // Marker value proving the DETOUR body does NOT run in the installed
+    // case (call() must reach the trampoline = the original, like the old
+    // `.get().unwrap().call(...)` shape did).
+    unsafe extern "system" fn dummy_detour(_x: u32) -> NTSTATUS {
+        0xDEAD_BEEFu32 as NTSTATUS
+    }
+
+    #[test]
+    fn fail_closed_when_detour_absent() {
+        static ABSENT: OnceLock<GenericDetour<FnDummy>> = OnceLock::new();
+        let rc = nt_call_original!(&ABSENT, "NtTestApi", (7u32));
+        assert_eq!(rc as u32, 0xC000_0022, "expected STATUS_ACCESS_DENIED");
+    }
+
+    #[test]
+    fn installed_detour_still_calls_original() {
+        static INSTALLED: OnceLock<GenericDetour<FnDummy>> = OnceLock::new();
+        // SAFETY: both operands are real fn pointers with matching ABI;
+        // `new` only builds the trampoline — no enable()/code patching.
+        let target: FnDummy = dummy_original;
+        let hook_fn: FnDummy = dummy_detour;
+        let detour = unsafe { GenericDetour::<FnDummy>::new(target, hook_fn) }
+            .expect("dummy fn must be detourable");
+        let _ = INSTALLED.set(detour);
+        // Behaviour-unchanged proof: with the detour installed the macro
+        // returns the ORIGINAL's result (0xC000_0001 + 7), not the detour's
+        // 0xDEADBEEF marker and not the fail-closed STATUS_ACCESS_DENIED.
+        let rc = nt_call_original!(&INSTALLED, "NtTestApi", (7u32));
+        assert_eq!(rc as u32, 0xC000_0008, "expected the original's result");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1564,6 +2328,15 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         let _ = crate::ipc_client::SANDBOX_ROOT.set(sb_root);
     }
 
+    // The per-session random section name arrives through the injection
+    // channel (launcher-authored for the root, spawn-hook-patched into every
+    // child's env block before it runs). Capture it BEFORE the session
+    // section is consulted below; with no injected name the section fallback
+    // deliberately opens nothing (no guessable constant name exists anymore).
+    if let Ok(section) = std::env::var(crate::inject::SECTION_ENV_VAR) {
+        crate::ipc_client::set_session_section_name(section);
+    }
+
     // Always load the session section from the shared memory mapping, EVEN
     // when env vars are present. Env vars cover pipe_name/dll_path/cwd/trace/
     // sandbox_root (legacy single-root), but the multi-root overlay layout
@@ -1595,10 +2368,29 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         }};
     }
 
+    // Audit 2026-09-19 High: snapshot EVERY guard input once, here, before
+    // any hook is enabled and before any guest code has run. After this
+    // point nothing re-reads the environment for guard configuration —
+    // decision code reads the GUARD_ENV / DISABLED_HOOK_CATS snapshots only,
+    // and hook_nt_create_user_process denies any spawn whose inherited
+    // environment carries forged guard values (child_guard_env_violation).
+    // This generalizes the P1-01 SPAWN_SCAN_GUARD snapshot to all inputs.
     let guard = std::env::var("FS_SANDBOX_GUARD").unwrap_or_else(|_| "full".into());
     let disabled = std::env::var("FS_SANDBOX_DISABLE_HOOKS").unwrap_or_default();
-    let disabled_cats: Vec<String> = disabled.split(',').map(|s| s.trim().to_ascii_lowercase()).collect();
-    let skip = |cat: &str| disabled_cats.iter().any(|d| d == cat);
+    let allow_rwx_env = std::env::var("FS_SANDBOX_ALLOW_RWX").is_ok();
+    let no_track_env = std::env::var_os("FS_SANDBOX_NO_TRACK").is_some();
+    let section_env = std::env::var(crate::inject::SECTION_ENV_VAR).unwrap_or_default();
+    let _ = GUARD_ENV.set(GuardEnvSnapshot {
+        guard: guard.clone(),
+        disabled: disabled.clone(),
+        allow_rwx: allow_rwx_env,
+        no_track: no_track_env,
+        section: section_env,
+    });
+    let disabled_cats: Vec<String> =
+        disabled.split(',').map(|s| s.trim().to_ascii_lowercase()).collect();
+    let _ = DISABLED_HOOK_CATS.set(disabled_cats.clone());
+    let skip = |cat: &str| hook_category_disabled(cat);
 
     if !skip("fs") {
         install!(HOOK_NT_CREATE_FILE,              "NtCreateFile\0",              hook_nt_create_file,              FnNtCreateFile);
@@ -1608,6 +2400,7 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         install!(HOOK_NT_CREATE_USER_PROCESS,      "NtCreateUserProcess\0",       hook_nt_create_user_process,      FnNtCreateUserProcess);
         crate::dir_filter::install()?;
         crate::fs_metadata_guard::install()?;
+        install!(crate::fs_metadata_guard::HOOK_NT_DELETE_FILE, "NtDeleteFile\0", crate::fs_metadata_guard::hook_nt_delete_file, crate::fs_metadata_guard::FnNtDeleteFile);
         crate::path_info_guard::install()?;
     }
 
@@ -1618,7 +2411,7 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         // on ntdll's legitimate syscall instructions.
         let _install_guard = anti_rec::enter();
         if !skip("memory") {
-            crate::memory_guard::install(&guard)?;
+            crate::memory_guard::install(&guard, &disabled_cats, allow_rwx_env)?;
         }
         if !skip("inject") {
             crate::inject_guard::install()?;
@@ -1826,7 +2619,7 @@ pub unsafe fn uninstall_hooks() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use policy::{Decision, Mode};
+    use policy::{Decision, Mode, Policy};
     use std::path::PathBuf;
 
     #[test]
@@ -1838,6 +2631,105 @@ mod tests {
         assert!(is_write_access(0, FILE_OVERWRITE_IF));
         assert!(is_write_access(0, FILE_SUPERSEDE));
         assert!(!is_write_access(0, 1)); // FILE_OPEN
+    }
+
+    /// GENERIC_ALL grants every write right there is. It used to fall
+    /// through the mask and ride the CoW read-passthrough onto the real
+    /// disk (observed escape: `fs_decide NtCreateFile: ... write=false
+    /// mode=Cow` for a CreateFileW(..., 0x1000_0000, ...) open).
+    #[test]
+    fn write_access_generic_all_is_write() {
+        assert!(is_write_access(GENERIC_ALL, 0));
+        assert!(is_write_access(GENERIC_ALL, FILE_OPEN));
+        // A generic-all open that also asks read rights is still a write.
+        assert!(is_write_access(GENERIC_ALL | 0x8000_0000, FILE_OPEN));
+    }
+
+    /// FILE_WRITE_ATTRIBUTES-only and FILE_WRITE_EA-only opens mutate a
+    /// real file (SetFileTime / EA writes) without any data-write bit —
+    /// audit 2026-09-19 Medium finding. They must classify as writes.
+    #[test]
+    fn write_access_metadata_bits_are_write() {
+        assert!(is_write_access(FILE_WRITE_ATTRIBUTES, FILE_OPEN));
+        assert!(is_write_access(FILE_WRITE_EA, FILE_OPEN));
+        // A read+metadata open is still a write.
+        assert!(is_write_access(0x8000_0000 | FILE_WRITE_ATTRIBUTES, 0));
+    }
+
+    /// False-positive guards: pure read/probe opens must stay reads so they
+    /// keep riding the (cheap) passthrough instead of forcing CoW copies.
+    /// MAXIMUM_ALLOWED is a documented deliberate exclusion: it resolves
+    /// per-DACL and is probe-heavy; classifying it as a write would
+    /// CoW-copy every probed file.
+    #[test]
+    fn write_access_read_bits_stay_read() {
+        assert!(!is_write_access(0x8000_0000, FILE_OPEN));
+        assert!(!is_write_access(0x0000_0001, FILE_OPEN)); // FILE_READ_DATA
+        assert!(!is_write_access(0x0002_0000, FILE_OPEN)); // READ_CONTROL
+        assert!(!is_write_access(0x0010_0000, FILE_OPEN)); // SYNCHRONIZE
+        assert!(!is_write_access(0x8000_0000 | 0x0010_0000, FILE_OPEN));
+        assert!(!is_write_access(0x0200_0000, FILE_OPEN)); // MAXIMUM_ALLOWED
+    }
+
+    /// Consequence test: a GENERIC_ALL or FILE_WRITE_ATTRIBUTES-only open
+    /// of a path OUTSIDE project_root must land in the CoW overlay, not
+    /// ride the read-passthrough onto the real disk. Uses the real policy
+    /// engine with an empty rule set, whose documented default is
+    /// read-outside-root -> Passthrough, write-outside-root -> Cow.
+    #[test]
+    fn attribute_only_and_generic_all_opens_outside_root_cow() {
+        let base = unique_temp_path("writemask-cow");
+        std::fs::create_dir_all(&base).expect("create base dir");
+        let project_root = base.join("project");
+        let sandbox_root = base.join("overlay");
+        let mock_dirs = base.join("mockdirs");
+        let outside = base.join("outside");
+        for d in [&project_root, &sandbox_root, &mock_dirs, &outside] {
+            std::fs::create_dir_all(d).expect("create policy dirs");
+        }
+        let policy = Policy::open_or_create(
+            &base.join("policy.redb"),
+            sandbox_root,
+            mock_dirs,
+            project_root.clone(),
+        )
+        .expect("open policy engine");
+
+        let outside_dos =
+            outside.join("writemask-target.dat").to_string_lossy().into_owned();
+
+        // Negative control: the SAME path with read intent passes through
+        // to the real disk — proves the path is genuinely outside
+        // project_root, so the Cow verdicts below are caused by the write
+        // classification, not by the path.
+        assert_eq!(policy.decide(&outside_dos, false).mode, Mode::Passthrough);
+
+        // GENERIC_ALL open (the observed escape): write-classified -> CoW.
+        assert!(is_write_access(GENERIC_ALL, FILE_OPEN));
+        let d = policy.decide(&outside_dos, is_write_access(GENERIC_ALL, FILE_OPEN));
+        assert_eq!(d.mode, Mode::Cow, "GENERIC_ALL open outside root must Cow");
+
+        // FILE_WRITE_ATTRIBUTES-only open: write-classified -> CoW.
+        assert!(is_write_access(FILE_WRITE_ATTRIBUTES, FILE_OPEN));
+        let d = policy.decide(&outside_dos, is_write_access(FILE_WRITE_ATTRIBUTES, FILE_OPEN));
+        assert_eq!(
+            d.mode,
+            Mode::Cow,
+            "FILE_WRITE_ATTRIBUTES open outside root must Cow"
+        );
+
+        // FILE_WRITE_EA-only open: write-classified -> CoW.
+        assert!(is_write_access(FILE_WRITE_EA, FILE_OPEN));
+        let d = policy.decide(&outside_dos, is_write_access(FILE_WRITE_EA, FILE_OPEN));
+        assert_eq!(d.mode, Mode::Cow, "FILE_WRITE_EA open outside root must Cow");
+
+        // In-root control: policy keeps project_root paths Passthrough
+        // regardless of write classification (CoW is an outside-root event).
+        let in_dos = project_root.join("in.dat").to_string_lossy().into_owned();
+        assert_eq!(policy.decide(&in_dos, true).mode, Mode::Passthrough);
+
+        drop(policy);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Build a path inside the OS temp dir that is unique per test invocation,
@@ -1902,15 +2794,18 @@ mod tests {
         assert!(prepare_overlay(&d).is_none());
     }
 
-    /// `prepare_overlay` returns `Some(<dos string>)` when an overlay path is
-    /// present, matching the lossy stringification of the supplied PathBuf.
+    /// `prepare_overlay` returns `Some(<dos string>)` for an overlay path
+    /// inside the supplied roots, matching the lossy stringification of the
+    /// supplied PathBuf and creating parent directories as before.
     #[test]
     fn prepare_overlay_some_when_overlay_field_present() {
         // Use a unique temp dir so create_dir_all (called inside prepare_overlay)
-        // succeeds without polluting an arbitrary location like c:\overlay.
+        // succeeds without polluting an arbitrary location.
         let dir = unique_temp_path("prep-some");
-        let overlay = dir.join("redirect.bin");
+        let root = dir.join(".winrsbox").join("myapp").join("workdir");
+        let overlay = root.join("redirect.bin");
         let expected = overlay.to_string_lossy().into_owned();
+        let root_str = root.to_string_lossy().to_ascii_lowercase();
 
         let d = Decision {
             mode: Mode::Cow,
@@ -1918,10 +2813,163 @@ mod tests {
             cow_from: None,
             mock_payload: None,
         };
-        let got = prepare_overlay(&d).expect("Some when overlay field is set");
+        let roots = [root_str.as_str()];
+        let got = prepare_overlay_in_roots(&d, &roots).expect("Some for in-root overlay");
         assert_eq!(got, expected);
+        assert!(overlay.parent().unwrap().exists(), "parent dirs must be created");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit Critical #2 defence in depth: an overlay destination OUTSIDE the
+    /// published roots (the audit PoC shape: a real Startup folder next to the
+    /// sandbox state) must be refused — no returned path, no directory
+    /// created, no CoW copy performed — even though the Decision carries it.
+    #[test]
+    fn prepare_overlay_refuses_out_of_root_destination() {
+        let dir = unique_temp_path("prep-out");
+        let state = dir.join(".winrsbox").join("myapp");
+        let root = state.join("workdir");
+        let outside_dest = dir.join("Startup").join("pwn.bat");
+        let src = dir.join("src.txt");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&src, b"payload").unwrap();
+
+        let d = Decision {
+            mode: Mode::Cow,
+            overlay: Some(outside_dest.clone()),
+            cow_from: Some(src.clone()),
+            mock_payload: None,
+        };
+        let root_str = root.to_string_lossy().to_ascii_lowercase();
+        let roots = [root_str.as_str()];
+        assert!(prepare_overlay_in_roots(&d, &roots).is_none());
+        assert!(!outside_dest.exists(), "destination must NOT be created");
+        assert!(
+            !outside_dest.parent().unwrap().exists(),
+            "destination parent must NOT be created"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `..` segments in a destination are refused outright (never folded
+    /// here), so `<root>\..\escape.bat` cannot smuggle a write outside.
+    #[test]
+    fn prepare_overlay_refuses_dotdot_destination() {
+        let dir = unique_temp_path("prep-dotdot");
+        let state = dir.join(".winrsbox").join("myapp");
+        let root = state.join("workdir");
+        let dest = root.join("..").join("escape.bat");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let d = Decision {
+            mode: Mode::Cow,
+            overlay: Some(dest),
+            cow_from: None,
+            mock_payload: None,
+        };
+        let root_str = root.to_string_lossy().to_ascii_lowercase();
+        let roots = [root_str.as_str()];
+        assert!(prepare_overlay_in_roots(&d, &roots).is_none());
+        assert!(!dir.join("escape.bat").exists(), "escaped file must NOT be created");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Mock-dir Cow decisions mirror into the `mock-dirs` SIBLING of the
+    /// workdir root — inside the launcher state dir but not inside the root
+    /// itself. These must keep working (state-dir allowance), while a state
+    /// dir sibling with a prefix-lookalike name must stay refused.
+    #[test]
+    fn prepare_overlay_allows_mock_dirs_sibling_but_not_lookalike() {
+        let dir = unique_temp_path("prep-mock");
+        let state = dir.join(".winrsbox").join("myapp");
+        let root = state.join("workdir");
+        let mock_dest = state.join("mock-dirs").join("c").join("fake.txt");
+        let lookalike = dir.join(".winrsbox").join("myappX").join("workdir").join("evil.txt");
+        let root_str = root.to_string_lossy().to_ascii_lowercase();
+        let roots = [root_str.as_str()];
+
+        let mk = |p: &PathBuf| Decision {
+            mode: Mode::Cow,
+            overlay: Some(p.clone()),
+            cow_from: None,
+            mock_payload: None,
+        };
+        assert!(prepare_overlay_in_roots(&mk(&mock_dest), &roots).is_some());
+        assert!(mock_dest.parent().unwrap().exists(), "mock-dirs parent must be created");
+        assert!(prepare_overlay_in_roots(&mk(&lookalike), &roots).is_none());
+        assert!(!lookalike.exists(), "lookalike destination must NOT be created");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Legit in-root CoW still copies the source — validation must not break
+    /// the copy-on-write path it protects.
+    #[test]
+    fn prepare_overlay_copies_cow_source_inside_root() {
+        let dir = unique_temp_path("prep-cow");
+        let state = dir.join(".winrsbox").join("myapp");
+        let root = state.join("workdir");
+        let dest = root.join("d").join("proj").join("f.txt");
+        let src = dir.join("orig.txt");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&src, b"real content").unwrap();
+        let d = Decision {
+            mode: Mode::Cow,
+            overlay: Some(dest.clone()),
+            cow_from: Some(src),
+            mock_payload: None,
+        };
+        let root_str = root.to_string_lossy().to_ascii_lowercase();
+        let roots = [root_str.as_str()];
+        let got = prepare_overlay_in_roots(&d, &roots).expect("in-root CoW must succeed");
+        assert_eq!(got, dest.to_string_lossy());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"real content");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unconfigured hook (no OVERLAY_ROOTS, no SANDBOX_ROOT — the state test
+    /// builds run in): prepare_overlay must fail closed, not write anywhere.
+    #[test]
+    fn prepare_overlay_fails_closed_when_roots_unpublished() {
+        // Assert the premise: no test sets the root OnceLocks (the session-
+        // section loader is stubbed out under cfg(test)).
+        assert!(crate::ipc_client::OVERLAY_ROOTS.get().map_or(true, |l| l.is_empty()));
+        assert!(crate::ipc_client::SANDBOX_ROOT.get().is_none());
+        let dir = unique_temp_path("prep-closed");
+        let d = Decision {
+            mode: Mode::Cow,
+            overlay: Some(dir.join("anywhere.bin")),
+            cow_from: None,
+            mock_payload: None,
+        };
+        assert!(prepare_overlay(&d).is_none());
+        assert!(!dir.join("anywhere.bin").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Segment rules of `overlay_dest_in_roots`, pinned directly.
+    #[test]
+    fn overlay_dest_in_roots_segment_rules() {
+        let root = r"c:\state\workdir".to_ascii_lowercase();
+        let roots = [root.as_str()];
+        // Root itself and descendants are accepted.
+        assert!(overlay_dest_in_roots(roots[0], &roots));
+        assert!(overlay_dest_in_roots(r"c:\state\workdir\sub\f.txt", &roots));
+        // Mock-dirs sibling of the root lives in the launcher state dir.
+        assert!(overlay_dest_in_roots(r"c:\state\mock-dirs\c\fake.txt", &roots));
+        // Sibling-prefix lookalikes are refused.
+        assert!(!overlay_dest_in_roots(r"c:\state\workdirevil\x.txt", &roots));
+        assert!(!overlay_dest_in_roots(r"c:\stateX\workdir\x.txt", &roots));
+        // Dot segments are refused outright.
+        assert!(!overlay_dest_in_roots(r"c:\state\workdir\..\escape.bat", &roots));
+        // Empty root list / empty destination fail closed.
+        assert!(!overlay_dest_in_roots(r"c:\state\workdir\f.txt", &[]));
+        assert!(!overlay_dest_in_roots("", &roots));
     }
 
     // ── path-normalization tests ────────────────────────────────────────────
@@ -2410,6 +3458,39 @@ mod status_constant_tests {
     }
 
     #[test]
+    fn bare_relative_branch_unmirrors_cwd_inside_overlay() {
+        // Audit 2026-09-19 Low: the bare-relative CWD branch of
+        // resolve_for_hook lacked the unmirror its sibling branches do.
+        // With the kernel CWD inside the overlay storage (the guest cd'd
+        // into a CoW'd external directory), the folded absolute path is the
+        // REAL overlay path, and the `.winrsbox` denylist would self-block
+        // the open. The branch must decide on the unmirrored virtual path.
+        let real = r"\??\c:\users\me\.winrsbox\sessionx\workdir\mytools\app\qwe.txt";
+        let real_u16: Vec<u16> = real.encode_utf16().collect();
+        let sb = r"c:\users\me\.winrsbox\sessionx\workdir";
+        let got = bare_relative_dos(&real_u16, Some(sb)).expect("resolve");
+        assert_eq!(got, r"c:\mytools\app\qwe.txt");
+        // The raw overlay path IS self-blocked by the denylist — that is the
+        // bug the unmirror fixes; the virtual path must not be.
+        let raw_dos = r"c:\users\me\.winrsbox\sessionx\workdir\mytools\app\qwe.txt";
+        assert!(
+            canonical_denylist_status(&raw_dos).is_some(),
+            "precondition: the raw overlay path trips the .winrsbox denylist"
+        );
+        assert!(
+            canonical_denylist_status(&got).is_none(),
+            "the virtual path the branch decides on must not be self-blocked"
+        );
+        // CWD outside the overlay: unchanged (defensive passthrough).
+        let plain = r"\??\d:\proj\file.txt";
+        let plain_u16: Vec<u16> = plain.encode_utf16().collect();
+        assert_eq!(
+            bare_relative_dos(&plain_u16, Some(sb)).as_deref(),
+            Some(r"d:\proj\file.txt")
+        );
+    }
+
+    #[test]
     fn unmirror_overlay_handle_relative_recovers_virtual_path() {
         // Real-world layout: handle resolved into overlay storage under
         // `.winrsbox\<name>\workdir\d\…`. The transform must recover the
@@ -2573,5 +3654,726 @@ mod status_constant_tests {
         assert!(r.is_some(), "Cow decision must be returned from HookCache");
         assert_eq!(r.unwrap().mode, policy::Mode::Cow,
             "retrieved decision must be Cow, not Passthrough or Hidden");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P0-04 / P1-01 / P2-01 regression tests (hooks-core security fixes)
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod hooks_core_security_tests {
+    use super::*;
+
+    // ── P2-01: NULL UNICODE_STRING.Buffer must fail closed ─────────────────
+    //
+    // Without the null check, `from_raw_parts(null_ptr, 1)` mints a slice
+    // whose first read dereferences address 0 — an access violation that
+    // kills the process (nothing wraps hook bodies in SEH/catch_unwind).
+    // Against the unfixed code these tests crash the test binary, which is
+    // exactly the failure mode the fix removes.
+
+    #[test]
+    fn extract_raw_nt_path_null_buffer_fails_closed() {
+        let ustr = UNICODE_STRING {
+            Length: 2,
+            MaximumLength: 2,
+            Buffer: std::ptr::null_mut(),
+        };
+        // Keep both locals in THIS frame: attrs.ObjectName points at ustr.
+        let attrs = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: std::ptr::null_mut(),
+            ObjectName: &ustr as *const UNICODE_STRING as *mut UNICODE_STRING,
+            Attributes: 0,
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
+        };
+        let got = unsafe { extract_raw_nt_path(&attrs) };
+        assert!(got.is_none(), "NULL Buffer must resolve to None, got {got:?}");
+    }
+
+    #[test]
+    fn resolve_for_hook_null_buffer_fails_closed() {
+        let ustr = UNICODE_STRING {
+            Length: 2,
+            MaximumLength: 2,
+            Buffer: std::ptr::null_mut(),
+        };
+        let attrs = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: std::ptr::null_mut(),
+            ObjectName: &ustr as *const UNICODE_STRING as *mut UNICODE_STRING,
+            Attributes: 0,
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
+        };
+        let got = unsafe { resolve_for_hook(&attrs) };
+        assert!(got.is_none(), "NULL Buffer must resolve to None, got {got:?}");
+    }
+
+    // ── P1-01: child scan gate + pipeline ──────────────────────────────────
+
+    #[test]
+    fn child_scan_enabled_matches_launcher_guard_levels() {
+        // launcher/src/main.rs scans the root under Full | Static only.
+        assert!(child_scan_enabled(Some("full")));
+        assert!(child_scan_enabled(Some("static")));
+        assert!(!child_scan_enabled(Some("scan")));
+        assert!(!child_scan_enabled(Some("none")));
+        assert!(!child_scan_enabled(Some("FULL")), "exact match only — launcher writes lowercase");
+        assert!(!child_scan_enabled(Some("")));
+        assert!(!child_scan_enabled(None), "unset guard (unit-test context) must not scan");
+    }
+
+    #[test]
+    fn scan_pipeline_runs_on_own_image() {
+        // Smoke test of the full remote-read pipeline (QIP → PEB → image
+        // base → PE headers → .text → iced-x86 scan) against a handle we
+        // know is valid: our own pseudo-handle. Whether HITS may exist in
+        // this binary is policy::scan's business (its own tests) and cannot
+        // be asserted here — so only the pipeline outcome is.
+        // SAFETY: GetCurrentProcess is a constant pseudo-handle call.
+        let h = unsafe { winapi::um::processthreadsapi::GetCurrentProcess() };
+        let result = scan_image_for_direct_syscalls(h);
+        assert!(result.is_ok(), "scan pipeline failed on own image: {result:?}");
+    }
+
+    // ── P0-04 + P1-01 structural pins ──────────────────────────────────────
+    //
+    // The create→inject race is fixed by code ORDER, and the scan by CALL
+    // PRESENCE inside the spawn hook; neither is observable from a unit test
+    // without a real spawned child. These textual pin tests follow the
+    // established precedent of inject.rs::intentional_leak_pin_tests.
+
+    fn spawn_hook_body() -> String {
+        let src = include_str!("hooks.rs");
+        let fn_start = src
+            .find("fn hook_nt_create_user_process")
+            .expect("hook_nt_create_user_process must exist");
+        let rest = &src[fn_start..];
+        let body_end = rest
+            .find("// ---------------------------------------------------------------------------")
+            .expect("section separator after hook_nt_create_user_process");
+        rest[..body_end].to_string()
+    }
+
+    #[test]
+    fn injection_precedes_child_registration_in_spawn_hook() {
+        // Two ordering invariants in hook_nt_create_user_process:
+        //   1. mark_spawned (local memory_guard authorization record) BEFORE
+        //      inject_via_apc;
+        //   2. inject_via_apc BEFORE ipc_register_child / ipc_spawned_child
+        //      (the two blocking IPC round-trips).
+        let body = spawn_hook_body();
+        let mark_off = body
+            .find("process_tracker::mark_spawned(")
+            .expect("spawn hook must call process_tracker::mark_spawned");
+        let inject_off = body
+            .find("inject::inject_via_apc(")
+            .expect("spawn hook must call inject::inject_via_apc");
+        let register_off = body
+            .find("ipc_register_child(")
+            .expect("spawn hook must call ipc_register_child");
+        assert!(
+            mark_off < inject_off,
+            "regression: mark_spawned must be ordered BEFORE inject_via_apc — \
+             memory_guard's cross-process NtAllocate/NtProtect/NtWriteVirtualMemory \
+             gates consult process_tracker::is_owned_child for exactly the writes \
+             injection performs; without the local record the DLL-path write loses \
+             its is_owned_child fast path (opcode-scanned on every spawn) and the \
+             VirtualAllocEx lands in the terminate-if-executable foreign branch"
+        );
+        assert!(
+            inject_off < register_off,
+            "P0-04 regression: injection must be ordered BEFORE ipc_register_child \
+             in hook_nt_create_user_process — the two blocking IPC round-trips \
+             must not delay the APC queue while the suspended child is visible \
+             system-wide (a same-user thread can ResumeThread it and win the \
+             race, leaving the child running with no hooks)"
+        );
+    }
+
+    #[test]
+    fn spawn_hook_scans_child_image_and_gates_on_guard() {
+        let body = spawn_hook_body();
+        assert!(
+            body.contains("scan_image_for_direct_syscalls("),
+            "P1-01 regression: hook_nt_create_user_process must scan the child's \
+             image for direct syscalls — the launcher scans the root target \
+             only, so every process below the root otherwise keeps the \
+             direct-syscall bypass open"
+        );
+        assert!(
+            body.contains("child_scan_enabled("),
+            "P1-01 regression: child scan must stay gated on the captured guard \
+             level (full/static only, never re-read from env)"
+        );
+    }
+
+    // ── `..` lexical fold in resolve_for_hook (audit Critical #1) ──────────
+
+    /// Build OBJECT_ATTRIBUTES with a UTF-16 ObjectName (RootDirectory null,
+    /// i.e. the absolute branch) and run resolve_for_hook on it.
+    fn resolve_abs(nt_path: &str) -> Option<(String, Option<Vec<u16>>)> {
+        let buf: Vec<u16> = nt_path.encode_utf16().collect();
+        let len_bytes = (buf.len() * 2) as u16;
+        let us = UNICODE_STRING {
+            Length: len_bytes,
+            MaximumLength: len_bytes,
+            Buffer: buf.as_ptr() as *mut u16,
+        };
+        let oa = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: std::ptr::null_mut(),
+            ObjectName: &us as *const UNICODE_STRING as *mut UNICODE_STRING,
+            Attributes: 0,
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
+        };
+        // SAFETY: us/oa/buf are valid locals for the duration of the call.
+        unsafe { resolve_for_hook(&oa) }
+    }
+
+    #[test]
+    fn resolve_for_hook_folds_parent_dir_escape_absolute() {
+        // THE regression (audit Critical #1): the exploit create
+        // `NtCreateFile("\??\d:\<root>\..\..\payload.exe",
+        // CREATE_ALWAYS)` must resolve to the FOLDED dos path so policy
+        // classifies it outside project_root (Cow/Deny), never Passthrough.
+        // Unfixed, resolve_for_hook returned the unfolded string and the
+        // containment prefix test matched the root while the kernel resolved
+        // the `..` segments outside the sandbox.
+        let got = resolve_abs(r"\??\D:\proj\..\..\outside.exe")
+            .expect("absolute DOS-form path must resolve");
+        assert_eq!(got.0, r"d:\outside.exe");
+        // Absolute opens keep pre_resolved = None (kernel gets the original
+        // ObjectName verbatim; unmirror carve-out + sans-reparse equivalence).
+        assert!(got.1.is_none());
+    }
+
+    #[test]
+    fn resolve_for_hook_folds_dotdot_inside_root() {
+        // Legitimate callers with `..` inside the root keep working: the
+        // folded path stays under the root and decision == kernel target.
+        let got = resolve_abs(r"\??\D:\proj\sub\..\file.txt").unwrap();
+        assert_eq!(got.0, r"d:\proj\file.txt");
+    }
+
+    #[test]
+    fn resolve_for_hook_folds_curdir_inside_root() {
+        let got = resolve_abs(r"\??\D:\proj\.\file.txt").unwrap();
+        assert_eq!(got.0, r"d:\proj\file.txt");
+    }
+
+    #[test]
+    fn resolve_for_hook_folds_forward_slash_dotdot() {
+        // The object manager accepts `/` as a separator; the fold must
+        // normalize and pop across it.
+        let got = resolve_abs(r"\??\D:\proj/sub/../../outside.exe").unwrap();
+        assert_eq!(got.0, r"d:\outside.exe");
+    }
+
+    #[test]
+    fn resolve_for_hook_clamps_dotdot_past_drive_root() {
+        // `..` past the volume root clamps at the drive, like the kernel.
+        let got = resolve_abs(r"\??\D:\..\..\x").unwrap();
+        assert_eq!(got.0, r"d:\x");
+    }
+
+    #[test]
+    fn resolve_for_hook_extended_prefix_fold() {
+        // `\\?\` skips Win32-side normalization but NOT kernel-side
+        // `..` resolution, so the exploit class works through it too — and
+        // the fold must handle it identically.
+        let got = resolve_abs(r"\\?\D:\proj\..\..\outside.exe").unwrap();
+        assert_eq!(got.0, r"d:\outside.exe");
+    }
+
+    #[test]
+    fn resolve_for_hook_folds_relative_case_through_lower() {
+        // Original case is folded away by nt_to_dos_lower; what matters is
+        // that the dot fold happens BEFORE that point so segments like
+        // `Sub` still pop correctly.
+        let got = resolve_abs(r"\??\D:\proj\Sub\..\FILE.txt").unwrap();
+        assert_eq!(got.0, r"d:\proj\file.txt");
+    }
+
+    // ── Guard configuration snapshot (audit 2026-09-19 High) ───────────────
+    //
+    // The environment block is guest-writable: a sandboxed process can
+    // SetEnvironmentVariable forged guard values into its own block, and any
+    // child it spawns inherits the forgery. Decision code therefore reads
+    // ONLY the install-time snapshot (GUARD_ENV / DISABLED_HOOK_CATS, both
+    // captured in install_hooks before any guest code has run), and the
+    // spawn gate denies any child whose inherited environment carries guard
+    // settings that differ from that snapshot.
+
+    /// Serializes env-mutating tests: the environment is process-wide while
+    /// cargo test runs tests on parallel threads (same pattern as
+    /// memory_guard.rs tests::ENV_LOCK and launcher nested_detection_tests,
+    /// both added after exactly that class of flake).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// RAII guard restoring FS_SANDBOX_DISABLE_HOOKS on drop.
+    struct DisableHooksEnvGuard(Option<std::ffi::OsString>);
+
+    impl DisableHooksEnvGuard {
+        fn capture() -> Self {
+            DisableHooksEnvGuard(std::env::var_os("FS_SANDBOX_DISABLE_HOOKS"))
+        }
+    }
+
+    impl Drop for DisableHooksEnvGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("FS_SANDBOX_DISABLE_HOOKS", v),
+                None => std::env::remove_var("FS_SANDBOX_DISABLE_HOOKS"),
+            }
+        }
+    }
+
+    /// Canonical section name every seeded snapshot shares (the OnceLock is
+    /// set once per test-binary process; all tests must agree on the value).
+    const TRUSTED_SECTION: &str = "Local\\WinRsBoxSession-trusted";
+
+    /// Pin the canonical install-time snapshot the guard tests assert
+    /// against. The OnceLocks can only be set once per test-binary process;
+    /// every caller must use these exact values so parallel tests agree.
+    fn seed_guard_snapshot() {
+        let _ = GUARD_ENV.set(GuardEnvSnapshot {
+            guard: "full".into(),
+            disabled: "reg".into(),
+            allow_rwx: false,
+            no_track: false,
+            section: TRUSTED_SECTION.into(),
+        });
+        let snap = GUARD_ENV.get().expect("GUARD_ENV seeded above");
+        assert_eq!(snap.guard, "full", "GUARD_ENV seeded with a conflicting guard level");
+        assert_eq!(snap.disabled, "reg", "GUARD_ENV seeded with a conflicting disable list");
+        assert!(!snap.allow_rwx, "GUARD_ENV seeded with a conflicting RWX allowance");
+        assert_eq!(
+            snap.section,
+            TRUSTED_SECTION,
+            "GUARD_ENV seeded with a conflicting section name"
+        );
+        let _ = DISABLED_HOOK_CATS.set(vec!["reg".to_string()]);
+        assert_eq!(
+            DISABLED_HOOK_CATS.get().map(|c| c.as_slice()),
+            Some(&["reg".to_string()][..]),
+            "DISABLED_HOOK_CATS seeded with a conflicting category list"
+        );
+    }
+
+    /// Regression core (audit 2026-09-19 High): the guest sets
+    /// FS_SANDBOX_DISABLE_HOOKS after startup — the category gate must keep
+    /// following the install-time snapshot, not the guest-writable
+    /// environment. Old behaviour re-read the env var at each consumer and
+    /// flipped categories on/off at the guest's whim.
+    #[test]
+    fn hook_category_disabled_ignores_post_startup_env_mutation() {
+        let _lock = env_lock();
+        let _env = DisableHooksEnvGuard::capture();
+        seed_guard_snapshot();
+
+        // The kill switch first: the guest forges categories into its own
+        // block after startup. The gate must not follow (old behaviour
+        // disabled the fs hooks and the whole memory guard here).
+        std::env::set_var("FS_SANDBOX_DISABLE_HOOKS", "fs,memory");
+        assert!(
+            !hook_category_disabled("fs"),
+            "post-startup FS_SANDBOX_DISABLE_HOOKS=fs must not disable the fs hooks"
+        );
+        assert!(
+            !hook_category_disabled("memory"),
+            "post-startup FS_SANDBOX_DISABLE_HOOKS=memory must not disable the memory guard"
+        );
+        assert!(
+            hook_category_disabled("reg"),
+            "the trusted category must stay disabled regardless of env state"
+        );
+
+        // Scrubbed to empty — the snapshot still wins.
+        std::env::set_var("FS_SANDBOX_DISABLE_HOOKS", "");
+        assert!(hook_category_disabled("reg"));
+        assert!(!hook_category_disabled("fs"));
+
+        // Removed entirely — still the snapshot (trusted baseline: only
+        // "reg"; a scrub must not re-enable anything).
+        std::env::remove_var("FS_SANDBOX_DISABLE_HOOKS");
+        assert!(hook_category_disabled("reg"));
+        assert!(!hook_category_disabled("fs"));
+        assert!(!hook_category_disabled("memory"));
+    }
+
+    /// The spawn gate must deny any spawn whose inherited environment
+    /// carries guard settings that differ from the trusted snapshot — that
+    /// forgery is how a guest booted its children with the memory guard
+    /// off. Absence of the variables and equivalent restatements of the
+    /// trusted values must stay allowed (no false positives).
+    #[test]
+    fn guard_env_mismatch_denies_forged_child_guard_env() {
+        let trusted = GuardEnvSnapshot {
+            guard: "full".into(),
+            disabled: "reg".into(),
+            allow_rwx: false,
+            no_track: false,
+            section: TRUSTED_SECTION.into(),
+        };
+
+        // FS_SANDBOX_NO_TRACK is gated like the rest. It makes mark_spawned
+        // skip the child, which makes the injector's own cross-process writes
+        // look foreign to memory_guard — injection then fails and the child is
+        // terminated before resume. That is a guest self-DoS rather than an
+        // escape, but a guard-relevant variable outside the gate is precisely
+        // the drift the gate exists to catch, so forging it is refused.
+        assert!(
+            guard_env_mismatch(
+                &[("FS_SANDBOX_NO_TRACK".to_string(), "1".to_string())],
+                &trusted,
+            )
+            .is_some_and(|m| m.contains("FS_SANDBOX_NO_TRACK")),
+            "forged FS_SANDBOX_NO_TRACK must be denied",
+        );
+        // When the launcher itself set it (integration tests do), a child
+        // inheriting the same value matches the snapshot and is allowed.
+        let trusted_no_track = GuardEnvSnapshot {
+            guard: "full".into(),
+            disabled: "reg".into(),
+            allow_rwx: false,
+            no_track: true,
+            section: TRUSTED_SECTION.into(),
+        };
+        assert_eq!(
+            guard_env_mismatch(
+                &[("FS_SANDBOX_NO_TRACK".to_string(), "1".to_string())],
+                &trusted_no_track,
+            ),
+            None,
+        );
+
+        // No guard variables at all: the child's hook boots with fail-safe
+        // defaults (guard "full", nothing disabled, RWX off) — allowed.
+        assert_eq!(guard_env_mismatch(&[], &trusted), None);
+        assert_eq!(
+            guard_env_mismatch(&[("PATH".to_string(), r"C:\Windows".to_string())], &trusted),
+            None,
+            "non-guard variables must not trip the gate"
+        );
+
+        // Forged disable list — the exact attack from the audit finding.
+        let reason = guard_env_mismatch(
+            &[("FS_SANDBOX_DISABLE_HOOKS".to_string(), "memory".to_string())],
+            &trusted,
+        );
+        assert!(
+            reason.is_some(),
+            "a child inheriting FS_SANDBOX_DISABLE_HOOKS=memory must be denied"
+        );
+        assert!(reason.unwrap().contains("forged"));
+
+        // An equivalent re-spelling of the trusted list passes (case,
+        // whitespace, order and duplicates are normalized on both sides).
+        assert_eq!(
+            guard_env_mismatch(
+                &[("FS_SANDBOX_DISABLE_HOOKS".to_string(), " REG , reg ".to_string())],
+                &trusted,
+            ),
+            None,
+            "an equivalent restatement of the trusted disable list is not a forgery"
+        );
+
+        // Forged RWX enable: presence-only semantics — ANY value counts as
+        // an enable, including one that reads like a denial.
+        let reason = guard_env_mismatch(
+            &[("fs_sandbox_allow_rwx".to_string(), "0".to_string())],
+            &trusted,
+        );
+        assert!(
+            reason.is_some(),
+            "FS_SANDBOX_ALLOW_RWX=0 still means present; the hook treats existence as enable"
+        );
+
+        // With RWX genuinely allowed by the snapshot, the variable passes.
+        let trusted_rwx = GuardEnvSnapshot {
+            guard: "full".into(),
+            disabled: "reg".into(),
+            allow_rwx: true,
+            no_track: false,
+            section: TRUSTED_SECTION.into(),
+        };
+        assert_eq!(
+            guard_env_mismatch(
+                &[("FS_SANDBOX_ALLOW_RWX".to_string(), "1".to_string())],
+                &trusted_rwx,
+            ),
+            None,
+        );
+
+        // Forged guard-level downgrade.
+        let reason = guard_env_mismatch(
+            &[("FS_SANDBOX_GUARD".to_string(), "none".to_string())],
+            &trusted,
+        );
+        assert!(
+            reason.is_some(),
+            "a child inheriting FS_SANDBOX_GUARD=none must be denied"
+        );
+        assert_eq!(
+            guard_env_mismatch(&[("FS_SANDBOX_GUARD".to_string(), "FULL".to_string())], &trusted),
+            None,
+            "the trusted guard level, re-cased, passes"
+        );
+
+        // One forged variable among legitimate ones is still caught.
+        let observed = vec![
+            ("FS_SANDBOX_PIPE".to_string(), "winrsbox-ipc".to_string()),
+            ("FS_SANDBOX_DISABLE_HOOKS".to_string(), "fs".to_string()),
+        ];
+        assert!(guard_env_mismatch(&observed, &trusted).is_some());
+    }
+
+    /// A child with no process-parameters block inherits no environment at
+    /// all — nothing to vouch for, nothing to deny; its hook boots with the
+    /// fail-safe defaults. (Seeding GUARD_ENV pins that the gate reaches the
+    /// null-params check rather than returning early on an empty snapshot.)
+    #[test]
+    fn child_guard_env_violation_null_params_fail_safe() {
+        seed_guard_snapshot();
+        assert_eq!(child_guard_env_violation(std::ptr::null_mut()), None);
+    }
+
+    /// The session-section name is guard-relevant: a forged name would point
+    /// the child's hook at an attacker-authored section carrying a poisoned
+    /// pipe_name / dll_path. The trusted value re-stated passes (that is what
+    /// ordinary inheritance looks like); a different value is denied; ANY
+    /// value is denied when this process itself booted without a name.
+    /// Old behaviour: the gate ignored FS_SANDBOX_SECTION entirely.
+    #[test]
+    fn guard_env_mismatch_denies_forged_section_name() {
+        let trusted = GuardEnvSnapshot {
+            guard: "full".into(),
+            disabled: "reg".into(),
+            allow_rwx: false,
+            no_track: false,
+            section: TRUSTED_SECTION.into(),
+        };
+        assert_eq!(
+            guard_env_mismatch(
+                &[(crate::inject::SECTION_ENV_VAR.to_string(), TRUSTED_SECTION.to_string())],
+                &trusted,
+            ),
+            None,
+            "ordinary inheritance of the trusted section name is not a forgery"
+        );
+        let reason = guard_env_mismatch(
+            &[(
+                crate::inject::SECTION_ENV_VAR.to_string(),
+                "Local\\WinRsBoxSession-evil".to_string(),
+            )],
+            &trusted,
+        );
+        assert!(
+            reason.is_some_and(|m| m.contains("FS_SANDBOX_SECTION")),
+            "a forged session-section name must be denied"
+        );
+        let trusted_no_name = GuardEnvSnapshot {
+            guard: "full".into(),
+            disabled: "reg".into(),
+            allow_rwx: false,
+            no_track: false,
+            section: String::new(),
+        };
+        let reason = guard_env_mismatch(
+            &[(
+                crate::inject::SECTION_ENV_VAR.to_string(),
+                "Local\\WinRsBoxSession-anything".to_string(),
+            )],
+            &trusted_no_name,
+        );
+        assert!(
+            reason.is_some(),
+            "any inherited section name must be denied when we booted without one"
+        );
+        // Absence stays allowed (the spawn hook injects the true value into
+        // the child after this gate runs — env-scrubbed children).
+        assert_eq!(
+            guard_env_mismatch(&[], &trusted_no_name),
+            None,
+            "absence of the section name must stay allowed"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sibling-drift check (audit 2026-09-19 High: "guarded API, unguarded
+// sibling"). This is the mechanical net for the exact drift that left
+// NtAllocateVirtualMemoryEx, NtAlpcConnectPortEx, NtSecureConnectPort,
+// ShellExecuteA / ShellExecuteExA and win32u!NtUserSendInput wide open while
+// their guarded twins carried all the enforcement.
+//
+// Each guard module keeps a `pub(crate) const HOOKED_EXPORTS` list naming the
+// exports it actually installs detours on. Two layers, both cheap and hermetic:
+//
+//   1. family coverage — whenever a family's base export is guarded, every
+//      listed sibling must be guarded too. Fails when someone removes a
+//      sibling detour, or guards a new `Foo` while leaving `FooEx` open.
+//   2. list-vs-source — every name in a module's list must appear in that
+//      module body as a quote-anchored install literal (`"Name@Z@"` for the
+//      str/byte-literal GetProcAddress names, `"Name"` for ui_guard's macro
+//      form), so the lists cannot rot independently of the real detours. The
+//      scan covers everything BEFORE the list itself — the module body where
+//      install() lives — so a stale list entry can never satisfy its own
+//      check, and export names merely mentioned in tests/comments do not
+//      count.
+//
+// Extending: guard a new export family → add its name to the module's export
+// list and add a row below. DllGetClassObject is deliberately NOT listed: it
+// is a per-DLL COM export resolved per loaded module (hundreds of copies
+// across loaded in-proc servers), not a single address one detour can cover —
+// a check row for it could never go green, so it stays documented as out of
+// scope for user-mode single-export detours (see com_guard.rs notes).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod sibling_drift_check {
+    use crate::alpc_guard::HOOKED_EXPORTS as ALPC_HOOKED;
+    use crate::memory_guard::HOOKED_EXPORTS as MEM_HOOKED;
+    use crate::shell_guard::HOOKED_EXPORTS as SHELL_HOOKED;
+    use crate::ui_guard::HOOKED_EXPORTS as UI_HOOKED;
+
+    /// (family, module file, that module's hooked-export list, base exports
+    /// carrying the guard today, siblings that MUST be guarded alongside).
+    const FAMILIES: &[(&str, &str, &[&str], &[&str], &[&str])] = &[
+        (
+            "memory-alloc",
+            "memory_guard.rs",
+            MEM_HOOKED,
+            &["NtAllocateVirtualMemory"],
+            &["NtAllocateVirtualMemoryEx"],
+        ),
+        (
+            "alpc-connect",
+            "alpc_guard.rs",
+            ALPC_HOOKED,
+            &["NtAlpcConnectPort"],
+            &["NtAlpcConnectPortEx", "NtSecureConnectPort"],
+        ),
+        (
+            "shell-execute",
+            "shell_guard.rs",
+            SHELL_HOOKED,
+            &["ShellExecuteW", "ShellExecuteExW"],
+            &["ShellExecuteA", "ShellExecuteExA"],
+        ),
+        (
+            "ui-input-injection",
+            "ui_guard.rs",
+            UI_HOOKED,
+            &["SendInput"],
+            &["NtUserSendInput"],
+        ),
+    ];
+
+    /// True when `src` contains the export name as a quote-anchored install
+    /// literal. Left-quote anchoring means `Foo` can never be satisfied by a
+    /// mention inside `FooEx` (e.g. `"SendInput"` does not match
+    /// `"NtUserSendInput@Z@"`), and the `@Z@` suffix form distinguishes
+    /// real GetProcAddress literals from prose.
+    fn referenced_in_install_code(src: &str, name: &str) -> bool {
+        // Look for the export name as a Rust string literal, in the two forms
+        // the install sites use: NUL-terminated (`"Name\0"`, what the detour
+        // macros pass to GetProcAddress) and plain (`"Name"`).
+        //
+        // The quote and backslash are built from chars rather than written
+        // inline so that this predicate's own source cannot be mistaken for an
+        // install site if hooks.rs ever gets scanned too.
+        const Q: char = '"';
+        const BS: char = '\\';
+        let with_nul = format!("{Q}{name}{BS}0{Q}");
+        let plain = format!("{Q}{name}{Q}");
+        src.contains(&with_nul) || src.contains(&plain)
+    }
+
+    #[test]
+    fn sibling_exports_guarded_when_base_is_guarded() {
+        for (family, file, list, bases, siblings) in FAMILIES {
+            for base in *bases {
+                if !list.contains(base) {
+                    // Base guard intentionally removed → the family is gone
+                    // wholesale; siblings may go with it (and must, see the
+                    // list-vs-source check).
+                    continue;
+                }
+                for sibling in *siblings {
+                    assert!(
+                        list.contains(sibling),
+                        "SIBLING DRIFT in family `{family}` ({file}): `{base}` is                          guarded but `{sibling}` is not — the guard is bypassable                          through the sibling export. Hook `{sibling}` in {file}, or                          delete the family row here if the whole family was                          intentionally unguarded."
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hooked_export_lists_match_installed_detours() {
+        for (family, file, list, _, _) in FAMILIES {
+            let src = match *file {
+                "memory_guard.rs" => include_str!("memory_guard.rs"),
+                "alpc_guard.rs" => include_str!("alpc_guard.rs"),
+                "shell_guard.rs" => include_str!("shell_guard.rs"),
+                "ui_guard.rs" => include_str!("ui_guard.rs"),
+                other => panic!("unknown guard module in FAMILIES: {other}"),
+            };
+            // Scan only the module body (everything before the list itself):
+            // a stale list entry cannot satisfy its own install check.
+            let body = src.split("HOOKED_EXPORTS").next().unwrap_or(src);
+            for name in *list {
+                assert!(
+                    referenced_in_install_code(body, name),
+                    "family `{family}`: `{name}` is listed in {file} exports but no                      install literal for it exists in the module body — the detour                      was removed without updating the list (or was never written)."
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn base_exports_of_every_family_are_actually_listed() {
+        // Pins the bases: if a base name silently disappears from its list,
+        // the family test above goes vacuously green and the drift net dies.
+        // Removing a base must be a deliberate, reviewed act that deletes
+        // the family row (with a justification) — never an accident.
+        for (family, file, list, bases, _) in FAMILIES {
+            for base in *bases {
+                assert!(
+                    list.contains(base),
+                    "family `{family}` ({file}): base export `{base}` is missing                      from the module's export list — restore the guard or delete                      the family row and justify why the guard is gone."
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hooked_export_names_are_wellformed() {
+        for (family, _, list, _, _) in FAMILIES {
+            assert!(!list.is_empty(), "family `{family}` has an empty export list");
+            for name in *list {
+                assert!(
+                    !name.is_empty() && name.is_ascii(),
+                    "bad export name {name:?} in family {family}"
+                );
+            }
+            let mut sorted: Vec<&str> = list.to_vec();
+            sorted.sort_unstable();
+            let count = sorted.len();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                count,
+                "duplicate export names in family {family}"
+            );
+        }
     }
 }

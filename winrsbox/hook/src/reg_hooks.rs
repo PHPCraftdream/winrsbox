@@ -29,7 +29,7 @@ use ntapi::winapi::shared::ntdef::{HANDLE, NTSTATUS, OBJECT_ATTRIBUTES, UNICODE_
 use winapi::ctypes::c_void;
 
 use crate::anti_rec;
-use crate::hooks::{STATUS_ACCESS_DENIED, STATUS_NOT_SUPPORTED};
+use crate::hooks::{nt_call_original, STATUS_ACCESS_DENIED, STATUS_NOT_SUPPORTED};
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -218,31 +218,53 @@ unsafe fn query_key_full_path(key: HANDLE) -> Option<Vec<u16>> {
     if status < 0 || ret_len < 4 {
         return None;
     }
-    // KEY_NAME_INFORMATION: ULONG NameLength; WCHAR Name[1];
-    // SAFETY: deref of first 4 bytes as u32 — buf is 4096 bytes, status and ret_len validated above.
-    let name_len_bytes = *(buf.as_ptr() as *const u32) as usize;
-    let char_count = name_len_bytes / 2;
-    if char_count == 0 || 4 + name_len_bytes > buf.len() {
+    parse_key_name(&buf)
+}
+
+/// Parse KEY_NAME_INFORMATION bytes — ULONG NameLength followed by WCHAR
+/// Name[] — into the UTF-16 key name. Every read is byte-wise: `info` has
+/// alignment 1, so casting its base (or base+4) to `*const u32`/`*const u16`
+/// and dereferencing would be misaligned-UB — the fields are only naturally
+/// aligned when the backing allocation happens to be.
+fn parse_key_name(info: &[u8]) -> Option<Vec<u16>> {
+    if info.len() < 4 {
         return None;
     }
-    let buf_ptr = buf.as_ptr().add(4) as *const u16;
-    // SAFETY: from_raw_parts for char_count u16s starting at offset 4; buf is 4096 bytes, char_count ≤ 2048.
-    let slice = std::slice::from_raw_parts(buf_ptr, char_count);
-    Some(slice.to_vec())
+    let name_len_bytes = u32::from_ne_bytes([info[0], info[1], info[2], info[3]]) as usize;
+    let char_count = name_len_bytes / 2;
+    if char_count == 0 || 4 + name_len_bytes > info.len() {
+        return None;
+    }
+    Some(
+        info[4..4 + name_len_bytes]
+            .chunks_exact(2)
+            .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+            .collect(),
+    )
 }
 
 /// Extract UNICODE_STRING into Rust String (lossy).
 ///
 /// # SAFETY
-/// `ustr` must be a valid pointer to a UNICODE_STRING whose Buffer is valid for Length/2 WCHARs.
+/// `ustr` must be a valid pointer to a UNICODE_STRING whose Buffer is valid
+/// for Length/2 WCHARs. Validity is the caller's guarantee — alignment is
+/// NOT: hooked callers (OBJECT_ATTRIBUTES chains) choose the address, so the
+/// header is read field-wise with unaligned loads and the WCHARs are copied
+/// byte-wise. `Buffer` itself may sit at an odd address; `&*ustr` or
+/// `slice::from_raw_parts::<u16>` would assert an alignment nobody promised.
 unsafe fn ustr_to_string(ustr: *const UNICODE_STRING) -> Option<String> {
     if ustr.is_null() { return None; }
-    // SAFETY: deref of non-null UNICODE_STRING pointer — caller guarantees validity.
-    let u = &*ustr;
+    // SAFETY: read_unaligned of a non-null UNICODE_STRING pointer — caller
+    // guarantees validity, not alignment.
+    let u = (ustr as *const UNICODE_STRING).read_unaligned();
     let cc = (u.Length / 2) as usize;
     if cc == 0 || u.Buffer.is_null() { return None; }
-    // SAFETY: from_raw_parts for cc WCHARs from UNICODE_STRING.Buffer; Length field bounds the region.
-    Some(String::from_utf16_lossy(std::slice::from_raw_parts(u.Buffer, cc)))
+    // SAFETY: cc WCHARs read byte-wise from UNICODE_STRING.Buffer; Length
+    // bounds the region and read_unaligned imposes no alignment.
+    let chars: Vec<u16> = (0..cc)
+        .map(|i| (u.Buffer.cast::<u8>().add(i * 2) as *const u16).read_unaligned())
+        .collect();
+    Some(String::from_utf16_lossy(&chars))
 }
 
 /// Resolve OBJECT_ATTRIBUTES into a friendly registry path (HKLM\..., HKCU\...).
@@ -252,8 +274,9 @@ unsafe fn ustr_to_string(ustr: *const UNICODE_STRING) -> Option<String> {
 /// `attrs` must be a valid pointer to OBJECT_ATTRIBUTES with a live UNICODE_STRING ObjectName.
 unsafe fn resolve_attrs_friendly(attrs: *const OBJECT_ATTRIBUTES) -> Option<String> {
     if attrs.is_null() { return None; }
-    // SAFETY: deref of non-null OBJECT_ATTRIBUTES pointer — caller guarantees validity.
-    let oa = &*attrs;
+    // SAFETY: read_unaligned of a non-null OBJECT_ATTRIBUTES pointer — the
+    // (hostile) caller guarantees validity, not alignment.
+    let oa = (attrs as *const OBJECT_ATTRIBUTES).read_unaligned();
     let leaf = ustr_to_string(oa.ObjectName)?;
     let full_nt: Vec<u16> = if oa.RootDirectory.is_null() {
         leaf.encode_utf16().collect()
@@ -346,9 +369,10 @@ fn check_write_mode(friendly_key: &str, value_name: Option<String>) -> policy::M
 /// Registry access-mask bits whose presence in `DesiredAccess` means the
 /// caller can mutate the key (set values, create subkeys, delete it,
 /// change owner / DACL, or — via the generic / maximum aliases — the kernel
-/// could grant any of the above). When NONE of these bits is set, an
-/// `NtCreateKey` is effectively just an open and never lets the caller
-/// mutate state, so it's safe to bypass our Cow-downgrade fail-closed.
+/// could grant any of the above). When NONE of these bits is set, the
+/// handle can't mutate values, so only the deny-policy check applies —
+/// the silent_ok downgrade is skipped (denying read-only NtCreateKey on
+/// CoW prefixes broke dnsapi; see `nt_create_key_action`).
 ///
 /// Public for tests; not exported beyond the crate.
 pub(crate) const NT_CREATE_KEY_WRITE_BITS: u32 = {
@@ -377,6 +401,36 @@ pub(crate) fn nt_create_key_is_write_access(desired_access: u32) -> bool {
     (desired_access & NT_CREATE_KEY_WRITE_BITS) != 0
 }
 
+/// What [`hook_nt_create_key`] must do for a given access mask + policy mode.
+///
+/// The decision is made BEFORE the original NtCreateKey runs: NtCreateKey is
+/// create-or-open, and the `Disposition` out-param only reports
+/// created-vs-opened after the key already exists — too late to gate a
+/// deny-listed creation. So the policy consult runs for every call and only
+/// this mapping decides the outcome:
+///
+/// - `Mode::Deny` → deny, whatever the access mask: the syscall may CREATE
+///   the key in the real hive even when called with KEY_READ, and creation
+///   is the mutation that must be gated (audit 2026-09-19, Medium).
+/// - `Mode::Cow` + write-intent access → deny (silent_ok downgrade, H4).
+/// - `Mode::Cow` + read-only access → proceed: a KEY_READ handle can't write
+///   values, and denying here breaks dnsapi's `RegCreateKeyEx(KEY_READ)` on
+///   `HKLM\System\…` — the compat the old early-bypass existed for.
+/// - everything else → proceed (call original).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CreateKeyAction {
+    Proceed,
+    Deny,
+}
+
+pub(crate) fn nt_create_key_action(desired_access: u32, mode: policy::Mode) -> CreateKeyAction {
+    match mode {
+        policy::Mode::Deny => CreateKeyAction::Deny,
+        policy::Mode::Cow if nt_create_key_is_write_access(desired_access) => CreateKeyAction::Deny,
+        _ => CreateKeyAction::Proceed,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Hook handlers
 // ---------------------------------------------------------------------------
@@ -392,10 +446,11 @@ unsafe extern "system" fn hook_nt_create_key(
     disposition: *mut u32,
 ) -> NTSTATUS {
     let call_original = || {
-        // SAFETY: detour2 guarantees trampoline matches FnNtCreateKey ABI.
-        HOOK_CREATE_KEY.get().unwrap().call(
-            key_handle, desired_access, object_attributes,
-            title_index, class, create_options, disposition,
+        nt_call_original!(
+            &HOOK_CREATE_KEY,
+            "NtCreateKey",
+            (key_handle, desired_access, object_attributes,
+             title_index, class, create_options, disposition)
         )
     };
 
@@ -403,34 +458,26 @@ unsafe extern "system" fn hook_nt_create_key(
         return call_original();
     };
 
-    // Bypass the policy / Cow-downgrade path when the caller is asking for a
-    // read-only handle: NtCreateKey is the create-OR-open primitive, and a
-    // read-only desired access can't mutate the key even if NtCreateKey ends
-    // up creating it. dnsapi's `RegCreateKeyEx(KEY_READ)` on `HKLM\System\…`
-    // tripped the previous unconditional deny and cascaded into
-    // "Could not resolve host" inside the sandbox.
-    if !nt_create_key_is_write_access(desired_access) {
-        return call_original();
-    }
-
+    // NtCreateKey is create-or-open and CREATES the key regardless of
+    // DesiredAccess, so the policy consult must run for every call — the
+    // access mask only decides whether the silent_ok downgrade applies
+    // (see nt_create_key_action). The previous early-bypass for read-only
+    // masks let `NtCreateKey(KEY_READ)` create real keys under deny-listed
+    // prefixes (audit 2026-09-19, Medium).
     if let Some(friendly) = resolve_attrs_friendly(object_attributes as *const _) {
         let mode = check_write_mode(&friendly, None);
-        if matches!(mode, policy::Mode::Deny) {
-            if !key_handle.is_null() {
-                *key_handle = std::ptr::null_mut();
+        // Mode is Clone, not Copy — clone so we can still inspect `mode`
+        // below to tell the deny-policy deny apart from the Cow downgrade.
+        if let CreateKeyAction::Deny = nt_create_key_action(desired_access, mode.clone()) {
+            if matches!(mode, policy::Mode::Cow) {
+                // Deny came from the silent_ok downgrade (Cow + write-intent):
+                // log it so it shows up in violations.jsonl.
+                log_silent_ok_downgrade(
+                    &format!("NtCreateKey(da=0x{desired_access:x})"),
+                    &friendly,
+                    None,
+                );
             }
-            return STATUS_ACCESS_DENIED;
-        }
-        if matches!(mode, policy::Mode::Cow) {
-            // H4-parity: NtCreateKey was the only registry write hook missing the
-            // silent_ok arm, so a silent_ok key creation fell through to the real
-            // syscall. Downgrade to deny (fail-closed) like NtSetValueKey /
-            // NtDeleteValueKey / NtDeleteKey until the read-side overlay lands.
-            log_silent_ok_downgrade(
-                &format!("NtCreateKey(da=0x{desired_access:x})"),
-                &friendly,
-                None,
-            );
             if !key_handle.is_null() {
                 *key_handle = std::ptr::null_mut();
             }
@@ -461,9 +508,10 @@ unsafe extern "system" fn hook_nt_set_value_key(
     data_size: u32,
 ) -> NTSTATUS {
     let call_original = || {
-        // SAFETY: detour2 guarantees trampoline matches FnNtSetValueKey ABI.
-        HOOK_SET_VALUE_KEY.get().unwrap().call(
-            key_handle, value_name, title_index, value_type, data, data_size,
+        nt_call_original!(
+            &HOOK_SET_VALUE_KEY,
+            "NtSetValueKey",
+            (key_handle, value_name, title_index, value_type, data, data_size)
         )
     };
 
@@ -526,8 +574,7 @@ unsafe extern "system" fn hook_nt_delete_value_key(
     value_name: *mut UNICODE_STRING,
 ) -> NTSTATUS {
     let call_original = || {
-        // SAFETY: detour2 guarantees trampoline matches FnNtDeleteValueKey ABI.
-        HOOK_DELETE_VALUE_KEY.get().unwrap().call(key_handle, value_name)
+        nt_call_original!(&HOOK_DELETE_VALUE_KEY, "NtDeleteValueKey", (key_handle, value_name))
     };
 
     let Some(_guard) = anti_rec::enter() else {
@@ -559,8 +606,7 @@ unsafe extern "system" fn hook_nt_delete_value_key(
 // SAFETY: Called by detour2 dispatcher with the same ABI as ntdll!NtDeleteKey.
 unsafe extern "system" fn hook_nt_delete_key(key_handle: HANDLE) -> NTSTATUS {
     let call_original = || {
-        // SAFETY: detour2 guarantees trampoline matches FnNtDeleteKey ABI.
-        HOOK_DELETE_KEY.get().unwrap().call(key_handle)
+        nt_call_original!(&HOOK_DELETE_KEY, "NtDeleteKey", (key_handle))
     };
 
     let Some(_guard) = anti_rec::enter() else {
@@ -628,7 +674,7 @@ unsafe extern "system" fn hook_nt_rename_key(
     new_name: *mut UNICODE_STRING,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
-        return HOOK_RENAME_KEY.get().unwrap().call(key_handle, new_name);
+        return nt_call_original!(&HOOK_RENAME_KEY, "NtRenameKey", (key_handle, new_name));
     };
     let target = if !key_handle.is_null() {
         resolve_handle_friendly(key_handle).or_else(|| ustr_to_string(new_name as *const _))
@@ -645,7 +691,7 @@ unsafe extern "system" fn hook_nt_save_key(
     file_handle: HANDLE,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
-        return HOOK_SAVE_KEY.get().unwrap().call(key_handle, file_handle);
+        return nt_call_original!(&HOOK_SAVE_KEY, "NtSaveKey", (key_handle, file_handle));
     };
     let target = resolve_handle_friendly(key_handle);
     log_persistence_blocked("NtSaveKey", target);
@@ -659,7 +705,7 @@ unsafe extern "system" fn hook_nt_save_key_ex(
     format: usize,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
-        return HOOK_SAVE_KEY_EX.get().unwrap().call(key_handle, file_handle, format);
+        return nt_call_original!(&HOOK_SAVE_KEY_EX, "NtSaveKeyEx", (key_handle, file_handle, format));
     };
     let target = resolve_handle_friendly(key_handle);
     log_persistence_blocked("NtSaveKeyEx", target);
@@ -673,7 +719,7 @@ unsafe extern "system" fn hook_nt_restore_key(
     flags: usize,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
-        return HOOK_RESTORE_KEY.get().unwrap().call(key_handle, file_handle, flags);
+        return nt_call_original!(&HOOK_RESTORE_KEY, "NtRestoreKey", (key_handle, file_handle, flags));
     };
     let target = resolve_handle_friendly(key_handle);
     log_persistence_blocked("NtRestoreKey", target);
@@ -686,7 +732,7 @@ unsafe extern "system" fn hook_nt_load_key(
     source_file: *mut OBJECT_ATTRIBUTES,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
-        return HOOK_LOAD_KEY.get().unwrap().call(target_key, source_file);
+        return nt_call_original!(&HOOK_LOAD_KEY, "NtLoadKey", (target_key, source_file));
     };
     let target = resolve_attrs_friendly(target_key as *const _);
     log_persistence_blocked("NtLoadKey", target);
@@ -705,9 +751,11 @@ unsafe extern "system" fn hook_nt_load_key_ex(
     io_status: *mut c_void,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
-        return HOOK_LOAD_KEY_EX.get().unwrap().call(
-            target_key, source_file, flags, trust_class_key,
-            event, desired_access, root_handle, io_status,
+        return nt_call_original!(
+            &HOOK_LOAD_KEY_EX,
+            "NtLoadKeyEx",
+            (target_key, source_file, flags, trust_class_key,
+             event, desired_access, root_handle, io_status)
         );
     };
     let target = resolve_attrs_friendly(target_key as *const _);
@@ -725,7 +773,7 @@ unsafe extern "system" fn hook_nt_unload_key(
     target_key: *mut OBJECT_ATTRIBUTES,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
-        return HOOK_UNLOAD_KEY.get().unwrap().call(target_key);
+        return nt_call_original!(&HOOK_UNLOAD_KEY, "NtUnloadKey", (target_key));
     };
     let target = resolve_attrs_friendly(target_key as *const _);
     log_persistence_blocked("NtUnloadKey", target);
@@ -738,7 +786,7 @@ unsafe extern "system" fn hook_nt_unload_key_2(
     flags: usize,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
-        return HOOK_UNLOAD_KEY_2.get().unwrap().call(target_key, flags);
+        return nt_call_original!(&HOOK_UNLOAD_KEY_2, "NtUnloadKey2", (target_key, flags));
     };
     let target = resolve_attrs_friendly(target_key as *const _);
     log_persistence_blocked("NtUnloadKey2", target);
@@ -751,7 +799,7 @@ unsafe extern "system" fn hook_nt_unload_key_ex(
     event: HANDLE,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
-        return HOOK_UNLOAD_KEY_EX.get().unwrap().call(target_key, event);
+        return nt_call_original!(&HOOK_UNLOAD_KEY_EX, "NtUnloadKeyEx", (target_key, event));
     };
     let target = resolve_attrs_friendly(target_key as *const _);
     log_persistence_blocked("NtUnloadKeyEx", target);
@@ -765,7 +813,7 @@ unsafe extern "system" fn hook_nt_replace_key(
     old_file: *mut OBJECT_ATTRIBUTES,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
-        return HOOK_REPLACE_KEY.get().unwrap().call(new_file, target_handle, old_file);
+        return nt_call_original!(&HOOK_REPLACE_KEY, "NtReplaceKey", (new_file, target_handle, old_file));
     };
     let target = resolve_handle_friendly(target_handle)
         .or_else(|| resolve_attrs_friendly(new_file as *const _));
@@ -812,9 +860,11 @@ unsafe extern "system" fn hook_nt_create_key_transacted(
     disposition: *mut u32,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
-        return HOOK_CREATE_KEY_TRANSACTED.get().unwrap().call(
-            key_handle, desired_access, object_attributes,
-            title_index, class, create_options, transaction, disposition,
+        return nt_call_original!(
+            &HOOK_CREATE_KEY_TRANSACTED,
+            "NtCreateKeyTransacted",
+            (key_handle, desired_access, object_attributes,
+             title_index, class, create_options, transaction, disposition)
         );
     };
     let target = resolve_attrs_friendly(object_attributes as *const _);
@@ -833,8 +883,10 @@ unsafe extern "system" fn hook_nt_open_key_transacted(
     transaction: HANDLE,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
-        return HOOK_OPEN_KEY_TRANSACTED.get().unwrap().call(
-            key_handle, desired_access, object_attributes, transaction,
+        return nt_call_original!(
+            &HOOK_OPEN_KEY_TRANSACTED,
+            "NtOpenKeyTransacted",
+            (key_handle, desired_access, object_attributes, transaction)
         );
     };
     let target = resolve_attrs_friendly(object_attributes as *const _);
@@ -854,8 +906,10 @@ unsafe extern "system" fn hook_nt_open_key_transacted_ex(
     transaction: HANDLE,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
-        return HOOK_OPEN_KEY_TRANSACTED_EX.get().unwrap().call(
-            key_handle, desired_access, object_attributes, open_options, transaction,
+        return nt_call_original!(
+            &HOOK_OPEN_KEY_TRANSACTED_EX,
+            "NtOpenKeyTransactedEx",
+            (key_handle, desired_access, object_attributes, open_options, transaction)
         );
     };
     let target = resolve_attrs_friendly(object_attributes as *const _);
@@ -976,6 +1030,92 @@ pub unsafe fn uninstall() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── unaligned-read regression (alignment-UB class, mirrors 9d73d34) ──
+    //
+    // query_key_full_path parses NtQueryKey's KEY_NAME_INFORMATION out of a
+    // Vec<u8> (alignment 1) and ustr_to_string / resolve_attrs_friendly read
+    // caller-supplied OBJECT_ATTRIBUTES/UNICODE_STRING chains. None of those
+    // bases carries an alignment guarantee, so every multi-byte access must
+    // be byte-wise or read_unaligned. The probes below force ODD base
+    // addresses on purpose — a helper that padded every record would hand
+    // back an 8-aligned buffer and prove nothing.
+
+    /// Byte offset within `backing` whose address is ODD.
+    fn odd_offset(backing: &[u8]) -> usize {
+        let off = 1 - (backing.as_ptr() as usize % 2);
+        assert_eq!((backing.as_ptr() as usize + off) % 2, 1, "probe must sit at an odd address");
+        off
+    }
+
+    /// Copy `value`'s bytes to `dst` — any alignment.
+    unsafe fn place_at<T>(dst: *mut u8, value: &T) {
+        std::ptr::copy_nonoverlapping(
+            value as *const T as *const u8,
+            dst,
+            std::mem::size_of::<T>(),
+        );
+    }
+
+    /// KEY_NAME_INFORMATION at an odd address: the old
+    /// `*(buf.as_ptr() as *const u32)` + `from_raw_parts::<u16>(base+4)`
+    /// pair aborted here (misaligned dereference, 0xc0000409) instead of
+    /// returning the name.
+    #[test]
+    fn parse_key_name_reads_misaligned_probe() {
+        let mut backing = vec![0u8; 64];
+        let off = odd_offset(&backing);
+        let info: [u8; 12] = [
+            8, 0, 0, 0, // NameLength = 8 bytes
+            b'A', 0, b'B', 0, b'C', 0, b'D', 0,
+        ];
+        // SAFETY: off ≤ 1 and 12 bytes fit inside the 64-byte backing.
+        unsafe { std::ptr::copy_nonoverlapping(info.as_ptr(), backing.as_mut_ptr().add(off), 12) };
+        // SAFETY: covers the 12 written bytes inside `backing`.
+        let probe = unsafe { std::slice::from_raw_parts(backing.as_ptr().add(off), 12) };
+        assert_eq!(parse_key_name(probe), Some(vec![0x0041, 0x0042, 0x0043, 0x0044]));
+    }
+
+    #[test]
+    fn parse_key_name_rejects_malformed_probes() {
+        assert_eq!(parse_key_name(&[]), None);
+        assert_eq!(parse_key_name(&[4, 0]), None);
+        assert_eq!(parse_key_name(&[0, 0, 0, 0]), None, "zero-length name");
+        assert_eq!(parse_key_name(&[8, 0, 0, 0, b'A', 0]), None, "length past buffer");
+    }
+
+    /// UNICODE_STRING header AND WCHAR buffer each placed at an odd address:
+    /// the old `&*ustr` asserted 8-byte header alignment and
+    /// `from_raw_parts::<u16>` asserted Buffer evenness — both abort here.
+    #[test]
+    fn ustr_to_string_reads_misaligned_header_and_buffer() {
+        let pattern = "*.log";
+        let wchars: Vec<u16> = pattern.encode_utf16().collect();
+        let mut text_backing = vec![0u8; wchars.len() * 2 + 8];
+        let toff = odd_offset(&text_backing);
+        // SAFETY: u8 view of an aligned Vec<u16> payload of the same length.
+        let wc_bytes = unsafe {
+            std::slice::from_raw_parts(wchars.as_ptr() as *const u8, wchars.len() * 2)
+        };
+        text_backing[toff..toff + wc_bytes.len()].copy_from_slice(wc_bytes);
+
+        let mut header_backing = vec![0u8; std::mem::size_of::<UNICODE_STRING>() + 8];
+        let hoff = odd_offset(&header_backing);
+        let header = UNICODE_STRING {
+            Length: (wchars.len() * 2) as u16,
+            MaximumLength: (wchars.len() * 2 + 2) as u16,
+            // SAFETY: pointer into `text_backing` at the odd offset, valid
+            // for Length bytes; `text_backing` outlives the call below.
+            Buffer: unsafe { text_backing.as_ptr().add(toff) } as *mut u16,
+        };
+        // SAFETY: hoff ≤ 1, struct fits the backing allocation.
+        unsafe { place_at(header_backing.as_mut_ptr().add(hoff), &header) };
+        let odd_header =
+            unsafe { header_backing.as_ptr().add(hoff) as *const UNICODE_STRING };
+        // SAFETY: the odd header is a byte-identical, live UNICODE_STRING.
+        let parsed = unsafe { ustr_to_string(odd_header) };
+        assert_eq!(parsed.as_deref(), Some(pattern));
+    }
 
     #[test]
     fn deny_mode_enum_match() {
@@ -1313,5 +1453,89 @@ mod tests {
             // Step to next bit; explicit overflow wrap exits the loop.
             bit = bit.checked_shl(1).unwrap_or(0);
         }
+    }
+
+    // ── NtCreateKey gate: the creation is gated, not the access mask ─────
+    //
+    // Audit 2026-09-19 (Medium): the old code early-returned call_original()
+    // for any DesiredAccess without write bits, so NtCreateKey(KEY_READ)
+    // created real keys under deny-listed prefixes. NtCreateKey creates the
+    // key regardless of the requested access, and Disposition only reports
+    // created-vs-opened after the key already exists — the decision has to
+    // happen before the call.
+
+    #[test]
+    fn create_key_deny_prefix_denied_even_with_key_read() {
+        use access_masks::*;
+        // The audit repro shape: create-or-open with KEY_READ against a
+        // deny rule. Old behaviour: early-bypass → key created for real.
+        assert_eq!(
+            nt_create_key_action(KEY_READ, policy::Mode::Deny),
+            CreateKeyAction::Deny,
+        );
+        assert_eq!(
+            nt_create_key_action(KEY_QUERY_VALUE, policy::Mode::Deny),
+            CreateKeyAction::Deny,
+        );
+        assert_eq!(
+            nt_create_key_action(0, policy::Mode::Deny),
+            CreateKeyAction::Deny,
+        );
+    }
+
+    #[test]
+    fn create_key_deny_prefix_denied_with_write_intent() {
+        use access_masks::*;
+        // Pre-existing deny behaviour must survive the refactor.
+        assert_eq!(
+            nt_create_key_action(KEY_WRITE, policy::Mode::Deny),
+            CreateKeyAction::Deny,
+        );
+        assert_eq!(
+            nt_create_key_action(KEY_ALL_ACCESS, policy::Mode::Deny),
+            CreateKeyAction::Deny,
+        );
+    }
+
+    #[test]
+    fn create_key_cow_read_only_proceeds() {
+        use access_masks::*;
+        // DNS-in-sandbox compat: read-only create-or-open on a CoW prefix
+        // is effectively an open of an existing key — must NOT be denied.
+        assert_eq!(
+            nt_create_key_action(KEY_READ, policy::Mode::Cow),
+            CreateKeyAction::Proceed,
+        );
+    }
+
+    #[test]
+    fn create_key_cow_write_intent_denied() {
+        use access_masks::*;
+        // H4 silent_ok downgrade: writable handle + CoW → deny.
+        assert_eq!(
+            nt_create_key_action(KEY_WRITE, policy::Mode::Cow),
+            CreateKeyAction::Deny,
+        );
+        assert_eq!(
+            nt_create_key_action(MAXIMUM_ALLOWED, policy::Mode::Cow),
+            CreateKeyAction::Deny,
+        );
+    }
+
+    #[test]
+    fn create_key_passthrough_and_mock_proceed() {
+        use access_masks::*;
+        assert_eq!(
+            nt_create_key_action(KEY_WRITE, policy::Mode::Passthrough),
+            CreateKeyAction::Proceed,
+        );
+        assert_eq!(
+            nt_create_key_action(KEY_READ, policy::Mode::Passthrough),
+            CreateKeyAction::Proceed,
+        );
+        assert_eq!(
+            nt_create_key_action(KEY_READ, policy::Mode::Mock),
+            CreateKeyAction::Proceed,
+        );
     }
 }

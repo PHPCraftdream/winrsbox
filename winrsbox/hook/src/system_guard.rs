@@ -35,7 +35,7 @@ use winapi::ctypes::c_void;
 
 use crate::anti_rec;
 use crate::hooks::{
-    buffer_install_error, ipc_log, is_trace, ntdll_export,
+    buffer_install_error, ipc_log, is_trace, ntdll_export, nt_call_original,
     STATUS_ACCESS_DENIED, STATUS_PRIVILEGE_NOT_HELD,
 };
 
@@ -113,10 +113,8 @@ static HOOK_UNLOAD_DRIVER: OnceLock<GenericDetour<FnNtUnloadDriver>> = OnceLock:
 
 // SAFETY: Called by detour2 dispatcher with ntdll!NtShutdownSystem ABI.
 unsafe extern "system" fn hook_nt_shutdown_system(action: u32) -> NTSTATUS {
-    let call_original = || {
-        // SAFETY: detour2 trampoline matches FnNtShutdownSystem ABI.
-        HOOK_SHUTDOWN.get().unwrap().call(action)
-    };
+    let call_original =
+        || nt_call_original!(&HOOK_SHUTDOWN, "NtShutdownSystem", (action));
     let Some(_g) = anti_rec::enter() else { return call_original(); };
     if is_trace() {
         ipc_log(ipc::LogLevel::Trace,
@@ -129,10 +127,8 @@ unsafe extern "system" fn hook_nt_shutdown_system(action: u32) -> NTSTATUS {
 unsafe extern "system" fn hook_nt_set_system_information(
     class: u32, info: *mut c_void, len: u32,
 ) -> NTSTATUS {
-    let call_original = || {
-        // SAFETY: detour2 trampoline matches FnNtSetSystemInformation ABI.
-        HOOK_SET_SYS_INFO.get().unwrap().call(class, info, len)
-    };
+    let call_original =
+        || nt_call_original!(&HOOK_SET_SYS_INFO, "NtSetSystemInformation", (class, info, len));
     let Some(_g) = anti_rec::enter() else { return call_original(); };
     if is_trace() {
         ipc_log(ipc::LogLevel::Trace,
@@ -149,8 +145,7 @@ unsafe extern "system" fn hook_nt_create_debug_object(
     flags: u32,
 ) -> NTSTATUS {
     let call_original = || {
-        // SAFETY: detour2 trampoline matches FnNtCreateDebugObject ABI.
-        HOOK_CREATE_DEBUG_OBJ.get().unwrap().call(handle, access, attrs, flags)
+        nt_call_original!(&HOOK_CREATE_DEBUG_OBJ, "NtCreateDebugObject", (handle, access, attrs, flags))
     };
     let Some(_g) = anti_rec::enter() else { return call_original(); };
     if is_trace() {
@@ -173,9 +168,11 @@ unsafe extern "system" fn hook_nt_raise_hard_error(
     response: *mut u32,
 ) -> NTSTATUS {
     let call_original = || {
-        // SAFETY: detour2 trampoline matches FnNtRaiseHardError ABI.
-        HOOK_RAISE_HARD_ERROR.get().unwrap().call(
-            error_status, num_params, unicode_mask, params, response_option, response)
+        nt_call_original!(
+            &HOOK_RAISE_HARD_ERROR,
+            "NtRaiseHardError",
+            (error_status, num_params, unicode_mask, params, response_option, response)
+        )
     };
     let Some(_g) = anti_rec::enter() else { return call_original(); };
     if is_trace() {
@@ -201,9 +198,11 @@ unsafe extern "system" fn hook_nt_create_symbolic_link_object(
     link_target: *const UNICODE_STRING,
 ) -> NTSTATUS {
     let call_original = || {
-        // SAFETY: detour2 trampoline matches FnNtCreateSymbolicLinkObject ABI.
-        HOOK_CREATE_SYMLINK_OBJ.get().unwrap().call(
-            link_handle, desired_access, object_attributes, link_target)
+        nt_call_original!(
+            &HOOK_CREATE_SYMLINK_OBJ,
+            "NtCreateSymbolicLinkObject",
+            (link_handle, desired_access, object_attributes, link_target)
+        )
     };
     let Some(_g) = anti_rec::enter() else { return call_original(); };
     if is_trace() {
@@ -233,10 +232,8 @@ unsafe extern "system" fn hook_nt_create_symbolic_link_object(
 unsafe extern "system" fn hook_nt_load_driver(
     driver_service_name: *const UNICODE_STRING,
 ) -> NTSTATUS {
-    let call_original = || {
-        // SAFETY: detour2 trampoline matches FnNtLoadDriver ABI.
-        HOOK_LOAD_DRIVER.get().unwrap().call(driver_service_name)
-    };
+    let call_original =
+        || nt_call_original!(&HOOK_LOAD_DRIVER, "NtLoadDriver", (driver_service_name));
     let Some(_g) = anti_rec::enter() else { return call_original(); };
     if is_trace() {
         // SAFETY: extract_unicode_string is defensive against null / empty / bogus Length.
@@ -255,10 +252,8 @@ unsafe extern "system" fn hook_nt_load_driver(
 unsafe extern "system" fn hook_nt_unload_driver(
     driver_service_name: *const UNICODE_STRING,
 ) -> NTSTATUS {
-    let call_original = || {
-        // SAFETY: detour2 trampoline matches FnNtUnloadDriver ABI.
-        HOOK_UNLOAD_DRIVER.get().unwrap().call(driver_service_name)
-    };
+    let call_original =
+        || nt_call_original!(&HOOK_UNLOAD_DRIVER, "NtUnloadDriver", (driver_service_name));
     let Some(_g) = anti_rec::enter() else { return call_original(); };
     if is_trace() {
         // SAFETY: extract_unicode_string is defensive against null / empty / bogus Length.
@@ -487,6 +482,24 @@ mod tests {
         // SAFETY: backing storage (`wide`) outlives the borrow; Length matches the slice in bytes.
         let s = unsafe { extract_unicode_string(&ustr as *const UNICODE_STRING) };
         assert_eq!(s, "\\??\\C:");
+    }
+
+    // Detour-absent fail-closed: hook_nt_load_driver entered with its
+    // OnceLock detour UNSET (always the case under `cargo test`, where no
+    // detour is ever installed) must return STATUS_ACCESS_DENIED, not
+    // unwrap-panic. A panic here is inside an `unsafe extern "system"` fn,
+    // which cannot unwind: the whole test binary aborts. Holding anti_rec
+    // forces the hook into its re-entrancy passthrough branch, which is
+    // exactly the `call_original()` path the fix covers.
+    #[test]
+    fn load_driver_fails_closed_when_detour_absent() {
+        let _g = anti_rec::enter().expect("test thread must not be re-entrant");
+        // SAFETY: the passthrough branch runs before any input is dereferenced;
+        // the driver_service_name pointer is never touched when the detour is
+        // absent (fail-closed returns before the trampoline call).
+        let rc = unsafe { hook_nt_load_driver(std::ptr::null()) };
+        drop(_g);
+        assert_eq!(rc as u32, 0xC000_0022, "expected STATUS_ACCESS_DENIED");
     }
 
     #[test]

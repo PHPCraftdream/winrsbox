@@ -7,7 +7,10 @@
 //         is out of scope).
 // Hook 2: Integrated into hooks.rs hook_nt_create_user_process — blocks denylisted
 //         executables (wsl, wmic, LOLBins) and parent-PID spoofing via
-//         PROC_THREAD_ATTRIBUTE_PARENT_PROCESS.
+//         PROC_THREAD_ATTRIBUTE_PARENT_PROCESS. The denylist matches BOTH
+//         image-name sources: the kernel-authoritative PsAttributeImageName
+//         (attribute 5) and the informational RTL_USER_PROCESS_PARAMETERS
+//         .ImagePathName.
 // Hook 3: NtAssignProcessToJobObject — unconditionally denies Job reassignment
 //         from within the sandbox, preventing nested-Job escape on Win10+.
 // Hook 4: NtSetInformationProcess — blocks dangerous ProcessInformationClass
@@ -23,9 +26,14 @@ use ntapi::winapi::shared::ntdef::{HANDLE, NTSTATUS, OBJECT_ATTRIBUTES};
 use winapi::ctypes::c_void;
 use winapi::um::processthreadsapi::GetCurrentProcessId;
 use winapi::shared::ntdef::ULONG;
+use winapi::um::memoryapi::VirtualQuery;
+use winapi::um::winnt::{
+    MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+};
 
 use crate::anti_rec;
-use crate::hooks::{ipc_log, is_trace, STATUS_ACCESS_DENIED};
+use crate::hooks::{ipc_log, is_trace, nt_call_original, STATUS_ACCESS_DENIED};
 use crate::process_tracker;
 
 // ---------------------------------------------------------------------------
@@ -174,8 +182,10 @@ unsafe extern "system" fn hook_nt_open_process(
     client_id: *const CLIENT_ID,
 ) -> NTSTATUS {
     let call_original = || {
-        HOOK_NT_OPEN_PROCESS.get().unwrap().call(
-            process_handle, desired_access, object_attributes, client_id,
+        nt_call_original!(
+            &HOOK_NT_OPEN_PROCESS,
+            "NtOpenProcess",
+            (process_handle, desired_access, object_attributes, client_id)
         )
     };
 
@@ -212,9 +222,8 @@ unsafe extern "system" fn hook_nt_assign_process_to_job_object(
     job: *mut c_void,
     process: *mut c_void,
 ) -> NTSTATUS {
-    let call_original = || {
-        HOOK_NT_ASSIGN_JOB.get().unwrap().call(job, process)
-    };
+    let call_original =
+        || nt_call_original!(&HOOK_NT_ASSIGN_JOB, "NtAssignProcessToJobObject", (job, process));
 
     let Some(_guard) = anti_rec::enter() else {
         return call_original();
@@ -276,7 +285,8 @@ unsafe extern "system" fn hook_nt_set_information_process(
     len: ULONG,
 ) -> NTSTATUS {
     let call_original = || {
-        HOOK_NT_SET_INFO_PROCESS.get().unwrap().call(process_handle, class, info, len)
+        nt_call_original!(&HOOK_NT_SET_INFO_PROCESS, "NtSetInformationProcess",
+            (process_handle, class, info, len))
     };
 
     let Some(_guard) = anti_rec::enter() else {
@@ -313,7 +323,8 @@ unsafe extern "system" fn hook_nt_terminate_process(
     exit_status: NTSTATUS,
 ) -> NTSTATUS {
     let call_original = || {
-        HOOK_NT_TERMINATE_PROCESS.get().unwrap().call(process_handle, exit_status)
+        nt_call_original!(&HOOK_NT_TERMINATE_PROCESS, "NtTerminateProcess",
+            (process_handle, exit_status))
     };
 
     let Some(_guard) = anti_rec::enter() else {
@@ -711,6 +722,10 @@ fn original_filename(image_path: &str) -> Option<String> {
 
 /// Check if the attribute list contains PROC_THREAD_ATTRIBUTE_PARENT_PROCESS.
 ///
+/// This is a spawn VETO: it also returns true when the list's
+/// `PsAttributeImageName` record (number 5) names a denylisted executable —
+/// see `attr5_image_denied` for why attribute 5 is the authoritative source.
+///
 /// The PS_ATTRIBUTE encoding: `Attribute = (number) | (input ? 0x20000 : 0) | ...`.
 /// PsAttributeParentProcess has number 0 in the NT attribute table.
 /// In the PS_ATTRIBUTE_LIST passed to NtCreateUserProcess, the encoded value
@@ -720,17 +735,14 @@ pub fn attribute_list_contains_parent_process(attr_list: *const c_void) -> bool 
     if attr_list.is_null() {
         return false;
     }
-    let list = attr_list as *const PS_ATTRIBUTE_LIST;
-    let total = unsafe { (*list).TotalLength };
-    if total < std::mem::size_of::<usize>() {
+    let Some(count) = attr_count(attr_list) else {
         return false;
-    }
-    let attr_count = (total - std::mem::size_of::<usize>()) / std::mem::size_of::<PS_ATTRIBUTE>();
-    if attr_count == 0 {
-        return false;
-    }
-    let attrs = unsafe { (*list).Attributes.as_ptr() };
-    for i in 0..attr_count {
+    };
+    // SAFETY: attr_count validated that attr_list is readable and that
+    // `count` whole records fit in the readable extent after TotalLength.
+    let attrs = unsafe { (*(attr_list as *const PS_ATTRIBUTE_LIST)).Attributes.as_ptr() };
+    for i in 0..count {
+        // SAFETY: i < count, clamped by attr_count to the readable extent.
         let attr = unsafe { &*attrs.add(i) };
         // PsAttributeParentProcess number = 0, encoded with input flag = 0x20000.
         // Match lower 16 bits == 0 — this is the attribute number.
@@ -738,7 +750,7 @@ pub fn attribute_list_contains_parent_process(attr_list: *const c_void) -> bool 
             return true;
         }
     }
-    false
+    attr5_image_denied(attr_list)
 }
 
 // ---------------------------------------------------------------------------
@@ -747,6 +759,10 @@ pub fn attribute_list_contains_parent_process(attr_list: *const c_void) -> bool 
 
 /// Check if the attribute list contains PROC_THREAD_ATTRIBUTE_HANDLE_LIST.
 ///
+/// This is a spawn VETO: it also returns true when the list's
+/// `PsAttributeImageName` record (number 5) names a denylisted executable —
+/// see `attr5_image_denied` for why attribute 5 is the authoritative source.
+///
 /// PsAttributeHandleList has attribute number 2 in the NT attribute table.
 /// The encoded value uses 0x00020002 (number=2 | PS_ATTRIBUTE_INPUT).
 /// We match on the lower 16 bits == 2 (PsAttributeHandleList number).
@@ -754,23 +770,20 @@ pub fn attribute_list_contains_handle_list(attr_list: *const c_void) -> bool {
     if attr_list.is_null() {
         return false;
     }
-    let list = attr_list as *const PS_ATTRIBUTE_LIST;
-    let total = unsafe { (*list).TotalLength };
-    if total < std::mem::size_of::<usize>() {
+    let Some(count) = attr_count(attr_list) else {
         return false;
-    }
-    let attr_count = (total - std::mem::size_of::<usize>()) / std::mem::size_of::<PS_ATTRIBUTE>();
-    if attr_count == 0 {
-        return false;
-    }
-    let attrs = unsafe { (*list).Attributes.as_ptr() };
-    for i in 0..attr_count {
+    };
+    // SAFETY: attr_count validated that attr_list is readable and that
+    // `count` whole records fit in the readable extent after TotalLength.
+    let attrs = unsafe { (*(attr_list as *const PS_ATTRIBUTE_LIST)).Attributes.as_ptr() };
+    for i in 0..count {
+        // SAFETY: i < count, clamped by attr_count to the readable extent.
         let attr = unsafe { &*attrs.add(i) };
         if (attr.Attribute & 0xFFFF) == 2 {
             return true;
         }
     }
-    false
+    attr5_image_denied(attr_list)
 }
 
 // ---------------------------------------------------------------------------
@@ -808,25 +821,158 @@ pub(crate) unsafe fn image_name_attr_mut(attr_list: *mut c_void) -> Option<*mut 
 
 /// Bounds-checked walk of the attribute list, returning the count of attribute
 /// records (excluding the leading `TotalLength` field). Returns `None` if the
-/// list is null or malformed (TotalLength too small).
+/// list is null, malformed (TotalLength too small), or not backed by readable
+/// memory.
+///
+/// `TotalLength` is caller-controlled, so it is CLAMPED to the readable extent
+/// of the buffer's memory region before it is used to derive the record count
+/// (audit 2026-09-19, Medium): a hostile length must never drive the walk off
+/// the mapping — an access violation inside a hook kills the process, since
+/// nothing wraps hook bodies in SEH. Only whole records that fit BOTH the
+/// declared length and the readable region are counted.
 ///
 /// Pure + shared between the C0 diagnostic dump and the C1 mutator.
 fn attr_count(attr_list: *const c_void) -> Option<usize> {
     if attr_list.is_null() {
         return None;
     }
-    // SAFETY: attr_list is a valid PS_ATTRIBUTE_LIST pointer per the
-    // NtCreateUserProcess contract. We only read TotalLength here.
-    let list = attr_list as *const PS_ATTRIBUTE_LIST;
-    let total = unsafe { (*list).TotalLength };
-    if total < std::mem::size_of::<usize>() {
+    let (base, len) = readable_region(attr_list)?;
+    // SAFETY: attr_list points into a committed, readable region (checked
+    // just above), so reading the TotalLength header is in-bounds.
+    let declared = unsafe { (*(attr_list as *const PS_ATTRIBUTE_LIST)).TotalLength };
+    if declared < std::mem::size_of::<usize>() {
         return None;
     }
-    let count = (total - std::mem::size_of::<usize>()) / std::mem::size_of::<PS_ATTRIBUTE>();
+    let off = attr_list as usize - base as usize;
+    let avail_after_header =
+        len.checked_sub(off)?.checked_sub(std::mem::size_of::<usize>())?;
+    let total = declared.min(avail_after_header);
+    let count = total / std::mem::size_of::<PS_ATTRIBUTE>();
     if count == 0 {
+        None
+    } else {
+        Some(count)
+    }
+}
+
+/// Readable-region query for a caller-supplied pointer.
+///
+/// Returns `(base, len)` of the committed, currently-readable memory region
+/// containing `addr`, or `None` when the address is null, unqueryable, or not
+/// in a readable region. Every caller-controlled length in this module is
+/// clamped through this before it is followed.
+///
+/// `pub(crate)` so hooks.rs can clamp the spawn-time guard-environment walk
+/// (audit 2026-09-19 High) through the same vetted probe.
+pub(crate) fn readable_region(addr: *const c_void) -> Option<(*const u8, usize)> {
+    if addr.is_null() {
         return None;
     }
-    Some(count)
+    // SAFETY: `mbi` is a plain C POD; all-bits-zero is a valid initial state
+    // and VirtualQuery fully overwrites it on success.
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `mbi` is valid for writes of its size for the duration of the call.
+    let got = unsafe {
+        VirtualQuery(addr, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>())
+    };
+    if got == 0 {
+        return None;
+    }
+    if mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) != 0 {
+        return None;
+    }
+    const READABLE: u32 = PAGE_READONLY
+        | PAGE_READWRITE
+        | PAGE_WRITECOPY
+        | PAGE_EXECUTE_READ
+        | PAGE_EXECUTE_READWRITE
+        | PAGE_EXECUTE_WRITECOPY;
+    if (mbi.Protect & READABLE) == 0 {
+        return None;
+    }
+    let base = mbi.BaseAddress as usize;
+    let end = base.checked_add(mbi.RegionSize)?;
+    let a = addr as usize;
+    if a < base || a >= end {
+        return None;
+    }
+    Some((base as *const u8, mbi.RegionSize))
+}
+
+/// Veto on the `PsAttributeImageName` attribute record (number 5).
+///
+/// The kernel image loader opens the child EXE by the path in THIS record,
+/// not by `RTL_USER_PROCESS_PARAMETERS.ImagePathName` (offset 0x60, which is
+/// informational PEB data a guest controls independently) — so the spawn
+/// denylist must match this record, else a guest decoys ImagePathName while
+/// attribute 5 names a denylisted binary (audit 2026-09-19, High). Value is a
+/// raw PWSTR and Size is the byte length excluding the trailing NUL,
+/// confirmed empirically by the C0 diagnostic dump.
+///
+/// A mismatch between the two sources needs no separate veto: both are
+/// denylist-checked independently and the kernel only ever loads attribute 5,
+/// so a decoy can only cause over-blocking, never a bypass.
+///
+/// Returns true when the record is present, readable, and denylisted.
+/// Absent/unreadable records yield false: without a usable image name the
+/// kernel itself cannot load an image, so the syscall fails downstream.
+fn attr5_image_denied(attr_list: *const c_void) -> bool {
+    let Some(name) = image_name_from_attr_list(attr_list) else {
+        return false;
+    };
+    if !is_denylisted(&name) {
+        return false;
+    }
+    if is_trace() {
+        ipc_log(ipc::LogLevel::Trace,
+            format!("spawn_image_attr_denied: {name}"));
+    }
+    true
+}
+
+/// Extract the `PsAttributeImageName` (attribute number 5) value as a String.
+///
+/// Every length is validated against the actual buffer before it is followed:
+/// the record count via `attr_count` (clamped to the readable region), and the
+/// record's `Size` via a `readable_region` check of `Value` (clamped to the
+/// readable extent, capped at 0x10000 bytes like the C0 dump). Null /
+/// odd-sized / oversized / unreadable → None — the same defensive standard as
+/// `extract_image_path`. Never dereferences outside a validated region.
+pub(crate) fn image_name_from_attr_list(attr_list: *const c_void) -> Option<String> {
+    let count = attr_count(attr_list)?;
+    // SAFETY: attr_count validated that attr_list is readable and that
+    // `count` whole records fit in the readable extent after TotalLength.
+    let attrs = unsafe { (*(attr_list as *const PS_ATTRIBUTE_LIST)).Attributes.as_ptr() };
+    for i in 0..count {
+        // SAFETY: i < count, clamped by attr_count to the readable extent.
+        let attr = unsafe { &*attrs.add(i) };
+        if (attr.Attribute & 0xFFFF) != 5 {
+            continue;
+        }
+        let ptr = attr.Value as *const u16;
+        if ptr.is_null() || attr.Size == 0 || attr.Size % 2 != 0 || attr.Size > 0x1_0000 {
+            return None;
+        }
+        let (base, len) = readable_region(ptr as *const c_void)?;
+        let off = ptr as usize - base as usize;
+        let avail_chars = len.checked_sub(off)? / 2;
+        let chars = (attr.Size / 2).min(avail_chars);
+        if chars == 0 {
+            return None;
+        }
+        // SAFETY: ptr points to `chars` readable UTF-16 units: chars is at
+        // most Size/2 (declared) and at most the region-clamped avail_chars.
+        let slice = unsafe { std::slice::from_raw_parts(ptr, chars) };
+        let mut name = String::from_utf16_lossy(slice);
+        if name.ends_with('\0') {
+            name.pop();
+        }
+        if name.is_empty() {
+            return None;
+        }
+        return Some(name);
+    }
+    None
 }
 
 /// C0 diagnostic: dump every attribute record in `attr_list` to the trace log,
@@ -858,10 +1004,24 @@ pub(crate) fn dump_attr_list_for_overlay_spawn(attr_list: *const c_void, target:
         let value_desc = if is_image_name {
             let ptr = attr.Value as *const u16;
             if !ptr.is_null() && attr.Size > 0 && attr.Size <= 0x10000 {
-                let chars = attr.Size / 2;
-                let slice = unsafe { std::slice::from_raw_parts(ptr, chars) };
-                let s = String::from_utf16_lossy(slice);
-                format!(" value=PWSTR \"{s}\" size_bytes={} (chars={})", attr.Size, chars)
+                // Clamp to the readable extent of Value — Size is
+                // caller-controlled (audit 2026-09-19, Medium).
+                let chars = match readable_region(ptr as *const c_void) {
+                    Some((base, len)) => {
+                        let off = ptr as usize - base as usize;
+                        (attr.Size / 2).min(len.saturating_sub(off) / 2)
+                    }
+                    None => 0,
+                };
+                if chars > 0 {
+                    // SAFETY: chars <= Size/2 and clamped to the readable
+                    // region by readable_region above.
+                    let slice = unsafe { std::slice::from_raw_parts(ptr, chars) };
+                    let s = String::from_utf16_lossy(slice);
+                    format!(" value=PWSTR \"{s}\" size_bytes={} (chars={})", attr.Size, chars)
+                } else {
+                    format!(" value=0x{:x} size={} (unreadable)", attr.Value, attr.Size)
+                }
             } else {
                 format!(" value=0x{:x} size={} (unreadable)", attr.Value, attr.Size)
             }
@@ -880,6 +1040,17 @@ pub(crate) fn dump_attr_list_for_overlay_spawn(attr_list: *const c_void, target:
 
 /// Extract the image path from process parameters.
 /// Reuses the same offset logic as hooks.rs extract_child_exe (offset 0x60 on x64).
+///
+/// `Length` and `Buffer` are caller-controlled, so `char_count` is CLAMPED to
+/// the readable extent of `Buffer`'s memory region before it is followed
+/// (audit 2026-09-19, Medium — same hostile-input class as the attribute-list
+/// `TotalLength`). Unreadable / null / zero-length → None, keeping the
+/// existing null / zero-length defensive standard.
+///
+/// # Safety
+/// `params` must point to a readable RTL_USER_PROCESS_PARAMETERS for the
+/// duration of the call (the 0x60 header is read unguarded, as before; the
+/// caller-controlled Buffer is validated via `readable_region` before use).
 pub unsafe fn extract_image_path(params: *const c_void) -> Option<String> {
     if params.is_null() {
         return None;
@@ -890,8 +1061,16 @@ pub unsafe fn extract_image_path(params: *const c_void) -> Option<String> {
     let image_path_offset = 0x60usize;
     let ustr_ptr = params_ptr.add(image_path_offset) as *const ntapi::winapi::shared::ntdef::UNICODE_STRING;
     let ustr = &*ustr_ptr;
-    let char_count = (ustr.Length / 2) as usize;
-    if char_count == 0 || ustr.Buffer.is_null() {
+    if ustr.Buffer.is_null() {
+        return None;
+    }
+    let Some((base, len)) = readable_region(ustr.Buffer as *const c_void) else {
+        return None;
+    };
+    let off = ustr.Buffer as usize - base as usize;
+    let avail_chars = len.checked_sub(off)? / 2;
+    let char_count = ((ustr.Length / 2) as usize).min(avail_chars);
+    if char_count == 0 {
         return None;
     }
     let name_slice = std::slice::from_raw_parts(ustr.Buffer, char_count);
@@ -1502,5 +1681,218 @@ mod tests {
         assert_ne!(DANGEROUS_ACCESS & 0x0002, 0, "PROCESS_CREATE_THREAD");
         assert_ne!(DANGEROUS_ACCESS & 0x0020, 0, "PROCESS_VM_WRITE");
         assert_ne!(DANGEROUS_ACCESS & 0x0040, 0, "PROCESS_DUP_HANDLE");
+    }
+
+    // -----------------------------------------------------------------------
+    // Attr-5 spawn veto + hostile-length clamping (audit 2026-09-19)
+    // -----------------------------------------------------------------------
+    //
+    // HIGH: the kernel loads the image named by PsAttributeImageName (attr 5),
+    // not RTL_USER_PROCESS_PARAMETERS.ImagePathName — the denylist veto must
+    // see attribute 5, else a decoyed ImagePathName lets a denylisted binary
+    // run.
+    // MEDIUM: TotalLength / attribute Size / UNICODE_STRING.Length are
+    // caller-controlled and must be clamped to the readable region before they
+    // are followed. Tests use guard-paged allocations so an unclamped walk
+    // faults deterministically instead of reading adjacent heap noise.
+
+    const PAGE_SIZE: usize = 0x1000;
+
+    /// Two-page allocation: page 0 committed PAGE_READWRITE, page 1 left as
+    /// PAGE_NOACCESS guard. Never freed — the test process exits first.
+    fn alloc_two_pages_first_committed() -> *mut u8 {
+        use winapi::um::memoryapi::VirtualAlloc;
+        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
+        // SAFETY: plain VirtualAlloc reserve; failure checked below.
+        let base = unsafe {
+            VirtualAlloc(std::ptr::null_mut(), 2 * PAGE_SIZE, MEM_RESERVE, PAGE_NOACCESS)
+        };
+        assert!(!base.is_null(), "VirtualAlloc(MEM_RESERVE) failed");
+        // SAFETY: commits page 0 of the reservation made above.
+        let committed =
+            unsafe { VirtualAlloc(base, PAGE_SIZE, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!committed.is_null(), "VirtualAlloc(MEM_COMMIT) failed");
+        assert_eq!(committed as usize, base as usize, "commit must land at reservation base");
+        base as *mut u8
+    }
+
+    /// PS_ATTRIBUTE_LIST with one PsAttributeImageName (number 5) record
+    /// pointing at `path` (PWSTR + Size in bytes, excluding the trailing
+    /// NUL — the C0-confirmed kernel convention). Returns the list buffer
+    /// and the wide-string backing store; caller must keep both alive.
+    fn make_image_name_list(path: &str) -> (Vec<u8>, Vec<u16>) {
+        let mut wide: Vec<u16> = path.encode_utf16().collect();
+        wide.push(0);
+        let size_bytes = (wide.len() - 1) * 2;
+        let buf = make_attr_list_with(&[(0x0002_0005, size_bytes, wide.as_ptr() as usize)]);
+        (buf, wide)
+    }
+
+    /// Minimal caller-shaped RTL_USER_PROCESS_PARAMETERS: a 0x100-byte block
+    /// with UNICODE_STRING {Length, MaximumLength, Buffer} at offset 0x60
+    /// pointing at `path` (NUL-terminated UTF-16; Length excludes the NUL).
+    /// Returns (block, wide); caller must keep both alive.
+    fn make_params_with_image_path(path: &str) -> (Vec<u8>, Vec<u16>) {
+        let mut wide: Vec<u16> = path.encode_utf16().collect();
+        wide.push(0);
+        let mut block = vec![0u8; 0x100];
+        let ustr_offset = 0x60usize;
+        let len_excl_nul = ((wide.len() - 1) * 2) as u16;
+        let len_incl_nul = (wide.len() * 2) as u16;
+        block[ustr_offset..ustr_offset + 2]
+            .copy_from_slice(&len_excl_nul.to_ne_bytes());
+        block[ustr_offset + 2..ustr_offset + 4]
+            .copy_from_slice(&len_incl_nul.to_ne_bytes());
+        block[ustr_offset + 8..ustr_offset + 16]
+            .copy_from_slice(&(wide.as_ptr() as usize).to_ne_bytes());
+        (block, wide)
+    }
+
+    #[test]
+    fn spoofed_attr5_denylisted_target_is_blocked() {
+        // HIGH regression: benign decoy in ImagePathName, denylisted target
+        // in attribute 5 (what the kernel actually loads). Before the fix
+        // the veto functions never looked at attribute 5 and returned false
+        // — the denylisted spawn ran.
+        let (block, wide_p) = make_params_with_image_path(r"C:\Windows\System32\notepad.exe");
+        let (list, wide_n) = make_image_name_list(r"C:\Windows\System32\wsl.exe");
+        // The decoy really is benign by the old signal — only attr 5 catches it.
+        let via_params = unsafe { extract_image_path(block.as_ptr() as *const c_void) };
+        assert_eq!(via_params.as_deref(), Some(r"C:\Windows\System32\notepad.exe"));
+        assert!(!is_denylisted(via_params.as_deref().unwrap()));
+        // The kernel-real signal vetoes.
+        assert!(
+            attribute_list_contains_parent_process(list.as_ptr() as _),
+            "denylisted PsAttributeImageName must veto the spawn"
+        );
+        assert!(
+            attribute_list_contains_handle_list(list.as_ptr() as _),
+            "denylisted PsAttributeImageName must veto at the second chokepoint too"
+        );
+        assert_eq!(
+            image_name_from_attr_list(list.as_ptr() as _).as_deref(),
+            Some(r"C:\Windows\System32\wsl.exe")
+        );
+        let _ = (wide_p, wide_n);
+    }
+
+    #[test]
+    fn benign_attr5_does_not_veto() {
+        // No over-blocking: a benign attribute-5 name (missing file, so
+        // OriginalFilename reads fail and basename matching alone applies)
+        // must not block, with or without other records present.
+        let (list, wide) = make_image_name_list(r"C:\definitely-missing-xyz\benign-tool.exe");
+        assert!(!attribute_list_contains_parent_process(list.as_ptr() as _));
+        assert!(!attribute_list_contains_handle_list(list.as_ptr() as _));
+        let _ = wide;
+    }
+
+    #[test]
+    fn hostile_total_length_is_clamped_to_the_readable_region() {
+        // MEDIUM regression: TotalLength claims ~4G of records; the list sits
+        // at the very end of the committed page so any record past the two
+        // in-page ones lands in the NOACCESS guard page. Before the fix the
+        // walk followed the declared length and faulted (fatal in a hook —
+        // no SEH). After the fix the count is clamped to the readable extent
+        // and the in-page records are still examined.
+        let base = alloc_two_pages_first_committed();
+        let header = std::mem::size_of::<usize>();
+        let attr_size = std::mem::size_of::<PS_ATTRIBUTE>();
+        let list_off = PAGE_SIZE - header - 2 * attr_size;
+        let list = unsafe { base.add(list_off) } as *mut PS_ATTRIBUTE_LIST;
+        unsafe {
+            (*list).TotalLength = 0xFFFF_FFFF;
+            let attrs = (*list).Attributes.as_mut_ptr();
+            // [0] PARENT — must still be detected within the clamped extent.
+            (*attrs.add(0)).Attribute = 0x0002_0000;
+            (*attrs.add(0)).Size = std::mem::size_of::<usize>();
+            (*attrs.add(0)).Value = 0xDEAD_BEEF;
+            // [1] HANDLE_LIST — ditto.
+            (*attrs.add(1)).Attribute = 0x0002_0002;
+            (*attrs.add(1)).Size = std::mem::size_of::<usize>();
+            (*attrs.add(1)).Value = 0xCAFE_BABE;
+        }
+        let ptr = list as *const c_void;
+        assert!(
+            attribute_list_contains_parent_process(ptr),
+            "parent record inside the clamped extent must still veto"
+        );
+        assert!(
+            attribute_list_contains_handle_list(ptr),
+            "handle-list record inside the clamped extent must still veto"
+        );
+        assert!(
+            unsafe { image_name_attr_mut(list as *mut c_void) }.is_none(),
+            "no record 5 inside the clamped extent"
+        );
+    }
+
+    #[test]
+    fn attr5_value_validation_ladder() {
+        // MEDIUM: every length on the attribute-5 path is validated before it
+        // is followed. Ladder, in validation order:
+        let base = alloc_two_pages_first_committed();
+        // (1) Size above the 0x10000 cap → None without touching memory.
+        let over_cap = make_attr_list_with(&[(0x0002_0005, 0x2_0000, base as usize)]);
+        assert_eq!(image_name_from_attr_list(over_cap.as_ptr() as _), None);
+        // (2) Odd Size → None.
+        let odd = make_attr_list_with(&[(0x0002_0005, 7, base as usize)]);
+        assert_eq!(image_name_from_attr_list(odd.as_ptr() as _), None);
+        // (3) Size sane but Value inside the NOACCESS guard page → None, no fault.
+        let guard_ptr = unsafe { base.add(PAGE_SIZE) } as usize;
+        let in_guard = make_attr_list_with(&[(0x0002_0005, 16, guard_ptr)]);
+        assert_eq!(image_name_from_attr_list(in_guard.as_ptr() as _), None);
+        assert!(!attribute_list_contains_parent_process(in_guard.as_ptr() as _));
+        // (4) Size sane but larger than the readable extent behind Value →
+        // clamped to the region (here: the last 4 bytes of the page = the
+        // two units "xe"; the declared Size claims far more).
+        let name_ptr = unsafe { base.add(PAGE_SIZE - 4) } as *mut u16;
+        unsafe {
+            name_ptr.write(0x0078); // 'x'
+            name_ptr.add(1).write(0x0065); // 'e' — ends exactly at the page end
+        }
+        let clamped = make_attr_list_with(&[(0x0002_0005, 0x8000, name_ptr as usize)]);
+        assert_eq!(
+            image_name_from_attr_list(clamped.as_ptr() as _),
+            Some("xe".to_string())
+        );
+        assert!(!attribute_list_contains_parent_process(clamped.as_ptr() as _));
+    }
+
+    #[test]
+    fn extract_image_path_hostile_length_is_clamped() {
+        // MEDIUM: UNICODE_STRING.Length claims 32767 chars; the buffer holds
+        // only the last 4 bytes of the committed page ("xe" — the trailing
+        // page end is the hard stop). Before the fix the full declared length
+        // was followed into the NOACCESS guard page (fault). After the fix
+        // the read is clamped to the readable extent.
+        let base = alloc_two_pages_first_committed();
+        let name_ptr = unsafe { base.add(PAGE_SIZE - 4) } as *mut u16;
+        unsafe {
+            name_ptr.write(0x0078); // 'x'
+            name_ptr.add(1).write(0x0065); // 'e' — ends exactly at the page end
+        }
+        let mut block = vec![0u8; 0x100];
+        let ustr_offset = 0x60usize;
+        block[ustr_offset..ustr_offset + 2].copy_from_slice(&0xFFFEu16.to_ne_bytes());
+        block[ustr_offset + 2..ustr_offset + 4].copy_from_slice(&0xFFFEu16.to_ne_bytes());
+        block[ustr_offset + 8..ustr_offset + 16]
+            .copy_from_slice(&(name_ptr as usize).to_ne_bytes());
+        let got = unsafe { extract_image_path(block.as_ptr() as *const c_void) };
+        assert_eq!(got.as_deref(), Some("xe"));
+    }
+
+    #[test]
+    fn extract_image_path_null_and_empty_stay_none() {
+        // Existing defensive standard, pinned: null params, null Buffer and
+        // zero Length all yield None without dereferencing.
+        assert!(unsafe { extract_image_path(std::ptr::null()) }.is_none());
+        let block = vec![0u8; 0x100]; // Buffer field = null (zeroed)
+        assert!(unsafe { extract_image_path(block.as_ptr() as *const c_void) }.is_none());
+        let (mut block2, wide) = make_params_with_image_path(r"C:\x\y.exe");
+        // Length = 0 → None even with a valid buffer.
+        block2[0x60..0x62].copy_from_slice(&0u16.to_ne_bytes());
+        assert!(unsafe { extract_image_path(block2.as_ptr() as *const c_void) }.is_none());
+        let _ = wide;
     }
 }

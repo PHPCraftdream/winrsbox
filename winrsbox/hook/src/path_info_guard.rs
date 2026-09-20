@@ -32,6 +32,7 @@ use winapi::ctypes::c_void;
 
 use crate::anti_rec;
 use crate::hooks;
+use crate::hooks::nt_call_original;
 
 // ---------------------------------------------------------------------------
 // Type alias + detour storage
@@ -173,18 +174,55 @@ pub(crate) fn rewrite_file_name_information(
             continue;
         }
 
-        // Recover the virtual DOS path. unmirror_from_overlay uses
-        // Path::strip_prefix which is case-SENSITIVE, so pass the root slice
-        // from the case-preserved overlay_dos (original case preserved).
+        // Recover the virtual DOS path.
+        //
+        // This used to call `policy::path::unmirror_from_overlay`, which only
+        // understands the LEGACY layout — it requires a `<drive>` component
+        // right after the root (`<root>\c\proj\...`). Under the current Path-1
+        // same-volume layout the drive is implicit in the chosen root, so that
+        // helper returned None, the `None => continue` below skipped the entry,
+        // and the raw `.winrsbox\...` overlay path leaked to the guest through
+        // GetFinalPathNameByHandleW (audit 2026-09-19, High: "class-48 masking
+        // is dead for the Path-1 layout"). The documented residual described
+        // this leak as class-9-only; it covered class 48 as well.
+        //
+        // `hooks::unmirror_overlay_handle_relative` is the dual-layout
+        // implementation the sibling code already used: it tries Path-1 first
+        // and falls back to legacy. Calling it here rather than copying its
+        // discriminator is what keeps the two callers from drifting apart
+        // again the next time the layout changes.
+        // Order matters, and the two layouts are genuinely ambiguous: under a
+        // C: root, `<root>\d\proj` is either legacy `d:\proj` or Path-1
+        // `c:\d\proj`. The legacy helper only succeeds when the first
+        // component is a lone drive letter, which is the stricter reading, so
+        // trying it FIRST preserves this guard's existing cross-drive legacy
+        // behaviour (mirroring a D: path into a C: root — what the legacy
+        // tests in this module pin). `unmirror_overlay_handle_relative` uses a
+        // different discriminator ("first component must equal the root's own
+        // drive") and would read those paths as Path-1 instead, silently
+        // changing the masked output. Path-1 paths make the legacy helper
+        // return None, so they fall through to the dual-layout helper — which
+        // is the case that was leaking.
         let overlay_root_preserved = &overlay_dos[..root_trimmed.len()];
         let overlay_pbuf = std::path::PathBuf::from(&overlay_dos);
-        let virtual_dos = match policy::path::unmirror_from_overlay(
+        let legacy = policy::path::unmirror_from_overlay(
             &overlay_pbuf,
             std::path::Path::new(overlay_root_preserved),
-        ) {
-            Some(v) => v,
-            None => continue,
-        };
+        );
+        let virtual_dos =
+            match legacy.or_else(|| {
+                crate::hooks::unmirror_overlay_handle_relative(&overlay_dos, Some(root))
+            }) {
+                Some(v) => v,
+                // Fail-closed is not available here: this function masks one
+                // entry of a caller-supplied buffer in place, and dropping an
+                // entry it cannot mask would mean rewriting the record chain,
+                // which is the enumeration path's job, not this one's. An entry
+                // that still cannot be unmirrored after trying both layouts is
+                // not under any known overlay root, so there is nothing to
+                // mask — the name is already a real path, not an overlay one.
+                None => continue,
+            };
 
         // FileNameInformation is volume-relative (no drive letter). Strip the
         // recovered `<letter>:` to produce `\proj\.git\HEAD`.
@@ -238,10 +276,11 @@ unsafe extern "system" fn hook_nt_query_information_file(
     file_information_class: u32,
 ) -> NTSTATUS {
     let call_original = || {
-        HOOK_NT_QUERY_INFORMATION_FILE
-            .get()
-            .unwrap()
-            .call(file_handle, io_status_block, file_information, length, file_information_class)
+        nt_call_original!(
+            &HOOK_NT_QUERY_INFORMATION_FILE,
+            "NtQueryInformationFile",
+            (file_handle, io_status_block, file_information, length, file_information_class)
+        )
     };
 
     // Only FileNormalizedNameInformation (48) is masked.
@@ -463,6 +502,31 @@ mod tests {
         // No leak of the storage markers.
         assert!(!name.contains(".winrsbox"));
         assert!(!name.contains("workdir"));
+    }
+
+    /// Path-1 (same-volume) layout regression — audit 2026-09-19, High.
+    ///
+    /// Every other test in this module uses the LEGACY layout, which carries a
+    /// `<drive>` component right after the root (`...\workdir\d\proj\...`).
+    /// That is exactly why they kept passing while the masking was dead: the
+    /// legacy-only `policy::path::unmirror_from_overlay` handled their shape
+    /// and returned None for the layout actually in use, so the guard fell
+    /// through `None => continue` and leaked the raw overlay path.
+    ///
+    /// Under Path-1 the drive is implicit in the chosen root, so the overlay
+    /// path has NO drive component. Before the fix this assertion fails with
+    /// the raw `\users\me\.winrsbox\sbx\workdir\proj\.git\HEAD` still in the
+    /// buffer (rewrite returns None).
+    #[test]
+    fn path1_layout_overlay_path_is_masked() {
+        let overlay_rel = r"\users\me\.winrsbox\sbx\workdir\proj\.git\HEAD";
+        let buf = build_fni(overlay_rel);
+        let rewritten = rewrite_file_name_information(&buf, ROOT)
+            .expect("Path-1 overlay path must be masked, not leaked");
+        let name = read_fni_name(&rewritten);
+        assert_eq!(name, r"\proj\.git\HEAD");
+        assert!(!name.contains(".winrsbox"), "storage marker leaked: {name}");
+        assert!(!name.contains("workdir"), "storage marker leaked: {name}");
     }
 
     #[test]

@@ -24,7 +24,7 @@ use winapi::ctypes::c_void;
 use winapi::um::processthreadsapi::GetCurrentProcessId;
 
 use crate::anti_rec;
-use crate::hooks::{ipc_log, is_trace, STATUS_ACCESS_DENIED};
+use crate::hooks::{ipc_log, is_trace, nt_call_original, STATUS_ACCESS_DENIED};
 use crate::process_tracker;
 
 // ---------------------------------------------------------------------------
@@ -52,9 +52,11 @@ unsafe extern "system" fn hook_nt_adjust_privileges_token(
     return_length: *mut u32,
 ) -> NTSTATUS {
     let call_original = || {
-        HOOK_ADJUST_PRIV.get().unwrap().call(
-            token_handle, disable_all, new_state,
-            buffer_length, previous_state, return_length,
+        nt_call_original!(
+            &HOOK_ADJUST_PRIV,
+            "NtAdjustPrivilegesToken",
+            (token_handle, disable_all, new_state,
+             buffer_length, previous_state, return_length)
         )
     };
 
@@ -68,52 +70,77 @@ unsafe extern "system" fn hook_nt_adjust_privileges_token(
     }
 
     // Enabling privileges: check if any dangerous privilege is being enabled.
-    // TOKEN_PRIVILEGES: PrivilegeCount(u32) + LUID_AND_ATTRIBUTES[N]
-    // LUID_AND_ATTRIBUTES: LUID(u64) + Attributes(u32) = 12 bytes each.
-    // SE_PRIVILEGE_ENABLED = 0x00000002
-    //
-    // SAFETY/DoS: `new_state` and `buffer_length` come from the (hostile)
-    // caller; neither is trusted. `PrivilegeCount` is attacker-controlled, so
-    // it MUST be bounded before driving the read. We require the byte span we
-    // intend to touch — 4 (PrivilegeCount) + count*12 — to fit inside the
-    // caller-declared `buffer_length`, AND cap count to MAX_PRIVS so a caller
-    // that lies about a huge buffer still can't drive an unbounded read.
-    // Real tokens carry ~35 privileges; 256 is generous headroom. If anything
-    // fails to validate we can't classify the request and fall through to the
-    // original syscall (same as every other "can't inspect" path here) — we do
-    // not invent a new deny that would break legitimate AdjustTokenPrivileges.
-    const PRIV_ENTRY_SIZE: u32 = 12; // sizeof(LUID_AND_ATTRIBUTES)
-    const PRIV_HEADER_SIZE: u32 = 4; // sizeof(PrivilegeCount)
-    const MAX_PRIVS: u32 = 256;
-    if !new_state.is_null() && buffer_length >= PRIV_HEADER_SIZE {
-        let count = *(new_state as *const u32);
-        // Required span; checked_mul/add guard against overflow on a hostile
-        // count, and the result must fit the declared buffer length.
-        let required = count
-            .checked_mul(PRIV_ENTRY_SIZE)
-            .and_then(|body| body.checked_add(PRIV_HEADER_SIZE));
-        let fits = matches!(required, Some(req) if req <= buffer_length);
-        if count > 0 && count <= MAX_PRIVS && fits {
-            let entries = (new_state as *const u8).add(PRIV_HEADER_SIZE as usize) as *const [u8; 12];
-            for i in 0..count as usize {
-                let entry = &*entries.add(i);
-                let attrs = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);
-                if attrs & 0x02 != 0 { // SE_PRIVILEGE_ENABLED
-                    let luid_low = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
-                    // Dangerous LUIDs: SeDebugPrivilege=20, SeTcbPrivilege=7,
-                    // SeAssignPrimaryTokenPrivilege=3, SeImpersonatePrivilege=29,
-                    // SeLoadDriverPrivilege=10, SeRestorePrivilege=18,
-                    // SeBackupPrivilege=17, SeTakeOwnershipPrivilege=9
-                    const DANGEROUS: &[u32] = &[3, 7, 9, 10, 17, 18, 20, 29];
-                    if DANGEROUS.contains(&luid_low) {
-                        return STATUS_ACCESS_DENIED;
-                    }
-                }
-            }
-        }
+    if enables_dangerous_privilege(new_state, buffer_length) {
+        return STATUS_ACCESS_DENIED;
     }
 
     call_original()
+}
+
+/// Scan the caller's TOKEN_PRIVILEGES buffer for a dangerous privilege being
+/// enabled. Returns true when the request must be denied.
+///
+/// TOKEN_PRIVILEGES: PrivilegeCount(u32) + LUID_AND_ATTRIBUTES[N]
+/// LUID_AND_ATTRIBUTES: LUID(u64) + Attributes(u32) = 12 bytes each.
+/// SE_PRIVILEGE_ENABLED = 0x00000002
+///
+/// # SAFETY
+/// `new_state` must be readable for the caller-declared `buffer_length` bytes.
+///
+/// # DoS
+/// `new_state` and `buffer_length` come from the (hostile) caller; neither is
+/// trusted. `PrivilegeCount` is attacker-controlled, so it MUST be bounded
+/// before driving the read. We require the byte span we intend to touch —
+/// 4 (PrivilegeCount) + count*12 — to fit inside the caller-declared
+/// `buffer_length`, AND cap count to MAX_PRIVS so a caller that lies about a
+/// huge buffer still can't drive an unbounded read. Real tokens carry ~35
+/// privileges; 256 is generous headroom. If anything fails to validate we
+/// can't classify the request and return false (fall through to the original
+/// syscall — same as every other "can't inspect" path here); we do not invent
+/// a new deny that would break legitimate AdjustTokenPrivileges.
+///
+/// Every multi-byte read is unaligned: `new_state` is the caller's address
+/// and nothing forces TOKEN_PRIVILEGES onto a 4-byte boundary — a plain
+/// `*(new_state as *const u32)` aborts on an odd probe (misaligned
+/// dereference) instead of classifying the request.
+unsafe fn enables_dangerous_privilege(new_state: *const c_void, buffer_length: u32) -> bool {
+    const PRIV_ENTRY_SIZE: u32 = 12; // sizeof(LUID_AND_ATTRIBUTES)
+    const PRIV_HEADER_SIZE: u32 = 4; // sizeof(PrivilegeCount)
+    const MAX_PRIVS: u32 = 256;
+    if new_state.is_null() || buffer_length < PRIV_HEADER_SIZE {
+        return false;
+    }
+    // SAFETY: read_unaligned — caller-supplied base, alignment untrusted.
+    let count = (new_state as *const u32).read_unaligned();
+    // Required span; checked_mul/add guard against overflow on a hostile
+    // count, and the result must fit the declared buffer length.
+    let required = count
+        .checked_mul(PRIV_ENTRY_SIZE)
+        .and_then(|body| body.checked_add(PRIV_HEADER_SIZE));
+    let fits = matches!(required, Some(req) if req <= buffer_length);
+    if count == 0 || count > MAX_PRIVS || !fits {
+        return false;
+    }
+    let entries = (new_state as *const u8).add(PRIV_HEADER_SIZE as usize) as *const [u8; 12];
+    for i in 0..count as usize {
+        // SAFETY: entries[i] is a `[u8; 12]` — align_of is 1, so `&*` is
+        // well-defined at any address; i is in bounds per the count/fits
+        // checks above. The field reads below are byte-wise (from_le_bytes).
+        let entry = &*entries.add(i);
+        let attrs = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);
+        if attrs & 0x02 != 0 { // SE_PRIVILEGE_ENABLED
+            let luid_low = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+            // Dangerous LUIDs: SeDebugPrivilege=20, SeTcbPrivilege=7,
+            // SeAssignPrimaryTokenPrivilege=3, SeImpersonatePrivilege=29,
+            // SeLoadDriverPrivilege=10, SeRestorePrivilege=18,
+            // SeBackupPrivilege=17, SeTakeOwnershipPrivilege=9
+            const DANGEROUS: &[u32] = &[3, 7, 9, 10, 17, 18, 20, 29];
+            if DANGEROUS.contains(&luid_low) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -162,8 +189,10 @@ unsafe extern "system" fn hook_nt_open_process_token_ex(
     token_handle: *mut HANDLE,
 ) -> NTSTATUS {
     let call_original = || {
-        HOOK_OPEN_PROC_TOKEN.get().unwrap().call(
-            process_handle, desired_access, handle_attributes, token_handle,
+        nt_call_original!(
+            &HOOK_OPEN_PROC_TOKEN,
+            "NtOpenProcessTokenEx",
+            (process_handle, desired_access, handle_attributes, token_handle)
         )
     };
 
@@ -178,7 +207,8 @@ unsafe extern "system" fn hook_nt_open_process_token_ex(
     let self_pid = GetCurrentProcessId();
     let target_pid = resolve_process_pid(process_handle);
 
-    if target_pid != 0 && target_pid != self_pid && !process_tracker::is_owned_child(target_pid) {
+    // 0 = handle did not resolve to a PID → treat as foreign (fail-closed).
+    if is_untrusted_token_pid(target_pid, self_pid) {
         let dangerous = desired_access & TOKEN_DANGEROUS_ACCESS;
         if dangerous != 0 {
             if is_trace() {
@@ -275,9 +305,11 @@ unsafe extern "system" fn hook_nt_duplicate_token(
     new_token_handle: *mut HANDLE,
 ) -> NTSTATUS {
     let call_original = || {
-        HOOK_DUPLICATE_TOKEN.get().unwrap().call(
-            existing_token, desired_access, object_attributes,
-            effective_only, token_type, new_token_handle,
+        nt_call_original!(
+            &HOOK_DUPLICATE_TOKEN,
+            "NtDuplicateToken",
+            (existing_token, desired_access, object_attributes,
+             effective_only, token_type, new_token_handle)
         )
     };
 
@@ -346,6 +378,36 @@ fn is_self_thread_impersonation(thread_handle: HANDLE, owner_pid: u32, self_pid:
     owner_pid != 0 && owner_pid == self_pid
 }
 
+/// Classify a resolved owner/target PID for token-guard enforcement.
+///
+/// `0` means the PID could not be resolved — `thread_owner_pid` and
+/// `resolve_process_pid` both return 0 on failure. Unresolvable counts as
+/// foreign, fail-closed: when the owner of the thread/process whose token is
+/// being impersonated or opened cannot be identified, we refuse instead of
+/// falling through to the original syscall (audit 2026-09-19: the old
+/// `pid != 0 &&` gates turned "cannot identify" into "allow"). Trusted
+/// shapes are our own PID and tracked owned children.
+fn is_untrusted_token_pid(pid: u32, self_pid: u32) -> bool {
+    pid == 0 || (pid != self_pid && !process_tracker::is_owned_child(pid))
+}
+
+/// Read the HANDLE value a caller passes for ThreadImpersonationToken.
+/// Returns None when the pointer is null or the caller-declared length cannot
+/// hold a HANDLE.
+///
+/// # SAFETY
+/// `thread_info` must be readable for `info_length` bytes. The HANDLE is read
+/// with read_unaligned: `thread_info` is the hooked caller's address and its
+/// alignment is whatever that caller chose — a plain
+/// `*(thread_info as *const HANDLE)` aborts on an odd probe.
+unsafe fn read_impersonation_token(thread_info: *mut c_void, info_length: u32) -> Option<HANDLE> {
+    if thread_info.is_null() || info_length < std::mem::size_of::<HANDLE>() as u32 {
+        return None;
+    }
+    // SAFETY: read_unaligned — caller-supplied base, alignment untrusted.
+    Some((thread_info as *const HANDLE).read_unaligned())
+}
+
 unsafe extern "system" fn hook_nt_set_information_thread(
     thread_handle: HANDLE,
     info_class: u32,
@@ -353,8 +415,10 @@ unsafe extern "system" fn hook_nt_set_information_thread(
     info_length: u32,
 ) -> NTSTATUS {
     let call_original = || {
-        HOOK_SET_INFO_THREAD.get().unwrap().call(
-            thread_handle, info_class, thread_info, info_length,
+        nt_call_original!(
+            &HOOK_SET_INFO_THREAD,
+            "NtSetInformationThread",
+            (thread_handle, info_class, thread_info, info_length)
         )
     };
 
@@ -365,8 +429,7 @@ unsafe extern "system" fn hook_nt_set_information_thread(
     if info_class == THREAD_IMPERSONATION_TOKEN {
         // thread_info points to a HANDLE value. If non-null, a token is being
         // assigned for impersonation.
-        if !thread_info.is_null() && info_length >= std::mem::size_of::<HANDLE>() as u32 {
-            let token = *(thread_info as *const HANDLE);
+        if let Some(token) = read_impersonation_token(thread_info, info_length) {
             if !token.is_null() {
                 // Self-impersonation is legitimate and must be allowed:
                 // Schannel/TLS, WinHTTP proxy detection, and the .NET
@@ -424,8 +487,10 @@ unsafe extern "system" fn hook_nt_impersonate_thread(
     sqos: *mut c_void,
 ) -> NTSTATUS {
     let call_original = || {
-        HOOK_IMPERSONATE_THREAD.get().unwrap().call(
-            server_thread, client_thread, sqos,
+        nt_call_original!(
+            &HOOK_IMPERSONATE_THREAD,
+            "NtImpersonateThread",
+            (server_thread, client_thread, sqos)
         )
     };
 
@@ -441,7 +506,9 @@ unsafe extern "system" fn hook_nt_impersonate_thread(
     let self_pid = GetCurrentProcessId();
     let owner_pid = crate::inject_guard::thread_owner_pid(server_thread);
 
-    if owner_pid != 0 && owner_pid != self_pid && !process_tracker::is_owned_child(owner_pid) {
+    // 0 = owner unresolvable → deny (fail-closed): cannot prove the server
+    // thread belongs to this process or a tracked child.
+    if is_untrusted_token_pid(owner_pid, self_pid) {
         if is_trace() {
             ipc_log(ipc::LogLevel::Trace,
                 format!("token_impersonate_thread_blocked server_owner_pid={owner_pid}"));
@@ -491,8 +558,10 @@ unsafe extern "system" fn hook_nt_open_thread_token_ex(
     token_handle: *mut HANDLE,
 ) -> NTSTATUS {
     let call_original = || {
-        HOOK_OPEN_THREAD_TOKEN.get().unwrap().call(
-            thread_handle, desired_access, open_as_self, handle_attributes, token_handle,
+        nt_call_original!(
+            &HOOK_OPEN_THREAD_TOKEN,
+            "NtOpenThreadTokenEx",
+            (thread_handle, desired_access, open_as_self, handle_attributes, token_handle)
         )
     };
 
@@ -509,7 +578,9 @@ unsafe extern "system" fn hook_nt_open_thread_token_ex(
     let self_pid = GetCurrentProcessId();
     let owner_pid = crate::inject_guard::thread_owner_pid(thread_handle);
 
-    if owner_pid != 0 && owner_pid != self_pid && !process_tracker::is_owned_child(owner_pid) {
+    // 0 = owner unresolvable → treat as foreign (fail-closed): dangerous
+    // access denied; read-only TOKEN_QUERY keeps the foreign-thread policy.
+    if is_untrusted_token_pid(owner_pid, self_pid) {
         let dangerous = desired_access & THREAD_TOKEN_DANGEROUS;
         if dangerous != 0 {
             if is_trace() {
@@ -622,6 +693,95 @@ pub unsafe fn uninstall() {
 mod tests {
     use super::*;
 
+    // ── unaligned-read regression (alignment-UB class, mirrors 9d73d34) ──
+    //
+    // Both TOKEN_PRIVILEGES and the ThreadImpersonationToken HANDLE arrive at
+    // caller-chosen addresses; nothing forces either onto its natural
+    // boundary. The probes below force ODD base addresses — the old plain
+    // `*(new_state as *const u32)` / `*(thread_info as *const HANDLE)`
+    // dereferences aborted there instead of classifying the request.
+
+    /// Byte offset within `backing` whose address is ODD.
+    fn odd_offset(backing: &[u8]) -> usize {
+        let off = 1 - (backing.as_ptr() as usize % 2);
+        assert_eq!((backing.as_ptr() as usize + off) % 2, 1, "probe must sit at an odd address");
+        off
+    }
+
+    /// TOKEN_PRIVILEGES { PrivilegeCount, [(LUID, Attributes); N] } laid out
+    /// at an ODD address inside a fresh backing buffer.
+    fn privileges_at_odd_address(entries: &[(u32, u32)]) -> (Vec<u8>, usize) {
+        let mut buf = vec![0u8; 4 + entries.len() * 12 + 8];
+        let off = odd_offset(&buf);
+        buf[off..off + 4].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (i, (luid, attrs)) in entries.iter().enumerate() {
+            let e = off + 4 + i * 12;
+            buf[e..e + 4].copy_from_slice(&luid.to_le_bytes());
+            buf[e + 4..e + 8].copy_from_slice(&0u32.to_le_bytes()); // LUID HighPart
+            buf[e + 8..e + 12].copy_from_slice(&attrs.to_le_bytes());
+        }
+        (buf, off)
+    }
+
+    #[test]
+    fn misaligned_privileges_with_dangerous_privilege_enabled_are_denied() {
+        // SeDebugPrivilege (LUID 20) enabled, whole struct at an odd address.
+        let (buf, off) = privileges_at_odd_address(&[(20, 0x0000_0002)]);
+        // SAFETY: ptr covers the probe written above, length as declared.
+        let deny = unsafe {
+            enables_dangerous_privilege(buf.as_ptr().add(off) as *const c_void, (4 + 12) as u32)
+        };
+        assert!(deny, "SeDebugPrivilege enabled must deny even at an odd address");
+    }
+
+    #[test]
+    fn misaligned_privileges_with_benign_entries_pass_through() {
+        let (buf, off) = privileges_at_odd_address(&[(5, 0x2), (6, 0x0)]);
+        // SAFETY: ptr covers the probe written above, length as declared.
+        let deny = unsafe {
+            enables_dangerous_privilege(buf.as_ptr().add(off) as *const c_void, (4 + 24) as u32)
+        };
+        assert!(!deny, "benign privileges must not deny (no over-blocking)");
+    }
+
+    #[test]
+    fn misaligned_privileges_hostile_counts_fail_closed() {
+        // Count 0, count above MAX_PRIVS, and a declared length that cannot
+        // hold the claimed span must all classify as "not dangerous" (fall
+        // through to the original syscall) — not crash, not deny.
+        let (buf0, off0) = privileges_at_odd_address(&[]);
+        let (buf2, off2) = privileges_at_odd_address(&[]);
+        let (buf3, off3) = privileges_at_odd_address(&[(20, 0x2)]);
+        // SAFETY: each ptr covers its probe; lengths as declared below.
+        unsafe {
+            assert!(!enables_dangerous_privilege(
+                buf0.as_ptr().add(off0) as *const c_void, 4));
+            assert!(!enables_dangerous_privilege(
+                buf2.as_ptr().add(off2) as *const c_void, (4 + 257 * 12) as u32),
+                "count > MAX_PRIVS must not drive the entry loop");
+            assert!(!enables_dangerous_privilege(
+                buf3.as_ptr().add(off3) as *const c_void, 15),
+                "span beyond the declared length must not be read");
+        }
+    }
+
+    #[test]
+    fn misaligned_impersonation_token_handle_reads_correctly() {
+        let mut backing = vec![0u8; std::mem::size_of::<HANDLE>() + 8];
+        let off = odd_offset(&backing);
+        backing[off..off + 8].copy_from_slice(&0x1EA7_usize.to_le_bytes());
+        // SAFETY: ptr covers the 8 written bytes at the odd address.
+        let ptr = unsafe { backing.as_ptr().add(off) as *mut c_void };
+        // SAFETY: ptr is valid for info_length = 8 bytes.
+        let got = unsafe { read_impersonation_token(ptr, 8) };
+        assert_eq!(got.map(|h| h as usize), Some(0x1EA7));
+        // SAFETY: length below sizeof(HANDLE) must be rejected unread.
+        unsafe {
+            assert_eq!(read_impersonation_token(ptr, 4), None, "short length");
+            assert_eq!(read_impersonation_token(std::ptr::null_mut(), 8), None, "null ptr");
+        }
+    }
+
     #[test]
     fn token_dangerous_includes_maximum_allowed() {
         assert_ne!(TOKEN_DANGEROUS_ACCESS & 0x0200_0000, 0);
@@ -677,5 +837,89 @@ mod tests {
         // owner_pid 0 (NtQueryInformationProcess failed / not resolvable) on
         // a non-pseudo handle: can't prove it's ours, fail-closed → block.
         assert!(!is_self_thread_impersonation(0x100 as *mut c_void, 0, 1234));
+    }
+
+    // ── fail-closed owner classification (audit 2026-09-19: the old
+    //    `pid != 0 &&` gates let an unresolvable owner reach call_original) ──
+
+    #[test]
+    fn unresolvable_pid_is_untrusted() {
+        // thread_owner_pid / resolve_process_pid return 0 on failure. The old
+        // `pid != 0 &&` gate classified 0 as "not foreign" and let the syscall
+        // through; it must classify as untrusted (deny).
+        assert!(is_untrusted_token_pid(0, 1234));
+    }
+
+    #[test]
+    fn self_pid_still_trusted() {
+        assert!(!is_untrusted_token_pid(1234, 1234));
+    }
+
+    #[test]
+    fn foreign_pid_still_untrusted() {
+        assert!(is_untrusted_token_pid(9999, 1234));
+    }
+
+    #[test]
+    fn owned_child_pid_still_trusted() {
+        // create_time 0 → membership-only ownership, no live query needed.
+        process_tracker::mark_spawned(0x5EED_0001, 1234, "token_guard_test.exe".into(), 0);
+        assert!(!is_untrusted_token_pid(0x5EED_0001, 1234));
+    }
+
+    // ── enforcement sites: an unresolvable owner must be denied at the hook ──
+    // These call the real hook fns with a handle that resolves to no owner, so
+    // thread_owner_pid / resolve_process_pid → 0. The deny path returns
+    // STATUS_ACCESS_DENIED before call_original(), so the detour statics —
+    // which are unset under `cargo test` — are never touched.
+    //
+    // The handle value must be UNRESOLVABLE BY CONSTRUCTION, not merely
+    // unlikely. An earlier version used 0x100: a well-formed handle value that,
+    // once sibling tests running in parallel had populated this process's
+    // handle table, sometimes named a live, self-owned handle. The owner then
+    // resolved to self, the deny path was skipped, and control reached
+    // call_original()'s unwrap() on a detour that is unset under `cargo test` —
+    // a panic inside an `extern "system"` fn, which cannot unwind and aborts
+    // the whole test process with 0xc0000409. The test passed alone and failed
+    // in roughly two of three full-suite runs.
+    //
+    // Setting a low bit (0x102) does NOT fix it: the kernel masks the low bits
+    // off when resolving a handle, so 0x102 resolves exactly like 0x100 —
+    // observed, still flaking in 4 of 6 runs.
+    //
+    // NULL is the one value that can never name an object no matter what the
+    // handle table holds. It is also not a pseudo-handle (those are negative
+    // and are matched earlier in each hook), so it reaches the owner lookup
+    // and resolves to 0 → untrusted → deny, deterministically.
+    const UNRESOLVABLE_HANDLE: usize = 0;
+
+    #[test]
+    fn site_impersonate_thread_denies_unresolvable_owner() {
+        let status = unsafe {
+            hook_nt_impersonate_thread(UNRESOLVABLE_HANDLE as HANDLE, std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(status, STATUS_ACCESS_DENIED);
+    }
+
+    #[test]
+    fn site_open_thread_token_denies_unresolvable_owner() {
+        let mut out: HANDLE = std::ptr::null_mut();
+        let status = unsafe {
+            // TOKEN_IMPERSONATE (0x0004) — in THREAD_TOKEN_DANGEROUS.
+            hook_nt_open_thread_token_ex(UNRESOLVABLE_HANDLE as HANDLE, 0x0004, 0, 0, &mut out)
+        };
+        assert_eq!(status, STATUS_ACCESS_DENIED);
+        assert!(out.is_null());
+    }
+
+    #[test]
+    fn site_open_process_token_denies_unresolvable_owner() {
+        let mut out: HANDLE = std::ptr::null_mut();
+        let status = unsafe {
+            // TOKEN_IMPERSONATE (0x0004) — in TOKEN_DANGEROUS_ACCESS.
+            hook_nt_open_process_token_ex(UNRESOLVABLE_HANDLE as HANDLE, 0x0004, 0, &mut out)
+        };
+        assert_eq!(status, STATUS_ACCESS_DENIED);
+        assert!(out.is_null());
     }
 }

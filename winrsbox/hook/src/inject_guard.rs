@@ -17,9 +17,11 @@ use std::sync::OnceLock;
 use detour2::GenericDetour;
 use ntapi::winapi::shared::ntdef::{HANDLE, NTSTATUS, OBJECT_ATTRIBUTES};
 use winapi::ctypes::c_void;
+use winapi::um::libloaderapi::{GetModuleFileNameW, GetModuleHandleExW};
 use winapi::um::processthreadsapi::GetCurrentProcessId;
 
 use crate::anti_rec;
+use crate::hooks::nt_call_original;
 
 // ---------------------------------------------------------------------------
 // Nt* function type aliases
@@ -115,36 +117,119 @@ pub fn is_system_pid(pid: u32) -> bool {
 // Filter 1: Caller-aware — is the caller a system DLL?
 // ---------------------------------------------------------------------------
 
+// System DLLs recognized by basename AND verified system-directory location.
+// `hook.dll` is deliberately absent: our own image is matched by full-path
+// identity (`verified_hook_image_path`), because a basename match would let
+// the guest get its own DLL trusted by naming it `hook.dll`.
 const SYSTEM_DLLS: &[&str] = &[
     "ntdll.dll", "kernel32.dll", "kernelbase.dll", "ucrtbase.dll",
     "ucrtbased.dll", "msvcrt.dll", "apphelp.dll", "rpcrt4.dll",
-    "hook.dll", // our own DLL — sandbox injection mechanism uses NtQueueApcThread
 ];
 
-pub fn is_system_caller() -> bool {
-    let stack = crate::memory_guard::capture_stack_pub(2, 16);
-    if stack.is_empty() {
-        return true; // can't determine → assume system
+/// Full lowercased path of the image that contains this hook's code — i.e.
+/// the module the launcher actually injected. Resolved from an in-image
+/// address (`ARMED` lives in this file), NOT from the session config: the
+/// session section is guest-writable on current builds (audit 2026-09-19,
+/// Critical 3), so the configured `dll_path` is not a trust anchor.
+/// `None` (resolution failed) → hook frames are not trusted; fail closed.
+fn verified_hook_image_path() -> Option<&'static str> {
+    static HOOK_IMAGE: OnceLock<Option<String>> = OnceLock::new();
+    HOOK_IMAGE
+        .get_or_init(|| {
+            // SAFETY: FROM_ADDRESS probes the address via loader structures
+            // without dereferencing it (mirrors memory_guard's usage);
+            // UNCHANGED_REFCOUNT does not bump the load count, so no
+            // FreeLibrary pairing is needed. `ARMED` is a static of this
+            // module, so its address is inside our own image.
+            let hmod = unsafe {
+                let mut hmod: *mut c_void = std::ptr::null_mut();
+                let ok = GetModuleHandleExW(
+                    0x0000_0004 /* FROM_ADDRESS */ | 0x0000_0002 /* UNCHANGED_REFCOUNT */,
+                    &ARMED as *const AtomicBool as *const u16,
+                    &mut hmod as *mut *mut c_void as *mut _,
+                );
+                if ok == 0 { None } else { Some(hmod) }
+            }?;
+            // SAFETY: hmod is a valid module handle from GetModuleHandleExW.
+            unsafe {
+                let mut buf = [0u16; 512];
+                let len = GetModuleFileNameW(hmod as _, buf.as_mut_ptr(), buf.len() as u32);
+                if len == 0 || len as usize >= buf.len() {
+                    return None; // failed or truncated path → fail closed
+                }
+                Some(String::from_utf16_lossy(&buf[..len as usize]).to_ascii_lowercase())
+            }
+        })
+        .as_deref()
+}
+
+/// Lowercased system-directory prefix (trailing `\` included), anchored on
+/// the directory of the actually-loaded ntdll image — every DLL in
+/// `SYSTEM_DLLS` loads from that directory for this process bitness.
+/// Anchoring on a real loaded image (not a `GetSystemDirectoryW` call)
+/// keeps the check valid under all Windows layouts. `None` on anchor
+/// failure → the caller fails closed (no frame trusted by basename).
+fn verified_system_dir_prefix() -> Option<&'static str> {
+    static SYSTEM_DIR: OnceLock<Option<String>> = OnceLock::new();
+    SYSTEM_DIR
+        .get_or_init(|| {
+            // SAFETY: ntdll_export only reads the loaded module's export table.
+            let addr = unsafe { crate::hooks::ntdll_export(b"NtCreateThreadEx\0") }?;
+            let path = crate::memory_guard::module_path_for_address(addr as *const c_void)?;
+            let lower = path.to_ascii_lowercase();
+            let sep = lower.rfind('\\')?;
+            Some(format!("{}\\", &lower[..=sep]))
+        })
+        .as_deref()
+}
+
+/// Decide whether ONE stack frame's module (path already lowercased) may be
+/// treated as system/sandbox code. `hook_image` is the verified full path
+/// of our own image, `system_dir` the verified system-directory prefix;
+/// either being `None` fails closed for the respective check.
+fn frame_is_trusted(
+    path_lower: &str,
+    hook_image: Option<&str>,
+    system_dir: Option<&str>,
+) -> bool {
+    if let Some(hook) = hook_image {
+        if path_lower == hook {
+            return true; // our own image, verified by full path
+        }
     }
-    // Walk ALL stack frames. If any frame is in a non-system, non-hook module
-    // (i.e., user code), this is a user-initiated call.
-    for &pc in &stack {
+    let basename = path_lower.rsplit_once('\\').map(|(_, b)| b).unwrap_or(path_lower);
+    if SYSTEM_DLLS.iter().any(|&s| s == basename) {
+        // Basename alone is spoofable — the guest can ship its own
+        // `ntdll.dll`; require the verified system directory as well.
+        return system_dir.map_or(false, |dir| path_lower.starts_with(dir));
+    }
+    false
+}
+
+/// Walk every frame. An empty/unresolvable stack, an anonymous frame, or
+/// any non-system frame means the caller is NOT system: "cannot determine"
+/// must deny, never allow (audit 2026-09-19, systemic pattern).
+fn stack_is_system(stack: &[u64]) -> bool {
+    if stack.is_empty() {
+        return false; // unresolvable stack → untrusted (was: treated as system)
+    }
+    let hook_image = verified_hook_image_path();
+    let system_dir = verified_system_dir_prefix();
+    for &pc in stack {
         let path = match crate::memory_guard::module_path_for_address(pc as *const c_void) {
             Some(p) => p,
             None => return false, // anonymous frame → NOT system
         };
-        let lower = path.to_ascii_lowercase();
-        let basename = lower.rsplit_once('\\').map(|(_, b)| b).unwrap_or(&lower);
-        if basename == "hook.dll" {
-            continue;
+        if !frame_is_trusted(&path.to_ascii_lowercase(), hook_image, system_dir) {
+            return false;
         }
-        if SYSTEM_DLLS.iter().any(|&s| s == basename) {
-            continue;
-        }
-        // Non-system, non-hook module found → user-initiated
-        return false;
     }
-    true // all frames are system DLLs or hook.dll
+    true
+}
+
+pub fn is_system_caller() -> bool {
+    let stack = crate::memory_guard::capture_stack_pub(2, 16);
+    stack_is_system(&stack)
 }
 
 // ---------------------------------------------------------------------------
@@ -280,11 +365,13 @@ unsafe extern "system" fn hook_nt_create_thread_ex(
     attribute_list: *mut c_void,
 ) -> NTSTATUS {
     let call_original = || {
-        HOOK_CREATE_THREAD_EX.get().unwrap().call(
-            thread_handle, desired_access, object_attributes,
-            process_handle, start_routine, argument,
-            create_flags, zero_bits, stack_size, maximum_stack_size,
-            attribute_list,
+        nt_call_original!(
+            &HOOK_CREATE_THREAD_EX,
+            "NtCreateThreadEx",
+            (thread_handle, desired_access, object_attributes,
+             process_handle, start_routine, argument,
+             create_flags, zero_bits, stack_size, maximum_stack_size,
+             attribute_list)
         )
     };
 
@@ -317,9 +404,11 @@ unsafe extern "system" fn hook_nt_create_thread(
     create_suspended: usize,
 ) -> NTSTATUS {
     let call_original = || {
-        HOOK_CREATE_THREAD.get().unwrap().call(
-            thread_handle, desired_access, object_attributes, process_handle,
-            client_id, thread_context, initial_teb, create_suspended,
+        nt_call_original!(
+            &HOOK_CREATE_THREAD,
+            "NtCreateThread",
+            (thread_handle, desired_access, object_attributes, process_handle,
+             client_id, thread_context, initial_teb, create_suspended)
         )
     };
 
@@ -352,21 +441,34 @@ const CTX_RIP_OFFSET: usize = 0xF8;
 const CTX_DR0_OFFSET: usize = 0x350;
 const CTX_DR7_OFFSET: usize = 0x370;
 
+// The fixed offsets above are naturally aligned, but the CONTEXT base is the
+// hooked caller's pointer — NtSetContextThread callers choose the address, and
+// nothing forces it onto CONTEXT's 16-byte boundary. A plain
+// `*(ctx.add(offset) as *const u64)` aborts on an odd probe (misaligned
+// dereference), so both readers are unaligned by design.
+
+/// Read a u32 at `offset` inside a caller-supplied CONTEXT.
+///
+/// # SAFETY
+/// `ctx.add(offset)` must be readable for 4 bytes.
 pub unsafe fn read_ctx_u32(ctx: *const c_void, offset: usize) -> u32 {
-    *(ctx.cast::<u8>().add(offset) as *const u32)
+    (ctx.cast::<u8>().add(offset) as *const u32).read_unaligned()
 }
 
+/// Read a u64 at `offset` inside a caller-supplied CONTEXT.
+///
+/// # SAFETY
+/// `ctx.add(offset)` must be readable for 8 bytes.
 pub unsafe fn read_ctx_u64(ctx: *const c_void, offset: usize) -> u64 {
-    *(ctx.cast::<u8>().add(offset) as *const u64)
+    (ctx.cast::<u8>().add(offset) as *const u64).read_unaligned()
 }
 
 unsafe extern "system" fn hook_nt_set_context_thread(
     thread_handle: HANDLE,
     context: *const c_void,
 ) -> NTSTATUS {
-    let call_original = || {
-        HOOK_SET_CONTEXT.get().unwrap().call(thread_handle, context)
-    };
+    let call_original =
+        || nt_call_original!(&HOOK_SET_CONTEXT, "NtSetContextThread", (thread_handle, context));
 
     let Some(_guard) = anti_rec::enter() else {
         return call_original();
@@ -420,8 +522,10 @@ unsafe extern "system" fn hook_nt_queue_apc_thread(
     apc_arg3: *mut c_void,
 ) -> NTSTATUS {
     let call_original = || {
-        HOOK_QUEUE_APC.get().unwrap().call(
-            thread_handle, apc_routine, apc_arg1, apc_arg2, apc_arg3,
+        nt_call_original!(
+            &HOOK_QUEUE_APC,
+            "NtQueueApcThread",
+            (thread_handle, apc_routine, apc_arg1, apc_arg2, apc_arg3)
         )
     };
 
@@ -453,9 +557,11 @@ unsafe extern "system" fn hook_nt_queue_apc_thread_ex(
     apc_arg3: *mut c_void,
 ) -> NTSTATUS {
     let call_original = || {
-        HOOK_QUEUE_APC_EX.get().unwrap().call(
-            thread_handle, user_apc_reserve_handle,
-            apc_routine, apc_arg1, apc_arg2, apc_arg3,
+        nt_call_original!(
+            &HOOK_QUEUE_APC_EX,
+            "NtQueueApcThreadEx",
+            (thread_handle, user_apc_reserve_handle,
+             apc_routine, apc_arg1, apc_arg2, apc_arg3)
         )
     };
 
@@ -543,6 +649,41 @@ pub unsafe fn uninstall() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── unaligned-read regression (alignment-UB class, mirrors 9d73d34) ──
+    //
+    // The CONTEXT pointer is the hooked NtSetContextThread caller's: the
+    // fixed offsets above are naturally aligned, but the BASE can be any
+    // address the caller chose. This probe forces an odd base — the old
+    // plain `*(... as *const u32/u64)` dereferences aborted there
+    // (misaligned dereference, 0xc0000409) instead of reading the fields.
+
+    #[test]
+    fn read_ctx_reads_misaligned_context_probe() {
+        let mut backing = vec![0u8; 0x380 + 8];
+        let off = 1 - (backing.as_ptr() as usize % 2);
+        assert_eq!((backing.as_ptr() as usize + off) % 2, 1,
+            "probe CONTEXT must sit at an odd address");
+        let flags: u32 = 0x0010_0015;
+        let rip: u64 = 0x0000_7FF6_0000_1234;
+        let dr0: u64 = 0x0000_DEAD_BEEF_0001;
+        let dr7: u64 = 0x0000_0000_0004_0DE7;
+        // Byte-wise stores: aligned u32/u64 stores would trip the same
+        // precondition the readers are being tested against.
+        backing[off + 0x30..off + 0x34].copy_from_slice(&flags.to_le_bytes());
+        backing[off + 0xF8..off + 0x100].copy_from_slice(&rip.to_le_bytes());
+        backing[off + 0x350..off + 0x358].copy_from_slice(&dr0.to_le_bytes());
+        backing[off + 0x370..off + 0x378].copy_from_slice(&dr7.to_le_bytes());
+        // SAFETY: base+offset stays inside `backing` for every read below.
+        let ctx = unsafe { backing.as_ptr().add(off) as *const c_void };
+        // SAFETY: each read is within the written probe region.
+        unsafe {
+            assert_eq!(read_ctx_u32(ctx, CTX_FLAGS_OFFSET), flags);
+            assert_eq!(read_ctx_u64(ctx, CTX_RIP_OFFSET), rip);
+            assert_eq!(read_ctx_u64(ctx, CTX_DR0_OFFSET), dr0);
+            assert_eq!(read_ctx_u64(ctx, CTX_DR7_OFFSET), dr7);
+        }
+    }
 
     // ARMED is a process-global AtomicBool, and cargo runs these tests on
     // parallel threads in one binary. Tests that mutate ARMED must not race each
@@ -691,5 +832,54 @@ mod tests {
             assert_eq!(read_ctx_u64(ctx, CTX_DR0_OFFSET), dr0);
             assert_eq!(read_ctx_u64(ctx, CTX_DR7_OFFSET), dr7);
         }
+    }
+
+    // --- Regression tests: audit 2026-09-19 Medium (inject_guard) ---
+    // These pin the deny-by-default classification: a spoofed `hook.dll`
+    // basename is not trusted, and an unresolvable stack is not "system".
+
+    #[test]
+    fn spoofed_hook_basename_is_not_trusted() {
+        let trusted = frame_is_trusted(
+            r"c:\guest\evil\hook.dll",
+            Some(r"c:\tools\winrsbox\hook.dll"),
+            Some(r"c:\windows\system32\"),
+        );
+        assert!(!trusted, "basename-only hook.dll match trusts a spoofed path");
+    }
+
+    #[test]
+    fn verified_hook_image_exact_path_is_trusted() {
+        let trusted = frame_is_trusted(
+            r"c:\tools\winrsbox\hook.dll",
+            Some(r"c:\tools\winrsbox\hook.dll"),
+            None,
+        );
+        assert!(trusted, "the verified injected image must stay trusted");
+    }
+
+    #[test]
+    fn unresolvable_stack_is_not_system() {
+        assert!(!stack_is_system(&[]), "empty stack must deny, not assume system");
+    }
+
+    #[test]
+    fn system_dll_basename_outside_system_dir_is_not_trusted() {
+        let trusted = frame_is_trusted(
+            r"d:\app\ntdll.dll",
+            None,
+            Some(r"c:\windows\system32\"),
+        );
+        assert!(!trusted, "guest-shipped system DLL name must not be trusted");
+    }
+
+    #[test]
+    fn system_dll_inside_verified_system_dir_is_trusted() {
+        let trusted = frame_is_trusted(
+            r"c:\windows\system32\kernelbase.dll",
+            None,
+            Some(r"c:\windows\system32\"),
+        );
+        assert!(trusted, "legit system frames must stay allow-listed (no over-blocking)");
     }
 }

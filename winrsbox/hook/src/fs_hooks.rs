@@ -16,14 +16,43 @@ use crate::hooks::{
     check_path_traversal, check_device_block, decide, resolve_for_hook,
     is_write_access, materialize_mock_overlay,
     prepare_overlay, set_io_status, ipc_record_overlay, ipc_record_overlay_case,
-    extract_nt_basename,
-    FILE_CREATE, FILE_OPEN_IF, FILE_OVERWRITE_IF, FILE_SUPERSEDE,
-    STATUS_ACCESS_DENIED, STATUS_OBJECT_NAME_NOT_FOUND,
+    extract_nt_basename, nt_call_original,
+    FILE_CREATE, FILE_DELETE_ON_CLOSE, FILE_OPEN, FILE_OPEN_IF, FILE_OVERWRITE_IF,
+    FILE_SUPERSEDE, STATUS_ACCESS_DENIED, STATUS_OBJECT_NAME_NOT_FOUND,
 };
 use crate::ipc_client::{
     cache, ipc_log, is_trace,
     ipc_clear_whiteout,
 };
+
+// ---------------------------------------------------------------------------
+// Dead-end (unresolved-path) write intent
+// ---------------------------------------------------------------------------
+
+// When resolve_for_hook returns None, the policy pipeline (decide()) was
+// never consulted. The documented model lets READS outside project_root
+// pass through to the real disk, so unresolved reads keep the tripwire
+// passthrough. A WRITE that cannot be classified must fail CLOSED: calling
+// the original NtCreateFile/NtOpenFile here would land the write on the
+// real disk/volume/share outside the CoW overlay — the P0-03 UNC escape
+// class.
+//
+// The desired-access/disposition clause IS the canonical `is_write_access`
+// (unified: the dead end used to keep its own broader mask, and two
+// diverging definitions of "this open intends to write" are how
+// write-granting bits like GENERIC_ALL reappear as "reads" on the resolved
+// path). The only dead-end extra is the FILE_DELETE_ON_CLOSE options bit,
+// which rides in CreateOptions rather than DesiredAccess; an actual
+// deletion also needs the DELETE access bit, which the canonical mask
+// already treats as a write.
+/// Write intent for the unresolved (dead-end) branch. `disposition` is
+/// Some(create_disposition) for NtCreateFile and None for NtOpenFile (which
+/// has no disposition parameter — FILE_OPEN keeps the disposition clause
+/// of the canonical mask inert).
+fn dead_end_write_intent(desired_access: u32, disposition: Option<u32>, options: u32) -> bool {
+    is_write_access(desired_access, disposition.unwrap_or(FILE_OPEN))
+        || options & FILE_DELETE_ON_CLOSE != 0
+}
 
 // ---------------------------------------------------------------------------
 // Nt* function type aliases
@@ -137,10 +166,12 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
 ) -> NTSTATUS {
     macro_rules! call_original {
         () => {
-            HOOK_NT_CREATE_FILE.get().unwrap().call(
-                file_handle, desired_access, object_attributes, io_status_block,
-                allocation_size, file_attributes, share_access, create_disposition,
-                create_options, ea_buffer, ea_length,
+            nt_call_original!(
+                &HOOK_NT_CREATE_FILE,
+                "NtCreateFile",
+                (file_handle, desired_access, object_attributes, io_status_block,
+                 allocation_size, file_attributes, share_access, create_disposition,
+                 create_options, ea_buffer, ea_length)
             )
         };
     }
@@ -181,15 +212,24 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
                 format!("fs_resolve_failed: NtCreateFile raw={raw} write=true"),
             );
         }
-        if let Some(status) = check_device_block(object_attributes as *const _) {
+        // Fail closed (P0-03): a write that does not resolve to a DOS path
+        // must not reach the original NtCreateFile — it would bypass decide()
+        // and the CoW overlay entirely (UNC shares, raw device namespaces).
+        let write_intent =
+            dead_end_write_intent(desired_access, Some(create_disposition), create_options);
+        if let Some(status) = check_device_block(object_attributes as *const _, write_intent) {
             set_io_status(io_status_block, status);
             return status;
         }
-        if is_write_access(desired_access, create_disposition)
-            && crate::hooks::is_fs_device_path(object_attributes as *const _)
-        {
+        if write_intent {
             if is_trace() {
-                ipc_log(ipc::LogLevel::Trace, "fs_block_device_volume_write".into());
+                // Keep the sharper forensic label for raw volume-device targets.
+                let kind = if crate::hooks::is_fs_device_path(object_attributes as *const _) {
+                    "device_volume"
+                } else {
+                    "unresolved"
+                };
+                ipc_log(ipc::LogLevel::Trace, format!("fs_block_{kind}_write").into());
             }
             set_io_status(io_status_block, STATUS_ACCESS_DENIED);
             return STATUS_ACCESS_DENIED;
@@ -356,10 +396,12 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
                 }
             };
             let attrs_ptr = copy.as_ptr_mut();
-            HOOK_NT_CREATE_FILE.get().unwrap().call(
-                file_handle, desired_access, attrs_ptr, io_status_block,
-                allocation_size, file_attributes, share_access, create_disposition,
-                create_options, ea_buffer, ea_length,
+            nt_call_original!(
+                &HOOK_NT_CREATE_FILE,
+                "NtCreateFile",
+                (file_handle, desired_access, attrs_ptr, io_status_block,
+                 allocation_size, file_attributes, share_access, create_disposition,
+                 create_options, ea_buffer, ea_length)
             )
         }
         Mode::Deny => {
@@ -420,10 +462,12 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
                         return STATUS_ACCESS_DENIED;
                     }
                 };
-                return HOOK_NT_CREATE_FILE.get().unwrap().call(
-                    file_handle, desired_access, copy.as_ptr_mut(), io_status_block,
-                    allocation_size, file_attributes, share_access, create_disposition,
-                    create_options, ea_buffer, ea_length,
+                return nt_call_original!(
+                    &HOOK_NT_CREATE_FILE,
+                    "NtCreateFile",
+                    (file_handle, desired_access, copy.as_ptr_mut(), io_status_block,
+                     allocation_size, file_attributes, share_access, create_disposition,
+                     create_options, ea_buffer, ea_length)
                 );
             }
 
@@ -454,10 +498,12 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
                     format!("fs_cow_create_pre dos={dos} disp={create_disposition:#x} overlay_exists={exists} overlay={overlay_dos}"),
                 );
             }
-            let status = HOOK_NT_CREATE_FILE.get().unwrap().call(
-                file_handle, desired_access, h.as_ptr_mut(), io_status_block,
-                allocation_size, file_attributes, share_access, create_disposition,
-                create_options, ea_buffer, ea_length,
+            let status = nt_call_original!(
+                &HOOK_NT_CREATE_FILE,
+                "NtCreateFile",
+                (file_handle, desired_access, h.as_ptr_mut(), io_status_block,
+                 allocation_size, file_attributes, share_access, create_disposition,
+                 create_options, ea_buffer, ea_length)
             );
             // Always log STATUS_REPARSE_POINT_ENCOUNTERED (0xC0000274 / os error 4395)
             // so it appears in sandbox.log at WARN level even without trace mode.
@@ -476,11 +522,29 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
             status
         }
         Mode::Mock => {
+            // A Mock decision missing its payload or overlay target is a
+            // MALFORMED decision (compute always sets both), so the decision
+            // channel cannot be trusted for this path — fail CLOSED. The old
+            // fall-through to call_original!() opened the REAL file whenever
+            // an incomplete Mock arrived (audit 2026-09-19 Low: Mock
+            // fail-open on a malformed decision).
             let Some(payload) = decision.mock_payload else {
-                return call_original!();
+                crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+                    pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                    level: ipc::LogLevel::Warn,
+                    msg: format!("mock_malformed_decision_deny create no_payload: {dos}"),
+                });
+                set_io_status(io_status_block, STATUS_ACCESS_DENIED);
+                return STATUS_ACCESS_DENIED;
             };
             let Some(ref overlay_path) = decision.overlay else {
-                return call_original!();
+                crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+                    pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                    level: ipc::LogLevel::Warn,
+                    msg: format!("mock_malformed_decision_deny create no_overlay: {dos}"),
+                });
+                set_io_status(io_status_block, STATUS_ACCESS_DENIED);
+                return STATUS_ACCESS_DENIED;
             };
             // Idempotent materialization: see materialize_mock_overlay docs.
             materialize_mock_overlay(overlay_path, payload.as_slice());
@@ -492,10 +556,12 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
             // hand-rolled code in this same file).
             // SAFETY: object_attributes is non-null.
             let mut h = HookedAttrs::redirect(&*object_attributes, &overlay_dos, true);
-            HOOK_NT_CREATE_FILE.get().unwrap().call(
-                file_handle, desired_access, h.as_ptr_mut(), io_status_block,
-                allocation_size, file_attributes, share_access,
-                create_disposition, create_options, ea_buffer, ea_length,
+            nt_call_original!(
+                &HOOK_NT_CREATE_FILE,
+                "NtCreateFile",
+                (file_handle, desired_access, h.as_ptr_mut(), io_status_block,
+                 allocation_size, file_attributes, share_access,
+                 create_disposition, create_options, ea_buffer, ea_length)
             )
         }
     }
@@ -511,9 +577,11 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
 ) -> NTSTATUS {
     macro_rules! call_original {
         () => {
-            HOOK_NT_OPEN_FILE.get().unwrap().call(
-                file_handle, desired_access, object_attributes,
-                io_status_block, share_access, open_options,
+            nt_call_original!(
+                &HOOK_NT_OPEN_FILE,
+                "NtOpenFile",
+                (file_handle, desired_access, object_attributes,
+                 io_status_block, share_access, open_options)
             )
         };
     }
@@ -536,15 +604,20 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
 
     // H5 resolve-once (same pattern as NtCreateFile above).
     let Some((dos, pre_resolved)) = resolve_for_hook(object_attributes as *const _) else {
-        if let Some(status) = check_device_block(object_attributes as *const _) {
+        // Fail closed (P0-03) — same contract as the NtCreateFile dead-end.
+        let write_intent = dead_end_write_intent(desired_access, None, open_options);
+        if let Some(status) = check_device_block(object_attributes as *const _, write_intent) {
             set_io_status(io_status_block, status);
             return status;
         }
-        if (desired_access & (crate::hooks::GENERIC_WRITE | crate::hooks::FILE_WRITE_DATA | crate::hooks::FILE_APPEND_DATA | crate::hooks::DELETE | crate::hooks::WRITE_DAC | crate::hooks::WRITE_OWNER)) != 0
-            && crate::hooks::is_fs_device_path(object_attributes as *const _)
-        {
+        if write_intent {
             if is_trace() {
-                ipc_log(ipc::LogLevel::Trace, "fs_block_device_volume_write".into());
+                let kind = if crate::hooks::is_fs_device_path(object_attributes as *const _) {
+                    "device_volume"
+                } else {
+                    "unresolved"
+                };
+                ipc_log(ipc::LogLevel::Trace, format!("fs_block_{kind}_write").into());
             }
             set_io_status(io_status_block, STATUS_ACCESS_DENIED);
             return STATUS_ACCESS_DENIED;
@@ -585,10 +658,11 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
         }
     }
 
-    let write_bits =
-        crate::hooks::GENERIC_WRITE | crate::hooks::FILE_WRITE_DATA | crate::hooks::FILE_APPEND_DATA
-        | crate::hooks::DELETE | crate::hooks::WRITE_DAC | crate::hooks::WRITE_OWNER;
-    let write = desired_access & write_bits != 0;
+    // NtOpenFile has no create-disposition parameter; FILE_OPEN keeps the
+    // disposition clause of the canonical mask inert so the single
+    // is_write_access definition drives the classification here too (this
+    // site used to re-inline the old narrow bit list).
+    let write = is_write_access(desired_access, FILE_OPEN);
     let decision = decide(&dos, write);
 
     if is_trace() {
@@ -639,9 +713,11 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
                 }
             };
             let attrs_ptr = copy.as_ptr_mut();
-            HOOK_NT_OPEN_FILE.get().unwrap().call(
-                file_handle, desired_access, attrs_ptr,
-                io_status_block, share_access, open_options,
+            nt_call_original!(
+                &HOOK_NT_OPEN_FILE,
+                "NtOpenFile",
+                (file_handle, desired_access, attrs_ptr,
+                 io_status_block, share_access, open_options)
             )
         }
         Mode::Deny => {
@@ -677,9 +753,11 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
 
             // SAFETY: object_attributes is non-null.
             let mut h = HookedAttrs::redirect(&*object_attributes, &overlay_dos, false);
-            let status = HOOK_NT_OPEN_FILE.get().unwrap().call(
-                file_handle, desired_access, h.as_ptr_mut(),
-                io_status_block, share_access, open_options,
+            let status = nt_call_original!(
+                &HOOK_NT_OPEN_FILE,
+                "NtOpenFile",
+                (file_handle, desired_access, h.as_ptr_mut(),
+                 io_status_block, share_access, open_options)
             );
             // Always log STATUS_REPARSE_POINT_ENCOUNTERED / STATUS_NOT_A_REPARSE_POINT
             // (os error 4395) at WARN level so they appear in sandbox.log even without
@@ -706,11 +784,25 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
             status
         }
         Mode::Mock => {
+            // Malformed Mock (payload/overlay missing) — fail CLOSED, same
+            // rationale as hook_nt_create_file's Mock arm.
             let Some(payload) = decision.mock_payload else {
-                return call_original!();
+                crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+                    pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                    level: ipc::LogLevel::Warn,
+                    msg: format!("mock_malformed_decision_deny open no_payload: {dos}"),
+                });
+                set_io_status(io_status_block, STATUS_ACCESS_DENIED);
+                return STATUS_ACCESS_DENIED;
             };
             let Some(ref overlay_path) = decision.overlay else {
-                return call_original!();
+                crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+                    pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                    level: ipc::LogLevel::Warn,
+                    msg: format!("mock_malformed_decision_deny open no_overlay: {dos}"),
+                });
+                set_io_status(io_status_block, STATUS_ACCESS_DENIED);
+                return STATUS_ACCESS_DENIED;
             };
             // Idempotent materialization (see materialize_mock_overlay docs).
             materialize_mock_overlay(overlay_path, payload.as_slice());
@@ -720,9 +812,11 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
             // for the rationale on STATUS_INVALID_PARAMETER.
             // SAFETY: object_attributes is non-null.
             let mut h = HookedAttrs::redirect(&*object_attributes, &overlay_dos, true);
-            HOOK_NT_OPEN_FILE.get().unwrap().call(
-                file_handle, desired_access, h.as_ptr_mut(),
-                io_status_block, share_access, open_options,
+            nt_call_original!(
+                &HOOK_NT_OPEN_FILE,
+                "NtOpenFile",
+                (file_handle, desired_access, h.as_ptr_mut(),
+                 io_status_block, share_access, open_options)
             )
         }
     }
@@ -733,18 +827,20 @@ pub(crate) unsafe extern "system" fn hook_nt_query_attributes_file(
     file_information: *mut c_void,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
-        return HOOK_NT_QUERY_ATTRIBUTES_FILE
-            .get()
-            .unwrap()
-            .call(object_attributes, file_information);
+        return nt_call_original!(
+            &HOOK_NT_QUERY_ATTRIBUTES_FILE,
+            "NtQueryAttributesFile",
+            (object_attributes, file_information)
+        );
     };
 
     // H5 resolve-once.
     let Some((dos, pre_resolved)) = resolve_for_hook(object_attributes as *const _) else {
-        return HOOK_NT_QUERY_ATTRIBUTES_FILE
-            .get()
-            .unwrap()
-            .call(object_attributes, file_information);
+        return nt_call_original!(
+            &HOOK_NT_QUERY_ATTRIBUTES_FILE,
+            "NtQueryAttributesFile",
+            (object_attributes, file_information)
+        );
     };
 
     let decision = decide(&dos, false);
@@ -772,18 +868,25 @@ pub(crate) unsafe extern "system" fn hook_nt_query_attributes_file(
                 }
             };
             let attrs_ptr = copy.as_ptr_mut();
-            HOOK_NT_QUERY_ATTRIBUTES_FILE
-                .get()
-                .unwrap()
-                .call(attrs_ptr, file_information)
+            nt_call_original!(
+                &HOOK_NT_QUERY_ATTRIBUTES_FILE,
+                "NtQueryAttributesFile",
+                (attrs_ptr, file_information)
+            )
         }
         Mode::Deny => STATUS_ACCESS_DENIED,
         Mode::Mock => {
+            // Malformed Mock — fail CLOSED like the create/open arms. A query
+            // fall-through would report the REAL file's attributes for a path
+            // policy decided to mock (unlike the Cow arm below, an incomplete
+            // Mock is corruption of the decision, not a pre-write state).
             let Some(ref overlay_path) = decision.overlay else {
-                return HOOK_NT_QUERY_ATTRIBUTES_FILE
-                    .get()
-                    .unwrap()
-                    .call(object_attributes, file_information);
+                crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+                    pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                    level: ipc::LogLevel::Warn,
+                    msg: format!("mock_malformed_decision_deny query_attributes no_overlay: {dos}"),
+                });
+                return STATUS_ACCESS_DENIED;
             };
             // If overlay missing, materialize mock payload first so the
             // redirected query observes the mocked file instead of ENOENT.
@@ -791,10 +894,12 @@ pub(crate) unsafe extern "system" fn hook_nt_query_attributes_file(
                 if let Some(ref payload) = decision.mock_payload {
                     materialize_mock_overlay(overlay_path, payload);
                 } else {
-                    return HOOK_NT_QUERY_ATTRIBUTES_FILE
-                        .get()
-                        .unwrap()
-                        .call(object_attributes, file_information);
+                    crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+                        pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                        level: ipc::LogLevel::Warn,
+                        msg: format!("mock_malformed_decision_deny query_attributes no_payload: {dos}"),
+                    });
+                    return STATUS_ACCESS_DENIED;
                 }
             }
             let overlay_dos = overlay_path.to_string_lossy().into_owned();
@@ -803,10 +908,11 @@ pub(crate) unsafe extern "system" fn hook_nt_query_attributes_file(
             // STATUS_INVALID_PARAMETER quirk).
             // SAFETY: object_attributes is non-null.
             let mut h = HookedAttrs::redirect(&*object_attributes, &overlay_dos, false);
-            HOOK_NT_QUERY_ATTRIBUTES_FILE
-                .get()
-                .unwrap()
-                .call(h.as_ptr_mut(), file_information)
+            nt_call_original!(
+                &HOOK_NT_QUERY_ATTRIBUTES_FILE,
+                "NtQueryAttributesFile",
+                (h.as_ptr_mut(), file_information)
+            )
         }
         Mode::Cow => {
             // Design choice: for read-only Query hooks we fall through to the
@@ -818,24 +924,27 @@ pub(crate) unsafe extern "system" fn hook_nt_query_attributes_file(
             // legitimate stat-then-open patterns where callers probe a file
             // first; the write-side is the actual security boundary.
             let Some(ref overlay_path) = decision.overlay else {
-                return HOOK_NT_QUERY_ATTRIBUTES_FILE
-                    .get()
-                    .unwrap()
-                    .call(object_attributes, file_information);
+                return nt_call_original!(
+                    &HOOK_NT_QUERY_ATTRIBUTES_FILE,
+                    "NtQueryAttributesFile",
+                    (object_attributes, file_information)
+                );
             };
             if !overlay_path.exists() {
-                return HOOK_NT_QUERY_ATTRIBUTES_FILE
-                    .get()
-                    .unwrap()
-                    .call(object_attributes, file_information);
+                return nt_call_original!(
+                    &HOOK_NT_QUERY_ATTRIBUTES_FILE,
+                    "NtQueryAttributesFile",
+                    (object_attributes, file_information)
+                );
             }
             let overlay_dos = overlay_path.to_string_lossy().into_owned();
             // SAFETY: object_attributes is non-null.
             let mut h = HookedAttrs::redirect(&*object_attributes, &overlay_dos, false);
-            HOOK_NT_QUERY_ATTRIBUTES_FILE
-                .get()
-                .unwrap()
-                .call(h.as_ptr_mut(), file_information)
+            nt_call_original!(
+                &HOOK_NT_QUERY_ATTRIBUTES_FILE,
+                "NtQueryAttributesFile",
+                (h.as_ptr_mut(), file_information)
+            )
         }
     }
 }
@@ -845,18 +954,20 @@ pub(crate) unsafe extern "system" fn hook_nt_query_full_attributes_file(
     file_information: *mut c_void,
 ) -> NTSTATUS {
     let Some(_guard) = anti_rec::enter() else {
-        return HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
-            .get()
-            .unwrap()
-            .call(object_attributes, file_information);
+        return nt_call_original!(
+            &HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE,
+            "NtQueryFullAttributesFile",
+            (object_attributes, file_information)
+        );
     };
 
     // H5 resolve-once.
     let Some((dos, pre_resolved)) = resolve_for_hook(object_attributes as *const _) else {
-        return HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
-            .get()
-            .unwrap()
-            .call(object_attributes, file_information);
+        return nt_call_original!(
+            &HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE,
+            "NtQueryFullAttributesFile",
+            (object_attributes, file_information)
+        );
     };
 
     let decision = decide(&dos, false);
@@ -884,18 +995,23 @@ pub(crate) unsafe extern "system" fn hook_nt_query_full_attributes_file(
                 }
             };
             let attrs_ptr = copy.as_ptr_mut();
-            HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
-                .get()
-                .unwrap()
-                .call(attrs_ptr, file_information)
+            nt_call_original!(
+                &HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE,
+                "NtQueryFullAttributesFile",
+                (attrs_ptr, file_information)
+            )
         }
         Mode::Deny => STATUS_ACCESS_DENIED,
         Mode::Mock => {
+            // Malformed Mock — fail CLOSED, same rationale as
+            // hook_nt_query_attributes_file's Mock arm.
             let Some(ref overlay_path) = decision.overlay else {
-                return HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
-                    .get()
-                    .unwrap()
-                    .call(object_attributes, file_information);
+                crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+                    pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                    level: ipc::LogLevel::Warn,
+                    msg: format!("mock_malformed_decision_deny query_full no_overlay: {dos}"),
+                });
+                return STATUS_ACCESS_DENIED;
             };
             // If overlay missing, materialize mock payload first so the
             // redirected query observes the mocked file instead of ENOENT.
@@ -903,42 +1019,48 @@ pub(crate) unsafe extern "system" fn hook_nt_query_full_attributes_file(
                 if let Some(ref payload) = decision.mock_payload {
                     materialize_mock_overlay(overlay_path, payload);
                 } else {
-                    return HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
-                        .get()
-                        .unwrap()
-                        .call(object_attributes, file_information);
+                    crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+                        pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                        level: ipc::LogLevel::Warn,
+                        msg: format!("mock_malformed_decision_deny query_full no_payload: {dos}"),
+                    });
+                    return STATUS_ACCESS_DENIED;
                 }
             }
             let overlay_dos = overlay_path.to_string_lossy().into_owned();
             // SAFETY: object_attributes is non-null.
             let mut h = HookedAttrs::redirect(&*object_attributes, &overlay_dos, false);
-            HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
-                .get()
-                .unwrap()
-                .call(h.as_ptr_mut(), file_information)
+            nt_call_original!(
+                &HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE,
+                "NtQueryFullAttributesFile",
+                (h.as_ptr_mut(), file_information)
+            )
         }
         Mode::Cow => {
             // See hook_nt_query_attributes_file for the read-only fall-through
             // rationale. Write-side fail-close lives in create/open hooks.
             let Some(ref overlay_path) = decision.overlay else {
-                return HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
-                    .get()
-                    .unwrap()
-                    .call(object_attributes, file_information);
+                return nt_call_original!(
+                    &HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE,
+                    "NtQueryFullAttributesFile",
+                    (object_attributes, file_information)
+                );
             };
             if !overlay_path.exists() {
-                return HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
-                    .get()
-                    .unwrap()
-                    .call(object_attributes, file_information);
+                return nt_call_original!(
+                    &HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE,
+                    "NtQueryFullAttributesFile",
+                    (object_attributes, file_information)
+                );
             }
             let overlay_dos = overlay_path.to_string_lossy().into_owned();
             // SAFETY: object_attributes is non-null.
             let mut h = HookedAttrs::redirect(&*object_attributes, &overlay_dos, false);
-            HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE
-                .get()
-                .unwrap()
-                .call(h.as_ptr_mut(), file_information)
+            nt_call_original!(
+                &HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE,
+                "NtQueryFullAttributesFile",
+                (h.as_ptr_mut(), file_information)
+            )
         }
     }
 }
@@ -983,6 +1105,84 @@ mod tests {
         assert!(is_create_disposition(FILE_OVERWRITE_IF)); // 5
     }
 
+    // ── Mock malformed-decision fail-closed pins (audit 2026-09-19 Low) ──
+    //
+    // The four Mode::Mock arms live inside unsafe extern "system" hook bodies
+    // that cannot be invoked without a live ntdll detour, so the invariant is
+    // pinned textually (same technique as hooks.rs::spawn_hook_body and
+    // inject.rs::intentional_leak_pin_tests): a Mock arm that falls through to
+    // the original syscall on a payload/overlay-missing Mock decision re-opens
+    // the fail-open hole these arms were patched to close.
+
+    fn fn_body(src: &str, fn_sig: &str) -> String {
+        let start = src
+            .find(fn_sig)
+            .unwrap_or_else(|| panic!("fn signature missing: {fn_sig}"));
+        let rest = &src[start..];
+        let end = rest
+            .find("
+pub(crate)")
+            .or_else(|| rest.find("
+#[cfg(test)]"))
+            .expect("next item bounds the fn body");
+        rest[..end].to_string()
+    }
+
+    fn mock_arm(body: &str) -> String {
+        let start = body
+            .find("Mode::Mock => {")
+            .expect("Mode::Mock arm must exist");
+        let rest = &body[start..];
+        let end = rest.find("Mode::Cow").unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    #[test]
+    fn mock_create_open_arms_fail_closed_on_malformed_decision() {
+        let src = include_str!("fs_hooks.rs");
+        for (sig, tag) in [
+            ("fn hook_nt_create_file", "create"),
+            ("fn hook_nt_open_file", "open"),
+        ] {
+            let arm = mock_arm(&fn_body(src, sig));
+            assert!(
+                !arm.contains("return call_original"),
+                "{tag}: Mode::Mock arm must never fall through to the original syscall on a malformed (payload/overlay-missing) Mock decision"
+            );
+            assert!(
+                arm.contains("mock_malformed_decision_deny"),
+                "{tag}: Mode::Mock arm must log the malformed decision"
+            );
+            assert!(
+                arm.contains("STATUS_ACCESS_DENIED"),
+                "{tag}: Mode::Mock arm must fail closed (ACCESS_DENIED)"
+            );
+        }
+    }
+
+    #[test]
+    fn mock_query_arms_fail_closed_on_malformed_decision() {
+        let src = include_str!("fs_hooks.rs");
+        for (sig, tag) in [
+            ("fn hook_nt_query_attributes_file", "query_attributes"),
+            ("fn hook_nt_query_full_attributes_file", "query_full"),
+        ] {
+            let arm = mock_arm(&fn_body(src, sig));
+            assert!(
+                !arm.contains(".call(object_attributes, file_information)"),
+                "{tag}: Mode::Mock arm must not pass the original path through on a malformed (payload/overlay-missing) Mock decision"
+            );
+            assert!(
+                arm.contains("mock_malformed_decision_deny"),
+                "{tag}: Mode::Mock arm must log the malformed decision"
+            );
+            assert!(
+                arm.contains("STATUS_ACCESS_DENIED"),
+                "{tag}: Mode::Mock arm must fail closed (ACCESS_DENIED)"
+            );
+        }
+    }
+
     #[test]
     fn is_create_disposition_rejects_pure_open() {
         // FILE_OPEN (1) and FILE_OVERWRITE (4) are NOT creates:
@@ -991,5 +1191,139 @@ mod tests {
         assert!(!is_create_disposition(4)); // FILE_OVERWRITE
         // Unknown dispositions are also not revives.
         assert!(!is_create_disposition(99));
+    }
+
+    // ── P0-03: dead-end write intent + device-block deny ───────────────────
+
+    #[test]
+    fn dead_end_write_intent_masks() {
+        // Plain data-write and generic masks.
+        assert!(dead_end_write_intent(crate::hooks::GENERIC_WRITE, None, 0));
+        assert!(dead_end_write_intent(crate::hooks::FILE_WRITE_DATA, None, 0));
+        assert!(dead_end_write_intent(crate::hooks::FILE_APPEND_DATA, None, 0));
+        // Metadata / EA / generic-all / delete / security ops — the
+        // canonical mask, not a dead-end-private one.
+        assert!(dead_end_write_intent(crate::hooks::GENERIC_ALL, None, 0));
+        assert!(dead_end_write_intent(crate::hooks::FILE_WRITE_ATTRIBUTES, None, 0));
+        assert!(dead_end_write_intent(crate::hooks::FILE_WRITE_EA, None, 0));
+        assert!(dead_end_write_intent(crate::hooks::DELETE, None, 0));
+        assert!(dead_end_write_intent(crate::hooks::WRITE_DAC, None, 0));
+        assert!(dead_end_write_intent(crate::hooks::WRITE_OWNER, None, 0));
+        // Generic READ must not count as a write.
+        assert!(!dead_end_write_intent(0x8000_0000, None, 0));
+        assert!(!dead_end_write_intent(0, None, 0));
+    }
+
+    /// The dead end must never disagree with the canonical mask: it is the
+    /// same definition plus the CreateOptions DELETE_ON_CLOSE bit. If this
+    /// table ever diverges from `is_write_access`, an open classified as a
+    /// read on one path and a write on the other is one edit away.
+    #[test]
+    fn dead_end_write_intent_agrees_with_is_write_access() {
+        let access_cases: [u32; 10] = [
+            crate::hooks::GENERIC_ALL,
+            crate::hooks::GENERIC_WRITE,
+            crate::hooks::FILE_WRITE_DATA,
+            crate::hooks::FILE_APPEND_DATA,
+            crate::hooks::FILE_WRITE_EA,
+            crate::hooks::FILE_WRITE_ATTRIBUTES,
+            crate::hooks::DELETE,
+            crate::hooks::WRITE_DAC,
+            crate::hooks::WRITE_OWNER,
+            0x8000_0000, // GENERIC_READ — must stay a read on BOTH paths
+        ];
+        let dispositions = [0, 1, 2, 3, 4, 5]; // SUPERSEDE..OVERWRITE_IF incl. FILE_OPEN
+        for &a in &access_cases {
+            for &d in &dispositions {
+                assert_eq!(
+                    dead_end_write_intent(a, Some(d), 0),
+                    is_write_access(a, d),
+                    "dead-end vs canonical disagreement for access={a:#010x} disposition={d}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dead_end_write_intent_dispositions_and_options() {
+        use crate::hooks::FILE_OVERWRITE;
+        // Create dispositions count as writes even with no access bits.
+        assert!(dead_end_write_intent(0, Some(FILE_CREATE), 0));
+        assert!(dead_end_write_intent(0, Some(FILE_OPEN_IF), 0));
+        assert!(dead_end_write_intent(0, Some(FILE_OVERWRITE), 0));
+        assert!(dead_end_write_intent(0, Some(FILE_OVERWRITE_IF), 0));
+        assert!(dead_end_write_intent(0, Some(FILE_SUPERSEDE), 0));
+        // Pure open stays a read.
+        assert!(!dead_end_write_intent(0, Some(1), 0)); // FILE_OPEN
+        // FILE_DELETE_ON_CLOSE turns even a read-mode open into a write.
+        assert!(dead_end_write_intent(0, None, FILE_DELETE_ON_CLOSE));
+        assert!(!dead_end_write_intent(0, None, 0));
+    }
+
+    /// Calls `check_device_block` on an NT path; returns its verdict.
+    fn device_block_for(path: &str, write: bool) -> Option<NTSTATUS> {
+        use ntapi::winapi::shared::ntdef::UNICODE_STRING;
+        let buf: Vec<u16> = path.encode_utf16().collect();
+        let len_bytes = (buf.len() * 2) as u16;
+        let mut us = UNICODE_STRING {
+            Length: len_bytes,
+            MaximumLength: len_bytes,
+            Buffer: buf.as_ptr() as *mut u16,
+        };
+        let oa = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: std::ptr::null_mut(),
+            ObjectName: &mut us,
+            Attributes: 0,
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
+        };
+        // SAFETY: us/oa/buf are valid locals for the duration of the call.
+        unsafe { crate::hooks::check_device_block(&oa as *const OBJECT_ATTRIBUTES, write) }
+    }
+
+    #[test]
+    fn check_device_block_denies_unc_write() {
+        // P0-03: `\??\UNC\…` (the NT form of `\\localhost\c$\…`) must not
+        // pass a write through — it reaches the REAL volume via the network
+        // redirector, outside the CoW overlay.
+        assert_eq!(
+            device_block_for(r"\??\UNC\localhost\c$\Users\Public\evil.exe", true),
+            Some(STATUS_ACCESS_DENIED)
+        );
+        // Raw Win32 UNC spelling classifies the same.
+        assert_eq!(
+            device_block_for(r"\\localhost\c$\Users\Public\evil.exe", true),
+            Some(STATUS_ACCESS_DENIED)
+        );
+    }
+
+    #[test]
+    fn check_device_block_allows_unc_read() {
+        // Reads keep the documented pass-through behaviour.
+        assert_eq!(
+            device_block_for(r"\??\UNC\localhost\c$\Users\Public\evil.exe", false),
+            None
+        );
+    }
+
+    #[test]
+    fn check_device_block_enforces_systemquery_write_deny() {
+        // The SystemQuery contract is "read OK, write denied" — CldFlt is the
+        // canonical SystemQuery member. Before the P0-03 fix this returned
+        // None (carry on) for writes too.
+        assert_eq!(device_block_for(r"\device\cldflt", true), Some(STATUS_ACCESS_DENIED));
+        assert_eq!(device_block_for(r"\device\cldflt", false), None);
+    }
+
+    #[test]
+    fn check_device_block_keeps_hard_blocks_and_volume_reads() {
+        // Hard blocks deny regardless of direction.
+        assert_eq!(
+            device_block_for(r"\device\physicaldrive0", false),
+            Some(STATUS_ACCESS_DENIED)
+        );
+        // Ordinary volume reads still pass the device gate.
+        assert_eq!(device_block_for(r"\device\harddiskvolume2\foo", false), None);
     }
 }

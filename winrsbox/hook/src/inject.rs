@@ -52,6 +52,7 @@ pub fn inject_via_apc(
     process: HANDLE,
     thread: HANDLE,
     dll_path: &str,
+    section_name: Option<&str>,
 ) -> Result<(), String> {
     // Encode the DLL path as null-terminated UTF-16.
     let mut wide: Vec<u16> = dll_path.encode_utf16().collect();
@@ -109,6 +110,26 @@ pub fn inject_via_apc(
             VirtualFreeEx(process, remote_buf, 0, MEM_RELEASE);
         }
         return Err("WriteProcessMemory failed".into());
+    }
+
+    // Deliver the session-section name through the injection channel:
+    // append FS_SANDBOX_SECTION to the suspended child's environment block.
+    // This runs before any guest code executes, so the value cannot be
+    // intercepted or forged, and it reaches env-scrubbed children (MSYS2
+    // first-run helpers) exactly like the DLL path above does. On failure
+    // the APC is never queued and the caller terminates the child: a hooked
+    // process without the session name could only fail closed later (no
+    // pipe name ⇒ self-termination), so failing early is strictly cleaner.
+    if let Some(name) = section_name {
+        if let Err(e) = patch_child_env_section(process, name) {
+            unsafe {
+                // SAFETY: remote_buf was successfully allocated above; the
+                //         APC was never queued, so nothing in the child can
+                //         still be reading it.
+                VirtualFreeEx(process, remote_buf, 0, MEM_RELEASE);
+            }
+            return Err(format!("session-name env patch failed: {e}"));
+        }
     }
 
     // Resolve NtQueueApcThread dynamically from ntdll.
@@ -183,6 +204,309 @@ pub fn inject_via_apc(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Session-name delivery (audit 2026-09-19, Critical #3 — companion to the
+// launcher's random per-session section name)
+// ---------------------------------------------------------------------------
+
+/// Environment variable carrying the per-session random section name. The
+/// launcher authors it for the root target; the spawn hook re-asserts it into
+/// every child through [`patch_child_env_section`].
+pub(crate) const SECTION_ENV_VAR: &str = "FS_SANDBOX_SECTION";
+
+/// x64 layout constants. Documented, stable since Win7; the spawn hook's
+/// `extract_child_exe` (params + 0x60 ImagePathName) and the launcher's
+/// `get_image_base` (PEB + 0x10) already rely on the same fixed-offset
+/// convention.
+const PEB_PROCESS_PARAMETERS_OFFSET: usize = 0x20; // PEB -> ProcessParameters
+const PARAMS_ENVIRONMENT_OFFSET: usize = 0x80; // RTL_USER_PROCESS_PARAMETERS -> Environment
+const PARAMS_ENVIRONMENT_SIZE_OFFSET: usize = 0x3F0; // -> EnvironmentSize (Win8+)
+const PARAMS_ENVIRONMENT_VALUES_SIZE_OFFSET: usize = 0x3F8; // -> EnvironmentValuesSize (Win8+)
+/// `RTL_USER_PROCESS_PARAMETERS.Length` for a genuine 64-bit process.
+const PARAMS_X64_LENGTH: usize = 0x400;
+/// Upper bound for scanning the child's env block for its double-NUL
+/// terminator (UTF-16 chars). A legitimate block stays far below this;
+/// refusing to scan further keeps a malformed block from turning into an
+/// unbounded cross-process read.
+const MAX_ENV_BLOCK_CHARS: usize = 1 << 20; // 1 MiB of UTF-16
+
+/// Build the replacement environment block: the existing entries (if any),
+/// then `NAME=VALUE`, then the double-NUL terminator.
+///
+/// Pure function so the wire format the child's environment consumers will
+/// parse is unit-testable without a real child process. `existing` is the
+/// block exactly as read from the child (terminator-inclusive); trailing
+/// terminator units are stripped, a single NUL separator is kept between the
+/// existing entries and the appended one, and the result ends in exactly one
+/// `\0\0`.
+fn env_block_bytes(existing: Option<&[u16]>, name: &str, value: &str) -> Vec<u8> {
+    let mut chars: Vec<u16> = Vec::new();
+    if let Some(existing) = existing {
+        chars.extend_from_slice(existing);
+        while chars.last() == Some(&0) {
+            chars.pop();
+        }
+        // The NUL that ended the last surviving entry is also the separator
+        // before the entry appended below — keep exactly one.
+        if !chars.is_empty() {
+            chars.push(0);
+        }
+    }
+    let mut entry: Vec<u16> = name.encode_utf16().collect();
+    entry.push('=' as u16);
+    entry.extend(value.encode_utf16());
+    chars.extend_from_slice(&entry);
+    chars.push(0); // entry terminator
+    chars.push(0); // block terminator
+    let mut bytes = Vec::with_capacity(chars.len() * 2);
+    for c in chars {
+        bytes.extend_from_slice(&c.to_le_bytes());
+    }
+    bytes
+}
+
+/// ReadProcessMemory with a full-length check (short reads are an error).
+fn read_remote_bytes(process: HANDLE, addr: usize, buf: &mut [u8]) -> Result<(), String> {
+    let mut read: usize = 0;
+    // SAFETY: buf is valid for buf.len() writes; addr is in the target's
+    //         address space (PEB / ProcessParameters — committed while the
+    //         suspended process exists).
+    let ok = unsafe {
+        winapi::um::memoryapi::ReadProcessMemory(
+            process,
+            addr as *const c_void,
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len(),
+            &mut read,
+        )
+    };
+    if ok == 0 {
+        return Err(format!("ReadProcessMemory failed at 0x{addr:x}"));
+    }
+    if read != buf.len() {
+        return Err(format!("short read at 0x{addr:x}: {read} of {}", buf.len()));
+    }
+    Ok(())
+}
+
+/// Append `FS_SANDBOX_SECTION=<section_name>` to the SUSPENDED child's
+/// environment block, cross-process.
+///
+/// This is the delivery channel for the per-session random section name
+/// (audit 2026-09-19, Critical #3): every child — including env-scrubbed
+/// ones such as MSYS2 first-run helpers — is written here before any guest
+/// code runs, so the value cannot be intercepted or forged by the guest.
+/// The hook reads the variable at DllMain install time via
+/// GetEnvironmentVariableW, which walks PEB->ProcessParameters->Environment
+/// live — exactly the pointer this function rewrites.
+///
+/// Mechanics: read the child's PEB -> ProcessParameters -> Environment,
+/// allocate a replacement block in the child, write old entries + our
+/// entry, then repoint Environment (plus the Win8+ EnvironmentSize /
+/// EnvironmentValuesSize fields). The old block is intentionally NOT freed:
+/// it was allocated by the process-creation path inside the child and may
+/// live under a heap we cannot safely VirtualFreeEx; a few KiB per child is
+/// acceptable (same trade as the intentionally leaked DLL-path buffer).
+///
+/// Returns Ok(()) without doing anything when the child does not look like a
+/// 64-bit process (struct Length mismatch): such a child cannot load this
+/// x64 hook DLL anyway, so there is no config to deliver.
+fn patch_child_env_section(process: HANDLE, section_name: &str) -> Result<(), String> {
+    #[allow(dead_code)] // reserved fields mirror the kernel struct layout
+    #[repr(C)]
+    struct PROCESS_BASIC_INFORMATION {
+        reserved1: *mut c_void,
+        peb_base_address: *mut c_void,
+        reserved2: [*mut c_void; 2],
+        unique_process_id: usize,
+        reserved3: *mut c_void,
+    }
+
+    type FnNtQueryInformationProcess = unsafe extern "system" fn(
+        HANDLE,
+        usize,       // ProcessInformationClass (0 = ProcessBasicInformation)
+        *mut c_void, // ProcessInformation
+        u32,         // ProcessInformationLength
+        *mut u32,    // ReturnLength
+    ) -> i32;
+
+    static QIP: std::sync::OnceLock<Option<FnNtQueryInformationProcess>> =
+        std::sync::OnceLock::new();
+    let qip = QIP.get_or_init(|| {
+        let ntdll_name: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
+        // SAFETY: literal ASCII name, null-terminated — always valid.
+        let hntdll = unsafe { GetModuleHandleW(ntdll_name.as_ptr()) };
+        if hntdll.is_null() {
+            return None;
+        }
+        // SAFETY: hntdll is valid, proc name is a valid ASCII literal.
+        let proc =
+            unsafe { GetProcAddress(hntdll, b"NtQueryInformationProcess\0".as_ptr() as *const i8) };
+        if proc.is_null() {
+            return None;
+        }
+        // SAFETY: fn_ptr is the real NtQueryInformationProcess export; the
+        //         usize intermediate avoids a direct fn-pointer transmute.
+        let fn_usize = proc as usize;
+        Some(unsafe { std::mem::transmute(fn_usize) })
+    });
+    let qip_fn = qip.ok_or_else(|| "NtQueryInformationProcess unavailable".to_string())?;
+
+    let mut pbi = std::mem::MaybeUninit::<PROCESS_BASIC_INFORMATION>::uninit();
+    // SAFETY: pbi is valid for size_of writes; process is a live child handle
+    //         with full access (returned by NtCreateUserProcess moments ago).
+    let status = unsafe {
+        qip_fn(
+            process,
+            0,
+            pbi.as_mut_ptr() as *mut c_void,
+            std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if status < 0 {
+        return Err(format!("NtQueryInformationProcess failed: 0x{status:08x}"));
+    }
+    // SAFETY: status >= 0 means the kernel wrote the full struct.
+    let peb_base = unsafe { (*pbi.as_ptr()).peb_base_address } as usize;
+    if peb_base == 0 {
+        return Err("PEB base address is null".into());
+    }
+
+    // ProcessParameters pointer (PEB + 0x20).
+    let mut params_bytes = [0u8; 8];
+    read_remote_bytes(process, peb_base + PEB_PROCESS_PARAMETERS_OFFSET, &mut params_bytes)?;
+    let params = usize::from_le_bytes(params_bytes);
+    if params == 0 {
+        return Err("child ProcessParameters is null".into());
+    }
+
+    // Struct Length sanity (offset 0x00): a genuine 64-bit process reports
+    // 0x400. A mismatch means a layout we do not claim to understand (e.g.
+    // WOW64) — skip instead of writing through guessed offsets.
+    let mut len_bytes = [0u8; 4];
+    read_remote_bytes(process, params, &mut len_bytes)?;
+    let params_length = u32::from_le_bytes(len_bytes) as usize;
+    if params_length != PARAMS_X64_LENGTH {
+        return Ok(());
+    }
+
+    // Existing entries, if any. Read in 4 KiB chunks (the block may end well
+    // before its surrounding allocation, and ReadProcessMemory fails whole
+    // when it crosses an unreadable page) and stop at the double-NUL
+    // terminator; the used prefix becomes the base of the new block.
+    let existing: Option<Vec<u16>> = if env_is_null(process, params)? {
+        None
+    } else {
+        let env_ptr = read_remote_usize(process, params + PARAMS_ENVIRONMENT_OFFSET)?;
+        let mut chars: Vec<u16> = Vec::new();
+        let mut terminated = false;
+        while chars.len() < MAX_ENV_BLOCK_CHARS {
+            let mut buf = [0u8; 4096]; // 2048 UTF-16 units per chunk
+            if read_remote_bytes(process, env_ptr + chars.len() * 2, &mut buf).is_err() {
+                break; // unreadable tail — stop with what we have
+            }
+            let old_len = chars.len();
+            chars.extend(buf.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])));
+            // `start` one before the append point so a pair spanning the
+            // chunk boundary is still found.
+            let start = old_len.saturating_sub(1);
+            if let Some(pos) = chars[start..].windows(2).position(|w| w == [0, 0]) {
+                chars.truncate(start + pos + 2);
+                terminated = true;
+                break;
+            }
+        }
+        if !terminated {
+            return Err("child env block not terminated within the scan bound".into());
+        }
+        Some(chars)
+    };
+
+    let new_block = env_block_bytes(existing.as_deref(), SECTION_ENV_VAR, section_name);
+    let new_size = new_block.len();
+
+    // SAFETY: process is a live child handle with full access; commit+reserve
+    //         a replacement environment block in the suspended child.
+    let remote_block = unsafe {
+        VirtualAllocEx(
+            process,
+            std::ptr::null_mut(),
+            new_size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
+    if remote_block.is_null() {
+        return Err("VirtualAllocEx (env block) failed".into());
+    }
+
+    // SAFETY: remote_block points to new_size writable bytes just allocated
+    //         in the child; new_block is exactly new_size bytes.
+    let write_ok = unsafe {
+        WriteProcessMemory(
+            process,
+            remote_block,
+            new_block.as_ptr() as *const c_void,
+            new_size,
+            std::ptr::null_mut(),
+        )
+    };
+    if write_ok == 0 {
+        unsafe {
+            // SAFETY: remote_block was allocated above and nothing in the
+            //         child can reference it yet (still suspended).
+            VirtualFreeEx(process, remote_block, 0, MEM_RELEASE);
+        }
+        return Err("WriteProcessMemory (env block) failed".into());
+    }
+
+    // Repoint ProcessParameters.Environment (and the Win8+ size fields) at
+    // the replacement block. Consumers either walk to the double-NUL or use
+    // these fields to size the block; both now describe the same bytes.
+    let patch = |addr: usize, bytes: &[u8]| -> Result<(), String> {
+        let mut written: usize = 0;
+        // SAFETY: addr is inside the child's ProcessParameters (committed,
+        //         length-verified as 0x400 above); bytes is valid for
+        //         bytes.len() reads.
+        let ok = unsafe {
+            WriteProcessMemory(
+                process,
+                addr as *mut c_void,
+                bytes.as_ptr() as *const c_void,
+                bytes.len(),
+                &mut written,
+            )
+        };
+        if ok == 0 || written != bytes.len() {
+            return Err(format!("WriteProcessMemory failed at 0x{addr:x}"));
+        }
+        Ok(())
+    };
+
+    patch(params + PARAMS_ENVIRONMENT_OFFSET, &(remote_block as usize).to_le_bytes())?;
+    patch(params + PARAMS_ENVIRONMENT_SIZE_OFFSET, &(new_size as u64).to_le_bytes())?;
+    patch(
+        params + PARAMS_ENVIRONMENT_VALUES_SIZE_OFFSET,
+        &(new_size as u64).to_le_bytes(),
+    )?;
+
+    Ok(())
+}
+
+/// Read the Environment pointer at `params + 0x80` and report whether it is
+/// null (a child may legitimately inherit no environment at all).
+fn env_is_null(process: HANDLE, params: usize) -> Result<bool, String> {
+    Ok(read_remote_usize(process, params + PARAMS_ENVIRONMENT_OFFSET)? == 0)
+}
+
+/// Read a native-pointer-sized value from the child.
+fn read_remote_usize(process: HANDLE, addr: usize) -> Result<usize, String> {
+    let mut buf = [0u8; 8];
+    read_remote_bytes(process, addr, &mut buf)?;
+    Ok(usize::from_le_bytes(buf))
+}
+
 /// Resolve the NT object name for an open handle using NtQueryObject.
 ///
 /// Returns the full NT path (e.g. `\Device\HarddiskVolume3\foo.txt`) or None
@@ -215,26 +539,92 @@ pub unsafe fn resolve_handle_path(handle: HANDLE) -> Option<Vec<u16>> {
         return None;
     }
 
-    // ObjectNameInformation layout: UNICODE_STRING at offset 0.
-    // UNICODE_STRING: Length(u16) + MaximumLength(u16) + [pad u32 on x64] + Buffer(*mut u16).
-    // We read Length and Buffer via the ObjectNameInfo repr we declared above.
-    let info = buf.as_ptr() as *const ObjectNameInfo;
-    let len_bytes = (*info).length as usize; // byte count, not char count
-    let char_count = len_bytes / 2;
-    if char_count == 0 {
+    // `returned` was previously ignored, so the parse below trusted the
+    // UNICODE_STRING's own Length/Buffer fields with nothing to check them
+    // against (audit 2026-09-19, Low — note the audit cites the launcher's
+    // inject.rs, but that copy validates its query; the defect is here, in
+    // the hook-side twin). Clamp to what the kernel actually wrote.
+    let valid = (returned as usize).min(buf_len);
+
+    // ObjectNameInformation layout: UNICODE_STRING at offset 0 — see
+    // parse_object_name_info for why every field read there is unaligned.
+    parse_object_name_info(buf.as_ptr(), valid)
+}
+
+/// Parse the OBJECT_NAME_INFORMATION a successful NtQueryObject wrote into
+/// `buf` (a raw byte buffer we own as a `Vec<u8>`) into its UTF-16 name.
+///
+/// A `Vec<u8>` allocation guarantees only 1-byte alignment, and the
+/// UNICODE_STRING sits at offset 0 of that buffer — so Length (@0), the
+/// Buffer pointer (@8) and the WCHAR data the kernel inlines behind the
+/// struct (@16, via the reported Buffer) are ALL potentially misaligned.
+/// Every read here goes through read_unaligned; a plain `(*info).length`
+/// dereference through a `*const ObjectNameInfo` (align 8) is UB on an odd
+/// buffer and aborts under the debug alignment check.
+///
+/// Returns `None` for a zero Length or a null Buffer.
+///
+/// # SAFETY
+/// `buf` must hold a well-formed OBJECT_NAME_INFORMATION as written by a
+/// successful NtQueryObject into a buffer of at least `buf_len` bytes: the
+/// reported Length bytes must be readable at the reported Buffer, which
+/// points inside `buf`.
+/// Decode an `OBJECT_NAME_INFORMATION` that the kernel wrote into our own
+/// buffer.
+///
+/// `valid_len` is how many bytes the kernel reported writing. Every field is
+/// checked against it: the header must fit, `Length` must fit behind the
+/// header, and `Buffer` must point at an inline span that lies wholly inside
+/// the same `valid_len` bytes. Without that the decode walked wherever
+/// `Buffer` pointed for however many characters `Length` claimed — both of
+/// which are just bytes in a buffer, trusted on a SAFETY comment rather than
+/// verified.
+unsafe fn parse_object_name_info(buf: *const u8, valid_len: usize) -> Option<Vec<u16>> {
+    const HEADER: usize = std::mem::size_of::<ObjectNameInfo>();
+    if valid_len < HEADER {
         return None;
     }
 
-    // Buffer pointer is valid inside our `buf` allocation for `char_count` u16s.
-    let buf_ptr = (*info).buffer;
+    let info = buf as *const ObjectNameInfo;
+    // SAFETY: addr_of + read_unaligned projects the field in place (no
+    // intermediate reference is minted) and tolerates any `buf` alignment.
+    let len_bytes = std::ptr::addr_of!((*info).length).read_unaligned() as usize; // byte count, not char count
+    let char_count = len_bytes / 2;
+    if char_count == 0 || len_bytes > valid_len - HEADER {
+        return None;
+    }
+
+    // SAFETY: addr_of + read_unaligned, as above — no alignment assumed.
+    let buf_ptr = std::ptr::addr_of!((*info).buffer).read_unaligned();
     if buf_ptr.is_null() {
         return None;
     }
 
-    // SAFETY: `buf_ptr` points inside `buf` which is valid for `buf_len` bytes;
-    // `char_count` * 2 <= len_bytes <= returned <= buf_len.
-    let slice = std::slice::from_raw_parts(buf_ptr, char_count);
-    Some(slice.to_vec())
+    // The kernel inlines the name behind the header, inside the very buffer we
+    // handed it. Require exactly that: `[buf_ptr, buf_ptr + len_bytes)` must
+    // sit within `[buf, buf + valid_len)`. A Buffer pointing outside means the
+    // record is not the self-contained reply we asked for, so refuse it rather
+    // than dereference it.
+    let base = buf as usize;
+    let start = buf_ptr as usize;
+    let end = match start.checked_add(len_bytes) {
+        Some(e) => e,
+        None => return None,
+    };
+    if start < base + HEADER || end > base + valid_len {
+        return None;
+    }
+
+    Some(
+        (0..char_count)
+            .map(|i| {
+                // SAFETY: the span was just proven to lie inside `buf`, which
+                // is valid for `valid_len` bytes; read_unaligned imposes no
+                // alignment requirement.
+                unsafe { buf_ptr.add(i).read_unaligned() }
+            })
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -340,6 +730,179 @@ mod intentional_leak_pin_tests {
             "inject_via_apc must document the intentional remote-buffer leak \
              with one of the marker phrases: {markers:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unaligned-buffer regression (alignment-UB class)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod object_name_parsing_tests {
+    use super::*;
+
+    /// REGRESSION: a `Vec<u8>` allocation guarantees only 1-byte alignment,
+    /// and resolve_handle_path parses OBJECT_NAME_INFORMATION straight out of
+    /// it — so Length (@0), the Buffer pointer (@8) and the inlined name
+    /// (@16) can all sit at odd addresses. Forcing the probe onto an odd
+    /// base, the parse must still produce the exact name; the old plain
+    /// `(*info).length` dereference through a `*const ObjectNameInfo` is UB
+    /// on the odd base and aborts under the debug alignment check.
+    #[test]
+    fn parse_object_name_info_reads_unaligned_buffer() {
+        let name: Vec<u16> = r"\Device\HarddiskVolume3\Mixed.TXT".encode_utf16().collect();
+        // OBJECT_NAME_INFORMATION: UNICODE_STRING (16 bytes) + inline WCHARs.
+        let body_len = 16 + name.len() * 2;
+        let mut backing = vec![0u8; body_len + 512];
+        let off = 1 - (backing.as_ptr() as usize % 2);
+        assert_eq!(
+            (backing.as_ptr() as usize + off) % 2,
+            1,
+            "probe buffer must start at an odd address",
+        );
+        let base = off;
+        // Length: bytes of the name, excluding any NUL.
+        backing[base..base + 2].copy_from_slice(&((name.len() * 2) as u16).to_le_bytes());
+        // MaximumLength: includes NUL slack.
+        backing[base + 2..base + 4].copy_from_slice(&(body_len as u16).to_le_bytes());
+        // Buffer: points at the inline data behind the struct (inside `backing`).
+        let inline_addr = backing.as_ptr() as usize + base + 16;
+        backing[base + 8..base + 16].copy_from_slice(&(inline_addr as u64).to_le_bytes());
+        for (i, u) in name.iter().enumerate() {
+            backing[base + 16 + i * 2..base + 18 + i * 2].copy_from_slice(&u.to_le_bytes());
+        }
+        // SAFETY: backing[base..base+body_len] is a well-formed
+        // OBJECT_NAME_INFORMATION whose Buffer points inside `backing`.
+        let parsed = unsafe { parse_object_name_info(backing.as_ptr().add(base), body_len) };
+        assert_eq!(
+            parsed.expect("well-formed OBJECT_NAME_INFORMATION must parse"),
+            name
+        );
+    }
+
+    /// Zero Length and a non-zero Length with a null Buffer both map to None,
+    /// matching the original inline behavior of resolve_handle_path.
+    #[test]
+    fn parse_object_name_info_rejects_empty_and_null() {
+        let mut backing = vec![0u8; 256];
+        // SAFETY: all-zero UNICODE_STRING header is a valid (empty) input.
+        let parsed = unsafe { parse_object_name_info(backing.as_ptr(), backing.len()) };
+        assert_eq!(parsed, None);
+
+        // Non-zero Length with null Buffer.
+        backing[0..2].copy_from_slice(&8u16.to_le_bytes());
+        // SAFETY: header is valid; the null-Buffer rejection is the contract.
+        let parsed = unsafe { parse_object_name_info(backing.as_ptr(), backing.len()) };
+        assert_eq!(parsed, None);
+    }
+
+    /// Bounds checking against what the kernel actually wrote (audit
+    /// 2026-09-19, Low — `returned` was ignored, so `Length` and `Buffer`
+    /// were trusted on a SAFETY comment rather than verified).
+    ///
+    /// Three shapes must all be refused, and before the fix each was decoded:
+    /// a `Length` larger than the reply, a `Buffer` pointing past the end of
+    /// the reply, and a reply too short to even hold the header.
+    #[test]
+    fn parse_object_name_info_rejects_out_of_bounds_fields() {
+        const HEADER: usize = std::mem::size_of::<ObjectNameInfo>();
+        let name: Vec<u16> = "abcd".encode_utf16().collect();
+        let body_len = HEADER + name.len() * 2;
+
+        let build = |len_bytes: u16, buffer_at: usize| -> Vec<u8> {
+            let mut b = vec![0u8; body_len + 512];
+            b[0..2].copy_from_slice(&len_bytes.to_le_bytes());
+            b[2..4].copy_from_slice(&(body_len as u16).to_le_bytes());
+            let addr = b.as_ptr() as usize + buffer_at;
+            b[8..16].copy_from_slice(&(addr as u64).to_le_bytes());
+            for (i, u) in name.iter().enumerate() {
+                b[HEADER + i * 2..HEADER + 2 + i * 2].copy_from_slice(&u.to_le_bytes());
+            }
+            b
+        };
+
+        // 1. Length claims far more than the kernel reported writing.
+        let b = build(4096, HEADER);
+        // SAFETY: `b` is valid for body_len bytes; the oversized Length is the input under test.
+        assert_eq!(unsafe { parse_object_name_info(b.as_ptr(), body_len) }, None);
+
+        // 2. Buffer points past the end of the valid region.
+        let b = build((name.len() * 2) as u16, body_len + 256);
+        // SAFETY: as above; the out-of-range Buffer must be refused, not followed.
+        assert_eq!(unsafe { parse_object_name_info(b.as_ptr(), body_len) }, None);
+
+        // 3. The reply is shorter than the header it claims to be.
+        let b = build((name.len() * 2) as u16, HEADER);
+        // SAFETY: as above; a truncated reply cannot be parsed.
+        assert_eq!(unsafe { parse_object_name_info(b.as_ptr(), HEADER - 1) }, None);
+
+        // Control: the same record with honest bounds still decodes.
+        let b = build((name.len() * 2) as u16, HEADER);
+        // SAFETY: well-formed, self-contained record.
+        assert_eq!(unsafe { parse_object_name_info(b.as_ptr(), body_len) }, Some(name));
+    }
+}
+
+#[cfg(test)]
+mod env_delivery_tests {
+    use super::*;
+
+    fn decode_block(block: &[u8]) -> String {
+        let chars: Vec<u16> = block
+            .chunks_exact(2)
+            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .collect();
+        String::from_utf16_lossy(&chars)
+    }
+
+    /// The block the child's environment consumers will parse: existing
+    /// entries verbatim, then NAME=VALUE, then exactly one double-NUL.
+    #[test]
+    fn env_block_appends_entry_with_terminator() {
+        let existing: Vec<u16> = "PATH=C:\\Windows\0TEMP=C:\\Temp\0\0"
+            .encode_utf16()
+            .collect();
+        let block = env_block_bytes(
+            Some(&existing),
+            SECTION_ENV_VAR,
+            r"Local\WinRsBoxSession-abcd",
+        );
+        let text = decode_block(&block);
+        assert!(
+            text.starts_with("PATH=C:\\Windows\0TEMP=C:\\Temp\0"),
+            "existing entries must survive verbatim: {text:?}"
+        );
+        assert_eq!(
+            text.matches("FS_SANDBOX_SECTION=").count(),
+            1,
+            "exactly one section entry may be appended: {text:?}"
+        );
+        assert!(
+            text.contains("FS_SANDBOX_SECTION=Local\\WinRsBoxSession-abcd\0"),
+            "the appended entry must be complete and NUL-terminated: {text:?}"
+        );
+        assert!(text.ends_with("\0\0"), "block must end in a double-NUL: {text:?}");
+    }
+
+    /// A child that inherited an empty (scrubbed) environment: no existing
+    /// entries — the block is exactly our entry plus the terminator. This is
+    /// the MSYS2 first-run case the section fallback exists for.
+    #[test]
+    fn env_block_handles_scrubbed_child() {
+        let block = env_block_bytes(None, SECTION_ENV_VAR, "Local\\WinRsBoxSession-x");
+        assert_eq!(
+            decode_block(&block),
+            "FS_SANDBOX_SECTION=Local\\WinRsBoxSession-x\0\0"
+        );
+    }
+
+    /// An existing block carrying extra trailing terminators is normalized:
+    /// the result keeps the entries and ends in exactly one terminator pair.
+    #[test]
+    fn env_block_strips_trailing_terminators_before_append() {
+        let existing: Vec<u16> = "A=B\0\0\0".encode_utf16().collect();
+        let block = env_block_bytes(Some(&existing), "K", "V");
+        assert_eq!(decode_block(&block), "A=B\0K=V\0\0");
     }
 }
 

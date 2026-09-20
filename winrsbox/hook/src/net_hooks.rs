@@ -44,13 +44,15 @@ pub unsafe fn parse_sockaddr(addr: *const c_void, len: i32) -> Option<(String, u
     if addr.is_null() || len < 16 {
         return None;
     }
-    // SAFETY: addr is non-null and len >= 16, verified above.
-    let family = *(addr as *const u16);
+    // SAFETY: addr is non-null and len >= 16, verified above. All multi-byte
+    // field reads are unaligned: `addr` is the hooked caller's pointer and its
+    // alignment is whatever that caller chose.
+    let family = (addr as *const u16).read_unaligned();
     match family {
         AF_INET => {
             // sockaddr_in: { u16 family; u16 port (BE); u8 addr[4]; ... }
             // SAFETY: len >= 16 confirmed above; offsets 2..8 are within bounds for AF_INET.
-            let port_be = *((addr as *const u8).add(2) as *const u16);
+            let port_be = ((addr as *const u8).add(2) as *const u16).read_unaligned();
             let port = u16::from_be(port_be);
             // SAFETY: from_raw_parts for 4 bytes starting at offset 4 — within the 16-byte sockaddr_in.
             let ip = std::slice::from_raw_parts((addr as *const u8).add(4), 4);
@@ -59,7 +61,7 @@ pub unsafe fn parse_sockaddr(addr: *const c_void, len: i32) -> Option<(String, u
         AF_INET6 if len >= 28 => {
             // sockaddr_in6: { u16 family; u16 port (BE); u32 flowinfo; u8 addr[16]; u32 scope }
             // SAFETY: len >= 28 confirmed by match guard; offsets 2..4 (port) and 8..24 (addr) are in bounds.
-            let port_be = *((addr as *const u8).add(2) as *const u16);
+            let port_be = ((addr as *const u8).add(2) as *const u16).read_unaligned();
             let port = u16::from_be(port_be);
             // SAFETY: from_raw_parts for 16 bytes starting at offset 8 — within the 28-byte sockaddr_in6.
             let ip = std::slice::from_raw_parts((addr as *const u8).add(8), 16);
@@ -114,6 +116,7 @@ unsafe extern "system" fn hook_connect(
     namelen: i32,
 ) -> i32 {
     let call_original = || {
+// Detour-absent: unwrap-abort kept on purpose — socket i32 family; fail-closed would be SOCKET_ERROR (-1), a per-API decision (see nt_call_original in hooks.rs).
         // SAFETY: detour2 guarantees the trampoline pointer is valid and matches FnConnect ABI.
         HOOK_CONNECT.get().unwrap().call(s, name, namelen)
     };
@@ -186,6 +189,46 @@ pub unsafe fn uninstall() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── unaligned-read regression (alignment-UB class, mirrors 9d73d34) ──
+    //
+    // The sockaddr base address is the hooked connect caller's choice and can
+    // be odd. The helpers above hand back a heap Vec — practically always
+    // 8-aligned, so they prove nothing about alignment. These probes shift an
+    // otherwise-normal sockaddr onto a forced-odd base; the old plain
+    // `*(addr as *const u16)` family/port reads aborted there.
+
+    fn odd_offset(backing: &[u8]) -> usize {
+        let off = 1 - (backing.as_ptr() as usize % 2);
+        assert_eq!((backing.as_ptr() as usize + off) % 2, 1, "probe must sit at an odd address");
+        off
+    }
+
+    #[test]
+    fn parse_sockaddr_in_at_odd_base() {
+        let mut backing = vec![0u8; 40];
+        let off = odd_offset(&backing);
+        let sa = make_sockaddr_in([10, 0, 0, 1], 8443);
+        backing[off..off + 16].copy_from_slice(&sa);
+        // SAFETY: the odd window holds a complete 16-byte sockaddr_in.
+        let parsed = unsafe { parse_sockaddr(backing.as_ptr().add(off) as *const _, 16) };
+        assert_eq!(parsed, Some(("10.0.0.1".into(), 8443)));
+    }
+
+    #[test]
+    fn parse_sockaddr_in6_at_odd_base() {
+        let mut backing = vec![0u8; 40];
+        let off = odd_offset(&backing);
+        let mut ip = [0u8; 16];
+        ip[15] = 1; // ::1
+        let sa = make_sockaddr_in6(ip, 9090);
+        backing[off..off + 28].copy_from_slice(&sa);
+        // SAFETY: the odd window holds a complete 28-byte sockaddr_in6.
+        let parsed = unsafe { parse_sockaddr(backing.as_ptr().add(off) as *const _, 28) };
+        let (host, port) = parsed.expect("odd-base sockaddr_in6 must parse");
+        assert_eq!(port, 9090);
+        assert!(host.ends_with(":1"));
+    }
 
     fn make_sockaddr_in(ip: [u8; 4], port: u16) -> Vec<u8> {
         let mut buf = vec![0u8; 16];

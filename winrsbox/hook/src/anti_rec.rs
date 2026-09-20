@@ -57,6 +57,30 @@ impl Drop for Guard {
 
 /// Attempt to enter a hook. Returns Some(Guard) on success (caller is not
 /// re-entrant), or None if we are already inside a hook on this thread.
+///
+/// # Window contract (audit 2026-09-19, Medium "anti_rec fail-open")
+///
+/// Everything between `enter()` and the `Guard` drop runs with hooks
+/// suppressed. The window must stay this wide: it covers the hook's own
+/// file/pipe I/O (e.g. ipc_client's named-pipe `CreateFileW` would
+/// otherwise re-enter the FS hooks and recurse into IPC until the stack is
+/// exhausted). Code inside the window therefore has two hard invariants:
+///
+/// 1. Never invoke guest code — no guest function pointers, and no
+///    alertable waits (`SleepEx`, `WaitForSingleObjectEx(TRUE)`, overlapped
+///    I/O with APC completion): a queued guest user-APC would otherwise be
+///    delivered mid-frame and run with every guard suppressed. (Verified:
+///    no such call exists anywhere in the hook today.)
+/// 2. Assume any fault raised in-window dispatches guest vectored/SEH
+///    handlers on this thread while the flag is set. The guard cannot
+///    absorb that; it is mitigated at the source by probing
+///    caller-controlled buffers before reading them (VirtualQuery-based,
+///    see shell_guard / proc_guard / memory_guard). Do not clear the flag
+///    during exception dispatch to "fix" this — that re-opens invariant 1.
+///
+/// System DLLs called from the window (ntdll/kernelbase, and the loader
+/// running system DllMains for install-time LoadLibraryW) are the same
+/// trusted system class every guard allow-lists elsewhere.
 pub fn enter() -> Option<Guard> {
     let s = slot();
     // SAFETY: `s` is a valid TlsAlloc slot; TlsGetValue is safe to call from
