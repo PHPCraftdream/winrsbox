@@ -659,26 +659,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
-name = "hook"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "detour2",
- "ipc",
- "ntapi",
- "once_cell",
- "policy",
- "pretty_assertions",
- "proptest",
- "quick_cache",
- "rstest",
- "tempfile",
- "widestring",
- "winapi",
- "xxhash-rust",
-]
-
-[[package]]
 name = "iced-x86"
 version = "1.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -697,36 +677,6 @@ dependencies = [
  "hashbrown 0.17.1",
  "serde",
  "serde_core",
-]
-
-[[package]]
-name = "integration-tests"
-version = "0.1.0"
-dependencies = [
- "assert_cmd",
- "ntapi",
- "policy",
- "predicates",
- "pretty_assertions",
- "serde_json",
- "serial_test",
- "tempfile",
- "winapi",
- "winrsbox",
-]
-
-[[package]]
-name = "ipc"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "criterion",
- "policy",
- "pretty_assertions",
- "proptest",
- "rstest",
- "serde",
- "thiserror",
 ]
 
 [[package]]
@@ -1059,30 +1009,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51bae2ac328883f7acdfea3d66a7c35751187f870bc81f94563733a154d7a670"
 dependencies = [
  "plotters-backend",
-]
-
-[[package]]
-name = "policy"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "base64",
- "bincode",
- "criterion",
- "iced-x86",
- "ktav",
- "pretty_assertions",
- "proptest",
- "quick_cache",
- "redb",
- "rstest",
- "rustc-hash",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "widestring",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -2186,10 +2112,8 @@ dependencies = [
  "criterion",
  "crossbeam-queue",
  "ferrisetw",
- "ipc",
  "ktav",
  "papaya",
- "policy",
  "redb",
  "rustc-hash",
  "serde",
@@ -2198,6 +2122,86 @@ dependencies = [
  "tokio",
  "windows 0.61.3",
  "winreg",
+ "winrsbox-ipc",
+ "winrsbox-policy",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "winrsbox-hook"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "detour2",
+ "ntapi",
+ "once_cell",
+ "pretty_assertions",
+ "proptest",
+ "quick_cache",
+ "rstest",
+ "tempfile",
+ "widestring",
+ "winapi",
+ "winrsbox-ipc",
+ "winrsbox-policy",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "winrsbox-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "assert_cmd",
+ "ntapi",
+ "predicates",
+ "pretty_assertions",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+ "winapi",
+ "winrsbox",
+ "winrsbox-policy",
+]
+
+[[package]]
+name = "winrsbox-ipc"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "criterion",
+ "pretty_assertions",
+ "proptest",
+ "rstest",
+ "serde",
+ "thiserror",
+ "winrsbox-policy",
+]
+
+[[package]]
+name = "winrsbox-layout-guard"
+version = "0.1.0"
+
+[[package]]
+name = "winrsbox-policy"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "base64",
+ "bincode",
+ "criterion",
+ "iced-x86",
+ "ktav",
+ "pretty_assertions",
+ "proptest",
+ "quick_cache",
+ "redb",
+ "rstest",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "widestring",
  "xxhash-rust",
 ]
 

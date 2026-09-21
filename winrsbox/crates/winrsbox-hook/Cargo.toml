@@ -1,0 +1,94 @@
+[package]
+name = "winrsbox-hook"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "winrsbox ntdll-level hook DLL — CoW FS redirect, memory/inject/COM/ALPC guards"
+repository = "https://github.com/PHPCraftdream/winrsbox"
+# Internal implementation crate — released as source with winrsbox, not to crates.io.
+publish = false
+
+[lib]
+# Pinned: the injector loads the DLL by this exact file name. Without it the
+# name would follow the package and become `winrsbox_hook.dll`.
+name = "hook"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+policy  = { package = "winrsbox-policy", path = "../winrsbox-policy" }
+ipc     = { package = "winrsbox-ipc", path = "../winrsbox-ipc" }
+
+detour2    = { version = "0.9", default-features = false }
+ntapi      = "0.4"
+winapi     = { version = "0.3", features = [
+    "winerror",
+    "minwindef",
+    "basetsd",
+    "winnt",
+    "processthreadsapi",
+    "libloaderapi",
+    "memoryapi",
+    "handleapi",
+    "synchapi",
+    "fileapi",
+    "processenv",
+    "debugapi",
+    "psapi",
+    "winuser",
+    "errhandlingapi",
+    "winver",
+    "stringapiset", # MultiByteToWideChar — shell_guard ANSI hook (ShellExecuteA)
+    "winnls",       # CP_ACP code-page id for the same conversion
+] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+once_cell  = "1"
+widestring = { workspace = true }
+quick_cache = "0.6"
+
+[dev-dependencies]
+criterion = { workspace = true }
+pretty_assertions = { workspace = true }
+rstest = { workspace = true }
+proptest = { workspace = true }
+policy = { package = "winrsbox-policy", path = "../winrsbox-policy" }
+tempfile = { workspace = true }
+
+[[bench]]
+name = "cache"
+path = "benches/fs/cache.rs"
+harness = false
+
+[[bench]]
+name = "is_write"
+path = "benches/fs/is_write.rs"
+harness = false
+
+[[bench]]
+name = "memory_guard"
+path = "benches/guards/memory_guard.rs"
+harness = false
+
+[[bench]]
+name = "inject_guard"
+path = "benches/guards/inject_guard.rs"
+harness = false
+
+[[bench]]
+name = "process_tracker"
+path = "benches/guards/process_tracker.rs"
+harness = false
+
+[[bench]]
+name = "net_hooks"
+path = "benches/guards/net_hooks.rs"
+harness = false
+
+[[bench]]
+name = "path_traversal"
+path = "benches/fs/path_traversal.rs"
+harness = false
+
+[[bench]]
+name = "decide_full"
+path = "benches/fs/decide_full.rs"
+harness = false

@@ -1,0 +1,432 @@
+[package]
+name = "winrsbox-integration-tests"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "integration-tests"
+path = "src/main.rs"
+
+[[bin]]
+name = "escape_alloc_rwx"
+path = "src/bin/mem/exec/escape_alloc_rwx.rs"
+
+[[bin]]
+name = "escape_jit_protect"
+path = "src/bin/mem/code/escape_jit_protect.rs"
+
+[[bin]]
+name = "escape_heap_to_exec"
+path = "src/bin/mem/exec/escape_heap_to_exec.rs"
+
+[[bin]]
+name = "escape_stack_exec"
+path = "src/bin/mem/exec/escape_stack_exec.rs"
+
+[[bin]]
+name = "escape_map_anon_rwx"
+path = "src/bin/mem/exec/escape_map_anon_rwx.rs"
+
+[[bin]]
+name = "escape_ntdll_double_map"
+path = "src/bin/mem/maps/escape_ntdll_double_map.rs"
+
+[[bin]]
+name = "escape_remote_thread"
+path = "src/bin/proc/inject/escape_remote_thread.rs"
+
+[[bin]]
+name = "clean_noop"
+path = "src/bin/clean/clean_noop.rs"
+
+[[bin]]
+name = "clean_normal_alloc"
+path = "src/bin/clean/clean_normal_alloc.rs"
+
+[[bin]]
+name = "clean_fileio"
+path = "src/bin/clean/clean_fileio.rs"
+
+[[bin]]
+name = "bypass_direct_syscall"
+path = "src/bin/bypass/bypass_direct_syscall.rs"
+
+[[bin]]
+name = "clean_sleep"
+path = "src/bin/clean/clean_sleep.rs"
+
+[[bin]]
+name = "escape_foreign_alloc_rwx"
+path = "src/bin/mem/exec/escape_foreign_alloc_rwx.rs"
+
+[[bin]]
+name = "escape_foreign_write_syscall"
+path = "src/bin/mem/maps/escape_foreign_write_syscall.rs"
+
+[[bin]]
+name = "escape_reg_appinit"
+path = "src/bin/proc/persist/escape_reg_appinit.rs"
+
+[[bin]]
+name = "escape_reg_ifeo"
+path = "src/bin/proc/persist/escape_reg_ifeo.rs"
+
+[[bin]]
+name = "escape_reg_silentexit"
+path = "src/bin/proc/persist/escape_reg_silentexit.rs"
+
+[[bin]]
+name = "escape_reg_service"
+path = "src/bin/broker/service/escape_reg_service.rs"
+
+[[bin]]
+name = "escape_thread_hijack"
+path = "src/bin/proc/inject/escape_thread_hijack.rs"
+
+[[bin]]
+name = "escape_hwbp_injection"
+path = "src/bin/proc/inject/escape_hwbp_injection.rs"
+
+[[bin]]
+name = "escape_apc_injection"
+path = "src/bin/proc/inject/escape_apc_injection.rs"
+
+[[bin]]
+name = "escape_apc_ex"
+path = "src/bin/proc/inject/escape_apc_ex.rs"
+
+[[bin]]
+name = "escape_net_rfc1918"
+path = "src/bin/net/escape_net_rfc1918.rs"
+
+[[bin]]
+name = "escape_memory_bomb"
+path = "src/bin/mem/maps/escape_memory_bomb.rs"
+
+[[bin]]
+name = "escape_dynamic_code"
+path = "src/bin/mem/code/escape_dynamic_code.rs"
+
+[[bin]]
+name = "escape_static_syscall"
+path = "src/bin/mem/code/escape_static_syscall.rs"
+
+[[bin]]
+name = "clean_jit_pattern"
+path = "src/bin/clean/clean_jit_pattern.rs"
+
+[[bin]]
+name = "legit_unpacker_sim"
+path = "src/bin/clean/benign/legit_unpacker_sim.rs"
+
+[[bin]]
+name = "legit_self_patching"
+path = "src/bin/clean/benign/legit_self_patching.rs"
+
+[[bin]]
+name = "escape_unpacker_syscall"
+path = "src/bin/mem/code/escape_unpacker_syscall.rs"
+
+[[bin]]
+name = "escape_self_modify_syscall"
+path = "src/bin/mem/code/escape_self_modify_syscall.rs"
+
+[[bin]]
+name = "escape_afd_direct"
+path = "src/bin/net/escape_afd_direct.rs"
+
+[[bin]]
+name = "escape_systemquery_write"
+path = "src/bin/fs/volume/escape_systemquery_write.rs"
+
+[[bin]]
+name = "escape_junction"
+path = "src/bin/fs/links/escape_junction.rs"
+
+[[bin]]
+name = "escape_hardlink"
+path = "src/bin/fs/links/escape_hardlink.rs"
+
+[[bin]]
+name = "escape_alpc_com"
+path = "src/bin/broker/com/escape_alpc_com.rs"
+
+[[bin]]
+name = "escape_token_priv"
+path = "src/bin/proc/token/escape_token_priv.rs"
+
+[[bin]]
+name = "escape_fs_system_write"
+path = "src/bin/fs/volume/escape_fs_system_write.rs"
+
+[[bin]]
+name = "escape_cow_isolation"
+path = "src/bin/fs/volume/escape_cow_isolation.rs"
+
+[[bin]]
+name = "escape_smb_egress"
+path = "src/bin/net/escape_smb_egress.rs"
+
+[[bin]]
+name = "escape_pipe_scm"
+path = "src/bin/broker/service/escape_pipe_scm.rs"
+
+[[bin]]
+name = "escape_shadow_copy"
+path = "src/bin/fs/volume/escape_shadow_copy.rs"
+
+[[bin]]
+name = "escape_raw_disk"
+path = "src/bin/fs/volume/escape_raw_disk.rs"
+
+[[bin]]
+name = "escape_localhost"
+path = "src/bin/net/escape_localhost.rs"
+
+[[bin]]
+name = "debug_cmdline"
+path = "src/bin/clean/benign/debug_cmdline.rs"
+
+[[bin]]
+name = "escape_lolbas_regsvr32"
+path = "src/bin/broker/service/escape_lolbas_regsvr32.rs"
+
+[[bin]]
+name = "escape_sendinput"
+path = "src/bin/proc/input/escape_sendinput.rs"
+
+[[bin]]
+name = "escape_keybd_event"
+path = "src/bin/proc/input/escape_keybd_event.rs"
+
+[[bin]]
+name = "escape_clipboard"
+path = "src/bin/proc/input/escape_clipboard.rs"
+
+[[bin]]
+name = "escape_inject_remote"
+path = "src/bin/proc/inject/escape_inject_remote.rs"
+
+[[bin]]
+name = "escape_spawn_wsl"
+path = "src/bin/proc/launch/escape_spawn_wsl.rs"
+
+[[bin]]
+name = "escape_spawn_wmic"
+path = "src/bin/proc/launch/escape_spawn_wmic.rs"
+
+[[bin]]
+name = "escape_parent_spoof"
+path = "src/bin/proc/launch/escape_parent_spoof.rs"
+
+[[bin]]
+name = "escape_handle_list_inheritance"
+path = "src/bin/proc/launch/escape_handle_list_inheritance.rs"
+
+[[bin]]
+name = "escape_com_shell"
+path = "src/bin/broker/com/escape_com_shell.rs"
+
+[[bin]]
+name = "escape_com_wscript"
+path = "src/bin/broker/com/escape_com_wscript.rs"
+
+[[bin]]
+name = "escape_com_wmi"
+path = "src/bin/broker/com/escape_com_wmi.rs"
+
+[[bin]]
+name = "escape_com_taskscheduler"
+path = "src/bin/broker/com/escape_com_taskscheduler.rs"
+
+[[bin]]
+name = "escape_globalroot"
+path = "src/bin/fs/naming/escape_globalroot.rs"
+
+[[bin]]
+name = "escape_ads"
+path = "src/bin/fs/naming/escape_ads.rs"
+
+[[bin]]
+name = "escape_short_name"
+path = "src/bin/fs/naming/escape_short_name.rs"
+
+[[bin]]
+name = "escape_file_by_id"
+path = "src/bin/fs/naming/escape_file_by_id.rs"
+
+[[bin]]
+name = "escape_job_reassign"
+path = "src/bin/proc/launch/escape_job_reassign.rs"
+
+[[bin]]
+name = "escape_job_breakaway"
+path = "src/bin/proc/launch/escape_job_breakaway.rs"
+
+[[bin]]
+name = "escape_token_open"
+path = "src/bin/proc/token/escape_token_open.rs"
+
+[[bin]]
+name = "escape_token_duplicate"
+path = "src/bin/proc/token/escape_token_duplicate.rs"
+
+[[bin]]
+name = "escape_token_impersonate"
+path = "src/bin/proc/token/escape_token_impersonate.rs"
+
+[[bin]]
+name = "escape_ntfs_ea"
+path = "src/bin/fs/volume/escape_ntfs_ea.rs"
+
+[[bin]]
+name = "escape_dll_sideload"
+path = "src/bin/proc/launch/escape_dll_sideload.rs"
+
+[[bin]]
+name = "escape_com_classobject"
+path = "src/bin/broker/com/escape_com_classobject.rs"
+
+[[bin]]
+name = "escape_winrsbox_read"
+path = "src/bin/fs/winrsbox/escape_winrsbox_read.rs"
+
+[[bin]]
+name = "escape_winrsbox_enum"
+path = "src/bin/fs/winrsbox/escape_winrsbox_enum.rs"
+
+[[bin]]
+name = "escape_scm_open"
+path = "src/bin/broker/service/escape_scm_open.rs"
+
+[[bin]]
+name = "escape_service_changeconfig"
+path = "src/bin/broker/service/escape_service_changeconfig.rs"
+
+[[bin]]
+name = "escape_rename_outside_sandbox"
+path = "src/bin/fs/rename/escape_rename_outside_sandbox.rs"
+
+[[bin]]
+name = "escape_hardlink_to_host"
+path = "src/bin/fs/links/escape_hardlink_to_host.rs"
+
+[[bin]]
+name = "escape_reparse_create"
+path = "src/bin/fs/links/escape_reparse_create.rs"
+
+[[bin]]
+name = "escape_setinfo_process"
+path = "src/bin/proc/system/escape_setinfo_process.rs"
+
+[[bin]]
+name = "escape_pipe_impersonate"
+path = "src/bin/broker/service/escape_pipe_impersonate.rs"
+
+[[bin]]
+name = "escape_unmap_foreign"
+path = "src/bin/mem/maps/escape_unmap_foreign.rs"
+
+[[bin]]
+name = "escape_map_foreign"
+path = "src/bin/mem/maps/escape_map_foreign.rs"
+
+[[bin]]
+name = "escape_shutdown"
+path = "src/bin/proc/system/escape_shutdown.rs"
+
+[[bin]]
+name = "escape_set_system_info"
+path = "src/bin/proc/system/escape_set_system_info.rs"
+
+[[bin]]
+name = "escape_debug_object"
+path = "src/bin/proc/inject/escape_debug_object.rs"
+
+[[bin]]
+name = "escape_raise_hard_error"
+path = "src/bin/proc/system/escape_raise_hard_error.rs"
+
+[[bin]]
+name = "escape_impersonate_thread"
+path = "src/bin/proc/token/escape_impersonate_thread.rs"
+
+[[bin]]
+name = "escape_open_thread_token"
+path = "src/bin/proc/token/escape_open_thread_token.rs"
+
+[[bin]]
+name = "clean_write_one_file"
+path = "src/bin/clean/clean_write_one_file.rs"
+
+[[bin]]
+name = "spawn_two_children"
+path = "src/bin/clean/benign/spawn_two_children.rs"
+
+[[test]]
+name = "mock_integration"
+path = "tests/mock_integration.rs"
+
+[[test]]
+name = "memory_guard"
+path = "tests/memory_guard/main.rs"
+
+[[test]]
+name = "real_world"
+path = "tests/real_world.rs"
+
+[[test]]
+name = "concurrent_children"
+path = "tests/concurrent_children.rs"
+
+[[test]]
+name = "net_installer"
+path = "tests/net/net_installer.rs"
+
+[[test]]
+name = "cli_workflow"
+path = "tests/cli/cli_workflow.rs"
+
+[[test]]
+name = "dev_e2e"
+path = "tests/cli/dev_e2e.rs"
+
+[[test]]
+name = "reg_cli_workflow"
+path = "tests/cli/reg_cli_workflow.rs"
+
+[dependencies]
+policy = { package = "winrsbox-policy", path = "../winrsbox-policy" }
+serde_json = "1"
+winapi = { version = "0.3", features = ["memoryapi", "winnt", "processthreadsapi", "libloaderapi", "errhandlingapi", "tlhelp32", "handleapi", "winreg", "minwindef", "fileapi", "ioapiset", "processenv", "winuser", "synchapi", "winbase", "jobapi2", "combaseapi", "winsvc", "namedpipeapi", "securitybaseapi"] }
+ntapi = "0.4"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+pretty_assertions = { workspace = true }
+serial_test = { workspace = true }
+assert_cmd = "2"
+predicates = "3"
+winrsbox = { path = "../winrsbox-launcher" }
+
+[[bin]]
+name = "escape_device_volume_write"
+path = "src/bin/fs/volume/escape_device_volume_write.rs"
+
+[[bin]]
+name = "escape_reg_environment"
+path = "src/bin/proc/persist/escape_reg_environment.rs"
+
+[[bin]]
+name = "escape_rename_device_path"
+path = "src/bin/fs/rename/escape_rename_device_path.rs"
+
+[[bin]]
+name = "escape_rename_sibling"
+path = "src/bin/fs/rename/escape_rename_sibling.rs"
+
+[[bin]]
+name = "escape_winrsbox_relative"
+path = "src/bin/fs/winrsbox/escape_winrsbox_relative.rs"

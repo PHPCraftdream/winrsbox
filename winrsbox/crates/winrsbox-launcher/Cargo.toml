@@ -1,0 +1,79 @@
+[package]
+name = "winrsbox"
+version = "0.1.0"
+edition = "2021"
+description = "Windows filesystem sandbox for AI agents (CoW overlay, ntdll-level hooks)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/PHPCraftdream/winrsbox"
+homepage = "https://github.com/PHPCraftdream/winrsbox"
+readme = "../../README.md"
+keywords = ["sandbox", "windows", "security", "filesystem", "hooks"]
+categories = ["os::windows-apis", "command-line-utilities"]
+
+[lib]
+name = "winrsbox"
+path = "src/lib.rs"
+
+[[bin]]
+name = "winrsbox"
+path = "src/main.rs"
+
+[dependencies]
+policy = { package = "winrsbox-policy", path = "../winrsbox-policy" }
+ipc = { package = "winrsbox-ipc", path = "../winrsbox-ipc" }
+tokio = { version = "1", features = ["full"] }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_System_Environment",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_JobObjects",
+    "Win32_Security_WinTrust",
+    "Win32_Security_Cryptography",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_System_Rpc",
+    "Wdk_NetworkManagement_WindowsFilteringPlatform",
+    "Wdk_System_Threading",
+] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+base64 = "0.22"
+serde = { workspace = true }
+serde_json = "1"
+redb = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+ktav = "=0.6.1"
+crossbeam-queue = "0.3"
+papaya = "0.2.4"
+rustc-hash = { workspace = true }
+winreg = "0.55"
+ferrisetw = "1.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "shell"
+harness = false
+
+[[bench]]
+name = "mitigations"
+harness = false
+
+[[bench]]
+name = "etw"
+harness = false
+
+[[bench]]
+name = "wfp"
+harness = false

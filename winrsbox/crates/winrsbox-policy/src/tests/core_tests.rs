@@ -1,0 +1,392 @@
+use crate::*;
+use std::io::Write;
+
+#[test]
+fn ensure_lower_is_ascii_only() {
+    assert_eq!(ensure_lower("CamelCase").as_ref(), "camelcase");
+    assert_eq!(ensure_lower("already-lower").as_ref(), "already-lower");
+    // U+0130 (LATIN CAPITAL LETTER I WITH DOT ABOVE) must pass through
+    // untouched — Unicode to_lowercase() would fold it to "i\u{307}",
+    // diverging from the kernel's ASCII-only RtlDowncaseUnicodeString.
+    let input = "C:\\WIN\u{0130}DIR";
+    assert_eq!(ensure_lower(input).as_ref(), "c:\\win\u{0130}dir");
+}
+
+#[test]
+fn ensure_lower_fast_path_borrows() {
+    let s = "already-lowercase-ascii";
+    let result = ensure_lower(s);
+    assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
+}
+
+#[test]
+fn fresh_db_defaults_passthrough_cow() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&mock_dirs).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let p = Policy::open_or_create(
+        &db_path,
+        sandbox,
+        mock_dirs,
+        project,
+    ).unwrap();
+
+    let d = p.decide(r"c:\some\path", false);
+    assert_eq!(d.mode, Mode::Passthrough);
+
+    // External write with no explicit rule → CoW (isolated into the
+    // sandbox overlay, never the real disk). This is the core isolation
+    // invariant of the merged-view model.
+    let d = p.decide(r"c:\some\path", true);
+    assert_eq!(d.mode, Mode::Cow);
+}
+
+#[test]
+fn deny_rule_on_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&mock_dirs).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let p = Policy::open_or_create(
+        &db_path,
+        sandbox,
+        mock_dirs,
+        project,
+    ).unwrap();
+
+    let cfg_path = dir.path().join("config.ktv");
+    let mut f = std::fs::File::create(&cfg_path).unwrap();
+    let cfg = "defaults: {\n\
+        \x20   read: passthrough\n\
+        \x20   write: cow\n\
+        }\n\
+        \n\
+        rules: [\n\
+        \x20   {\n\
+        \x20       prefix: c:\\test\n\
+        \x20       write: deny\n\
+        \x20   }\n\
+        ]";
+    write!(f, "{}", cfg).unwrap();
+    drop(f);
+
+    p.load_config(&cfg_path).unwrap();
+    let d = p.decide("c:\\test\\x", true);
+    assert_eq!(d.mode, Mode::Deny);
+}
+
+#[test]
+fn record_overlay_then_read_cow() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&mock_dirs).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let p = Policy::open_or_create(
+        &db_path,
+        sandbox,
+        mock_dirs,
+        project,
+    ).unwrap();
+
+    let overlay_path = dir.path().join("sb").join("c").join("data.txt");
+    p.record_overlay(r"c:\data.txt", overlay_path.to_str().unwrap()).unwrap();
+
+    let d = p.decide(r"c:\data.txt", false);
+    assert_eq!(d.mode, Mode::Cow);
+    assert!(d.overlay.is_some());
+}
+
+#[test]
+fn project_root_always_passthrough() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&mock_dirs).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let p = Policy::open_or_create(
+        &db_path,
+        sandbox,
+        mock_dirs,
+        project.clone(),
+    ).unwrap();
+
+    let cfg_path = dir.path().join("config.ktv");
+    let mut f = std::fs::File::create(&cfg_path).unwrap();
+    let cfg = "defaults: {\n\
+        \x20   read: deny\n\
+        \x20   write: deny\n\
+        }\n\
+        \n\
+        rules: [\n\
+        \x20   {\n\
+        \x20       prefix: c:\\deny_all\n\
+        \x20       read: deny\n\
+        \x20       write: deny\n\
+        \x20   }\n\
+        ]";
+    write!(f, "{}", cfg).unwrap();
+    drop(f);
+    p.load_config(&cfg_path).unwrap();
+
+    let inside = project.join("src").join("main.rs");
+    let d = p.decide(inside.to_str().unwrap(), false);
+    assert_eq!(d.mode, Mode::Passthrough);
+
+    let d = p.decide(inside.to_str().unwrap(), true);
+    assert_eq!(d.mode, Mode::Passthrough);
+}
+
+#[test]
+fn mock_dirs_prefix_cow() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&mock_dirs).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let p = Policy::open_or_create(
+        &db_path,
+        sandbox,
+        mock_dirs.clone(),
+        project,
+    ).unwrap();
+
+    let cfg_path = dir.path().join("config.ktv");
+    let mut f = std::fs::File::create(&cfg_path).unwrap();
+    write!(f, "defaults: {{\n\
+        read: passthrough\n\
+        write: cow\n\
+    }}\n\
+    \n\
+    mock_dirs: [\n\
+        {{\n\
+            prefix: c:\\fake\n\
+        }}\n\
+    ]\n\
+    ").unwrap();
+    drop(f);
+    p.load_config(&cfg_path).unwrap();
+
+    let d = p.decide(r"c:\fake\sub\file.txt", false);
+    assert_eq!(d.mode, Mode::Cow);
+    let expected = mock_dirs.join("c").join("fake").join("sub").join("file.txt");
+    assert_eq!(d.overlay.unwrap(), expected);
+}
+
+// ── Additional policy integration tests ─────────────────────────────────
+
+#[test]
+fn decide_cache_hit_returns_same_decision() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&mock_dirs).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+    let d1 = p.decide(r"c:\some\path", false);
+    let d2 = p.decide(r"c:\some\path", false);
+    assert_eq!(d1.mode, d2.mode);
+    assert_eq!(d1.overlay, d2.overlay);
+}
+
+#[test]
+fn decide_cow_write_nonexistent_file_no_cow_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&mock_dirs).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+    // Path outside project_root + write, no explicit rule → CoW by the
+    // merged-view default (write isolation). The file does not exist on
+    // the real disk, so cow_from must be None (nothing to copy from).
+    let d = p.decide(r"c:\nonexistent\file.txt", true);
+    assert_eq!(d.mode, Mode::Cow);
+    assert!(d.cow_from.is_none(), "cow_from should be None for non-existent files");
+    assert!(d.overlay.is_some());
+}
+
+#[test]
+fn record_overlay_invalidates_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&mock_dirs).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+
+    // First call: default passthrough for read
+    let d1 = p.decide(r"c:\data.txt", false);
+    assert_eq!(d1.mode, Mode::Passthrough);
+
+    // Record overlay
+    let overlay = dir.path().join("sb").join("c").join("data.txt");
+    p.record_overlay(r"c:\data.txt", overlay.to_str().unwrap()).unwrap();
+
+    // Second call: should see Cow now
+    let d2 = p.decide(r"c:\data.txt", false);
+    assert_eq!(d2.mode, Mode::Cow);
+}
+
+#[test]
+fn sandbox_root_accessor() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&mock_dirs).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let p = Policy::open_or_create(&db_path, sandbox.clone(), mock_dirs, project).unwrap();
+    assert_eq!(p.sandbox_root(), sandbox);
+}
+
+#[test]
+fn mock_dirs_root_accessor() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&mock_dirs).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let p = Policy::open_or_create(&db_path, sandbox, mock_dirs.clone(), project).unwrap();
+    assert_eq!(p.mock_dirs_root(), mock_dirs);
+}
+
+#[test]
+fn project_root_accessor_lowercase() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+    let project = dir.path().join("ProjDir");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&mock_dirs).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+    // project_root should be lowercased
+    assert!(p.project_root().contains("projdir"));
+    assert!(!p.project_root().contains("ProjDir"));
+}
+
+#[test]
+fn decide_with_mock_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&mock_dirs).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+
+    let cfg_path = dir.path().join("config.ktv");
+    let mut f = std::fs::File::create(&cfg_path).unwrap();
+    // NOTE: ktav includes the quotes as part of the string value
+    write!(f, "defaults: {{\n\
+        read: passthrough\n\
+        write: cow\n\
+    }}\n\
+    \n\
+    mocks: [\n\
+        {{\n\
+            path: c:\\fake\\token.txt\n\
+            content_inline: secret data\n\
+        }}\n\
+    ]\n\
+    ").unwrap();
+    drop(f);
+    p.load_config(&cfg_path).unwrap();
+
+    let d = p.decide(r"c:\fake\token.txt", false);
+    assert_eq!(d.mode, Mode::Mock);
+    assert_eq!(d.mock_payload.unwrap(), b"secret data");
+}
+
+#[test]
+fn load_config_invalid_ktav_returns_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&mock_dirs).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+
+    let cfg_path = dir.path().join("bad.ktv");
+    std::fs::write(&cfg_path, "{{{{invalid}}}}").unwrap();
+    let result = p.load_config(&cfg_path);
+    assert!(result.is_err());
+}
+
+#[test]
+fn load_config_missing_file_returns_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&mock_dirs).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+    let result = p.load_config(dir.path().join("nonexistent.ktv").as_path());
+    assert!(result.is_err());
+}
+
+// ── CoW-overlay isolation boundary tests ──────────────────────────────
+//
+// These pin the merged-view isolation model: writes to paths OUTSIDE
+// project_root are isolated into the sandbox overlay (CoW), never hitting
+// the real disk. Reads of un-recorded external paths fall through to the
+// real disk (read-through consults OVERLAY_IDX first). The agent's own
+// project_root stays real (passthrough). Explicit deny/passthrough rules
+// on external paths still override the default.
+

@@ -1,5 +1,12 @@
 [workspace]
-members = ["policy", "ipc", "hook", "launcher", "integration-tests"]
+members = [
+    "crates/winrsbox-policy",
+    "crates/winrsbox-ipc",
+    "crates/winrsbox-hook",
+    "crates/winrsbox-launcher",
+    "crates/winrsbox-integration-tests",
+    "crates/winrsbox-layout-guard",
+]
 resolver = "2"
 
 [profile.release]

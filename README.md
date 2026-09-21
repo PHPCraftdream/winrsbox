@@ -19,12 +19,12 @@ Intercepts filesystem calls at the ntdll level and redirects them through a poli
 - Go ≥ 1.21 — **only for building the escape-test helper binaries** (`workdir/go-chain`,
   `workdir/go-cwd-child`, `workdir/target-app`). The sandbox itself (`winrsbox.exe` +
   `hook.dll`) is pure Rust and needs no Go. If you only want to build and use the
-  sandbox, run `cargo build --release` in `winrsbox/` and skip `build.cmd`.
+  sandbox, run `cargo build --release` in `winrsbox/` and skip `scripts/build.cmd`.
 
 ## Quick start
 
 ```
-build.cmd                       # builds the Go test helpers + the Rust sandbox
+scriptsuild.cmd               # builds the Go test helpers + the Rust sandbox
 cd bin
 winrsbox -- your-program.exe [args]
 ```

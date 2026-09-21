@@ -1,0 +1,2 @@
+// Diagnostics.
+pub mod doctor;
