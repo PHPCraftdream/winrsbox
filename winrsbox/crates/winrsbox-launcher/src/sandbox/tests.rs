@@ -1,4 +1,7 @@
     use super::*;
+    use super::inject::{digest_to_hex, sha256_file, verify_staged_artifacts_in};
+    use windows::Win32::Security::TOKEN_QUERY;
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     /// Lock-in the convention that IMAGE_FILE_MACHINE_UNKNOWN (=0) is the
     /// sentinel "process is NOT WoW64" value, and that the I386 constant
@@ -397,4 +400,422 @@
             .expect_err("a nonexistent explicit path must not resolve")
             .to_string();
         assert!(err.contains("does not exist"), "err: {err}");
+    }
+
+    /// S06 gap 4 (launcher side): the pre-launch image scan (sandbox/inject.rs)
+    /// must not carry the silent 64 MiB truncation cap — the tail of a large
+    /// section used to go unchecked. Structural on purpose: the cap is a
+    /// one-line regression magnet. (Same include_str! pattern as the
+    /// forbidden-literal test in launch_prep.rs.)
+    #[test]
+    fn s06_pre_launch_scan_has_no_64mib_cap() {
+        let src = include_str!("inject.rs");
+        assert!(
+            !src.contains("64 * 1024 * 1024"),
+            "the 64 MiB scan cap must stay out of the pre-launch scan (S06 gap 4)"
+        );
+    }
+
+    // ── S07: per-project C: overlay root (full-path key + no-reparse) ────────
+
+    /// S07 fixture root INSIDE the worktree (gitignored target/): creating
+    /// real junctions/symlinks needs a genuine NTFS path inside the project,
+    /// not tempfile's %TEMP% (same pattern as the policy crate's
+    /// s05-fixtures). pid + run nanos + a per-run counter: no collisions
+    /// between or within test runs.
+    fn s07_fixture_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("s07-fixtures")
+            .join(format!(
+                "s07-{}-{}-{}-{}",
+                tag,
+                std::process::id(),
+                nanos,
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+        std::fs::create_dir_all(&base).expect("create s07 fixture dir");
+        base
+    }
+
+    /// Create a real NTFS junction (mount point) at `link` → `target`.
+    /// Junctions need no privilege (unlike symlink_dir). Mirrors the
+    /// FSCTL_SET_REPARSE_POINT dance in crates/winrsbox-integration-tests/
+    /// src/bin/fs/links/escape_junction.rs; uses the already-enabled windows
+    /// crate features (Win32_Storage_FileSystem, Win32_System_IO,
+    /// Win32_Foundation) with hand-defined reparse consts so no new feature
+    /// is pulled in.
+    fn create_junction(link: &Path, target: &Path) -> Result<(), String> {
+        use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE};
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING,
+        };
+        use windows::Win32::System::IO::DeviceIoControl;
+
+        // Hand-defined (matching winnt.h) so no extra windows feature is needed.
+        const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+        const FSCTL_SET_REPARSE_POINT: u32 = 0x0009_00A4;
+
+        // Canonicalized absolute target without the \?\ prefix; the substitute
+        // name must be an NT path (\??\…), the print name is display-only.
+        let abs = target.canonicalize().map_err(|e| e.to_string())?;
+        let abs_str = abs.to_string_lossy();
+        let abs_str = abs_str.strip_prefix(r"\?\").unwrap_or(&abs_str);
+        let substitute = format!(r"\??\{abs_str}");
+        let print_name = abs_str.to_string();
+
+        let sub_wide: Vec<u16> = substitute.encode_utf16().collect();
+        let print_wide: Vec<u16> = print_name.encode_utf16().collect();
+        let sub_bytes = sub_wide.len() * 2;
+        let print_bytes = print_wide.len() * 2;
+
+        // REPARSE_DATA_BUFFER for IO_REPARSE_TAG_MOUNT_POINT: header
+        // ReparseTag(4) + ReparseDataLength(2) + Reserved(2), then the
+        // mount-point fields SubstituteNameOffset/Length +
+        // PrintNameOffset/Length, then both names (NUL-terminated).
+        let header_size = 8;
+        let mount_header = 8;
+        let data_len = mount_header + sub_bytes + 2 + print_bytes + 2;
+        let total = header_size + data_len;
+
+        let mut buf = vec![0u8; total];
+        // ReparseTag
+        buf[0..4].copy_from_slice(&IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+        // ReparseDataLength (Reserved stays 0, SubstituteNameOffset stays 0)
+        buf[4..6].copy_from_slice(&(data_len as u16).to_le_bytes());
+        // SubstituteNameLength
+        buf[10..12].copy_from_slice(&(sub_bytes as u16).to_le_bytes());
+        // PrintNameOffset = sub_bytes + 2
+        buf[12..14].copy_from_slice(&((sub_bytes + 2) as u16).to_le_bytes());
+        // PrintNameLength
+        buf[14..16].copy_from_slice(&(print_bytes as u16).to_le_bytes());
+        // SubstituteName + PrintName (the +2 gaps hold the NUL terminators)
+        for (i, &w) in sub_wide.iter().enumerate() {
+            let o = 16 + i * 2;
+            buf[o..o + 2].copy_from_slice(&w.to_le_bytes());
+        }
+        let off2 = 16 + sub_bytes + 2;
+        for (i, &w) in print_wide.iter().enumerate() {
+            let o = off2 + i * 2;
+            buf[o..o + 2].copy_from_slice(&w.to_le_bytes());
+        }
+
+        let mut link_wide: Vec<u16> = link.to_string_lossy().encode_utf16().collect();
+        link_wide.push(0);
+
+        // A mount point can only be SET on an existing EMPTY directory (the
+        // reparse data then turns it into the junction) — same flow as
+        // escape_junction.rs, whose target dir is created up front.
+        std::fs::create_dir_all(link).map_err(|e| e.to_string())?;
+
+        // SAFETY: link_wide is a valid NUL-terminated UTF-16 buffer kept alive
+        // for the whole call; the returned handle (if any) is owned by us and
+        // closed on every path below.
+        let h = unsafe {
+            CreateFileW(
+                PCWSTR(link_wide.as_ptr()),
+                GENERIC_WRITE.0 | FILE_WRITE_ATTRIBUTES.0,
+                FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0),
+                None,
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(
+                    FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0,
+                ),
+                None,
+            )
+        }
+        .map_err(|e| format!("CreateFileW on {}: {e}", link.display()))?;
+
+        // SAFETY: h is an open handle we own; buf is a fully initialized
+        // REPARSE_DATA_BUFFER of exactly the length passed; out-buffer and
+        // overlapped are unused (synchronous call).
+        unsafe {
+            DeviceIoControl(
+                h,
+                FSCTL_SET_REPARSE_POINT,
+                Some(buf.as_ptr() as *const std::ffi::c_void),
+                buf.len() as u32,
+                None,
+                0,
+                None,
+                None,
+            )
+        }
+        .map_err(|e| e.to_string())?;
+
+        // SAFETY: h is the handle CreateFileW returned to us above.
+        unsafe { CloseHandle(h).map_err(|e| e.to_string())? };
+        Ok(())
+    }
+
+    /// S07 core regression: two projects that differ ONLY in their parent
+    /// directory (same basename) used to share one C: overlay root keyed by
+    /// the basename, so they read/overwrote each other's CoW data. The key
+    /// must encode the FULL project path, be distinct per project, stable
+    /// across calls/re-runs, and always end in `workdir`.
+    #[test]
+    fn s07_same_basename_projects_get_distinct_c_overlay_roots() {
+        let parent_a = tempfile::tempdir().expect("tempdir for project A");
+        let parent_b = tempfile::tempdir().expect("tempdir for project B");
+        let proj_a = parent_a.path().join("proj");
+        let proj_b = parent_b.path().join("proj");
+        std::fs::create_dir(&proj_a).expect("create project A");
+        std::fs::create_dir(&proj_b).expect("create project B");
+        // Guard the premise: the fixtures must really share the basename.
+        assert_eq!(
+            proj_a.file_name(),
+            proj_b.file_name(),
+            "fixtures must share the last path component or the test is vacuous"
+        );
+        let local = tempfile::tempdir().expect("LOCALAPPDATA stand-in tempdir");
+
+        let root_a = super::ensure_c_overlay_root(local.path(), &proj_a)
+            .expect("create C: overlay root for project A");
+        let root_b = super::ensure_c_overlay_root(local.path(), &proj_b)
+            .expect("create C: overlay root for project B");
+
+        assert_ne!(
+            root_a, root_b,
+            "same-basename projects must NOT share a C: overlay root (S07)"
+        );
+        assert!(root_a.ends_with("workdir"), "root A must end in workdir: {}", root_a.display());
+        assert!(root_b.ends_with("workdir"), "root B must end in workdir: {}", root_b.display());
+        assert!(root_a.is_dir(), "root A must exist as a dir: {}", root_a.display());
+        assert!(root_b.is_dir(), "root B must exist as a dir: {}", root_b.display());
+
+        // Stability: a second run for the same project must reuse the root.
+        let again = super::ensure_c_overlay_root(local.path(), &proj_a)
+            .expect("re-create C: overlay root for project A");
+        assert_eq!(root_a, again, "the C: root key must be stable across calls");
+    }
+
+    /// S07 hardening: a junction planted at the per-project key component of
+    /// the shared C: tree (attacker-planted redirect) must make
+    /// ensure_c_overlay_root fail loudly instead of creating the overlay
+    /// behind the junction. Negative control: removing the LINK (not its
+    /// target) must let the same call succeed and return the same path.
+    #[test]
+    fn s07_c_overlay_root_refuses_junction_at_key_component() {
+        let base = s07_fixture_dir("junction-key");
+        let link_target = base.join("link-target");
+        let proj = base.join("proj");
+        let localapp = base.join("localapp");
+        std::fs::create_dir_all(&link_target).expect("create link-target dir");
+        std::fs::create_dir_all(&proj).expect("create proj dir");
+        std::fs::create_dir_all(localapp.join(".winrsbox")).expect("create localapp/.winrsbox");
+
+        let key = super::c_overlay_key(&proj);
+        let link = localapp.join(".winrsbox").join(&key);
+        create_junction(&link, &link_target).expect("create junction at key component");
+
+        let err = super::ensure_c_overlay_root(&localapp, &proj)
+            .expect_err("junction at the C: root key component must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reparse point"),
+            "error must name the symlink/junction (reparse point) refusal: {msg}"
+        );
+
+        // Negative control: remove the LINK (not link-target) → must succeed.
+        std::fs::remove_dir(&link).expect("remove the junction link");
+        let c_root = super::ensure_c_overlay_root(&localapp, &proj)
+            .expect("after removing the junction the root must be creatable");
+        assert_eq!(
+            c_root,
+            localapp.join(".winrsbox").join(&key).join("workdir"),
+            "the returned root must be the canonical key path"
+        );
+        assert!(c_root.is_dir(), "root must exist after the fix-up call");
+        assert!(link_target.is_dir(), "junction target must be untouched");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// S07 hardening: the same refusal applies when the junction sits one
+    /// level up, at the shared `.winrsbox` component — the whole chain is
+    /// validated, not just the leaf.
+    #[test]
+    fn s07_c_overlay_root_refuses_junction_at_winrsbox_component() {
+        let base = s07_fixture_dir("junction-winrsbox");
+        let link_target = base.join("link-target");
+        let proj = base.join("proj");
+        let localapp = base.join("localapp");
+        std::fs::create_dir_all(&link_target).expect("create link-target dir");
+        std::fs::create_dir_all(&proj).expect("create proj dir");
+        std::fs::create_dir_all(&localapp).expect("create localapp dir");
+
+        create_junction(&localapp.join(".winrsbox"), &link_target)
+            .expect("create junction at .winrsbox");
+
+        let err = super::ensure_c_overlay_root(&localapp, &proj)
+            .expect_err("junction at the .winrsbox component must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reparse point"),
+            "error must name the symlink/junction (reparse point) refusal: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// S07 hardening: symbolic links (not just junctions) are equally
+    /// rejected at the key component. Graceful skip when the process lacks
+    /// SeCreateSymbolicLinkPrivilege / Developer Mode — same convention as
+    /// the policy crate's S05 tests.
+    #[test]
+    fn s07_c_overlay_root_refuses_symlink_at_key_component() {
+        let base = s07_fixture_dir("symlink-key");
+        let link_target = base.join("link-target");
+        let proj = base.join("proj");
+        let localapp = base.join("localapp");
+        std::fs::create_dir_all(&link_target).expect("create link-target dir");
+        std::fs::create_dir_all(&proj).expect("create proj dir");
+        std::fs::create_dir_all(localapp.join(".winrsbox")).expect("create localapp/.winrsbox");
+
+        let key = super::c_overlay_key(&proj);
+        let link = localapp.join(".winrsbox").join(&key);
+        if let Err(e) = std::os::windows::fs::symlink_dir(&link_target, &link) {
+            eprintln!(
+                "SKIPPED S07 symlink case: creating the symlink fixture failed ({e}) — \
+                 needs SeCreateSymbolicLinkPrivilege or Developer Mode"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let err = super::ensure_c_overlay_root(&localapp, &proj)
+            .expect_err("symlink at the C: root key component must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reparse point"),
+            "error must name the symlink/junction (reparse point) refusal: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── S11: published roots fold to the canonical NTFS identity ─────────────
+
+    /// The launcher publishes cwd/sandbox_root/overlay_roots (SessionConfig)
+    /// and the root target's exe through `fold_published`. Oracles are
+    /// hardcoded kernel-truth literals: Cyrillic СЕКРЕТ folds to секрет (the
+    /// S11 bypass — the old ASCII-only publication left it uppercase and the
+    /// hook's kernel-folded spelling never matched), while İ (U+0130), ς
+    /// (U+03C2) and ẞ (U+1E9E) are IDENTITY under the kernel upcase table
+    /// (see winrsbox-policy/src/path/case_fold.rs docs) even though Rust's
+    /// locale-aware folds would move them. Every ASCII root must stay
+    /// byte-identical to the historic `to_ascii_lowercase` publication.
+    #[test]
+    fn s11_published_roots_fold_to_kernel_identity() {
+        // Non-ASCII now folds (kernel table), unlike the pre-S11 publication.
+        assert_eq!(
+            crate::fold_published(r"D:\СЕКРЕТ\proj"),
+            r"d:\секрет\proj"
+        );
+        // ASCII roots: byte-identical to the old behavior.
+        let ascii_root = r"D:\Dev\MyProj";
+        assert_eq!(
+            crate::fold_published(ascii_root),
+            ascii_root.to_ascii_lowercase()
+        );
+        // Kernel-identity facts the locale fold gets wrong: these must NOT move.
+        assert_eq!(
+            crate::fold_published("C:\\W\u{0130}NDOWS"),
+            "c:\\w\u{0130}ndows"
+        );
+        assert_eq!(crate::fold_published("C:\\\u{03C2}"), "c:\\\u{03C2}");
+        assert_eq!(crate::fold_published("C:\\\u{1E9E}"), "c:\\\u{1E9E}");
+    }
+
+    // ── R04-1c: launch_suspended now creates the root guest under a
+    //    privilege-reduced token via CreateProcessAsUserW ──────────────────
+
+    /// `launch_suspended` with a harmless real target (`cmd.exe`, same
+    /// convention `probe.rs::probe_child` uses) must produce a suspended
+    /// child whose ACTUAL primary token is privilege-reduced — verified the
+    /// same way `guest_token.rs`'s own tests and `probe.rs` do
+    /// (`OpenProcessToken` + `GetTokenInformation`, here via
+    /// `guest_token::verify_guest_token_shape`, the exact function
+    /// `launch_suspended` itself already ran internally before returning).
+    /// The child is terminated here without ever being resumed — same
+    /// cleanup discipline every other suspended-process test in this
+    /// codebase (`probe.rs::probe_child`) already follows.
+    #[test]
+    fn launch_suspended_produces_a_privilege_reduced_child_token() {
+        let cwd = std::env::temp_dir();
+        let target_args = vec!["cmd.exe".to_string(), "/c".to_string(), "exit".to_string()];
+
+        let pi = launch_suspended(&cwd, &target_args, crate::GuardLevel::None)
+            .expect("launch_suspended must succeed for a harmless cmd.exe target");
+
+        // Independent re-verification (launch_suspended already ran this
+        // check internally before returning Ok — this proves the guarantee
+        // holds from the OUTSIDE too, not just that the internal check ran).
+        let mut child_token = HANDLE::default();
+        // SAFETY: pi.hProcess is the valid suspended process handle just
+        // returned by launch_suspended above; TOKEN_QUERY is read-only.
+        let opened = unsafe { OpenProcessToken(pi.hProcess, TOKEN_QUERY, &mut child_token) };
+
+        // Compute the expected shape the same way launch_suspended did: this
+        // process's own Administrators-enabled state at the time of launch.
+        let own_token_for_check = unsafe {
+            let mut t = HANDLE::default();
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut t).ok();
+            t
+        };
+        let source_admin_enabled = guest_token::administrators_state(own_token_for_check)
+            .map(|(enabled, _)| enabled)
+            .unwrap_or(false);
+        unsafe { CloseHandle(own_token_for_check).ok() };
+
+        let verify_result = opened
+            .context("OpenProcessToken(child) failed")
+            .and_then(|_| guest_token::verify_guest_token_shape(child_token, source_admin_enabled));
+        if child_token != HANDLE::default() {
+            // SAFETY: child_token was opened by us above (if opened.is_ok()).
+            unsafe { CloseHandle(child_token).ok() };
+        }
+
+        // Cleanup FIRST (never let an assertion failure leak a live suspended
+        // process): terminate, never resume, then close both handles.
+        // SAFETY: pi.hProcess/pi.hThread are our own just-created handles;
+        // the process is still CREATE_SUSPENDED — TerminateProcess is safe.
+        unsafe {
+            let _ = TerminateProcess(pi.hProcess, 0);
+            CloseHandle(pi.hThread).ok();
+            CloseHandle(pi.hProcess).ok();
+        }
+
+        verify_result.expect(
+            "child process token must pass verify_guest_token_shape \
+             (privilege-reduced, Administrators deny-only if source was admin-enabled)",
+        );
+    }
+
+    /// `build_guest_token`'s own failure path (forced via an invalid source
+    /// token handle) must surface as an `Err` all the way through — this is
+    /// the failure-surfacing contract `launch_suspended` relies on to abort
+    /// the launch instead of falling back to an unrestricted token.
+    /// `launch_suspended` itself always opens a VALID source token
+    /// internally, so this test exercises the same underlying guarantee one
+    /// layer down, at the boundary `launch_suspended` depends on — mirroring
+    /// `guest_token.rs`'s own `build_guest_token_propagates_error_on_invalid_handle`.
+    #[test]
+    fn build_guest_token_failure_does_not_panic_and_is_an_err() {
+        let bogus = HANDLE(0xDEAD_BEEF_usize as *mut std::ffi::c_void);
+        let result = winrsbox::contain::guest::build_guest_token(bogus);
+        assert!(
+            result.is_err(),
+            "build_guest_token must return Err (not panic) for an invalid token handle — \
+             this is what makes launch_suspended's '?' on the same call abort the launch \
+             instead of silently continuing with an unrestricted token"
+        );
     }

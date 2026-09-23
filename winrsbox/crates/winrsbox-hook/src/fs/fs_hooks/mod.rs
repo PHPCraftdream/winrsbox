@@ -8,7 +8,7 @@ use detour2::GenericDetour;
 use ntapi::ntioapi::IO_STATUS_BLOCK;
 use ntapi::winapi::shared::ntdef::{HANDLE, NTSTATUS, OBJECT_ATTRIBUTES};
 use ntapi::winapi::um::winnt::ACCESS_MASK;
-use policy::Mode;
+use policy::{Decision, Mode};
 
 use crate::anti_rec;
 use crate::hooked_attrs::HookedAttrs;
@@ -149,6 +149,103 @@ pub(crate) fn is_create_disposition(create_disposition: u32) -> bool {
         create_disposition,
         FILE_CREATE | FILE_OPEN_IF | FILE_OVERWRITE_IF | FILE_SUPERSEDE
     )
+}
+
+// ---------------------------------------------------------------------------
+// C04 (docs/review-xa-2026-09-20): stale cached Cow + overlay-index publish
+// ordering
+// ---------------------------------------------------------------------------
+
+/// Pure-FS probe: does this decision name an overlay target that is
+/// physically absent right now? C04: the trigger condition for a
+/// possibly-stale cached Cow.
+pub(crate) fn overlay_target_missing(decision: &Decision) -> bool {
+    decision
+        .overlay
+        .as_ref()
+        .is_some_and(|p| !std::path::Path::new(p).exists())
+}
+
+/// C04: a locally cached Cow decision can outlive the overlay file — a
+/// sibling process may have deleted the overlay copy and recorded a
+/// whiteout after this process cached Cow. When the overlay target is
+/// physically missing, drop the cached entry and re-decide fresh: the
+/// server cleared its own cache on the sibling's mutation, so the fresh
+/// decision is current (Hidden for a whiteout, Deny for a fresh rule,
+/// Cow when the copy genuinely wasn't made yet). The caller must act on
+/// the RETURNED decision, not the original.
+pub(crate) fn decide_fresh_if_overlay_missing(
+    decision: &Decision,
+    dos: &str,
+    write: bool,
+) -> Decision {
+    if !overlay_target_missing(decision) {
+        return decision.clone();
+    }
+    let lower = policy::path::nt_case_fold(dos);
+    // PERF-cow: the physical overlay vanished, so the index state for this
+    // path is untrusted — the next materialization must re-publish.
+    overlay_publish_forget(&lower);
+    cache().invalidate(&lower);
+    decide(dos, write)
+}
+
+/// C04 gate: NT_SUCCESS is a non-negative NTSTATUS.
+pub(crate) fn cow_publish_allowed(status: NTSTATUS) -> bool {
+    status >= 0
+}
+
+/// PERF-cow: process-local registry of overlay paths whose index entry this
+/// process has already published successfully. Bounded like HookCache;
+/// eviction is the safe direction (one redundant re-publish, never a missed
+/// first publish).
+fn overlay_publish_registry() -> &'static quick_cache::sync::Cache<String, ()> {
+    static REG: OnceLock<quick_cache::sync::Cache<String, ()>> = OnceLock::new();
+    REG.get_or_init(|| quick_cache::sync::Cache::new(8192))
+}
+
+pub(crate) fn overlay_already_published(lower: &str) -> bool {
+    overlay_publish_registry().get(lower).is_some()
+}
+
+pub(crate) fn overlay_mark_published(lower: &str) {
+    overlay_publish_registry().insert(lower.to_owned(), ());
+}
+
+/// Re-arm publication: any local event that can mean the overlay index and
+/// the physical overlay diverged (failed redirected open, stale-cache
+/// re-decide, whiteout revive) must force the next successful
+/// materialization to re-publish.
+pub(crate) fn overlay_publish_forget(lower: &str) {
+    overlay_publish_registry().remove(lower);
+}
+
+/// C04: publish the overlay index only AFTER the redirected kernel open
+/// succeeded. Records idx + original-case basename, then drops the local
+/// cached decision for the path so the next decide sees the overlay.
+/// PERF-cow: publication is idempotent per process — a path already marked
+/// published skips BOTH IPC writes and the local invalidation; divergence
+/// events call `overlay_publish_forget` to re-arm it.
+pub(crate) fn publish_overlay_decision(
+    lower: &str,
+    overlay_dos: &str,
+    original_basename: &Option<String>,
+) {
+    if overlay_already_published(lower) {
+        return;
+    }
+    let idx_sent = ipc_record_overlay(lower, overlay_dos);
+    let case_sent = match original_basename {
+        Some(basename) => ipc_record_overlay_case(lower, basename),
+        None => true,
+    };
+    // Mark only when both records were actually delivered; a failed send
+    // leaves the path unmarked so the next successful open retries (C04:
+    // the index must match the successful physical operation).
+    if idx_sent && case_sent {
+        overlay_mark_published(lower);
+    }
+    cache().invalidate(lower);
 }
 
 #[cfg(test)]

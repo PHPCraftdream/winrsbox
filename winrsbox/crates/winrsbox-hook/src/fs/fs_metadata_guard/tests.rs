@@ -2,26 +2,30 @@ use super::*;
 
 // ── Relative-rename passthrough rewrite (audit 2026-09-19 Low) ────
 
+/// S04: the passthrough rename buffer is rebuilt from the OWNED pre-decision
+/// snapshot — the flags word is preserved verbatim and RootDirectory (here a
+/// stale handle value) is nulled, so the kernel acts on exactly the approved
+/// path.
 #[test]
 fn absolute_rename_buffer_nulls_root_and_keeps_flags() {
-    let dest = r"c:\proj\renamed.txt";
-    let nt = policy::path::dos_to_nt(dest); // \??\c:\proj\renamed.txt\0
+    let dest = r"c:\x\y.txt";
+    let nt = policy::path::dos_to_nt(dest); // \??\c:\x\y.txt\0
     let name_bytes = (nt.len() - 1) * 2;
 
-    let mut orig = vec![0u8; 0x14 + 8];
-    orig[0] = 1; // ReplaceIfExists = TRUE (non-Ex) / flags word (Ex)
-    orig[8] = 0xAB; // root-handle bytes — must be zeroed in the output
-    orig[0x10] = 0x99; // stale FileNameLength — must be overwritten
-
+    let snap = RenameRequest {
+        header8: [1u8, 0, 0, 0, 0, 0, 0, 0], // ReplaceIfExists = TRUE / flags word
+        root: 0xDEADBEEF as HANDLE, // stale handle value — must be zeroed
+        name_utf16: r"\??\C:\x\y.txt".encode_utf16().collect(),
+    };
     let (out, out_len) =
-        build_absolute_rename_buffer(&orig, dest).expect("buffer must build");
+        build_kernel_rename_buffer(&snap, dest).expect("buffer must build");
     assert_eq!(out_len as usize, 0x14 + nt.len() * 2);
-    assert_eq!(&out[..8], &orig[..8], "flags word copied verbatim");
+    assert_eq!(&out[..8], &snap.header8, "flags word copied verbatim");
     assert_eq!(&out[8..16], &0u64.to_ne_bytes(), "RootDirectory must be NULL");
     let got_len = u32::from_le_bytes([out[16], out[17], out[18], out[19]]) as usize;
     assert_eq!(
         got_len, name_bytes,
-        "FileNameLength counts name bytes, not the NUL terminator"
+        "FileNameLength counts name chars (excl NUL), not the NUL terminator"
     );
     let mut want = Vec::new();
     for w in &nt {
@@ -30,18 +34,23 @@ fn absolute_rename_buffer_nulls_root_and_keeps_flags() {
     assert_eq!(&out[0x14..], &want[..], "FileName must be the absolute NT form");
 }
 
+/// The 0x14-header guard now lives in the snapshot reader (S04): a 0x13-byte
+/// buffer must be rejected before any field is read.
 #[test]
-fn absolute_rename_buffer_rejects_short_header() {
+fn rename_snapshot_rejects_short_header() {
     let orig = [0u8; 0x13];
-    assert!(build_absolute_rename_buffer(&orig, r"c:\x").is_none());
+    // SAFETY: len equals the real buffer length; the reader must reject the
+    // short buffer without reading past it.
+    assert!(unsafe { snapshot_rename_request(orig.as_ptr(), orig.len()) }.is_none());
 }
 
 #[test]
 fn rename_passthrough_arm_rewrites_relative_root() {
     // Textual pin (hooks.rs::spawn_hook_body precedent): the Passthrough
-    // arm of the rename/link handler must rewrite a relative
-    // RootDirectory buffer to the absolute NT form instead of handing
-    // the caller's buffer back for a second, racy handle resolution.
+    // arm of the rename/link handler must rebuild the kernel buffer from
+    // the owned pre-decision snapshot instead of handing the caller's
+    // buffer back for a second read — relative AND absolute passthrough
+    // both rebuild from the owned snapshot (S04).
     let src = crate::hooks::module_source("fs_metadata_guard.rs");
     let fn_start = src
         .find("fn hook_nt_set_information_file")
@@ -62,12 +71,9 @@ pub(crate)"))
         .expect("Cow arm must follow Passthrough");
     let pt = &body[pt_start..pt_end];
     assert!(
-        pt.contains("root.is_null()"),
-        "Passthrough arm must branch on the relative-open case"
-    );
-    assert!(
-        pt.contains("build_absolute_rename_buffer"),
-        "Passthrough arm must rewrite the relative rename buffer to the absolute NT form (racy RootDirectory fix)"
+        pt.contains("build_kernel_rename_buffer"),
+        "Passthrough arm must rebuild the rename buffer from the owned snapshot \
+         (racy RootDirectory fix + S04: no live guest buffer reaches the kernel)"
     );
     assert!(
         pt.contains("fs_setinfo_passthrough_rewrite_failed"),
@@ -143,6 +149,30 @@ unsafe fn odd_attrs_chain(
     (attrs, oa_backing, ustr_backing, name_backing)
 }
 
+/// Build a live OBJECT_ATTRIBUTES naming `name` (null root, case-insensitive)
+/// and snapshot it — for apply_delete_decision tests whose policy branch
+/// never dereferences the attrs (Deny / Hidden / unmaterialised Cow) but
+/// whose signature now requires the pre-decision snapshot (S04).
+fn snapshot_attrs_chain(name: &str) -> DeleteRequest {
+    let mut name_u16: Vec<u16> = name.encode_utf16().collect();
+    let mut ustr = UNICODE_STRING {
+        Length: (name_u16.len() * 2) as u16,
+        MaximumLength: (name_u16.len() * 2 + 2) as u16,
+        Buffer: name_u16.as_mut_ptr(),
+    };
+    let oa = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: std::ptr::null_mut(),
+        ObjectName: &mut ustr,
+        Attributes: 0x40,
+        SecurityDescriptor: std::ptr::null_mut(),
+        SecurityQualityOfService: std::ptr::null_mut(),
+    };
+    // SAFETY: oa and its name chain are live, aligned and valid for the
+    // duration of the snapshot call.
+    unsafe { snapshot_delete_request(&oa) }.expect("snapshot of a live attrs chain")
+}
+
 #[test]
 fn resolve_delete_target_resolves_misaligned_attrs_chain() {
     let name: Vec<u16> = r"\??\C:\Users\Someone\Important.TXT".encode_utf16().collect();
@@ -198,13 +228,17 @@ fn nt_delete_overlay_branch_reads_misaligned_caller_attrs() {
     // outlive the apply_delete_decision call.
     let (attrs, _oa_backing, _ustr_backing, _name_backing) =
         unsafe { odd_attrs_chain(&name) };
+    // Snapshot BEFORE the apply — the owned pre-decision read (S04).
+    // SAFETY: attrs is a self-consistent live OBJECT_ATTRIBUTES chain whose
+    // name buffer is valid for its Length bytes.
+    let snap = unsafe { snapshot_delete_request(attrs) }.expect("snapshot before apply");
 
     let mut seen_target: Option<String> = None;
     let mut seen_root_null = false;
     let overlay_for_stub = overlay.clone();
     let result = unsafe {
         apply_delete_decision(
-            attrs as *mut OBJECT_ATTRIBUTES,
+            &snap,
             &real.to_string_lossy().to_ascii_lowercase(),
             &decision,
             |a| {
@@ -433,9 +467,12 @@ fn nt_delete_external_path_records_whiteout_and_spares_real_file() {
     };
 
     let mut original_called = false;
+    // The Cow-without-overlay branch never dereferences the attrs, but the
+    // seam now consumes the owned pre-decision snapshot (S04).
+    let snap = snapshot_attrs_chain(r"\??\C:\Users\Someone\Important.TXT");
     let result = unsafe {
         apply_delete_decision(
-            std::ptr::null_mut(), // not dereferenced on this branch
+            &snap,
             &real.to_string_lossy().to_ascii_lowercase(),
             &decision,
             |_a| {
@@ -490,13 +527,18 @@ fn nt_delete_materialised_overlay_copy_is_deleted_then_whiteouted() {
         SecurityDescriptor: std::ptr::null_mut(),
         SecurityQualityOfService: std::ptr::null_mut(),
     };
+    // Snapshot BEFORE the apply — the owned pre-decision read (S04).
+    // SAFETY: caller_attrs is a live OBJECT_ATTRIBUTES whose name chain is
+    // valid for its Length bytes.
+    let snap =
+        unsafe { snapshot_delete_request(&caller_attrs) }.expect("snapshot before apply");
 
     let mut seen_target: Option<String> = None;
     let mut seen_root_null = false;
     let overlay_for_stub = overlay.clone();
     let result = unsafe {
         apply_delete_decision(
-            &mut caller_attrs,
+            &snap,
             &real.to_string_lossy().to_ascii_lowercase(),
             &decision,
             |a| {
@@ -565,9 +607,14 @@ fn nt_delete_overlay_copy_vanished_still_whiteouts_success() {
         SecurityQualityOfService: std::ptr::null_mut(),
     };
 
+    // Snapshot BEFORE the apply — the owned pre-decision read (S04).
+    // SAFETY: caller_attrs is a live OBJECT_ATTRIBUTES whose name chain is
+    // valid for its Length bytes.
+    let snap =
+        unsafe { snapshot_delete_request(&caller_attrs) }.expect("snapshot before apply");
     let result = unsafe {
         apply_delete_decision(
-            &mut caller_attrs,
+            &snap,
             &real.to_string_lossy().to_ascii_lowercase(),
             &decision,
             |_a| STATUS_OBJECT_NAME_NOT_FOUND, // kernel: overlay copy gone
@@ -594,9 +641,12 @@ fn nt_delete_hidden_mode_reports_not_found_without_calling_original() {
         mock_payload: None,
     };
     let mut original_called = false;
+    // The Hidden branch never dereferences the attrs, but the seam now
+    // consumes the owned pre-decision snapshot (S04).
+    let snap = snapshot_attrs_chain(r"\??\C:\some\virtual\path.txt");
     let result = unsafe {
         apply_delete_decision(
-            std::ptr::null_mut(),
+            &snap,
             r"c:\some\virtual\path.txt",
             &decision,
             |_a| {
@@ -619,9 +669,12 @@ fn nt_delete_deny_mode_is_blocked() {
         mock_payload: None,
     };
     let mut original_called = false;
+    // The Deny branch never dereferences the attrs, but the seam now
+    // consumes the owned pre-decision snapshot (S04).
+    let snap = snapshot_attrs_chain(r"\??\C:\some\denied\path.txt");
     let result = unsafe {
         apply_delete_decision(
-            std::ptr::null_mut(),
+            &snap,
             r"c:\some\denied\path.txt",
             &decision,
             |_a| {
@@ -632,48 +685,6 @@ fn nt_delete_deny_mode_is_blocked() {
     };
     assert_eq!(result, DeleteResult::Status(STATUS_ACCESS_DENIED));
     assert!(!original_called);
-}
-
-/// Inside project_root: the caller's own OBJECT_ATTRIBUTES reach the
-/// original untouched and its status is returned verbatim.
-#[test]
-fn nt_delete_passthrough_forwards_caller_attrs_to_original() {
-    let decision = policy::Decision {
-        mode: policy::Mode::Passthrough,
-        overlay: None,
-        cow_from: None,
-        mock_payload: None,
-    };
-    let mut caller_name: Vec<u16> =
-        r"\??\C:\project\file.txt".encode_utf16().collect();
-    let mut caller_ustr = UNICODE_STRING {
-        Length: (caller_name.len() * 2) as u16,
-        MaximumLength: (caller_name.len() * 2 + 2) as u16,
-        Buffer: caller_name.as_mut_ptr(),
-    };
-    let mut caller_attrs = OBJECT_ATTRIBUTES {
-        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-        RootDirectory: std::ptr::null_mut(),
-        ObjectName: &mut caller_ustr,
-        Attributes: 0x40,
-        SecurityDescriptor: std::ptr::null_mut(),
-        SecurityQualityOfService: std::ptr::null_mut(),
-    };
-    let expected_ptr: *mut OBJECT_ATTRIBUTES = &mut caller_attrs;
-    let mut seen_ptr: *mut OBJECT_ATTRIBUTES = std::ptr::null_mut();
-    let result = unsafe {
-        apply_delete_decision(
-            expected_ptr,
-            r"c:\project\file.txt",
-            &decision,
-            |a| {
-                seen_ptr = a;
-                0x1234
-            },
-        )
-    };
-    assert_eq!(seen_ptr, expected_ptr, "passthrough must forward the caller's attrs");
-    assert_eq!(result, DeleteResult::Status(0x1234));
 }
 
 // -----------------------------------------------------------------------
@@ -689,7 +700,8 @@ fn nt_delete_passthrough_forwards_caller_attrs_to_original() {
 
 /// Copy `buf` into a larger backing allocation so the probe starts at an
 /// ODD address regardless of the allocator's base alignment.
-fn odd_window(buf: &[u8]) -> (Vec<u8>, usize) {
+/// `pub(crate)`: also used by the sibling `snapshot_tests` module (S04).
+pub(crate) fn odd_window(buf: &[u8]) -> (Vec<u8>, usize) {
     let mut backing = vec![0u8; buf.len() + 512];
     let off = 1 - (backing.as_ptr() as usize % 2);
     backing[off..off + buf.len()].copy_from_slice(buf);
@@ -699,7 +711,8 @@ fn odd_window(buf: &[u8]) -> (Vec<u8>, usize) {
 /// Build a FILE_RENAME_INFORMATION buffer (shared prefix with the Ex
 /// variant): ReplaceIfExists @0x00, RootDirectory @0x08, FileNameLength
 /// @0x10, FileName[] @0x14.
-fn build_rename_info(root: usize, name: &str) -> Vec<u8> {
+/// `pub(crate)`: also used by the sibling `snapshot_tests` module (S04).
+pub(crate) fn build_rename_info(root: usize, name: &str) -> Vec<u8> {
     let name_u16: Vec<u16> = name.encode_utf16().collect();
     let mut buf = vec![0u8; 0x14 + name_u16.len() * 2];
     buf[0x08..0x10].copy_from_slice(&(root as u64).to_le_bytes());
@@ -802,5 +815,127 @@ fn parse_disposition_info_class_discipline() {
     assert_eq!(
         unsafe { parse_disposition_info(b0.as_ptr(), 1, FILE_DISPOSITION_INFO_CLASS) },
         Some((false, 0)),
+    );
+}
+
+/// S04: NtDeleteFile passthrough used to forward the CALLER's attrs verbatim
+/// to the original syscall. The decision read the guest name once; the
+/// kernel then re-read the same hostile buffer. A swap between the two made
+/// the kernel delete a path policy never approved. Contract: what the
+/// original syscall receives must carry the DECIDED name, immune to a
+/// post-decision swap of the guest bytes/pointer.
+#[test]
+fn s04_delete_passthrough_kernel_sees_decided_name_not_swapped() {
+    let decided: Vec<u16> = r"\??\C:\project\keep.txt".encode_utf16().collect();
+    let mut guest = decided.clone();
+    let mut guest_ustr = UNICODE_STRING {
+        Length: (guest.len() * 2) as u16,
+        MaximumLength: (guest.len() * 2 + 2) as u16,
+        Buffer: guest.as_mut_ptr(),
+    };
+    let mut attrs = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: std::ptr::null_mut(),
+        ObjectName: &mut guest_ustr,
+        Attributes: 0x40,
+        SecurityDescriptor: std::ptr::null_mut(),
+        SecurityQualityOfService: std::ptr::null_mut(),
+    };
+
+    // Classification reads the guest name ONCE; this is what policy approved.
+    let dest = unsafe { resolve_delete_target(&attrs) }.expect("decided delete must resolve");
+    assert_eq!(dest, r"c:\project\keep.txt");
+
+    // Snapshot BEFORE the swap — the owned request classification consumed.
+    // SAFETY: attrs is a live OBJECT_ATTRIBUTES whose name chain is valid
+    // for its Length bytes.
+    let snap = unsafe { snapshot_delete_request(&attrs) }.expect("snapshot before swap");
+
+    // Concurrent swap after the decision: contents AND pointer.
+    for c in guest.iter_mut() { *c = u16::from(b'X'); }
+    let mut evil: Vec<u16> = r"\??\C:\windows\evil.txt".encode_utf16().collect();
+    let mut evil_ustr = UNICODE_STRING {
+        Length: (evil.len() * 2) as u16,
+        MaximumLength: (evil.len() * 2 + 2) as u16,
+        Buffer: evil.as_mut_ptr(),
+    };
+    attrs.ObjectName = &mut evil_ustr;
+
+    let decision = policy::Decision {
+        mode: policy::Mode::Passthrough,
+        overlay: None,
+        cow_from: None,
+        mock_payload: None,
+    };
+    let mut seen_name: Option<Vec<u16>> = None;
+    // The stub "kernel": records exactly the name the original syscall would
+    // delete, reading the hostile caller memory with unaligned loads.
+    let spy_kernel = |a: *mut OBJECT_ATTRIBUTES| {
+        // Observe exactly what the kernel would delete.
+        // SAFETY: the pointer handed to `original` is a valid
+        // OBJECT_ATTRIBUTES for the duration of the call.
+        let oa = unsafe { a.read_unaligned() };
+        // SAFETY: read_unaligned of the non-null UNICODE_STRING pointer the
+        // attrs carry (validity per the passthrough contract).
+        let us = unsafe { oa.ObjectName.read_unaligned() };
+        let chars = (us.Length / 2) as usize;
+        seen_name = Some(
+            // SAFETY: Buffer is valid for Length bytes per the UNICODE_STRING contract.
+            unsafe { std::slice::from_raw_parts(us.Buffer, chars) }.to_vec(),
+        );
+        0x1234
+    };
+    // SAFETY: `snap` is the owned pre-decision snapshot (S04); the stub
+    // `original` only reads the rebuilt attrs handed to it.
+    let result = unsafe { apply_delete_decision(&snap, &dest, &decision, spy_kernel) };
+    let kernel_name = seen_name.expect("passthrough must call the original");
+    assert_eq!(
+        kernel_name,
+        decided,
+        "S04: kernel must delete the DECIDED name, not post-decision swapped bytes/pointer",
+    );
+    assert_eq!(result, DeleteResult::Status(0x1234));
+}
+
+/// S04: with RootDirectory = NULL the rename passthrough arm used to hand
+/// the caller's buffer straight back to the original syscall
+/// (`if root.is_null() { return call_original(); }`) after the decision had
+/// already read it once — the same double-fetch class as the absolute-open
+/// case. Contract: the Passthrough arm must rebuild the kernel buffer from
+/// the owned snapshot taken before classification, for BOTH root cases, and
+/// must not branch on the live RootDirectory value.
+#[test]
+fn s04_rename_passthrough_rebuilds_from_snapshot_not_caller_buffer() {
+    let src = crate::hooks::module_source("fs_metadata_guard.rs");
+    let fn_start = src
+        .find("fn hook_nt_set_information_file")
+        .expect("rename hook must exist");
+    let rest = &src[fn_start..];
+    let body_end = rest
+        .find("
+#[cfg(test)]")
+        .or_else(|| rest.find("
+pub(crate)"))
+        .expect("next item bounds the fn body");
+    let body = &rest[..body_end];
+    let pt_start = body
+        .find("policy::Mode::Passthrough =>")
+        .expect("Passthrough arm must exist");
+    let pt_end = body
+        .find("policy::Mode::Cow")
+        .expect("Cow arm must follow Passthrough");
+    let pt = &body[pt_start..pt_end];
+    assert!(
+        !pt.contains("root.is_null()"),
+        "S04: passthrough must not branch on the live RootDirectory — both root \
+         cases must consume the snapshot taken before classification",
+    );
+    assert!(
+        pt.contains("build_kernel_rename_buffer"),
+        "S04: passthrough must rebuild the kernel rename buffer from the owned snapshot",
+    );
+    assert!(
+        pt.contains("fs_setinfo_passthrough_rewrite_failed"),
+        "rewrite failure must stay visible in trace logs and fail closed",
     );
 }

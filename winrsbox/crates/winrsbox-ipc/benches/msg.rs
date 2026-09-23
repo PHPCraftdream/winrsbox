@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use ipc::{write_msg, read_msg, Req, LogLevel};
+use winrsbox_ipc::{write_msg, read_msg, Req, LogLevel};
 use std::io::Cursor;
 
 fn bench_encode_decide(c: &mut Criterion) {
@@ -148,7 +148,7 @@ fn bench_roundtrip_memory_violation(c: &mut Criterion) {
     let msg = Req::MemoryViolation {
         pid: 1234,
         exe: r"c:\app\target.exe".into(),
-        kind: ipc::AllocKind::Allocate,
+        kind: winrsbox_ipc::AllocKind::Allocate,
         requested_protect: 0x40,
         region_size: 4096,
         target_address: 0x7ff800000000,
@@ -172,7 +172,7 @@ fn bench_roundtrip_injection_violation(c: &mut Criterion) {
     let msg = Req::InjectionViolation {
         pid: 1234,
         exe: r"c:\app\target.exe".into(),
-        kind: ipc::InjectKind::CreateRemoteThread,
+        kind: winrsbox_ipc::InjectKind::CreateRemoteThread,
         target_pid: 5678,
         start_address: 0x7ff800000000,
         caller_pc: 0x7ff8a1234567,
@@ -216,7 +216,7 @@ fn bench_roundtrip_context_hijack(c: &mut Criterion) {
     let msg = Req::InjectionViolation {
         pid: 1234,
         exe: r"c:\app\evil.exe".into(),
-        kind: ipc::InjectKind::ContextHijack,
+        kind: winrsbox_ipc::InjectKind::ContextHijack,
         target_pid: 5678,
         start_address: 0xDEADBEEF,
         caller_pc: 0x7ff8a1234567,

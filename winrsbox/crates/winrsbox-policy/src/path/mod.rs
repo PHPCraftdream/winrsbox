@@ -1,5 +1,9 @@
 use std::path::{Path, PathBuf};
 
+mod case_fold;
+
+pub use case_fold::{fold_u16_unit, nt_case_fold, nt_case_fold_utf16};
+
 /// Strip NT prefix and return DOS path (lowercase).
 /// Handles \??\ and \\?\ prefixes.
 /// Returns None for device paths, UNC \Device\... etc.
@@ -7,10 +11,13 @@ pub fn nt_to_dos(raw: &[u16]) -> Option<String> {
     _nt_to_dos_impl(raw, false)
 }
 
-/// Same as `nt_to_dos` but ASCII-lowercases the result in-place during
-/// UTF-16 → UTF-8 conversion, avoiding a separate `to_lowercase()` pass.
-/// Non-ASCII bytes are preserved as-is (sufficient for Windows paths which
-/// are overwhelmingly ASCII; rare non-ASCII falls through unchanged).
+/// Same as `nt_to_dos` but folds the result to the canonical NTFS-identity
+/// form in-place during UTF-16 → UTF-8 conversion (see `case_fold`),
+/// avoiding a separate folding pass. ASCII folds exactly like the historic
+/// `to_ascii_lowercase`; non-ASCII folds per the kernel upcase/downcase
+/// tables — case-paired letters merge (Cyrillic АБВ → абв), while the
+/// kernel-conservative letters the upcase table leaves alone (İ ı ς ß ẞ
+/// KELVIN) pass through unchanged.
 pub fn nt_to_dos_lower(raw: &[u16]) -> Option<String> {
     _nt_to_dos_impl(raw, true)
 }
@@ -32,7 +39,7 @@ fn _nt_to_dos_impl(raw: &[u16], lowercase: bool) -> Option<String> {
 
     // Must look like a drive-letter path: second u16 must be ':' (0x3A)
     if stripped.len() >= 2 && stripped[1] == 0x3A {
-        Some(u16_slice_to_ascii_lower(stripped, lowercase))
+        Some(u16_slice_fold(stripped, lowercase))
     } else {
         None
     }
@@ -67,26 +74,16 @@ fn starts_with_u16_ascii(slice: &[u16], prefix: &[u8]) -> bool {
     slice[..prefix.len()].iter().zip(prefix.iter()).all(|(&u, &b)| u == b as u16)
 }
 
-/// Convert UTF-16 slice to String, optionally ASCII-lowercasing in one pass.
-/// Uses `char::decode_utf16` to correctly handle surrogate pairs (non-BMP
-/// codepoints such as emoji, CJK extension B, etc.). Lone surrogates become
-/// the replacement character U+FFFD, matching `String::from_utf16_lossy`.
-fn u16_slice_to_ascii_lower(raw: &[u16], lowercase: bool) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for r in std::char::decode_utf16(raw.iter().copied()) {
-        match r {
-            Ok(c) if lowercase && c.is_ascii_uppercase() => {
-                out.push((c as u8 + 0x20) as char);
-            }
-            Ok(c) => {
-                out.push(c);
-            }
-            Err(_) => {
-                out.push('\u{FFFD}');
-            }
-        }
+/// Convert UTF-16 slice to String, optionally folding each unit to the
+/// canonical NTFS-identity form in one pass (`case_fold::fold_u16_unit`).
+/// Surrogate pairs are handled by the kernel tables themselves (astral
+/// units pass through untouched); lone surrogates become the replacement
+/// character U+FFFD, matching `String::from_utf16_lossy`.
+fn u16_slice_fold(raw: &[u16], fold: bool) -> String {
+    if fold {
+        return String::from_utf16_lossy(&case_fold::nt_case_fold_utf16(raw));
     }
-    out
+    String::from_utf16_lossy(raw)
 }
 
 /// DOS path → NT path as null-terminated UTF-16.
@@ -353,6 +350,8 @@ impl OverlayLayout {
     ) -> Self {
         let per_drive = per_drive
             .into_iter()
+            // Drive letters are ASCII-only by definition, so the ASCII fold
+            // equals the kernel NTFS-identity fold here.
             .map(|(c, p)| (c.to_ascii_lowercase(), p))
             .collect();
         Self { primary_root, per_drive }
@@ -520,12 +519,13 @@ pub fn pattern_matches_prefix(pattern: &str, path: &str) -> bool {
     prefix_match(&pat_segs, &path_segs)
 }
 
-fn prefix_match(pat: &[&str], path: &[&str]) -> bool {
+/// Shared by the string wrappers and the precompiled rule index (one implementation, two container shapes).
+pub(crate) fn prefix_match<S: AsRef<str>>(pat: &[S], path: &[&str]) -> bool {
     let (mut pi, mut si) = (0usize, 0usize);
     let (mut star_pi, mut star_si) = (None::<usize>, 0usize);
     loop {
         // Consume trailing ** in pattern
-        while pi < pat.len() && is_globstar(pat[pi]) {
+        while pi < pat.len() && is_globstar(pat[pi].as_ref()) {
             star_pi = Some(pi);
             star_si = si;
             pi += 1;
@@ -536,7 +536,7 @@ fn prefix_match(pat: &[&str], path: &[&str]) -> bool {
         if si == path.len() {
             return false; // path shorter than remaining pattern
         }
-        if segment_match(pat[pi], path[si]) {
+        if segment_match(pat[pi].as_ref(), path[si]) {
             pi += 1;
             si += 1;
         } else if let Some(sp) = star_pi {
@@ -604,12 +604,13 @@ pub fn pattern_matches_exact(pattern: &str, path: &str) -> bool {
     exact_match(&pat_segs, &path_segs)
 }
 
-fn exact_match(pat: &[&str], path: &[&str]) -> bool {
+/// Shared by the string wrappers and the precompiled rule index (one implementation, two container shapes).
+pub(crate) fn exact_match<S: AsRef<str>>(pat: &[S], path: &[&str]) -> bool {
     let (mut pi, mut si) = (0usize, 0usize);
     let (mut star_pi, mut star_si) = (None::<usize>, 0usize);
     loop {
         // Consume consecutive ** in pattern
-        while pi < pat.len() && is_globstar(pat[pi]) {
+        while pi < pat.len() && is_globstar(pat[pi].as_ref()) {
             star_pi = Some(pi);
             star_si = si;
             pi += 1;
@@ -630,7 +631,7 @@ fn exact_match(pat: &[&str], path: &[&str]) -> bool {
         if si == path.len() {
             return false; // path shorter than remaining pattern
         }
-        if segment_match(pat[pi], path[si]) {
+        if segment_match(pat[pi].as_ref(), path[si]) {
             pi += 1;
             si += 1;
         } else if let Some(sp) = star_pi {

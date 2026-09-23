@@ -35,6 +35,21 @@ use super::response::{
     report_and_terminate, teardown_in_progress, verify_detours_or_die,
 };
 
+mod map_and_write;
+mod manual_alloc;
+
+pub(crate) use map_and_write::{hook_nt_map_view_of_section, hook_nt_write_virtual_memory};
+// Decision helpers consumed only by memory_guard::tests (the hook bodies use
+// them within map_and_write itself); gating keeps the lib build warning-free.
+#[cfg(test)]
+pub(crate) use map_and_write::{
+    ForeignWriteDecision, foreign_write_decision, map_foreign_denied,
+};
+pub(crate) use manual_alloc::{
+    install_manual_alloc_hook, install_manual_alloc_ex_hook, uninstall_manual_alloc_hook,
+};
+use manual_alloc::{alloc_anti_rec_enter, alloc_anti_rec_leave};
+
 // ---------------------------------------------------------------------------
 // Hook: NtUnmapViewOfSection — deny foreign-process unmap (Process Hollowing)
 // ---------------------------------------------------------------------------
@@ -59,19 +74,31 @@ pub(crate) unsafe extern "system" fn hook_nt_unmap_view_of_section(
     // Resolve PID for real handles
     let target_pid = unsafe { winapi::um::processthreadsapi::GetProcessId(process_handle) };
     let self_pid = unsafe { GetCurrentProcessId() };
-    if target_pid == 0 || target_pid == self_pid {
-        return call_original();
+    // pid 0 = unresolvable identity (invalid handle, or a handle with
+    // mutation rights but no PROCESS_QUERY_LIMITED_INFORMATION — a
+    // documented GetProcessId failure mode, XA review R02) → denied like
+    // any foreign target; only the real self PID passes.
+    if unmap_foreign_denied(target_pid, self_pid) {
+        // Foreign process: deny unconditionally.
+        // Even our own owned children should not have their image unmapped —
+        // that's the core of Process Hollowing.
+        if is_trace() {
+            ipc_log(ipc::LogLevel::Trace,
+                format!("mem_unmap_foreign_blocked pid={target_pid} base=0x{:x}",
+                    base_address as usize));
+        }
+        return STATUS_ACCESS_DENIED;
     }
+    call_original()
+}
 
-    // Foreign process: deny unconditionally.
-    // Even our own owned children should not have their image unmapped —
-    // that's the core of Process Hollowing.
-    if is_trace() {
-        ipc_log(ipc::LogLevel::Trace,
-            format!("mem_unmap_foreign_blocked pid={target_pid} base=0x{:x}",
-                base_address as usize));
-    }
-    STATUS_ACCESS_DENIED
+/// Unmap decision (XA review R02): deny everything that is not exactly the
+/// calling process. `target_pid == 0` means `GetProcessId` could not resolve
+/// the handle — an invalid handle, or a documented failure mode: a handle
+/// holding mutation rights without PROCESS_QUERY_LIMITED_INFORMATION.
+/// Unresolvable identity is denied, not passed through.
+pub(crate) fn unmap_foreign_denied(target_pid: u32, self_pid: u32) -> bool {
+    target_pid != self_pid
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +203,28 @@ pub(crate) fn decide_mapview_protection(
 // Region scan — bounded-chunk linear sweep for direct syscalls
 // ---------------------------------------------------------------------------
 
+/// Page size for scan-range rounding (x64). VirtualProtect operates at this
+/// granularity regardless of the caller-passed range.
+const PAGE_SIZE: usize = 0x1000;
+
+/// Round the caller-passed protect range `[addr, addr + size)` OUT to full
+/// page boundaries, returning the rounded `(start, len)` — or None on
+/// overflow (the caller must fail closed on None).
+///
+/// S06 gap 1 (XA review 2026-09-20): VirtualProtect changes the protection
+/// of EVERY page the range touches, not just the bytes named. A RW→RX
+/// request for one clean byte legitimizes execution of the whole first/last
+/// page, including unscanned neighboring bytes outside the passed range.
+/// The scan range is therefore widened to exactly the pages the kernel will
+/// flip. The rounded range stays within pages the kernel itself touches, so
+/// a legitimate call remains fully readable; anything else lands on the
+/// existing `Unreadable → Deny` fail-closed path.
+pub(crate) fn page_round_scan_range(addr: usize, size: usize) -> Option<(usize, usize)> {
+    let start = addr & !(PAGE_SIZE - 1);
+    let end = addr.checked_add(size)?.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1);
+    Some((start, end - start))
+}
+
 /// Decode-chunk size for region scans. This bounds the work and the hit
 /// buffer of a single decode pass — it is NOT a coverage cap: every byte of
 /// the region is scanned exactly once (plus the overlap below), regardless
@@ -214,19 +263,23 @@ pub(crate) fn region_has_direct_syscalls_with(
         let chunk = &bytes[off..off + extended];
         let chunk_addr = base_addr.wrapping_add(off);
         let dirty = if use_cache {
-            match scan_cache().lookup(chunk_addr, chunk.len(), chunk) {
+            // Hash the chunk once: the same key serves the lookup and the
+            // clean insert (the old lookup+insert pair hashed the bytes
+            // twice on a miss; the miss path itself scans via the bool
+            // predicate and never re-hashes).
+            let key = crate::scan_cache::ScanCache::compute_key(chunk_addr, chunk.len(), chunk);
+            match scan_cache().lookup_keyed(key) {
                 Some(clean) => !clean,
                 None => {
-                    let hits = policy::scan::find_direct_syscalls(chunk, chunk_addr as u64);
-                    let dirty = !hits.is_empty();
+                    let dirty = policy::scan::has_direct_syscall(chunk, chunk_addr as u64);
                     if !dirty {
-                        scan_cache().insert(chunk_addr, chunk.len(), chunk, true);
+                        scan_cache().insert_keyed(key, true);
                     }
                     dirty
                 }
             }
         } else {
-            !policy::scan::find_direct_syscalls(chunk, chunk_addr as u64).is_empty()
+            policy::scan::has_direct_syscall(chunk, chunk_addr as u64)
         };
         if dirty {
             return true;
@@ -234,6 +287,175 @@ pub(crate) fn region_has_direct_syscalls_with(
         off += chunk_len;
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// Guarded (fault-safe) region read — S03 (XA review 2026-09-20)
+// ---------------------------------------------------------------------------
+
+/// Chunk size for the guarded copy scan. Small enough that the stack
+/// buffer is safe on any guest thread (hooks run on the caller's stack),
+/// large enough that the per-chunk copy syscall is noise next to the
+/// instruction decode it feeds.
+const GUARDED_SCAN_CHUNK_BYTES: usize = 16 * 1024;
+
+/// What `guarded_scan_region` concluded about the caller-supplied range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GuardedScanVerdict {
+    /// Every byte was copied and the scan found no direct syscalls.
+    Clean,
+    /// The scan found a direct syscall instruction.
+    SyscallsFound,
+    /// The kernel-mediated copy could not produce the full range:
+    /// unmapped, PAGE_NOACCESS/guard-protected, or partially readable.
+    /// Never a fault — see `guarded_region_copy`.
+    Unreadable,
+}
+
+/// Response for the protect-hook scan path, kept pure and unit-testable
+/// (the hook body itself cannot run under `cargo test` — its kill path
+/// terminates the process).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProtectScanResponse {
+    /// Scan passed; continue with the syscall.
+    Proceed,
+    /// Region could not be fully read: deny without calling the original.
+    /// Fail-closed on purpose: skipping the scan and calling the original
+    /// would let a caller hide syscall payloads behind unreadable pages
+    /// and have them made executable unscanned.
+    Deny,
+    /// Direct syscall bytes found: terminate via report_and_terminate.
+    Kill,
+}
+
+pub(crate) fn protect_scan_response(verdict: GuardedScanVerdict) -> ProtectScanResponse {
+    match verdict {
+        GuardedScanVerdict::Clean => ProtectScanResponse::Proceed,
+        GuardedScanVerdict::SyscallsFound => ProtectScanResponse::Kill,
+        GuardedScanVerdict::Unreadable => ProtectScanResponse::Deny,
+    }
+}
+
+/// Copy `dst.len()` bytes from `src` in the CURRENT process without ever
+/// raising a user-mode exception on this thread.
+///
+/// S03 (XA review 2026-09-20): the protect hook previously built a
+/// `from_raw_parts` slice over the caller-controlled range and let the
+/// scanner dereference it while `anti_rec` was held. A committed
+/// PAGE_NOACCESS page made that read fault BEFORE the kernel call, and
+/// Windows dispatches guest vectored/SEH handlers BEFORE stack unwinding
+/// — guest code could then observe `anti_rec` set and call file APIs
+/// through `call_original` with every guard suppressed (anti_rec
+/// invariant 2 violated at the source).
+///
+/// `ReadProcessMemory` with the current-process pseudo handle performs a
+/// kernel-mediated copy that probes the source under KERNEL SEH: an
+/// unreadable source yields a failed or partial copy and an error return
+/// — no user-mode exception dispatch happens, so no guest handler runs
+/// and the TLS flag cannot be observed in-flight. A plain VirtualQuery
+/// probe before a raw read is NOT a substitute: another thread can flip
+/// the page protection between the query and the read.
+///
+/// Strict on purpose: returns true only when the FULL requested length
+/// was copied. A partial copy (ERROR_PARTIAL_COPY) is reported as
+/// failure so callers fail closed.
+fn guarded_region_copy(src: *const u8, dst: &mut [u8]) -> bool {
+    if src.is_null() || dst.is_empty() {
+        return false;
+    }
+    let mut copied: usize = 0;
+    // SAFETY: dst is a valid mutable buffer of dst.len() bytes. src is
+    // never dereferenced by us — the kernel probes it under SEH and
+    // never faults this thread. GetCurrentProcess returns the pseudo
+    // handle, which is always valid.
+    let ok = unsafe {
+        winapi::um::memoryapi::ReadProcessMemory(
+            winapi::um::processthreadsapi::GetCurrentProcess(),
+            src as *const c_void,
+            dst.as_mut_ptr() as *mut c_void,
+            dst.len(),
+            &mut copied,
+        )
+    };
+    ok != 0 && copied == dst.len()
+}
+
+/// Scan the range `[addr, addr + size)` for direct syscall instructions
+/// through a fault-safe copy (`guarded_region_copy`), in bounded,
+/// forward-overlapping chunks — the same overlap discipline as
+/// `region_has_direct_syscalls_with`, applied at copy level, so an
+/// instruction straddling a chunk boundary is still decoded. The scan
+/// cache sees the copied snapshot; keys are content-hashed, so verdict
+/// semantics are unchanged from scanning live bytes.
+///
+/// KNOWN LIMITATION — recorded per XA review S03, deliberately NOT fixed
+/// in this patch: the `anti_rec` window this scan runs under is carried
+/// by a TLS slot that lives in the guest's own address space. TlsAlloc
+/// slot indices are process-wide and enumerable, so native guest code
+/// that learns the index can call TlsSetValue to set the flag without
+/// our consent (or clear it inside our window). The slot index therefore
+/// cannot be a secret, and in-process hooks are not an impermeable
+/// boundary against arbitrary native code. Closing this for real means
+/// keeping the authorization state outside the guest (kernel-side or
+/// out-of-process) — a redesign, not a patch.
+pub(crate) fn guarded_scan_region(
+    addr: *const u8,
+    size: usize,
+    use_cache: bool,
+) -> GuardedScanVerdict {
+    let mut buf = [0u8; GUARDED_SCAN_CHUNK_BYTES + SCAN_CHUNK_OVERLAP];
+    let mut off = 0usize;
+    while off < size {
+        let n = (size - off).min(GUARDED_SCAN_CHUNK_BYTES);
+        // Extend non-final chunks past the boundary so an instruction
+        // split across chunks is decoded by the earlier pass (mirrors
+        // the overlap rule of region_has_direct_syscalls_with).
+        let ext = (n + SCAN_CHUNK_OVERLAP).min(size - off);
+        // The pointer is never dereferenced here — the kernel validates
+        // it during the copy; hostile/unmapped values surface as
+        // `Unreadable`, not as a fault.
+        let chunk = (addr as usize + off) as *const u8;
+        if !guarded_region_copy(chunk, &mut buf[..ext]) {
+            return GuardedScanVerdict::Unreadable;
+        }
+        if region_has_direct_syscalls(&buf[..ext], addr as usize + off, use_cache) {
+            return GuardedScanVerdict::SyscallsFound;
+        }
+        off += n;
+    }
+    GuardedScanVerdict::Clean
+}
+
+/// Scan `[addr, addr + size)` for direct syscalls, then RE-VERIFY the
+/// identical bytes immediately before the caller proceeds to the original
+/// syscall. Returns the worse of the two verdicts.
+///
+/// KNOWN LIMITATION (TOCTOU) — S06 gap 5, XA review 2026-09-20 — recorded
+/// rather than overclaimed as closed: the bytes are guest-writable RW at
+/// scan time BY DEFINITION (this hook authorizes their RW→RX transition),
+/// so another guest thread can write syscall bytes into the range while we
+/// scan, and a SEC_IMAGE mapping likewise appears in the process before it
+/// is scanned. The second pass narrows that race: when nothing changed it
+/// is ~free (the scan cache keys on content hash, so the re-read hits the
+/// cached verdict), and when a write DID land it re-decodes and catches
+/// the tampered payload. What remains is the sliver between the second
+/// pass and the kernel's protect — no in-process check can close that,
+/// because the protecting syscall itself is the commit point. (A post-RX
+/// write needs another NtProtect, which re-enters this hook and is
+/// rescanned, so the sliver is the only window.) Residual risk accepted
+/// and documented; closing it for real means moving the authorization
+/// commit point outside the guest — the same redesign class as the S03
+/// TLS-slot limitation documented on `guarded_scan_region` above.
+pub(crate) fn guarded_scan_region_twice(
+    addr: *const u8,
+    size: usize,
+    use_cache: bool,
+) -> GuardedScanVerdict {
+    let first = guarded_scan_region(addr, size, use_cache);
+    if first != GuardedScanVerdict::Clean {
+        return first;
+    }
+    guarded_scan_region(addr, size, use_cache)
 }
 
 // ---------------------------------------------------------------------------
@@ -300,13 +522,16 @@ pub(crate) fn alloc_decision_kill_required(
     } else {
         // Foreign-process allocation: executable memory in a process we do
         // not own is the injection primitive itself.
-        // SAFETY: GetProcessId is safe on any HANDLE; returns 0 on invalid.
+        // SAFETY: GetProcessId is safe on any HANDLE; returns 0 on invalid,
+        // and also on a handle holding mutation rights without
+        // PROCESS_QUERY_LIMITED_INFORMATION (a documented failure mode, XA
+        // review R02). pid 0 is never a tracked child (mark_spawned is
+        // gated on child_pid != 0 in core/hooks/spawn.rs), so an
+        // unresolvable identity is a kill for executable allocations.
         let target_pid = unsafe {
             winapi::um::processthreadsapi::GetProcessId(process_handle)
         };
-        target_pid != 0
-            && !crate::process_tracker::is_owned_child(target_pid)
-            && is_executable(protect)
+        !crate::process_tracker::is_owned_child(target_pid) && is_executable(protect)
     }
 }
 
@@ -401,6 +626,23 @@ unsafe extern "system" fn hook_nt_allocate_virtual_memory_ex(
     result
 }
 
+/// Protect decision (XA review R02): a foreign target is killed on an
+/// executable protect unless it is a tracked owned child. `owned_child` is
+/// computed by the caller from `target_pid`; because pid 0 is never a
+/// tracked child, an unresolvable identity (`GetProcessId` returned 0 for a
+/// handle with mutation rights but no PROCESS_QUERY_LIMITED_INFORMATION —
+/// a documented failure mode) is killed like any foreign target.
+pub(crate) fn protect_foreign_exec_kill(
+    target_pid: u32,
+    owned_child: bool,
+    new_protect: u32,
+) -> bool {
+    // target_pid names the decision's subject for call-site symmetry with
+    // the other foreign-target helpers; ownership alone decides here.
+    let _ = target_pid;
+    !owned_child && is_executable(new_protect)
+}
+
 pub(crate) unsafe extern "system" fn hook_nt_protect_virtual_memory(
     process_handle: HANDLE,
     base_address: *mut *mut c_void,
@@ -424,7 +666,17 @@ pub(crate) unsafe extern "system" fn hook_nt_protect_virtual_memory(
     if !is_current_process(process_handle) {
         // Foreign process VirtualProtectEx
         let target_pid = winapi::um::processthreadsapi::GetProcessId(process_handle);
-        if target_pid != 0 && !crate::process_tracker::is_owned_child(target_pid) {
+        // is_owned_child(0) is always false (pid 0 is never tracked), so an
+        // unresolvable identity — a handle with mutation rights but no
+        // PROCESS_QUERY_LIMITED_INFORMATION, a documented GetProcessId
+        // failure mode (XA review R02) — is killed on executable protect
+        // like any foreign target. Non-executable protects keep passing,
+        // matching the existing foreign policy.
+        if protect_foreign_exec_kill(
+            target_pid,
+            crate::process_tracker::is_owned_child(target_pid),
+            new_protect,
+        ) {
             // External process making memory executable → block
             if is_executable(new_protect) && !base_address.is_null() {
                 let addr = *base_address;
@@ -438,18 +690,37 @@ pub(crate) unsafe extern "system" fn hook_nt_protect_virtual_memory(
     // Self-process content-aware scan: when non-module memory transitions to
     // executable, scan its content for direct syscall instructions. Module
     // memory (.text of loaded DLLs) is skipped — DLLs scanned at MapView time.
+    //
+    // S03 (XA review 2026-09-20): the scan reads ONLY through the
+    // kernel-mediated guarded copy — it can never fault in-window (an
+    // in-window fault would dispatch the guest's own VEH with anti_rec
+    // still set), and a region that cannot be fully read is DENIED, not
+    // skipped: skipping would let unreadable pages carrying syscall
+    // bytes be made executable unscanned.
     if is_executable(new_protect) && !base_address.is_null() {
         let addr = *base_address;
         // Skip loaded module regions (loader operations, CRT, etc.)
         if !addr.is_null() && !is_address_in_module(addr) {
             let size = if region_size.is_null() { 0 } else { *region_size };
             if size > 0 {
-                let bytes = std::slice::from_raw_parts(addr as *const u8, size);
-                // Full-region scan in bounded chunks. The previous
-                // `size <= 64 MB` gate silently skipped oversized regions —
-                // fail-open by construction; every byte is covered now.
-                if region_has_direct_syscalls(bytes, addr as usize, true) {
-                    report_and_terminate(ipc::AllocKind::Protect, new_protect, size as u64, addr as u64);
+                // S06 gap 1: widen the scanned range to the full pages the
+                // kernel will flip — see `page_round_scan_range`. Overflow
+                // fails closed (None → Deny); an unreadable rounded page
+                // fails closed through the existing Unreadable → Deny path.
+                // S06 gap 5: the second pass re-verifies the bytes right
+                // before the syscall (see `guarded_scan_region_twice`).
+                let scanned = match page_round_scan_range(addr as usize, size) {
+                    Some((scan_addr, scan_size)) => protect_scan_response(
+                        guarded_scan_region_twice(scan_addr as *const u8, scan_size, true),
+                    ),
+                    None => ProtectScanResponse::Deny,
+                };
+                match scanned {
+                    ProtectScanResponse::Kill => {
+                        report_and_terminate(ipc::AllocKind::Protect, new_protect, size as u64, addr as u64);
+                    }
+                    ProtectScanResponse::Deny => return STATUS_ACCESS_DENIED,
+                    ProtectScanResponse::Proceed => {}
                 }
             }
         }
@@ -489,474 +760,7 @@ pub(crate) unsafe extern "system" fn hook_nt_protect_virtual_memory(
     status
 }
 
-pub(crate) unsafe extern "system" fn hook_nt_map_view_of_section(
-    section_handle: HANDLE,
-    process_handle: HANDLE,
-    base_address: *mut *mut c_void,
-    zero_bits: usize,
-    commit_size: usize,
-    section_offset: *mut i64,
-    view_size: *mut usize,
-    inherit_disposition: u32,
-    allocation_type: u32,
-    win32_protect: u32,
-) -> NTSTATUS {
-    let call_original = || {
-        nt_call_original!(
-            &HOOK_MAP_VIEW,
-            "NtMapViewOfSection",
-            (section_handle, process_handle, base_address, zero_bits,
-             commit_size, section_offset, view_size, inherit_disposition,
-             allocation_type, win32_protect)
-        )
-    };
-
-    // Cross-process mapping deny:
-    // If target is a foreign process (not self, not NtCurrentProcess), deny
-    // independently of section content. Attacker mapping section into foreign
-    // proc address space → when that proc reads/executes → runs attacker code.
-    // Self-process mapping continues to existing content-aware path.
-    if !is_current_process(process_handle) {
-        let target_pid = unsafe { winapi::um::processthreadsapi::GetProcessId(process_handle) };
-        let self_pid = unsafe { GetCurrentProcessId() };
-        if target_pid != 0 && target_pid != self_pid {
-            if is_trace() {
-                ipc_log(ipc::LogLevel::Trace,
-                    format!("mem_map_foreign_blocked pid={target_pid} win32protect=0x{:x}",
-                        win32_protect));
-            }
-            return STATUS_ACCESS_DENIED;
-        }
-        // Handle belongs to self (pseudo-handle resolved to same PID)
-        return call_original();
-    }
-
-    // anti_rec: if we're already inside a hook on this thread, pass through.
-    // During process startup, NtMapViewOfSection is called heavily for DLL
-    // loading. We must allow those (anti_rec handles it). After startup,
-    // user code triggering this hook will have anti_rec available.
-    let Some(_guard) = anti_rec::enter() else {
-        return call_original();
-    };
-
-    // Pre-mapping SEC_IMAGE check: query the section object BEFORE mapping it.
-    // NtQuerySection(SectionImageInformation) succeeds only for SEC_IMAGE
-    // sections (PE files opened by the NT loader). This is authoritative and
-    // avoids the VirtualQuery ambiguity that causes the post-mapping
-    // is_image_mapping() to return false for some CLR managed-assembly loads
-    // (e.g. mscorlib.ni.dll, system.dll) where the NT loader maps a
-    // file-backed section that VirtualQuery reports as MEM_MAPPED rather than
-    // MEM_IMAGE, even though the underlying file IS a PE image.
-    let section_is_image = is_section_image_backed(section_handle);
-
-    // Call original first — we need the mapped base to distinguish SEC_IMAGE
-    // (normal DLL loading) from anonymous sections (shellcode/manual map).
-    let status = call_original();
-    if status < 0 || base_address.is_null() {
-        return status;
-    }
-
-    let mapped_base = *base_address;
-    if mapped_base.is_null() {
-        return status;
-    }
-
-    // Image mapping: either VirtualQuery confirms MEM_IMAGE, or the pre-mapping
-    // NtQuerySection confirmed SEC_IMAGE (covers CLR managed-assembly paths where
-    // VirtualQuery may report MEM_MAPPED for a valid PE image section).
-    if is_image_mapping(mapped_base) || section_is_image {
-        if let Some(basename) = get_mapped_file_basename(mapped_base) {
-            if is_critical_dll(&basename) {
-                if let Some(unmap_fn) = unmap_section_original_pub() {
-                    // SAFETY: mapped_base was just mapped successfully; we unmap
-                    // it before terminating to clean up.
-                    unmap_fn(-1isize as HANDLE, mapped_base);
-                }
-                let size = if view_size.is_null() { 0 } else { *view_size as u64 };
-                report_and_terminate(ipc::AllocKind::MapView, win32_protect, size, mapped_base as u64);
-            }
-
-            // Scan .text of user DLLs for direct syscalls at full level and
-            // above. static is a superset of full — it MUST also run this scan
-            // (skipping it would make the hardest tier weaker than full).
-            if is_full_mode() || is_static_mode() {
-            if let Some(full_path) = get_mapped_file_path(mapped_base) {
-                if !is_system_dll_path(&full_path) {
-                    // Bound every read to the actual mapped view. The PE header
-                    // fields (virtual_address / virtual_size) are attacker-
-                    // influenced for a manually-built section, so reading a flat
-                    // 4 KiB header or `mapped_base + virtual_address` for
-                    // `virtual_size` bytes could run past the mapping → OOB read /
-                    // crash. Clamp to *view_size (the kernel-reported mapped size).
-                    let view_bytes = if view_size.is_null() { 0usize } else { *view_size };
-                    let header_len = view_bytes.min(4096);
-                    if header_len >= 64 {
-                        let header_slice = std::slice::from_raw_parts(mapped_base as *const u8, header_len);
-                        if let Some(text) = policy::scan::pe_text_section(header_slice) {
-                            let va = text.virtual_address as usize;
-                            // Skip if the section claims to start at/after the view end.
-                            if va < view_bytes {
-                                let avail = view_bytes - va;
-                                let scan_size = (text.virtual_size as usize).min(avail);
-                                if scan_size > 0 {
-                                    let text_addr = (mapped_base as usize + va) as *const u8;
-                                    let text_slice = std::slice::from_raw_parts(text_addr, scan_size);
-                                    if region_has_direct_syscalls(text_slice, text_addr as usize, false) {
-                                        let unmap = unmap_section_original_pub();
-                                        if let Some(unmap_fn) = unmap {
-                                            unmap_fn(-1isize as HANDLE, mapped_base);
-                                        }
-                                        let size = if view_size.is_null() { 0 } else { *view_size as u64 };
-                                        report_and_terminate(ipc::AllocKind::MapView, win32_protect, size, mapped_base as u64);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            } // full || static
-        }
-    } else {
-        // Non-image mapping (VirtualQuery did not return MEM_IMAGE and
-        // NtQuerySection did not confirm SEC_IMAGE).
-        let mut effective = win32_protect;
-        let mut mbi: winapi::um::winnt::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-        let ret = winapi::um::memoryapi::VirtualQuery(
-            mapped_base,
-            &mut mbi,
-            std::mem::size_of::<winapi::um::winnt::MEMORY_BASIC_INFORMATION>(),
-        );
-        if ret != 0 {
-            effective |= mbi.Protect;
-        }
-        if is_executable(effective) {
-            // Both anonymous (pagefile-backed) sections and file-backed sections
-            // appear as MEM_MAPPED after NtMapViewOfSection. Distinguish them by
-            // querying whether the mapping has an underlying file:
-            //   - GetMappedFileNameW succeeds  → file-backed (disk-backed section).
-            //     CLR maps managed assemblies (.ni.dll) this way with
-            //     PAGE_EXECUTE_WRITECOPY — a legitimate read-only copy-on-write
-            //     view. Blocking it terminates .NET / PowerShell at startup.
-            //   - GetMappedFileNameW fails (returns 0) → anonymous / pagefile-
-            //     backed section. This is the classic shellcode / manual-map
-            //     injection pattern → deny regardless of mode.
-            //   - VirtualQuery failed (ret == 0) → err on the side of caution
-            //     and treat as anonymous → deny.
-            let is_file_backed = get_mapped_file_path(mapped_base).is_some();
-
-            if !is_file_backed {
-                // Anonymous or pagefile-backed executable mapping: deny.
-                let unmap = unmap_section_original_pub();
-                if let Some(unmap_fn) = unmap {
-                    unmap_fn(-1isize as HANDLE, mapped_base);
-                }
-                let size = if view_size.is_null() { 0 } else { *view_size as u64 };
-                report_and_terminate(ipc::AllocKind::MapView, mbi.Protect, size, mapped_base as u64);
-            }
-            // File-backed non-image executable mapping: scan for direct
-            // syscalls at full/static level. An attacker could write shellcode
-            // to a file and map it; the content scan closes that gap without
-            // blocking CLR's legitimate file-view PE loads.
-            if (is_full_mode() || is_static_mode()) && is_file_backed {
-                let view_bytes = if view_size.is_null() { 0usize } else { *view_size };
-                if view_bytes > 0 {
-                    let bytes = std::slice::from_raw_parts(mapped_base as *const u8, view_bytes);
-                    if region_has_direct_syscalls(bytes, mapped_base as usize, false) {
-                        let unmap = unmap_section_original_pub();
-                        if let Some(unmap_fn) = unmap {
-                            unmap_fn(-1isize as HANDLE, mapped_base);
-                        }
-                        let size = if view_size.is_null() { 0 } else { *view_size as u64 };
-                        report_and_terminate(ipc::AllocKind::MapView, mbi.Protect, size, mapped_base as u64);
-                    }
-                }
-            }
-        }
-    }
-
-    status
-}
-
-/// Decision for a cross-process `NtWriteVirtualMemory` target that is not the
-/// calling process (the self path is handled above with the P0-01
-/// hook-integrity check).
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ForeignWriteDecision {
-    /// `GetProcessId` could not resolve the handle (pid 0): let the original
-    /// call fail downstream on its own merits.
-    PassThrough,
-    /// Self via a real handle, or a tracked owned child — the launcher's
-    /// hook.dll injection path.
-    Allow,
-    /// Any other process. The write itself is the injection primitive;
-    /// content heuristics cannot decide it.
-    Deny,
-}
-
-pub(crate) fn foreign_write_decision(
-    target_pid: u32,
-    self_pid: u32,
-    owned_child: bool,
-) -> ForeignWriteDecision {
-    if target_pid == 0 {
-        ForeignWriteDecision::PassThrough
-    } else if target_pid == self_pid || owned_child {
-        ForeignWriteDecision::Allow
-    } else {
-        ForeignWriteDecision::Deny
-    }
-}
-
-pub(crate) unsafe extern "system" fn hook_nt_write_virtual_memory(
-    process_handle: HANDLE,
-    base_address: *mut c_void,
-    _buffer: *const c_void,
-    bytes_to_write: usize,
-    bytes_written: *mut usize,
-) -> NTSTATUS {
-    let call_original = || {
-        nt_call_original!(
-            &HOOK_WRITE_MEM,
-            "NtWriteVirtualMemory",
-            (process_handle, base_address, _buffer, bytes_to_write, bytes_written)
-        )
-    };
-
-    let Some(_guard) = anti_rec::enter() else {
-        return call_original();
-    };
-
-    // Self-process write is fine (memcpy-style) EXCEPT when it targets an
-    // executable page of a critical module (P0-01): patching detour prologues
-    // through WriteProcessMemory(self) is the same unhooking primitive as
-    // direct memcpy after a protect. Our own detour installer writes through
-    // direct memory access during the anti_rec-held install window, so no
-    // legitimate in-process path reaches this branch post-install. Enforced
-    // at every guard level.
-    if is_current_process(process_handle) {
-        if !base_address.is_null()
-            && bytes_to_write > 0
-            && !teardown_in_progress()
-            && overlaps_critical_exec(base_address, bytes_to_write)
-        {
-            report_and_terminate(
-                ipc::AllocKind::Write,
-                0,
-                bytes_to_write as u64,
-                base_address as u64,
-            );
-        }
-        return call_original();
-    }
-
-    // Foreign target: allow/deny decision, not a content heuristic. A
-    // content scan only catches payload shapes it knows; any other bytes
-    // (second-stage payloads, ROP stacks, data for an existing code cave)
-    // sailed through. Cross-process WriteProcessMemory from inside the
-    // sandbox is the injection primitive itself — fail-stop, matching the
-    // foreign-exec paths of NtAllocateVirtualMemory / NtProtectVirtualMemory
-    // above. Legitimate launcher injection into owned children is
-    // unaffected (process_tracker::is_owned_child).
-    let target_pid = winapi::um::processthreadsapi::GetProcessId(process_handle);
-    let self_pid = GetCurrentProcessId();
-    let owned = target_pid != 0 && crate::process_tracker::is_owned_child(target_pid);
-    match foreign_write_decision(target_pid, self_pid, owned) {
-        ForeignWriteDecision::PassThrough | ForeignWriteDecision::Allow => call_original(),
-        ForeignWriteDecision::Deny => report_and_terminate(
-            ipc::AllocKind::Write,
-            0,
-            bytes_to_write as u64,
-            base_address as u64,
-        ),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TLS-based re-entry guard for NtAllocateVirtualMemory
-// ---------------------------------------------------------------------------
-
-unsafe fn alloc_anti_rec_enter() -> bool {
-    let idx = ALLOC_TLS_INDEX.load(std::sync::atomic::Ordering::Relaxed);
-    if idx == 0xFFFFFFFF { return false; }
-    // SAFETY: TlsGetValue never allocates. Returns NULL (0) if not set.
-    let val = winapi::um::processthreadsapi::TlsGetValue(idx);
-    if val as usize != 0 {
-        return false; // already in hook on this thread
-    }
-    // SAFETY: TlsSetValue never allocates.
-    winapi::um::processthreadsapi::TlsSetValue(idx, 1usize as *mut _);
-    true
-}
-
-unsafe fn alloc_anti_rec_leave() {
-    let idx = ALLOC_TLS_INDEX.load(std::sync::atomic::Ordering::Relaxed);
-    if idx != 0xFFFFFFFF {
-        winapi::um::processthreadsapi::TlsSetValue(idx, std::ptr::null_mut());
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Manual inline hook for NtAllocateVirtualMemory
-// ---------------------------------------------------------------------------
-
-/// # SAFETY
-/// Must be called once from install(). Patches ntdll in-place.
-unsafe fn alloc_near(target: usize, size: usize) -> *mut c_void {
-    // SAFETY: Try addresses within ±2GB of target in 64KB steps (allocation
-    // granularity). VirtualAlloc returns NULL on failure → safe.
-    let mut addr = (target & !0xFFFF).wrapping_sub(0x7FFF_0000);
-    let end = (target & !0xFFFF).wrapping_add(0x7FFF_0000);
-    while addr < end {
-        let p = winapi::um::memoryapi::VirtualAlloc(
-            addr as *mut _,
-            size,
-            0x1000 | 0x2000, // MEM_COMMIT | MEM_RESERVE
-            0x40,             // PAGE_EXECUTE_READWRITE
-        );
-        if !p.is_null() { return p; }
-        addr = addr.wrapping_add(0x10000);
-    }
-    std::ptr::null_mut()
-}
-
-/// Allocate the shared alloc-path TLS re-entry slot once. Both manual alloc
-/// hooks (classic + Ex) share one slot: re-entrancy from our own bookkeeping
-/// inside either hook is the same concern (TlsAlloc never uses NtAlloc).
-unsafe fn ensure_alloc_tls_index() -> Result<(), Box<dyn std::error::Error>> {
-    if ALLOC_TLS_INDEX.load(std::sync::atomic::Ordering::Relaxed) != 0xFFFFFFFF {
-        return Ok(());
-    }
-    let tls_idx = winapi::um::processthreadsapi::TlsAlloc();
-    if tls_idx == 0xFFFFFFFF {
-        return Err("TlsAlloc failed".into());
-    }
-    ALLOC_TLS_INDEX.store(tls_idx, std::sync::atomic::Ordering::Relaxed);
-    Ok(())
-}
-
-/// Manual inline hook installer for a syscall stub with the prologue
-/// `4c 8b d1 b8 <ssn>` (mov r10, rcx; mov eax, ssn). Copies the prologue to
-/// a trampoline page near ntdll, patches the stub with a JMP to `$hook_fn`,
-/// and records the site for hook-integrity verification. Shared by
-/// NtAllocateVirtualMemory and NtAllocateVirtualMemoryEx (audit High sibling
-/// closure) — GenericDetour produces broken trampolines on this stub family
-/// (see the HOOK_ALLOC note above).
-macro_rules! install_manual_syscall_hook {
-    ($symbol:literal, $hook_fn:expr, $tramp_slot:expr, $active_flag:expr, $fn_ty:ty) => {{
-        ensure_alloc_tls_index()?;
-
-        let target_addr = crate::hooks::ntdll_export($symbol.as_bytes())
-            .ok_or_else(|| format!("ntdll export not found: {}", $symbol))?;
-
-        // Verify expected prologue: 4c 8b d1 b8 XX XX XX XX (8 bytes)
-        let prologue = std::slice::from_raw_parts(target_addr as *const u8, 8);
-        if prologue[0] != 0x4c || prologue[1] != 0x8b || prologue[2] != 0xd1 || prologue[3] != 0xb8 {
-            return Err(format!(
-                "unexpected {} prologue: {:02x} {:02x} {:02x} {:02x}",
-                $symbol,
-                prologue[0], prologue[1], prologue[2], prologue[3]
-            ).into());
-        }
-
-        // Allocate trampoline page NEAR ntdll (within ±2GB for JMP rel32)
-        let tramp_page = alloc_near(target_addr as usize, 4096);
-        if tramp_page.is_null() {
-            return Err("VirtualAlloc for trampoline failed (no space near ntdll)".into());
-        }
-        let tramp = tramp_page as *mut u8;
-
-        // Trampoline: [original 8 bytes] [JMP rel32 to ntdll+8]
-        std::ptr::copy_nonoverlapping(target_addr as *const u8, tramp, 8);
-        let jmp_target = (target_addr as usize) + 8;
-        let jmp_src = (tramp as usize) + 8 + 5;
-        let rel32 = (jmp_target as isize - jmp_src as isize) as i32;
-        *tramp.add(8) = 0xe9;
-        std::ptr::copy_nonoverlapping(&rel32 as *const i32 as *const u8, tramp.add(9), 4);
-
-        // SAFETY: tramp points to valid executable code matching $fn_ty.
-        let trampoline_fn: $fn_ty = std::mem::transmute(tramp_page);
-        let _ = $tramp_slot.set(trampoline_fn);
-
-        // Springboard: [JMP rel32 to our hook] lives in the same near-page.
-        // We write it at tramp+64. Then ntdll patch uses JMP rel32 to springboard,
-        // and springboard uses indirect JMP to the real hook address.
-        let spring = tramp.add(64);
-        let hook_addr = $hook_fn as *const () as usize;
-        // ff 25 00 00 00 00 [8-byte abs addr] = indirect JMP to absolute address
-        *spring = 0xff;
-        *spring.add(1) = 0x25;
-        std::ptr::write_unaligned(spring.add(2) as *mut u32, 0u32); // RIP+0
-        std::ptr::write_unaligned(spring.add(6) as *mut u64, hook_addr as u64);
-
-        // Patch ntdll: JMP rel32 from the stub to springboard
-        let spring_addr = spring as usize;
-        let patch_src = (target_addr as usize) + 5;
-        let hook_rel32 = (spring_addr as isize - patch_src as isize) as i32;
-
-        let mut old_protect: u32 = 0;
-        winapi::um::memoryapi::VirtualProtect(
-            target_addr as *mut _, 8, 0x40, &mut old_protect,
-        );
-        let target = target_addr as *mut u8;
-        *target = 0xe9;
-        std::ptr::copy_nonoverlapping(&hook_rel32 as *const i32 as *const u8, target.add(1), 4);
-        *target.add(5) = 0x90;
-        *target.add(6) = 0x90;
-        *target.add(7) = 0x90;
-        let mut dummy: u32 = 0;
-        winapi::um::memoryapi::VirtualProtect(
-            target_addr as *mut _, 8, old_protect, &mut dummy,
-        );
-
-        // SAFETY: flush instruction cache for both trampoline and patched ntdll
-        // to ensure CPU doesn't execute stale prefetched instructions.
-        winapi::um::processthreadsapi::FlushInstructionCache(
-            winapi::um::processthreadsapi::GetCurrentProcess(),
-            tramp_page,
-            128,
-        );
-        winapi::um::processthreadsapi::FlushInstructionCache(
-            winapi::um::processthreadsapi::GetCurrentProcess(),
-            target_addr as *mut _,
-            8,
-        );
-
-        // Snapshot the patched prologue for hook-integrity verification.
-        record_detour_for_watch(target_addr as usize);
-        $active_flag.store(true, std::sync::atomic::Ordering::Release);
-        Ok(())
-    }};
-}
-
-pub(crate) unsafe fn install_manual_alloc_hook() -> Result<(), Box<dyn std::error::Error>> {
-    install_manual_syscall_hook!(
-        "NtAllocateVirtualMemory\0",
-        hook_nt_allocate_virtual_memory,
-        MANUAL_ALLOC_TRAMPOLINE,
-        MANUAL_ALLOC_ACTIVE,
-        FnNtAllocateVirtualMemory
-    )
-}
-
-/// Audit High sibling closure: the same manual-hook treatment for the
-/// NtAllocateVirtualMemoryEx stub (VirtualAlloc2's backend).
-pub(crate) unsafe fn install_manual_alloc_ex_hook() -> Result<(), Box<dyn std::error::Error>> {
-    install_manual_syscall_hook!(
-        "NtAllocateVirtualMemoryEx\0",
-        hook_nt_allocate_virtual_memory_ex,
-        MANUAL_ALLOC_EX_TRAMPOLINE,
-        MANUAL_ALLOC_EX_ACTIVE,
-        FnNtAllocateVirtualMemoryEx
-    )
-}
-
-/// Unpatch NtAllocateVirtualMemory manual hook.
-pub(crate) unsafe fn uninstall_manual_alloc_hook() {
-    if !MANUAL_ALLOC_ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
-        return;
-    }
-    // We don't restore original bytes here because DLL_PROCESS_DETACH runs during
-    // process teardown — ntdll patching at that point is unsafe.
-}
+// NtMapViewOfSection, NtWriteVirtualMemory: see detours::map_and_write.
+// Manual NtAllocateVirtualMemory(Ex) hook install/uninstall: see
+// detours::manual_alloc. Both re-exported above.
 

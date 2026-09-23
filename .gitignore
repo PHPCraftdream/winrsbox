@@ -12,6 +12,9 @@
 # Rust target dirs
 /sandbox/target/
 /winrsbox/target/
+# any nested per-crate target dir (e.g. a stray standalone `cargo build`
+# run from inside a crate directory instead of the workspace root)
+winrsbox/crates/*/target/
 
 # Sandbox runtime state (CoW overlay, policy DB, logs) — must never be committed
 .winrsbox/

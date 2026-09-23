@@ -3,22 +3,24 @@ use super::cache;
 use super::c_void;
 use super::check_path_traversal;
 use super::classify_device_open;
+use super::cow_publish_allowed;
 use super::decide;
+use super::decide_fresh_if_overlay_missing;
 use super::dead_end_write_intent;
 use super::DeviceVerdict;
 use super::extract_nt_basename;
 use super::HookedAttrs;
 use super::ipc_clear_whiteout;
 use super::ipc_log;
-use super::ipc_record_overlay;
-use super::ipc_record_overlay_case;
 use super::is_create_disposition;
 use super::is_ea_present;
 use super::is_trace;
 use super::is_write_access;
 use super::materialize_mock_overlay;
 use super::nt_call_original;
+use super::overlay_publish_forget;
 use super::prepare_overlay;
+use super::publish_overlay_decision;
 use super::resolve_for_hook;
 use super::set_io_status;
 use super::STATUS_ACCESS_DENIED;
@@ -34,6 +36,12 @@ use super::HOOK_NT_CREATE_FILE;
 use super::HOOK_NT_OPEN_FILE;
 use super::HOOK_NT_QUERY_ATTRIBUTES_FILE;
 use super::HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE;
+use policy::Decision;
+
+mod passthrough_probe;
+pub(crate) use passthrough_probe::{PassthroughProbe, probe_passthrough, aliased_resolution_permits, passthrough_alias_decision};
+mod query_attributes;
+pub(crate) use query_attributes::{hook_nt_query_attributes_file, hook_nt_query_full_attributes_file};
 
 // ---------------------------------------------------------------------------
 // Hook implementations
@@ -194,6 +202,14 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
     // intended).
     let ea_present = is_ea_present(ea_buffer as *const _, ea_length);
     let mut decision = decide(&dos, write);
+    // C04 (docs/review-xa-2026-09-20): a locally cached Cow decision can be
+    // stale — a sibling process may have deleted the overlay copy and
+    // recorded a whiteout. If the overlay target is physically missing,
+    // re-decide fresh so the whiteout (Hidden) or a fresh deny rule (Deny)
+    // is honored; a create disposition then still flows into the revive
+    // block below, a pure open/read returns not-found, and fresh Cow keeps
+    // today's behavior.
+    decision = decide_fresh_if_overlay_missing(&decision, &dos, write);
 
     // ── Revive: a create/supersede/open-if against a Hidden (whiteouted) path
     // means the caller wants to (re)create the file. We clear the whiteout
@@ -206,8 +222,15 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
     // escape). Instead we clear + re-decide inline and fall through to the
     // normal match below.
     if decision.mode == Mode::Hidden && is_create_disposition(create_disposition) {
-        let lower = dos.to_lowercase();
+        // S11: `dos` comes from resolve_for_hook (already kernel-folded via
+        // nt_to_dos_lower); the re-fold is idempotent and replaces the old
+        // Unicode `.to_lowercase()` whose record keys diverged from the
+        // kernel-folded lookup keys on non-ASCII paths.
+        let lower = policy::path::nt_case_fold(&dos);
         ipc_clear_whiteout(&lower);
+        // The whiteout clear may have removed the server-side index entry,
+        // so re-arm publication.
+        overlay_publish_forget(&lower);
         cache().invalidate(&lower);
         if is_trace() {
             ipc_log(
@@ -263,6 +286,22 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
                     pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
                     level: ipc::LogLevel::Warn,
                     msg: format!("ntfs_ea_blocked: {dos} (ea_len={ea_length})"),
+                });
+                if !file_handle.is_null() {
+                    *file_handle = std::ptr::null_mut();
+                }
+                set_io_status(io_status_block, STATUS_ACCESS_DENIED);
+                return STATUS_ACCESS_DENIED;
+            }
+            // S05 (docs/review-xa-2026-09-20): a passthrough WRITE open must not
+            // traverse a pre-existing reparse point or mutate a multi-link file
+            // object under another name. Probed BEFORE the kernel open — a
+            // post-open check is too late for OVERWRITE/truncate dispositions.
+            if let Some(_deny) = passthrough_alias_decision(&dos, write) {
+                crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+                    pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                    level: ipc::LogLevel::Warn,
+                    msg: format!("passthrough_alias_denied: {dos}"),
                 });
                 if !file_handle.is_null() {
                     *file_handle = std::ptr::null_mut();
@@ -333,7 +372,10 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
                     return STATUS_ACCESS_DENIED;
                 }
             };
-            let lower = dos.to_lowercase();
+            // S11: kernel-fold (idempotent on the already-folded `dos`) —
+            // overlay record keys must be the exact strings policy folds
+            // lookups to, not Unicode-lowercase variants of them.
+            let lower = policy::path::nt_case_fold(&dos);
 
             // CoW read-passthrough: on a READ of a file with no overlay copy,
             // open the REAL file (passthrough). CoW = copy-on-WRITE, not copy-
@@ -344,10 +386,12 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
             // and many other tools that read config from the user profile.
             let overlay_exists_phys = std::path::Path::new(&overlay_dos).exists();
             if !is_write_access(desired_access, create_disposition) && !overlay_exists_phys {
-                // Don't record an overlay entry — the file is still real.
-                // The hook cache's Cow decision is fine: if a later WRITE
-                // arrives, it will copy-on-write and record the overlay then.
-                cache().invalidate(&lower);
+                // Don't record an overlay entry — the file is still real;
+                // a later WRITE copy-on-writes and records the overlay then.
+                // (C04: staleness of the cached Cow this arm runs under is
+                // already handled by the fresh re-check before dispatch, so
+                // no cache invalidation here — it would evict the just-
+                // verified fresh Cow and force an extra IPC on every read.)
                 let mut copy = match HookedAttrs::copy_passthrough_inner(
                     &*object_attributes, pre_resolved.as_deref()
                 ) {
@@ -372,18 +416,6 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
                 );
             }
 
-            ipc_record_overlay(&lower, &overlay_dos);
-            // Record original-case basename so the directory-enumeration hook
-            // can restore case for overlay-only dirs (variant B hybrid).
-            // Use `original_basename` captured before nt_to_dos_lower (which
-            // lowercases the entire path), so the true caller-supplied case is
-            // preserved. Falls back to the dos basename when the early capture
-            // returned None (path already all-lowercase — nothing to preserve).
-            if let Some(ref basename) = original_basename {
-                ipc_record_overlay_case(&lower, basename);
-            }
-            cache().invalidate(&lower);
-
             // Cow: redirect to overlay path. Keep orig's SQOS verbatim
             // (Cow is invoked from NtCreateFile/NtOpenFile where the
             // original SQOS is whatever the caller passed; the historical
@@ -406,6 +438,19 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
                  allocation_size, file_attributes, share_access, create_disposition,
                  create_options, ea_buffer, ea_length)
             );
+            // C04 (docs/review-xa-2026-09-20): publish only after the redirected
+            // open actually succeeded — a failed open (disk full, permissions,
+            // TOCTOU) must not leave the index claiming an overlay exists. On
+            // failure, drop the cached Cow that produced the redirect so the next
+            // decide re-queries current state.
+            if cow_publish_allowed(status) {
+                publish_overlay_decision(&lower, &overlay_dos, &original_basename);
+            } else {
+                // PERF-cow: a failed open can mean the index and the physical
+                // overlay diverged — re-arm publication for the next success.
+                overlay_publish_forget(&lower);
+                cache().invalidate(&lower);
+            }
             // Always log STATUS_REPARSE_POINT_ENCOUNTERED (0xC0000274 / os error 4395)
             // so it appears in sandbox.log at WARN level even without trace mode.
             const STATUS_REPARSE_POINT_ENCOUNTERED: i32 = 0xC000_0274_u32 as i32;
@@ -575,7 +620,15 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
     // is_write_access definition drives the classification here too (this
     // site used to re-inline the old narrow bit list).
     let write = is_write_access(desired_access, FILE_OPEN);
-    let decision = decide(&dos, write);
+    let mut decision = decide(&dos, write);
+    // C04 (docs/review-xa-2026-09-20): a locally cached Cow decision can be
+    // stale — a sibling process may have deleted the overlay copy and
+    // recorded a whiteout. If the overlay target is physically missing,
+    // re-decide fresh so the whiteout (Hidden) or a fresh deny rule (Deny)
+    // is honored; a create disposition then still flows into the revive
+    // block below, a pure open/read returns not-found, and fresh Cow keeps
+    // today's behavior.
+    decision = decide_fresh_if_overlay_missing(&decision, &dos, write);
 
     if is_trace() {
         ipc_log(
@@ -603,6 +656,22 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
             STATUS_OBJECT_NAME_NOT_FOUND
         }
         Mode::Passthrough => {
+            // S05 (docs/review-xa-2026-09-20): a passthrough WRITE open must not
+            // traverse a pre-existing reparse point or mutate a multi-link file
+            // object under another name. Probed BEFORE the kernel open — a
+            // post-open check is too late for OVERWRITE/truncate dispositions.
+            if let Some(_deny) = passthrough_alias_decision(&dos, write) {
+                crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+                    pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
+                    level: ipc::LogLevel::Warn,
+                    msg: format!("passthrough_alias_denied: {dos}"),
+                });
+                if !file_handle.is_null() {
+                    *file_handle = std::ptr::null_mut();
+                }
+                set_io_status(io_status_block, STATUS_ACCESS_DENIED);
+                return STATUS_ACCESS_DENIED;
+            }
             // SAFETY: object_attributes is non-null.
             let mut copy = match HookedAttrs::copy_passthrough_inner(
                 &*object_attributes, pre_resolved.as_deref()
@@ -654,14 +723,10 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
                     return STATUS_ACCESS_DENIED;
                 }
             };
-            let lower = dos.to_lowercase();
-            ipc_record_overlay(&lower, &overlay_dos);
-            // Record original-case basename (variant B hybrid — NtOpenFile path).
-            // Use `original_basename` captured before nt_to_dos_lower lowercased the path.
-            if let Some(ref basename) = original_basename {
-                ipc_record_overlay_case(&lower, basename);
-            }
-            cache().invalidate(&lower);
+            // S11: kernel-fold (idempotent on the already-folded `dos`) —
+            // overlay record keys must be the exact strings policy folds
+            // lookups to, not Unicode-lowercase variants of them.
+            let lower = policy::path::nt_case_fold(&dos);
 
             // SAFETY: object_attributes is non-null.
             let mut h = HookedAttrs::redirect(&*object_attributes, &overlay_dos, false);
@@ -671,6 +736,19 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
                 (file_handle, desired_access, h.as_ptr_mut(),
                  io_status_block, share_access, open_options)
             );
+            // C04 (docs/review-xa-2026-09-20): publish only after the redirected
+            // open actually succeeded — a failed open (disk full, permissions,
+            // TOCTOU) must not leave the index claiming an overlay exists. On
+            // failure, drop the cached Cow that produced the redirect so the next
+            // decide re-queries current state.
+            if cow_publish_allowed(status) {
+                publish_overlay_decision(&lower, &overlay_dos, &original_basename);
+            } else {
+                // PERF-cow: a failed open can mean the index and the physical
+                // overlay diverged — re-arm publication for the next success.
+                overlay_publish_forget(&lower);
+                cache().invalidate(&lower);
+            }
             // Always log STATUS_REPARSE_POINT_ENCOUNTERED / STATUS_NOT_A_REPARSE_POINT
             // (os error 4395) at WARN level so they appear in sandbox.log even without
             // trace mode.
@@ -734,248 +812,6 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
     }
 }
 
-pub(crate) unsafe extern "system" fn hook_nt_query_attributes_file(
-    object_attributes: *mut OBJECT_ATTRIBUTES,
-    file_information: *mut c_void,
-) -> NTSTATUS {
-    let Some(_guard) = anti_rec::enter() else {
-        return nt_call_original!(
-            &HOOK_NT_QUERY_ATTRIBUTES_FILE,
-            "NtQueryAttributesFile",
-            (object_attributes, file_information)
-        );
-    };
-
-    // H5 resolve-once.
-    let Some((dos, pre_resolved)) = resolve_for_hook(object_attributes as *const _) else {
-        return nt_call_original!(
-            &HOOK_NT_QUERY_ATTRIBUTES_FILE,
-            "NtQueryAttributesFile",
-            (object_attributes, file_information)
-        );
-    };
-
-    let decision = decide(&dos, false);
-    if is_trace() {
-        ipc_log(ipc::LogLevel::Trace, format!("fs_decide NtQueryAttributesFile: {dos} write=false mode={:?}", decision.mode));
-    }
-    match decision.mode {
-        Mode::Hidden => STATUS_OBJECT_NAME_NOT_FOUND,
-        Mode::Passthrough => {
-            // SAFETY: object_attributes is non-null.
-            let mut copy = match HookedAttrs::copy_passthrough_inner(
-                &*object_attributes, pre_resolved.as_deref()
-            ) {
-                Some(c) => c,
-                None => {
-                    // Oversized / unresolvable path — fail CLOSED (audit H5).
-                    if is_trace() {
-                        crate::ipc_client::ipc_log_violation(ipc::Req::Log {
-                            pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
-                            level: ipc::LogLevel::Warn,
-                            msg: "passthrough_copy_failed_fail_closed".to_string(),
-                        });
-                    }
-                    return STATUS_ACCESS_DENIED;
-                }
-            };
-            let attrs_ptr = copy.as_ptr_mut();
-            nt_call_original!(
-                &HOOK_NT_QUERY_ATTRIBUTES_FILE,
-                "NtQueryAttributesFile",
-                (attrs_ptr, file_information)
-            )
-        }
-        Mode::Deny => STATUS_ACCESS_DENIED,
-        Mode::Mock => {
-            // Malformed Mock — fail CLOSED like the create/open arms. A query
-            // fall-through would report the REAL file's attributes for a path
-            // policy decided to mock (unlike the Cow arm below, an incomplete
-            // Mock is corruption of the decision, not a pre-write state).
-            let Some(ref overlay_path) = decision.overlay else {
-                crate::ipc_client::ipc_log_violation(ipc::Req::Log {
-                    pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
-                    level: ipc::LogLevel::Warn,
-                    msg: format!("mock_malformed_decision_deny query_attributes no_overlay: {dos}"),
-                });
-                return STATUS_ACCESS_DENIED;
-            };
-            // If overlay missing, materialize mock payload first so the
-            // redirected query observes the mocked file instead of ENOENT.
-            if !overlay_path.exists() {
-                if let Some(ref payload) = decision.mock_payload {
-                    materialize_mock_overlay(overlay_path, payload);
-                } else {
-                    crate::ipc_client::ipc_log_violation(ipc::Req::Log {
-                        pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
-                        level: ipc::LogLevel::Warn,
-                        msg: format!("mock_malformed_decision_deny query_attributes no_payload: {dos}"),
-                    });
-                    return STATUS_ACCESS_DENIED;
-                }
-            }
-            let overlay_dos = overlay_path.to_string_lossy().into_owned();
-            // Query path: keep orig's SQOS verbatim (NtQueryAttributesFile is
-            // not a create/open syscall and does not exhibit the SQOS
-            // STATUS_INVALID_PARAMETER quirk).
-            // SAFETY: object_attributes is non-null.
-            let mut h = HookedAttrs::redirect(&*object_attributes, &overlay_dos, false);
-            nt_call_original!(
-                &HOOK_NT_QUERY_ATTRIBUTES_FILE,
-                "NtQueryAttributesFile",
-                (h.as_ptr_mut(), file_information)
-            )
-        }
-        Mode::Cow => {
-            // Design choice: for read-only Query hooks we fall through to the
-            // original path when overlay is missing (or the field itself is
-            // None). Querying the original is benign — it merely reports
-            // attributes; any actual write/open will hit hook_nt_create_file /
-            // hook_nt_open_file which fail-close on Mode::Cow + overlay=None.
-            // Returning STATUS_OBJECT_NAME_NOT_FOUND here would break
-            // legitimate stat-then-open patterns where callers probe a file
-            // first; the write-side is the actual security boundary.
-            let Some(ref overlay_path) = decision.overlay else {
-                return nt_call_original!(
-                    &HOOK_NT_QUERY_ATTRIBUTES_FILE,
-                    "NtQueryAttributesFile",
-                    (object_attributes, file_information)
-                );
-            };
-            if !overlay_path.exists() {
-                return nt_call_original!(
-                    &HOOK_NT_QUERY_ATTRIBUTES_FILE,
-                    "NtQueryAttributesFile",
-                    (object_attributes, file_information)
-                );
-            }
-            let overlay_dos = overlay_path.to_string_lossy().into_owned();
-            // SAFETY: object_attributes is non-null.
-            let mut h = HookedAttrs::redirect(&*object_attributes, &overlay_dos, false);
-            nt_call_original!(
-                &HOOK_NT_QUERY_ATTRIBUTES_FILE,
-                "NtQueryAttributesFile",
-                (h.as_ptr_mut(), file_information)
-            )
-        }
-    }
-}
-
-pub(crate) unsafe extern "system" fn hook_nt_query_full_attributes_file(
-    object_attributes: *mut OBJECT_ATTRIBUTES,
-    file_information: *mut c_void,
-) -> NTSTATUS {
-    let Some(_guard) = anti_rec::enter() else {
-        return nt_call_original!(
-            &HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE,
-            "NtQueryFullAttributesFile",
-            (object_attributes, file_information)
-        );
-    };
-
-    // H5 resolve-once.
-    let Some((dos, pre_resolved)) = resolve_for_hook(object_attributes as *const _) else {
-        return nt_call_original!(
-            &HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE,
-            "NtQueryFullAttributesFile",
-            (object_attributes, file_information)
-        );
-    };
-
-    let decision = decide(&dos, false);
-    if is_trace() {
-        ipc_log(ipc::LogLevel::Trace, format!("fs_decide NtQueryFullAttributesFile: {dos} write=false mode={:?}", decision.mode));
-    }
-    match decision.mode {
-        Mode::Hidden => STATUS_OBJECT_NAME_NOT_FOUND,
-        Mode::Passthrough => {
-            // SAFETY: object_attributes is non-null.
-            let mut copy = match HookedAttrs::copy_passthrough_inner(
-                &*object_attributes, pre_resolved.as_deref()
-            ) {
-                Some(c) => c,
-                None => {
-                    // Oversized / unresolvable path — fail CLOSED (audit H5).
-                    if is_trace() {
-                        crate::ipc_client::ipc_log_violation(ipc::Req::Log {
-                            pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
-                            level: ipc::LogLevel::Warn,
-                            msg: "passthrough_copy_failed_fail_closed".to_string(),
-                        });
-                    }
-                    return STATUS_ACCESS_DENIED;
-                }
-            };
-            let attrs_ptr = copy.as_ptr_mut();
-            nt_call_original!(
-                &HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE,
-                "NtQueryFullAttributesFile",
-                (attrs_ptr, file_information)
-            )
-        }
-        Mode::Deny => STATUS_ACCESS_DENIED,
-        Mode::Mock => {
-            // Malformed Mock — fail CLOSED, same rationale as
-            // hook_nt_query_attributes_file's Mock arm.
-            let Some(ref overlay_path) = decision.overlay else {
-                crate::ipc_client::ipc_log_violation(ipc::Req::Log {
-                    pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
-                    level: ipc::LogLevel::Warn,
-                    msg: format!("mock_malformed_decision_deny query_full no_overlay: {dos}"),
-                });
-                return STATUS_ACCESS_DENIED;
-            };
-            // If overlay missing, materialize mock payload first so the
-            // redirected query observes the mocked file instead of ENOENT.
-            if !overlay_path.exists() {
-                if let Some(ref payload) = decision.mock_payload {
-                    materialize_mock_overlay(overlay_path, payload);
-                } else {
-                    crate::ipc_client::ipc_log_violation(ipc::Req::Log {
-                        pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
-                        level: ipc::LogLevel::Warn,
-                        msg: format!("mock_malformed_decision_deny query_full no_payload: {dos}"),
-                    });
-                    return STATUS_ACCESS_DENIED;
-                }
-            }
-            let overlay_dos = overlay_path.to_string_lossy().into_owned();
-            // SAFETY: object_attributes is non-null.
-            let mut h = HookedAttrs::redirect(&*object_attributes, &overlay_dos, false);
-            nt_call_original!(
-                &HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE,
-                "NtQueryFullAttributesFile",
-                (h.as_ptr_mut(), file_information)
-            )
-        }
-        Mode::Cow => {
-            // See hook_nt_query_attributes_file for the read-only fall-through
-            // rationale. Write-side fail-close lives in create/open hooks.
-            let Some(ref overlay_path) = decision.overlay else {
-                return nt_call_original!(
-                    &HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE,
-                    "NtQueryFullAttributesFile",
-                    (object_attributes, file_information)
-                );
-            };
-            if !overlay_path.exists() {
-                return nt_call_original!(
-                    &HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE,
-                    "NtQueryFullAttributesFile",
-                    (object_attributes, file_information)
-                );
-            }
-            let overlay_dos = overlay_path.to_string_lossy().into_owned();
-            // SAFETY: object_attributes is non-null.
-            let mut h = HookedAttrs::redirect(&*object_attributes, &overlay_dos, false);
-            nt_call_original!(
-                &HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE,
-                "NtQueryFullAttributesFile",
-                (h.as_ptr_mut(), file_information)
-            )
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Unit tests (audit H-S2 / H-S3 helpers — pure, FFI-free)

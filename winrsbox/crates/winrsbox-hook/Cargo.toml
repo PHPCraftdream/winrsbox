@@ -23,12 +23,20 @@ ntapi      = "0.4"
 winapi     = { version = "0.3", features = [
     "winerror",
     "minwindef",
+    "minwinbase",   # SECURITY_ATTRIBUTES — explicit per-object SD (R04-1b)
     "basetsd",
+    "bcrypt",       # BCryptGenRandom — per-child ack event name entropy (review XA S02 #3)
     "winnt",
+    "securitybaseapi", # GetTokenInformation — resolve own user SID (R04-1b)
+    "sddl",         # ConvertStringSecurityDescriptorToSecurityDescriptorW / ConvertSidToStringSidW (R04-1b)
+    "aclapi",       # GetSecurityInfo — test-only DACL inspection (R04-1b)
+    "accctrl",      # SE_KERNEL_OBJECT — test-only DACL inspection (R04-1b)
     "processthreadsapi",
     "libloaderapi",
     "memoryapi",
     "handleapi",
+    "namedpipeapi", # CreateNamedPipeW — in-test pipe server for the identity check (S02)
+    "winbase",      # GetNamedPipeServerProcessId — pipe-server identity check (S02)
     "synchapi",
     "fileapi",
     "processenv",
@@ -39,6 +47,7 @@ winapi     = { version = "0.3", features = [
     "winver",
     "stringapiset", # MultiByteToWideChar — shell_guard ANSI hook (ShellExecuteA)
     "winnls",       # CP_ACP code-page id for the same conversion
+    "fibersapi",    # FlsAlloc — per-thread IPC destructor (review C02)
 ] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 once_cell  = "1"

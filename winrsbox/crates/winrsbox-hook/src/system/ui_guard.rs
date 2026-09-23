@@ -21,7 +21,7 @@ use winapi::um::winnt::LPCWSTR;
 use winapi::um::winuser::INPUT;
 
 use crate::anti_rec;
-use crate::hooks::{ipc_log, is_trace};
+use crate::hooks::{buffer_install_error, ipc_log, is_trace};
 
 type FnSendInput    = unsafe extern "system" fn(UINT, *mut INPUT, i32) -> UINT;
 type FnKeybdEvent   = unsafe extern "system" fn(u8, u8, DWORD, usize);
@@ -70,18 +70,142 @@ static HOOK_EXIT_WINDOWS_EX:   OnceLock<GenericDetour<FnExitWindowsEx>>   = Once
 type FnNtUserSendInput = unsafe extern "system" fn(UINT, *mut INPUT, i32) -> UINT;
 static HOOK_NT_USER_SEND_INPUT: OnceLock<GenericDetour<FnNtUserSendInput>> = OnceLock::new();
 
-/// Returns true when `hwnd` is a window owned by a process **other** than us.
-/// For cross-process HWNDs we deny PostMessage/SendMessage. Own-process
-/// windows still work normally.
+/// F3 (R04) classification of an HWND seen by a UI hook. Replaces the old
+/// boolean `is_foreign_hwnd`, which collapsed NULL and failed
+/// GetWindowThreadProcessId lookups into the same "allowed" outcome,
+/// conflating special destinations and unresolvable handles with genuinely
+/// safe own-process targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HwndClass {
+    /// NULL — no concrete destination. PostMessage(NULL) posts to the
+    /// calling thread's own queue; SendMessage(NULL) is a documented no-op
+    /// returning 0; FindWindow returning NULL means "not found".
+    NoTarget,
+    /// Documented pseudo-destinations: HWND_BROADCAST (0xffff), HWND_TOPMOST
+    /// (-1), HWND_NOTOPMOST (-2), HWND_MESSAGE (-3). Not real windows;
+    /// HWND_BROADCAST fans a message out to every top-level window on the
+    /// desktop — a cross-process dispatch by definition.
+    SpecialDest,
+    /// GetWindowThreadProcessId resolved no owning PID for a value that is
+    /// NOT one of the recognized special constants: stale/destroyed HWND,
+    /// cross-desktop or otherwise unresolvable destination. Unknown identity
+    /// for a message dispatch is not evidence of safety (F3).
+    Unknown,
+    /// Resolves to this process's own PID (the sandbox-tree root) or to a
+    /// PID that `crate::process_tracker` currently tracks as our own spawned
+    /// child (creation-time fingerprint verified against PID reuse).
+    OwnSandbox,
+    /// Resolves to a live PID that is neither us nor a tracked sandbox child.
+    Foreign,
+}
+
+/// Classify documented special HWND constants before any OS query. These
+/// pseudo-values must never be resolved via GetWindowThreadProcessId —
+/// HWND_BROADCAST fails there and was previously misclassified as "allowed"
+/// through the pid==0 hole. HWND_BOTTOM (1) is deliberately absent: it is a
+/// SetWindowPos z-order constant, not a message destination, so an
+/// unresolvable value like it classifies as `Unknown`.
+fn classify_special(hwnd: HWND) -> Option<HwndClass> {
+    match hwnd as usize {
+        0 => Some(HwndClass::NoTarget), // NULL == HWND_DESKTOP == HWND_TOP
+        0xFFFF => Some(HwndClass::SpecialDest),         // HWND_BROADCAST
+        usize::MAX => Some(HwndClass::SpecialDest),     // HWND_TOPMOST (-1)
+        // usize::MAX - 1 / - 2 are not valid match patterns; literal spellings:
+        0xFFFF_FFFF_FFFF_FFFE => Some(HwndClass::SpecialDest), // HWND_NOTOPMOST (-2)
+        0xFFFF_FFFF_FFFF_FFFD => Some(HwndClass::SpecialDest), // HWND_MESSAGE (-3)
+        _ => None,
+    }
+}
+
+/// Pure decision core over the PID the OS reported for the HWND. `pid == 0`
+/// (lookup failed) is `Unknown`, NOT `NoTarget` — the two must stay distinct
+/// because NULL has documented own-scope semantics and a failed lookup does
+/// not.
+fn classify_pid(pid: DWORD) -> HwndClass {
+    if pid == 0 {
+        return HwndClass::Unknown;
+    }
+    // SAFETY: GetCurrentProcessId is a constant-cost TEB read.
+    if pid == unsafe { winapi::um::processthreadsapi::GetCurrentProcessId() } {
+        return HwndClass::OwnSandbox;
+    }
+    if crate::process_tracker::is_owned_child(pid) {
+        return HwndClass::OwnSandbox;
+    }
+    HwndClass::Foreign
+}
+
+/// F3 (R04) classifier: map an HWND to its `HwndClass`. See `f3_denied` for
+/// the per-family policy each class feeds.
 ///
 /// # SAFETY
-/// `hwnd` may be any HWND value; null is handled internally.
-unsafe fn is_foreign_hwnd(hwnd: HWND) -> bool {
-    if hwnd.is_null() { return false; }
+/// `hwnd` may be any HWND value, including null and the special
+/// pseudo-constants (all handled in `classify_special`). The
+/// `process_tracker` membership check is bounded (one map probe; only
+/// tracked PIDs trigger one PROCESS_QUERY_LIMITED_INFORMATION open). Every
+/// caller runs inside an `anti_rec` window, so a nested OpenProcess that
+/// re-enters proc_guard's NtOpenProcess hook forwards straight to the
+/// original — see process_tracker's own anti-recursion analysis (M2).
+unsafe fn classify_hwnd(hwnd: HWND) -> HwndClass {
+    if let Some(class) = classify_special(hwnd) {
+        return class;
+    }
     let mut pid: DWORD = 0;
+    // SAFETY: hwnd is opaque; GetWindowThreadProcessId only reads it.
     let _ = winapi::um::winuser::GetWindowThreadProcessId(hwnd, &mut pid);
-    if pid == 0 { return false; }
-    pid != winapi::um::processthreadsapi::GetCurrentProcessId()
+    classify_pid(pid)
+}
+
+/// F3 (R04) policy: map an `HwndClass` to the soft-deny decision for every
+/// family this file hooks. `true` = hook soft-denies (already logged),
+/// `false` = forward to the original.
+///
+/// Dispatch family — SendMessageW/A, PostMessageW/A:
+///   - `NoTarget` (NULL): allowed. PostMessage(NULL) posts to the calling
+///     thread's own queue and SendMessage(NULL) is a documented no-op
+///     returning 0 — neither crosses a process boundary. Keeps F1's
+///     null-HWND seam tests meaningful.
+///   - `OwnSandbox`: allowed — compatibility posture (interactive
+///     terminal/IDE sessions): own windows and fingerprint-verified sandbox
+///     children keep messaging. NOT a trust claim under the R04 model
+///     (children are on the untrusted side there); this keeps intra-sandbox
+///     plumbing working until the headless profile — separate R04
+///     architectural work per the finding — can deny it explicitly. The
+///     class is distinct from `Foreign` precisely so that switch is a
+///     policy change at this one match, not a classifier change.
+///   - `SpecialDest`: denied. HWND_BROADCAST reaches every top-level window
+///     on the desktop — cross-process by definition, previously smuggled
+///     through the pid==0 hole. The other pseudo-handles are invalid
+///     message targets the real APIs fail on anyway, so denying them is
+///     behavior-preserving.
+///   - `Unknown`: denied. "Lookup resolved nothing" used to be an allow
+///     through the same pid==0 hole; an unresolvable identity for a
+///     side-effectful dispatch is not evidence of safety. A genuinely stale
+///     HWND would have failed the real call anyway, and callers already
+///     handle FALSE/0 returns.
+///   - `Foreign`: denied (unchanged).
+///
+/// Probe family — FindWindowW/A/ExW/ExA (result filter): same partition;
+/// deny means return NULL ("not found"). A SpecialDest or Unknown result is
+/// not vouchable as own-process and is hidden like a foreign one. FindWindow
+/// never legitimately returns the pseudo-constants, so those arms are pure
+/// fail-closed.
+fn f3_denied(class: HwndClass, api: &str) -> bool {
+    match class {
+        HwndClass::NoTarget | HwndClass::OwnSandbox => false,
+        HwndClass::SpecialDest => {
+            log_soft_deny(api, "special destination HWND");
+            true
+        }
+        HwndClass::Unknown => {
+            log_soft_deny(api, "unknown HWND");
+            true
+        }
+        HwndClass::Foreign => {
+            log_soft_deny(api, "foreign HWND");
+            true
+        }
+    }
 }
 
 fn log_soft_deny(api: &str, detail: &str) {
@@ -196,8 +320,7 @@ unsafe extern "system" fn hook_find_window_w(class: LPCWSTR, name: LPCWSTR) -> H
 // Detour-absent: unwrap-abort kept on purpose — HWND family; fail-closed would be NULL, a per-API decision (see nt_call_original in hooks.rs).
     // SAFETY: detour2 trampoline matches FnFindWindowW ABI; same args passed through.
     let hwnd = HOOK_FIND_WINDOW_W.get().unwrap().call(class, name);
-    if is_foreign_hwnd(hwnd) {
-        log_soft_deny("FindWindowW", "foreign HWND");
+    if f3_denied(unsafe { classify_hwnd(hwnd) }, "FindWindowW") {
         return std::ptr::null_mut();
     }
     hwnd
@@ -213,8 +336,7 @@ unsafe extern "system" fn hook_find_window_a(class: LPCSTR, name: LPCSTR) -> HWN
 // Detour-absent: unwrap-abort kept on purpose — HWND family; fail-closed would be NULL, a per-API decision (see nt_call_original in hooks.rs).
     // SAFETY: detour2 trampoline matches FnFindWindowA ABI; same args passed through.
     let hwnd = HOOK_FIND_WINDOW_A.get().unwrap().call(class, name);
-    if is_foreign_hwnd(hwnd) {
-        log_soft_deny("FindWindowA", "foreign HWND");
+    if f3_denied(unsafe { classify_hwnd(hwnd) }, "FindWindowA") {
         return std::ptr::null_mut();
     }
     hwnd
@@ -232,8 +354,7 @@ unsafe extern "system" fn hook_find_window_ex_w(
 // Detour-absent: unwrap-abort kept on purpose — HWND family; fail-closed would be NULL, a per-API decision (see nt_call_original in hooks.rs).
     // SAFETY: detour2 trampoline matches FnFindWindowExW ABI; same args passed through.
     let hwnd = HOOK_FIND_WINDOW_EX_W.get().unwrap().call(parent, child, class, name);
-    if is_foreign_hwnd(hwnd) {
-        log_soft_deny("FindWindowExW", "foreign HWND");
+    if f3_denied(unsafe { classify_hwnd(hwnd) }, "FindWindowExW") {
         return std::ptr::null_mut();
     }
     hwnd
@@ -251,8 +372,7 @@ unsafe extern "system" fn hook_find_window_ex_a(
 // Detour-absent: unwrap-abort kept on purpose — HWND family; fail-closed would be NULL, a per-API decision (see nt_call_original in hooks.rs).
     // SAFETY: detour2 trampoline matches FnFindWindowExA ABI; same args passed through.
     let hwnd = HOOK_FIND_WINDOW_EX_A.get().unwrap().call(parent, child, class, name);
-    if is_foreign_hwnd(hwnd) {
-        log_soft_deny("FindWindowExA", "foreign HWND");
+    if f3_denied(unsafe { classify_hwnd(hwnd) }, "FindWindowExA") {
         return std::ptr::null_mut();
     }
     hwnd
@@ -345,8 +465,7 @@ unsafe extern "system" fn hook_post_message_w(
         // SAFETY: detour2 trampoline matches FnPostMessageW ABI.
         return HOOK_POST_MESSAGE_W.get().unwrap().call(hwnd, msg, wparam, lparam);
     };
-    if is_foreign_hwnd(hwnd) {
-        log_soft_deny("PostMessageW", "foreign HWND");
+    if f3_denied(unsafe { classify_hwnd(hwnd) }, "PostMessageW") {
         return 0;
     }
 // Detour-absent: unwrap-abort kept on purpose — BOOL family; fail-closed would be FALSE, a per-API decision (see nt_call_original in hooks.rs).
@@ -362,45 +481,96 @@ unsafe extern "system" fn hook_post_message_a(
         // SAFETY: detour2 trampoline matches FnPostMessageA ABI.
         return HOOK_POST_MESSAGE_A.get().unwrap().call(hwnd, msg, wparam, lparam);
     };
-    if is_foreign_hwnd(hwnd) {
-        log_soft_deny("PostMessageA", "foreign HWND");
+    if f3_denied(unsafe { classify_hwnd(hwnd) }, "PostMessageA") {
         return 0;
     }
 // Detour-absent: unwrap-abort kept on purpose — BOOL family; fail-closed would be FALSE, a per-API decision (see nt_call_original in hooks.rs).
     HOOK_POST_MESSAGE_A.get().unwrap().call(hwnd, msg, wparam, lparam)
 }
 
+/// F1 (R04) decision seam for `hook_send_message_w`: the F3
+/// HWND-classification decision and its soft-deny log run under an anti_rec
+/// window this
+/// function opens and closes. The real SendMessageW runs the target window
+/// procedure synchronously on this thread — guest-reachable application
+/// code — so the hook must invoke it only AFTER this returns, with the
+/// window closed: a hooked call made from inside that wndproc gets a fresh
+/// policy check instead of stale suppression (anti_rec invariant 3).
+///
+/// Returns `true` when the message must be soft-denied (already logged
+/// in-window). `false` means the original must be invoked; this includes
+/// the re-entrancy passthrough — when an outer hook window is already held
+/// on this thread (`anti_rec::enter()` returns `None`) this returns `false`
+/// unchecked, so the original still runs under that outer window exactly as
+/// before the split.
+///
+/// # SAFETY
+/// `hwnd` may be any HWND value; `classify_hwnd` handles null (as
+/// `HwndClass::NoTarget`) and the special pseudo-constants (as
+/// `HwndClass::SpecialDest`) internally.
+unsafe fn send_message_w_deny(hwnd: HWND) -> bool {
+    let Some(_g) = anti_rec::enter() else {
+        return false;
+    };
+    f3_denied(unsafe { classify_hwnd(hwnd) }, "SendMessageW")
+}
+
 // SAFETY: Called by detour2 dispatcher with user32!SendMessageW ABI.
 unsafe extern "system" fn hook_send_message_w(
     hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM,
 ) -> isize {
-    let Some(_g) = anti_rec::enter() else {
-// Detour-absent: unwrap-abort kept on purpose — LRESULT family; fail-closed would be 0, a per-API decision (see nt_call_original in hooks.rs).
-        // SAFETY: detour2 trampoline matches FnSendMessageW ABI.
-        return HOOK_SEND_MESSAGE_W.get().unwrap().call(hwnd, msg, wparam, lparam);
-    };
-    if is_foreign_hwnd(hwnd) {
-        log_soft_deny("SendMessageW", "foreign HWND");
+    if send_message_w_deny(hwnd) {
         return 0;
     }
 // Detour-absent: unwrap-abort kept on purpose — LRESULT family; fail-closed would be 0, a per-API decision (see nt_call_original in hooks.rs).
+    // SAFETY: detour2 trampoline matches FnSendMessageW ABI.
+    // F1 (R04): no anti_rec window is held here — send_message_w_deny closed
+    // it. SendMessageW runs the target window procedure synchronously in
+    // this thread's frame; a hooked call from that code must run a fresh
+    // policy check.
     HOOK_SEND_MESSAGE_W.get().unwrap().call(hwnd, msg, wparam, lparam)
+}
+
+/// F1 (R04) decision seam for `hook_send_message_a`: the F3
+/// HWND-classification decision and its soft-deny log run under an anti_rec
+/// window this
+/// function opens and closes. The real SendMessageA runs the target window
+/// procedure synchronously on this thread — guest-reachable application
+/// code — so the hook must invoke it only AFTER this returns, with the
+/// window closed: a hooked call made from inside that wndproc gets a fresh
+/// policy check instead of stale suppression (anti_rec invariant 3).
+///
+/// Returns `true` when the message must be soft-denied (already logged
+/// in-window). `false` means the original must be invoked; this includes
+/// the re-entrancy passthrough — when an outer hook window is already held
+/// on this thread (`anti_rec::enter()` returns `None`) this returns `false`
+/// unchecked, so the original still runs under that outer window exactly as
+/// before the split.
+///
+/// # SAFETY
+/// `hwnd` may be any HWND value; `classify_hwnd` handles null (as
+/// `HwndClass::NoTarget`) and the special pseudo-constants (as
+/// `HwndClass::SpecialDest`) internally.
+unsafe fn send_message_a_deny(hwnd: HWND) -> bool {
+    let Some(_g) = anti_rec::enter() else {
+        return false;
+    };
+    f3_denied(unsafe { classify_hwnd(hwnd) }, "SendMessageA")
 }
 
 // SAFETY: Called by detour2 dispatcher with user32!SendMessageA ABI.
 unsafe extern "system" fn hook_send_message_a(
     hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM,
 ) -> isize {
-    let Some(_g) = anti_rec::enter() else {
-// Detour-absent: unwrap-abort kept on purpose — LRESULT family; fail-closed would be 0, a per-API decision (see nt_call_original in hooks.rs).
-        // SAFETY: detour2 trampoline matches FnSendMessageA ABI.
-        return HOOK_SEND_MESSAGE_A.get().unwrap().call(hwnd, msg, wparam, lparam);
-    };
-    if is_foreign_hwnd(hwnd) {
-        log_soft_deny("SendMessageA", "foreign HWND");
+    if send_message_a_deny(hwnd) {
         return 0;
     }
 // Detour-absent: unwrap-abort kept on purpose — LRESULT family; fail-closed would be 0, a per-API decision (see nt_call_original in hooks.rs).
+    // SAFETY: detour2 trampoline matches FnSendMessageA ABI.
+    // F1 (R04): no anti_rec window is held here — send_message_a_deny closed
+    // it. SendMessageA runs the target window procedure synchronously in
+    // this thread's frame; a hooked call from that code must run a fresh
+    // policy check.
     HOOK_SEND_MESSAGE_A.get().unwrap().call(hwnd, msg, wparam, lparam)
 }
 
@@ -439,6 +609,10 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
         return Err("LoadLibraryW(user32.dll) failed".into());
     }
 
+    // ui is the one OPTIONAL hook category: a failed install never aborts
+    // startup, but every failure mode is buffered so the degradation is
+    // observable (S10 degraded-init event + first-Hello flush) instead of
+    // being silently swallowed.
     macro_rules! install {
         ($lock:expr, $sym:literal, $hook:ident, $ty:ty) => {{
             let addr = winapi::um::libloaderapi::GetProcAddress(
@@ -447,12 +621,21 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
                 // SAFETY: transmute of GetProcAddress result; ABI matches the hook function type $ty.
                 let target: $ty = std::mem::transmute(addr as usize);
                 let hook_ptr: $ty = $hook;
-                if let Ok(detour) = GenericDetour::<$ty>::new(target, hook_ptr) {
-                    $lock.set(detour).ok();
-                    if let Some(d) = $lock.get() {
-                        let _ = d.enable();
+                match GenericDetour::<$ty>::new(target, hook_ptr) {
+                    Ok(detour) => {
+                        $lock.set(detour).ok();
+                        if let Some(d) = $lock.get() {
+                            if let Err(e) = d.enable() {
+                                buffer_install_error(
+                                    format!("ui_guard: detour enable {}: {:?}", $sym, e));
+                            }
+                        }
                     }
+                    Err(e) => buffer_install_error(
+                        format!("ui_guard: detour init {}: {:?}", $sym, e)),
                 }
+            } else {
+                buffer_install_error(format!("ui_guard: export not found: {}", $sym));
             }
         }};
     }
@@ -467,12 +650,21 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
                 // SAFETY: transmute of GetProcAddress result; ABI matches the hook function type $ty.
                 let target: $ty = std::mem::transmute(addr as usize);
                 let hook_ptr: $ty = $hook;
-                if let Ok(detour) = GenericDetour::<$ty>::new(target, hook_ptr) {
-                    $lock.set(detour).ok();
-                    if let Some(d) = $lock.get() {
-                        let _ = d.enable();
+                match GenericDetour::<$ty>::new(target, hook_ptr) {
+                    Ok(detour) => {
+                        $lock.set(detour).ok();
+                        if let Some(d) = $lock.get() {
+                            if let Err(e) = d.enable() {
+                                buffer_install_error(
+                                    format!("ui_guard: detour enable {}: {:?}", $sym, e));
+                            }
+                        }
                     }
+                    Err(e) => buffer_install_error(
+                        format!("ui_guard: detour init {}: {:?}", $sym, e)),
                 }
+            } else {
+                buffer_install_error(format!("ui_guard: export not found: {}", $sym));
             }
         }};
     }
@@ -513,7 +705,8 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
 
     // win32u.dll — audit High sibling closure for SendInput. Present since
     // Win10 1809; on older builds there is no win32u path to guard, so a
-    // missing module/export is skipped (consistent with the install! macro).
+    // missing module/export is buffered (consistent with the install!
+    // macro) — an unguarded NtUserSendInput is a real coverage gap.
     let win32u_w: Vec<u16> = "win32u.dll\0".encode_utf16().collect();
     // SAFETY: LoadLibraryW with a null-terminated wide name; win32u is a
     // KnownDLL on Win10 1809+ and always loadable.
@@ -521,9 +714,8 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     if !win32u.is_null() {
         install_from!(win32u, HOOK_NT_USER_SEND_INPUT, "NtUserSendInput",
                       hook_nt_user_send_input, FnNtUserSendInput);
-    } else if is_trace() {
-        ipc_log(
-            ipc::LogLevel::Warn,
+    } else {
+        buffer_install_error(
             "ui_guard: win32u.dll not loaded — NtUserSendInput unguarded".into(),
         );
     }
@@ -635,5 +827,171 @@ mod tests {
             HOOK_NT_USER_SEND_INPUT.get().is_none(),
             "win32u hook must not be installed under unit tests"
         );
+    }
+
+    /// F1 (R04): the W decision seam must close its anti_rec window before
+    /// returning on the allow path, so the trampoline runs with no window
+    /// held. The decisive assertion is the nested `enter()` below: it
+    /// simulates a hooked call made from inside the target window procedure
+    /// (dispatched synchronously by the real SendMessageW) and must be able
+    /// to open its own window for a fresh policy check — pre-F1 it returned
+    /// `None` (stale suppression). Null HWND classifies as `HwndClass::NoTarget`
+    /// and stays allowed by design, so this exercises the allow path only;
+    /// the deny path needs a real foreign window handle and is not unit-testable.
+    #[test]
+    fn send_message_w_deny_seam_closes_window_on_allow() {
+        assert!(!crate::anti_rec::in_hook(), "precondition: no window held");
+        let null_hwnd: HWND = std::ptr::null_mut();
+        let denied = unsafe { send_message_w_deny(null_hwnd) };
+        assert!(!denied);
+        assert!(
+            !crate::anti_rec::in_hook(),
+            "window must be closed at the call-original boundary"
+        );
+        let nested = crate::anti_rec::enter().expect(
+            "nested hook call must not be suppressed after the seam closed the window",
+        );
+        drop(nested);
+        assert!(!crate::anti_rec::in_hook());
+    }
+
+    /// Same F1 (R04) contract for the A twin of the decision seam.
+    #[test]
+    fn send_message_a_deny_seam_closes_window_on_allow() {
+        assert!(!crate::anti_rec::in_hook(), "precondition: no window held");
+        let null_hwnd: HWND = std::ptr::null_mut();
+        let denied = unsafe { send_message_a_deny(null_hwnd) };
+        assert!(!denied);
+        assert!(
+            !crate::anti_rec::in_hook(),
+            "window must be closed at the call-original boundary"
+        );
+        let nested = crate::anti_rec::enter().expect(
+            "nested hook call must not be suppressed after the seam closed the window",
+        );
+        drop(nested);
+        assert!(!crate::anti_rec::in_hook());
+    }
+
+    /// F1 (R04): the recursion breaker is preserved — under an outer hook
+    /// window the seam returns `false` unchecked (passthrough), so the
+    /// original still runs under that outer window exactly as pre-F1.
+    #[test]
+    fn send_message_w_deny_seam_passthrough_when_window_already_held() {
+        assert!(!crate::anti_rec::in_hook(), "precondition: no window held");
+        let outer =
+            crate::anti_rec::enter().expect("test thread must not be re-entrant");
+        let null_hwnd: HWND = std::ptr::null_mut();
+        let denied = unsafe { send_message_w_deny(null_hwnd) };
+        assert!(!denied);
+        drop(outer);
+        assert!(!crate::anti_rec::in_hook());
+    }
+
+    /// Same passthrough contract for the A twin of the decision seam.
+    #[test]
+    fn send_message_a_deny_seam_passthrough_when_window_already_held() {
+        assert!(!crate::anti_rec::in_hook(), "precondition: no window held");
+        let outer =
+            crate::anti_rec::enter().expect("test thread must not be re-entrant");
+        let null_hwnd: HWND = std::ptr::null_mut();
+        let denied = unsafe { send_message_a_deny(null_hwnd) };
+        assert!(!denied);
+        drop(outer);
+        assert!(!crate::anti_rec::in_hook());
+    }
+
+    /// F3 test fixtures — PIDs disjoint from every other tracker fixture.
+    const F3_TEST_CHILD_PID: u32 = 0x5EED_5F30;
+    const F3_TEST_FOREIGN_PID: u32 = 0x5EED_5F31;
+
+    /// F3: the documented pseudo-destinations must classify as their own
+    /// `SpecialDest` case (and NULL as `NoTarget`) — not silently merged into
+    /// "allowed" or "foreign". classify_special answers before any OS query, so
+    /// this is fully deterministic.
+    #[test]
+    fn f3_special_destinations_classify_distinctly() {
+        let null_hwnd: HWND = std::ptr::null_mut();
+        let broadcast = 0xFFFFusize as HWND;  // winuser!HWND_BROADCAST
+        let topmost   = (-1isize) as HWND;    // winuser!HWND_TOPMOST
+        let notopmost = (-2isize) as HWND;    // winuser!HWND_NOTOPMOST
+        let message   = (-3isize) as HWND;    // winuser!HWND_MESSAGE
+        assert_eq!(unsafe { classify_hwnd(null_hwnd) }, HwndClass::NoTarget);
+        assert_eq!(unsafe { classify_hwnd(broadcast) }, HwndClass::SpecialDest);
+        assert_eq!(unsafe { classify_hwnd(topmost) }, HwndClass::SpecialDest);
+        assert_eq!(unsafe { classify_hwnd(notopmost) }, HwndClass::SpecialDest);
+        assert_eq!(unsafe { classify_hwnd(message) }, HwndClass::SpecialDest);
+    }
+
+    /// F3: an own-sandbox child PID (tracked via process_tracker, the same
+    /// membership-only fixture convention every tracker test uses) classifies
+    /// as `OwnSandbox` — distinctly from an untracked foreign PID — and falls
+    /// back to `Foreign` once untracked. Drives `classify_pid`, the pure
+    /// decision core, so no foreign window needs to exist.
+    #[test]
+    fn f3_sandbox_child_classifies_distinctly_from_foreign() {
+        let own = unsafe { winapi::um::processthreadsapi::GetCurrentProcessId() };
+        assert_eq!(classify_pid(own), HwndClass::OwnSandbox, "own PID is the sandbox root");
+        crate::process_tracker::mark_spawned(F3_TEST_CHILD_PID, 1, "f3_test_child.exe".into(), 0);
+        assert_eq!(
+            classify_pid(F3_TEST_CHILD_PID),
+            HwndClass::OwnSandbox,
+            "tracked sandbox child must be its own class, not Foreign"
+        );
+        assert_eq!(classify_pid(F3_TEST_FOREIGN_PID), HwndClass::Foreign);
+        crate::process_tracker::untrack(F3_TEST_CHILD_PID);
+        assert_eq!(
+            classify_pid(F3_TEST_CHILD_PID),
+            HwndClass::Foreign,
+            "after untrack the PID must fall back to Foreign"
+        );
+        assert_eq!(classify_pid(0), HwndClass::Unknown, "failed lookup is Unknown");
+    }
+
+    /// F3: "unknown identity для опасного действия не должна считаться safe".
+    /// NULL keeps its narrow allow (own-thread queue / documented no-op —
+    /// required so F1's null-HWND seam tests stay valid); a genuinely
+    /// unresolvable non-special HWND must NOT get that outcome, nor may a
+    /// special destination or a foreign one.
+    #[test]
+    fn f3_unknown_is_denied_not_null_allow() {
+        assert!(!f3_denied(HwndClass::NoTarget, "SendMessageW"));
+        assert!(f3_denied(HwndClass::Unknown, "SendMessageW"));
+        assert!(f3_denied(HwndClass::SpecialDest, "PostMessageW"));
+        assert!(f3_denied(HwndClass::Foreign, "FindWindowW"));
+    }
+
+    /// F3: the real FFI path — GetWindowThreadProcessId on a live own-process
+    /// window — must classify as `OwnSandbox`. A message-only window (parent
+    /// HWND_MESSAGE) is used: never visible, no pump needed for classification.
+    #[test]
+    fn f3_real_own_window_classifies_own_sandbox() {
+        let class_name: Vec<u16> = "winrsbox_ui_guard_f3_test\0".encode_utf16().collect();
+        // SAFETY: WNDCLASSW is plain-data FFI input; all-zero is a valid value.
+        let mut wc: winapi::um::winuser::WNDCLASSW = unsafe { std::mem::zeroed() };
+        wc.lpfnWndProc = Some(winapi::um::winuser::DefWindowProcW);
+        wc.lpszClassName = class_name.as_ptr();
+        // SAFETY: wc points to a fully initialized WNDCLASSW whose strings
+        // outlive the RegisterClassW call.
+        let atom = unsafe { winapi::um::winuser::RegisterClassW(&wc) };
+        assert_ne!(atom, 0, "RegisterClassW must succeed");
+        // SAFETY: FFI window creation with a registered class; result checked.
+        let hwnd = unsafe {
+            winapi::um::winuser::CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                std::ptr::null(),
+                0,
+                0, 0, 0, 0,
+                winapi::um::winuser::HWND_MESSAGE,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(!hwnd.is_null(), "message-only window must be created");
+        assert_eq!(unsafe { classify_hwnd(hwnd) }, HwndClass::OwnSandbox);
+        // SAFETY: destroying a window this thread just created.
+        unsafe { winapi::um::winuser::DestroyWindow(hwnd) };
     }
 }

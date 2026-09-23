@@ -49,6 +49,32 @@ impl Policy {
         // after a write decision, which uses the process's actual context.
         // For safety, we clear the entire cache on overlay recording (rare event).
         self.inner.cache.clear();
+        // Maintain the in-memory parent→children index. Fail-safe by design:
+        // this runs only after a successful commit and is infallible (a
+        // poisoned lock is recovered, never propagated), so an index update
+        // can never fail the public method — worst case the index is
+        // momentarily stale until the next mutation or reopen.
+        // Same normalized key shape the table row got (L41-42 above).
+        let lower = ensure_lower(orig);
+        let key = trim_trailing_sep(&lower);
+        let (parent, name) = match key.rsplit_once('\\') {
+            Some((p, n)) => (p, n),
+            None => ("", key), // bare drive — see PolicyInner::overlay_children_idx
+        };
+        {
+            let mut idx = self
+                .inner
+                .overlay_children_idx
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            let children = idx.entry(parent.into()).or_default();
+            // Keep the Vec sorted bytewise so `overlay_children` output order
+            // matches the old full-table range scan.
+            match children.binary_search_by(|c| (**c).cmp(name)) {
+                Ok(_) => {} // re-record of the same path: no index change
+                Err(pos) => children.insert(pos, name.into()),
+            }
+        }
         Ok(())
     }
 
@@ -119,8 +145,10 @@ impl Policy {
         if original_basename.is_empty() {
             return;
         }
-        // Only worth storing when case differs from lowercase (optimization).
-        if original_basename == original_basename.to_ascii_lowercase() {
+        // Only worth storing when the basename is not already in canonical
+        // (folded) form — fold-relative so non-ASCII case pairs (Секрет)
+        // are recorded too, not just ASCII ones.
+        if path::nt_case_fold(original_basename) == original_basename {
             return;
         }
         let key = trim_trailing_sep(lower_path);
@@ -183,10 +211,34 @@ impl Policy {
     /// comment defers to enumeration for "passthrough directory with sparse
     /// overlay children" (a CoW write outside `project_root` into a
     /// directory that also exists on the real disk).
+    ///
+    /// The candidate child names come from `PolicyInner::overlay_children_idx`,
+    /// an in-memory (parent → direct-children basenames) index over the
+    /// `OVERLAY_IDX` table, sorted bytewise per parent. The index is rebuilt
+    /// from `OVERLAY_IDX` at `Policy` open and maintained incrementally by
+    /// `record_overlay`/`clear_overlay` — the only two writers of that table
+    /// (everything else only sends IPC requests that land in those methods).
+    /// Legacy DBs need no migration: whatever `OVERLAY_IDX` rows exist are
+    /// folded into the index on the next open. Each child is still resolved
+    /// against `OVERLAY_IDX` and stat'ed live below, so the per-child cost is
+    /// unchanged — only the old O(S) full-subtree prefix range scan (S = all
+    /// descendant keys) collapsed to O(U) point lookups (U = direct children);
+    /// no O(1) claim is made.
     pub fn overlay_children(&self, dir: &str) -> Vec<OverlayChildMeta> {
         let dir_lower = ensure_lower(dir);
         let dir_trimmed = dir_lower.trim_end_matches('\\');
         if dir_trimmed.is_empty() {
+            return Vec::new();
+        }
+        let children: Vec<Box<str>> = self
+            .inner
+            .overlay_children_idx
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(dir_trimmed)
+            .cloned()
+            .unwrap_or_default();
+        if children.is_empty() {
             return Vec::new();
         }
         let prefix_with_sep = format!("{}\\", dir_trimmed);
@@ -199,23 +251,27 @@ impl Policy {
         let case = txn.open_table(db::OVERLAY_CASE).ok();
 
         let mut out = Vec::new();
-        let Ok(iter) = idx.range(prefix_with_sep.as_str()..) else { return Vec::new() };
-        for entry in iter.flatten() {
-            let key = entry.0.value();
-            let Some(rest) = key.strip_prefix(&prefix_with_sep) else { break };
-            // Direct children only — no further backslash.
-            if rest.contains('\\') {
-                continue;
-            }
-            let overlay_phys = entry.1.value();
+        // Iterating the sorted Vec preserves the old scan's output order:
+        // within one parent, bytewise order on the basename equals bytewise
+        // order on the full `parent\name` key.
+        for name in children {
+            let key = format!("{}{}", prefix_with_sep, name);
+            // Defensive: index/DB divergence must never fabricate an entry.
+            let Some(phys_guard) = idx.get(key.as_str()).ok().flatten() else { continue };
+            let overlay_phys = phys_guard.value();
             let (is_dir, size, creation_time, last_access_time, last_write_time) =
                 stat_overlay_phys(overlay_phys);
-            let name = case.as_ref()
-                .and_then(|t| t.get(key).ok().flatten())
+            let display = case.as_ref()
+                .and_then(|t| t.get(key.as_str()).ok().flatten())
                 .map(|v| v.value().to_owned())
-                .unwrap_or_else(|| rest.to_owned());
+                .unwrap_or_else(|| name.to_string());
             out.push(OverlayChildMeta {
-                name, is_dir, size, creation_time, last_access_time, last_write_time,
+                name: display,
+                is_dir,
+                size,
+                creation_time,
+                last_access_time,
+                last_write_time,
             });
         }
         out
@@ -293,6 +349,33 @@ impl Policy {
         }
         txn.commit()?;
         self.inner.cache.clear();
+        // Maintain the in-memory parent→children index. Fail-safe by design:
+        // runs only after a successful commit, is infallible, and must never
+        // fail this method — worst case the index is momentarily stale until
+        // the next mutation or reopen.
+        let (parent, name) = match lower.rsplit_once('\\') {
+            Some((p, n)) => (p, n),
+            None => ("", lower), // bare drive — see PolicyInner::overlay_children_idx
+        };
+        {
+            let mut idx = self
+                .inner
+                .overlay_children_idx
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            let became_empty = match idx.get_mut(parent) {
+                Some(children) => {
+                    if let Ok(pos) = children.binary_search_by(|c| (**c).cmp(name)) {
+                        children.remove(pos);
+                    }
+                    children.is_empty()
+                }
+                None => false, // index already missing the parent: nothing to do
+            };
+            if became_empty {
+                idx.remove(parent);
+            }
+        }
         Ok(())
     }
 
@@ -399,7 +482,10 @@ impl Policy {
         let lower: &str = &lower_owned;
 
         // project_root always passthrough
-        if path_contained_in(lower, &self.inner.project_root_lower) {
+        if path_contained_in(lower, &self.inner.project_root_lower)
+            && (!write_access
+                || !path_aliases_outside_root(lower, &self.inner.project_root_lower))
+        {
             return TracedDecision {
                 decision: db::RuleMode::Passthrough,
                 target_path: None,
@@ -410,6 +496,9 @@ impl Policy {
                 chain: vec![],
             };
         }
+        // S05 (docs/review-xa-2026-09-20): an aliased in-root WRITE (see
+        // `compute`) falls through here so the trace mirrors compute's
+        // isolation decision; reads and honest in-root paths returned above.
 
         // Whiteout check mirrors `compute`: a hidden external path is reported
         // as Passthrough in the trace's RuleMode field (there is no RuleMode::Hidden
@@ -640,7 +729,12 @@ impl Policy {
     /// Resolution order:
     /// 1. **`project_root` short-circuit** — the agent's own dir is always real
     ///    (passthrough), regardless of any rule. This is the only path that may
-    ///    hit the real disk for writes.
+    ///    hit the real disk for writes. Exception (S05): on WRITE, a
+    ///    pre-existing alias — a junction/symlink/mount point in any component,
+    ///    or a multi-link file — whose filesystem resolution escapes the root
+    ///    does NOT get the short-circuit; it falls through to the normal rule
+    ///    flow and is isolated (default Cow) like any external path. Reads
+    ///    keep the short-circuit (read authority is global).
     /// 2. **Mock payload / mock dir** — synthesized content, never real disk.
     /// 3. **Rule lookup** via `best_rule_match` (explicit prefix rule, else the
     ///    configured default catch-all rule). An explicit rule may force
@@ -675,7 +769,18 @@ impl Policy {
         let lower: &str = lower_owned.as_ref();
 
         if path_contained_in(lower, &self.inner.project_root_lower) {
-            return Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None };
+            // S05 (docs/review-xa-2026-09-20): string containment alone no
+            // longer grants WRITE trust to a pre-existing filesystem alias. A
+            // junction/symlink inside the root pointing outside it, or a file
+            // hardlinked to an outside object, resolves off the root; writes
+            // through it must be isolated (fall through → default Cow) like
+            // any external path, not passed to the real disk. Reads keep the
+            // legacy short-circuit (read authority is global by design).
+            if !write_access
+                || !path_aliases_outside_root(lower, &self.inner.project_root_lower)
+            {
+                return Decision { mode: Mode::Passthrough, overlay: None, cow_from: None, mock_payload: None };
+            }
         }
 
         // ── Whiteout (OverlayFS tombstone) check ────────────────────────────

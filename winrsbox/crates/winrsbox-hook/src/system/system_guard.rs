@@ -278,7 +278,7 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
         HOOK_SHUTDOWN.get().expect("set above").enable()
             .map_err(|e| format!("detour enable NtShutdownSystem: {:?}", e))?;
     } else {
-        ipc_log(ipc::LogLevel::Warn,
+        buffer_install_error(
             "system_guard: ntdll export NtShutdownSystem not found".into());
     }
 
@@ -293,7 +293,7 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
         HOOK_SET_SYS_INFO.get().expect("set above").enable()
             .map_err(|e| format!("detour enable NtSetSystemInformation: {:?}", e))?;
     } else {
-        ipc_log(ipc::LogLevel::Warn,
+        buffer_install_error(
             "system_guard: ntdll export NtSetSystemInformation not found".into());
     }
 
@@ -308,7 +308,7 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
         HOOK_CREATE_DEBUG_OBJ.get().expect("set above").enable()
             .map_err(|e| format!("detour enable NtCreateDebugObject: {:?}", e))?;
     } else {
-        ipc_log(ipc::LogLevel::Warn,
+        buffer_install_error(
             "system_guard: ntdll export NtCreateDebugObject not found".into());
     }
 
@@ -323,7 +323,7 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
         HOOK_RAISE_HARD_ERROR.get().expect("set above").enable()
             .map_err(|e| format!("detour enable NtRaiseHardError: {:?}", e))?;
     } else {
-        ipc_log(ipc::LogLevel::Warn,
+        buffer_install_error(
             "system_guard: ntdll export NtRaiseHardError not found".into());
     }
 
@@ -332,19 +332,11 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
         // SAFETY: transmute of ntdll export address; ABI matches FnNtCreateSymbolicLinkObject.
         let target: FnNtCreateSymbolicLinkObject = std::mem::transmute(addr as usize);
         let hook_ptr: FnNtCreateSymbolicLinkObject = hook_nt_create_symbolic_link_object;
-        match GenericDetour::<FnNtCreateSymbolicLinkObject>::new(target, hook_ptr) {
-            Ok(detour) => {
-                let _ = HOOK_CREATE_SYMLINK_OBJ.set(detour);
-                if let Some(h) = HOOK_CREATE_SYMLINK_OBJ.get() {
-                    if let Err(e) = h.enable() {
-                        buffer_install_error(
-                            format!("system_guard: detour enable NtCreateSymbolicLinkObject: {:?}", e));
-                    }
-                }
-            }
-            Err(e) => buffer_install_error(
-                format!("system_guard: detour init NtCreateSymbolicLinkObject: {:?}", e)),
-        }
+        let detour = GenericDetour::<FnNtCreateSymbolicLinkObject>::new(target, hook_ptr)
+            .map_err(|e| format!("detour init NtCreateSymbolicLinkObject: {:?}", e))?;
+        HOOK_CREATE_SYMLINK_OBJ.set(detour).ok();
+        HOOK_CREATE_SYMLINK_OBJ.get().expect("set above").enable()
+            .map_err(|e| format!("detour enable NtCreateSymbolicLinkObject: {:?}", e))?;
     } else {
         buffer_install_error(
             "system_guard: ntdll export NtCreateSymbolicLinkObject not found".into());
@@ -355,19 +347,11 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
         // SAFETY: transmute of ntdll export address; ABI matches FnNtLoadDriver.
         let target: FnNtLoadDriver = std::mem::transmute(addr as usize);
         let hook_ptr: FnNtLoadDriver = hook_nt_load_driver;
-        match GenericDetour::<FnNtLoadDriver>::new(target, hook_ptr) {
-            Ok(detour) => {
-                let _ = HOOK_LOAD_DRIVER.set(detour);
-                if let Some(h) = HOOK_LOAD_DRIVER.get() {
-                    if let Err(e) = h.enable() {
-                        buffer_install_error(
-                            format!("system_guard: detour enable NtLoadDriver: {:?}", e));
-                    }
-                }
-            }
-            Err(e) => buffer_install_error(
-                format!("system_guard: detour init NtLoadDriver: {:?}", e)),
-        }
+        let detour = GenericDetour::<FnNtLoadDriver>::new(target, hook_ptr)
+            .map_err(|e| format!("detour init NtLoadDriver: {:?}", e))?;
+        HOOK_LOAD_DRIVER.set(detour).ok();
+        HOOK_LOAD_DRIVER.get().expect("set above").enable()
+            .map_err(|e| format!("detour enable NtLoadDriver: {:?}", e))?;
     } else {
         buffer_install_error(
             "system_guard: ntdll export NtLoadDriver not found".into());
@@ -378,19 +362,11 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
         // SAFETY: transmute of ntdll export address; ABI matches FnNtUnloadDriver.
         let target: FnNtUnloadDriver = std::mem::transmute(addr as usize);
         let hook_ptr: FnNtUnloadDriver = hook_nt_unload_driver;
-        match GenericDetour::<FnNtUnloadDriver>::new(target, hook_ptr) {
-            Ok(detour) => {
-                let _ = HOOK_UNLOAD_DRIVER.set(detour);
-                if let Some(h) = HOOK_UNLOAD_DRIVER.get() {
-                    if let Err(e) = h.enable() {
-                        buffer_install_error(
-                            format!("system_guard: detour enable NtUnloadDriver: {:?}", e));
-                    }
-                }
-            }
-            Err(e) => buffer_install_error(
-                format!("system_guard: detour init NtUnloadDriver: {:?}", e)),
-        }
+        let detour = GenericDetour::<FnNtUnloadDriver>::new(target, hook_ptr)
+            .map_err(|e| format!("detour init NtUnloadDriver: {:?}", e))?;
+        HOOK_UNLOAD_DRIVER.set(detour).ok();
+        HOOK_UNLOAD_DRIVER.get().expect("set above").enable()
+            .map_err(|e| format!("detour enable NtUnloadDriver: {:?}", e))?;
     } else {
         buffer_install_error(
             "system_guard: ntdll export NtUnloadDriver not found".into());
@@ -507,5 +483,41 @@ mod tests {
         // Documented constants for cross-reference.
         assert_eq!(STATUS_ACCESS_DENIED as u32, 0xC000_0022);
         assert_eq!(STATUS_PRIVILEGE_NOT_HELD as u32, 0xC000_0061);
+    }
+
+    // S10 failure-posture pin: install() must PROPAGATE detour init/enable
+    // failures (a present export that can't be hooked = active ntdll
+    // interference; system is REQUIRED → fail closed via DllMain FALSE),
+    // while a genuinely absent export only buffers a soft-skip report. The
+    // slice covers just install()'s source, so the searched literals in the
+    // assertions below cannot match themselves.
+    #[test]
+    fn install_fails_closed_on_detour_failures() {
+        let src = crate::hooks::module_source("system_guard");
+        let start = src.find("pub unsafe fn install()").expect("install() must exist");
+        let rest = &src[start..];
+        let end = rest
+            .find("pub unsafe fn uninstall()")
+            .expect("uninstall() must follow install()");
+        let body = &rest[..end];
+        let init_errs = body.matches(".map_err(|e| format!(\"detour init ").count();
+        let enable_errs = body.matches(".map_err(|e| format!(\"detour enable ").count();
+        let buffered = body.matches("buffer_install_error(").count();
+        assert_eq!(
+            init_errs, 7,
+            "all 7 hooks must propagate detour init failures; found {init_errs}",
+        );
+        assert_eq!(
+            enable_errs, 7,
+            "all 7 hooks must propagate detour enable failures; found {enable_errs}",
+        );
+        assert_eq!(
+            buffered, 7,
+            "all 7 missing-export soft-skips must buffer; found {buffered}",
+        );
+        assert!(
+            !body.contains("ipc_log(ipc::LogLevel::Warn"),
+            "install-time soft-skips must not use fire-and-forget ipc_log (dropped pre-pipe)",
+        );
     }
 }

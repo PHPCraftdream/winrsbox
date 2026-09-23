@@ -1,10 +1,13 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use windows::{
-    core::PCWSTR,
+    core::{HRESULT, PCWSTR, PWSTR},
     Win32::{
-        Foundation::{CloseHandle, FILETIME, HANDLE},
-        System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+        Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE},
+        System::Threading::{
+            GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+            PROCESS_QUERY_LIMITED_INFORMATION,
+        },
     },
 };
 
@@ -49,6 +52,143 @@ pub(crate) fn query_process_create_time(pid: u32) -> Option<u64> {
     // SAFETY: h was opened by us above and is closed exactly once here.
     unsafe { CloseHandle(h).ok() };
     if ct == 0 { None } else { Some(ct) }
+}
+
+// ─── S09: kernel-truth identity gates (image path, exe context, kinship) ─────
+
+/// Kernel-truth image path of a live process, via QueryFullProcessImageNameW.
+/// Opens a transient `PROCESS_QUERY_LIMITED_INFORMATION` handle — the
+/// documented minimum access right required by QueryFullProcessImageNameW, so
+/// no stronger handle (and no new privilege surface) is needed — reads the
+/// path, closes the handle exactly once on every path. Returns None if the
+/// process cannot be opened (gone / access denied), the path cannot fit a
+/// 32768-u16 buffer, or the query fails.
+///
+/// S09 rationale: this is the kernel's record of what the process is actually
+/// running. The exe string a guest reports in its `Hello` is read from
+/// guest-controlled memory, so a compromised guest can claim anything; the
+/// image path the kernel reports cannot be spoofed by user-mode code inside
+/// the guest, which makes it the only safe key for exe-scoped policy rules.
+pub(crate) fn query_process_image_path(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: pid is a non-zero PID; bInheritHandle=false. Failure (process
+    //         gone / access denied) yields Err, which `?` maps to None before
+    //         the handle is ever used.
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()? };
+    let mut size = 1024u32;
+    let result = loop {
+        let mut buf = vec![0u16; size as usize];
+        let mut len = size;
+        // SAFETY: h is our valid process handle; buf is a fully initialized
+        //         UTF-16 buffer of `size` u16s that outlives the call;
+        //         QueryFullProcessImageNameW writes only into buf and `len`.
+        match unsafe {
+            QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len)
+        } {
+            Ok(()) => {
+                // `len` is the number of u16s written; trim any trailing NULs
+                // before decoding.
+                let written = (len as usize).min(buf.len());
+                let mut path = &buf[..written];
+                while path.last() == Some(&0) {
+                    path = &path[..path.len() - 1];
+                }
+                if path.is_empty() {
+                    break None;
+                }
+                break Some(String::from_utf16_lossy(path));
+            }
+            // Buffer too small: double and retry, capped at 32768 u16s so a
+            // pathological target can never spin this loop forever.
+            Err(e) if e.code() == HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0) => {
+                if size >= 32768 {
+                    break None;
+                }
+                size = size.saturating_mul(2);
+            }
+            Err(_) => break None,
+        }
+    };
+    // SAFETY: h was opened by us above and is closed exactly once here.
+    unsafe { CloseHandle(h).ok() };
+    result
+}
+
+/// Testable core: given the kernel image-path probe, decide the exe context
+/// for a Hello. `Ok((kernel_folded, claimed_differs))` uses ONLY the
+/// kernel path; `Err` means the kernel path could not be resolved (fail
+/// closed).
+///
+/// After S09 the guest-claimed exe string is diagnostics-only: a compromised
+/// guest can report any path it likes, so the exe context served to policy
+/// must come from `query_process_image_path` (kernel truth). The bool flags a
+/// mismatch between what the guest claimed and what the kernel says, so the
+/// caller can log a spoof warning while still deciding from the kernel path.
+pub(crate) fn hello_exe_context_impl(
+    client_pid: u32,
+    claimed_exe: &str,
+    image_path_of: &dyn Fn(u32) -> Option<String>,
+) -> Result<(String, bool), ()> {
+    let kernel = image_path_of(client_pid).ok_or(())?;
+    // S11: canonical NTFS-identity fold (kernel tables) — the same fold the
+    // policy db applies to `when.exe` rule keys; ASCII input folds
+    // byte-identically to the historic ASCII-only lowercase.
+    let lower = crate::fold_published(&kernel);
+    let spoof = crate::fold_published(claimed_exe) != lower;
+    Ok((lower, spoof))
+}
+
+/// Production binding of `hello_exe_context_impl` to the real kernel probe.
+pub(crate) fn hello_exe_context(client_pid: u32, claimed_exe: &str) -> Result<(String, bool), ()> {
+    hello_exe_context_impl(client_pid, claimed_exe, &query_process_image_path)
+}
+
+/// Testable core of the SpawnedChild kinship proof (S09 point 2): true iff
+/// the kernel records `client_pid` as the direct creator of `child_pid`.
+///
+/// WHY kernel `InheritedFromUniqueProcessId` is the chosen proof:
+/// * Windows never reparents — the creator PID the kernel records at
+///   `CreateProcess` is immutable for the child's lifetime and survives the
+///   parent's death, so the check is race-free.
+/// * A hostile parent naming an arbitrary unrelated PID as the child fails:
+///   the kernel records the REAL creator, not the claimed one.
+/// * PID reuse of `child_pid` is covered separately by the caller's
+///   creation-time fingerprint when the child itself connects.
+/// * Job membership is NOT used: the sandbox Job object exists, but its
+///   handle is not plumbed into the pipe server — and direct-child semantics
+///   is exactly what a SpawnedChild report claims, so kernel parentage
+///   proves precisely that claim.
+pub(crate) fn spawned_child_kinship_impl(
+    child_pid: u32,
+    client_pid: u32,
+    parent_of: ParentPidFn<'_>,
+) -> bool {
+    child_pid != 0 && parent_of(child_pid) == Some(client_pid)
+}
+
+/// Production binding of `spawned_child_kinship_impl` to the real kernel
+/// parent probe (`NtQueryInformationProcess` → InheritedFromUniqueProcessId).
+pub(crate) fn spawned_child_kinship(child_pid: u32, client_pid: u32) -> bool {
+    spawned_child_kinship_impl(child_pid, client_pid, &get_parent_pid)
+}
+
+/// Decide-context gate for the Hello-first state machine (S09 point 3).
+/// Returns `(depth, exe_lower)` of the tracked entry for the connection's
+/// kernel-vouched PID.
+///
+/// Before S09, a Decide arriving on a connection that had not said Hello was
+/// served with `(None, None)`, which makes exe-scoped rules be SKIPPED — a
+/// permissive fall-through. Here `Err` means refuse: it covers both "never
+/// Hello'd" (no connection PID) and "Hello'd but the entry is no longer
+/// live / pruned" (the identity broke between Hello and Decide) — strictly
+/// more fail-closed than the old `(None, None)` fallback.
+pub(crate) fn decide_context(conn_pid: Option<u32>) -> Result<(u8, std::sync::Arc<str>), ()> {
+    let pid = conn_pid.ok_or(())?;
+    let map = crate::sandbox::proc_table::global_proc_info().pin();
+    let info = map.get(&pid).ok_or(())?;
+    Ok((info.depth, std::sync::Arc::clone(&info.exe_lower)))
 }
 
 // ─── C3 Part 3: validate that the connecting client is one of our own PIDs ────
@@ -267,4 +407,161 @@ fn get_parent_pid(pid: u32) -> Option<u32> {
         return None;
     }
     Some(info.inherited_from_unique_process_id as u32)
+}
+
+// ─── S09: kernel-truth identity gates (inline tests) ─────────────────────────
+
+#[cfg(test)]
+mod s09_identity_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// S09 point 1: the image-path probe returns the REAL exe path of a live
+    /// process — our own test binary — as a non-empty string ending in ".exe"
+    /// (case-insensitively). Mirrors the live-kernel roundtrip convention of
+    /// pipe_server::tests::live_kernel_roundtrip_self_pid.
+    #[test]
+    fn image_path_live_kernel_roundtrip_self_pid() {
+        let pid = std::process::id();
+        let path = query_process_image_path(pid).expect("own live process must be queryable");
+        assert!(!path.is_empty());
+        let lower = path.to_ascii_lowercase();
+        assert!(
+            lower.ends_with(".exe"),
+            "kernel image path of the test binary must end in .exe, got {path}"
+        );
+    }
+
+    /// S09 point 1: a PID that cannot be opened must fail closed with None —
+    /// never panic, never fabricate a path.
+    #[test]
+    fn image_path_dead_pid_returns_none() {
+        // 0x5A09_DEAD is not a multiple of 4 (Windows PIDs always are), so it
+        // can never name a live process.
+        assert_eq!(query_process_image_path(0x5A09_DEADu32), None);
+    }
+
+    /// S09 point 1: the Hello exe decision is made from the KERNEL path, never
+    /// the guest-claimed one. Kernel says Notepad.EXE, the guest claims an
+    /// unrelated fake.cmd → the returned context is the kernel path
+    /// (lowercased) AND the mismatch is flagged as a spoof.
+    #[test]
+    fn hello_exe_context_uses_kernel_path_not_claim() {
+        let pid = 0x5A09_0001u32;
+        let (path, spoof) = hello_exe_context_impl(
+            pid,
+            "c:\\definitely\\fake.cmd",
+            &|p: u32| {
+                if p == pid { Some("C:\\Windows\\System32\\Notepad.EXE".to_string()) } else { None }
+            },
+        )
+        .expect("kernel path probe must resolve");
+        assert_eq!(path, "c:\\windows\\system32\\notepad.exe");
+        assert!(spoof, "claimed exe differing from kernel path must flag spoof");
+    }
+
+    /// S09 point 1: a claimed exe that matches the kernel path (modulo case)
+    /// is NOT a spoof — Ok((lowercased kernel path, false)).
+    #[test]
+    fn hello_exe_context_match_is_not_spoof() {
+        let pid = 0x5A09_0002u32;
+        let (path, spoof) = hello_exe_context_impl(
+            pid,
+            "c:\\tools\\app.exe",
+            &|p: u32| if p == pid { Some("C:\\tools\\app.exe".to_string()) } else { None },
+        )
+        .expect("kernel path probe must resolve");
+        assert_eq!(path, "c:\\tools\\app.exe");
+        assert!(!spoof, "a matching claim must not be flagged as spoof");
+    }
+
+    /// S09 point 1: when the kernel path cannot be resolved (probe returns
+    /// None) the decision fails closed — Err, never a decision derived from
+    /// the guest-claimed string.
+    #[test]
+    fn hello_exe_context_unresolved_fails_closed() {
+        assert!(hello_exe_context_impl(0x5A09_0003u32, "c:\\tools\\app.exe", &|_| None).is_err());
+    }
+
+    /// S09 point 2: a child whose kernel-recorded creator is exactly the
+    /// connecting client passes the kinship proof.
+    #[test]
+    fn spawned_child_kinship_accepts_kernel_child() {
+        let child = 0x5A09_0004u32;
+        let parent = 0x5A09_0005u32;
+        assert!(spawned_child_kinship_impl(
+            child,
+            parent,
+            &|p: u32| if p == child { Some(parent) } else { None },
+        ));
+    }
+
+    /// S09 point 2: a hostile SpawnedChild naming a child whose kernel
+    /// creator is an unrelated PID fails, and so does a child that is already
+    /// gone (probe returns None) — both reject.
+    #[test]
+    fn spawned_child_kinship_rejects_unrelated_pid() {
+        let child = 0x5A09_0006u32;
+        let other = 0x5A09_0007u32;
+        // Kernel records a different creator than the connecting client.
+        assert!(!spawned_child_kinship_impl(
+            child,
+            other,
+            &|p: u32| if p == child { Some(0x5A09_0008u32) } else { None },
+        ));
+        // Child gone before the probe: no kinship.
+        assert!(!spawned_child_kinship_impl(child, other, &|_| None));
+    }
+
+    /// S09 point 2: pid 0 is never a child, and self-parentage (child ==
+    /// client) is never kernel truth — even with the probe offering a
+    /// grandparent, the check rejects.
+    #[test]
+    fn spawned_child_kinship_rejects_zero_and_self() {
+        let client = 0x5A09_0009u32;
+        let grandparent = 0x5A09_000Au32;
+        assert!(!spawned_child_kinship_impl(0, client, &|_| Some(grandparent)));
+        assert!(!spawned_child_kinship_impl(
+            client,
+            client,
+            &|p: u32| if p == client { Some(grandparent) } else { None },
+        ));
+    }
+
+    /// S09 point 3: a Decide arriving before any Hello (no connection PID)
+    /// must be refused — never served with the old permissive (None, None)
+    /// fall-through that skips exe-scoped rules.
+    #[test]
+    fn decide_context_requires_hello() {
+        assert!(decide_context(None).is_err());
+    }
+
+    /// S09 point 3: a connection PID with no tracked entry (never Hello'd,
+    /// pruned, or recycled) is refused — fail closed rather than deciding
+    /// without an identity.
+    #[test]
+    fn decide_context_refuses_when_entry_missing() {
+        assert!(decide_context(Some(0x5A09_0010u32)).is_err());
+    }
+
+    /// S09 point 3: a Hello'd, tracked connection returns exactly the entry's
+    /// (depth, exe_lower) so Decide can apply exe-scoped rules; the entry is
+    /// cleaned up so the global map stays pristine for other tests.
+    #[test]
+    fn decide_context_returns_entry_context() {
+        let pid = 0x5A09_0011u32;
+        crate::sandbox::proc_table::global_proc_info().pin().insert(
+            pid,
+            crate::sandbox::proc_table::ProcInfo {
+                depth: 3,
+                exe_lower: Arc::from("c:\\x\\y.exe"),
+                create_time: 42,
+            },
+        );
+        let (depth, exe) = decide_context(Some(pid)).expect("tracked entry must decide");
+        assert_eq!(depth, 3);
+        assert_eq!(&*exe, "c:\\x\\y.exe");
+        crate::sandbox::proc_table::global_proc_info().pin().remove(&pid);
+        assert!(crate::sandbox::proc_table::global_proc_info().pin().get(&pid).is_none());
+    }
 }

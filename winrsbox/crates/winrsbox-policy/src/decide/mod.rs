@@ -83,6 +83,9 @@ pub(crate) struct Snapshot {
     pub(crate) mocks_exact: rustc_hash::FxHashMap<String, Vec<u8>>,
     pub(crate) mocks_glob: Vec<(String, Vec<u8>)>,
     pub(crate) mock_dirs: Vec<String>,
+    /// Precompiled rule index (literal-segment trie + wildcard list), built
+    /// once per snapshot load. `index.compiled(i)` corresponds to `rules[i]`.
+    pub(crate) index: rule_index::RuleIndex,
 }
 
 impl Snapshot {
@@ -123,7 +126,11 @@ impl Snapshot {
                 mock_dirs.push(key.value().to_owned());
             }
         }
-        Ok(Snapshot { rules, default_rule, mocks_exact, mocks_glob, mock_dirs })
+        // Rules are fully populated above — precompile the matching index
+        // once per snapshot load instead of re-splitting/re-scoring every
+        // rule on every decision.
+        let index = rule_index::RuleIndex::build(&rules);
+        Ok(Snapshot { rules, default_rule, mocks_exact, mocks_glob, mock_dirs, index })
     }
 
     pub(crate) fn find_mock_payload(&self, lower_path: &str) -> Option<Vec<u8>> {
@@ -164,44 +171,56 @@ impl Snapshot {
     /// Used to distinguish "matched an explicit rule" from "fell through to the
     /// default rule": a path outside `project_root` that hits only the default
     /// must NOT be CoW-redirected into the overlay (see `compute`).
+    ///
+    /// Matching is index-driven: literal rules are found via the segment trie
+    /// (they match by construction — the trie walk proves the segment
+    /// prefix), while wildcard rules are re-checked right in the candidate
+    /// loop below, via `path::prefix_match` on the rule's precompiled
+    /// FILTERED segments against the already-split path — the same glob
+    /// algorithm (globstar semantics included) as the old per-rule
+    /// `pattern_matches_prefix`, but with zero allocation and no re-splits.
+    /// The path is split once (FILTERED, mirroring `pattern_matches_prefix`)
+    /// and the exe once (UNFILTERED, mirroring `pattern_matches_exact`). Tie-break: highest precompiled
+    /// specificity, then earliest table index — order-independent and
+    /// identical to the old in-order strict-`>` scan.
     pub(crate) fn best_explicit_rule_match(
         &self,
         lower_path: &str,
         depth: Option<u8>,
         exe_lower: Option<&str>,
     ) -> Option<&db::RuleRow> {
-        let mut best: Option<(usize, &db::RuleRow)> = None;
-        for sr in &self.rules {
-            if !path::pattern_matches_prefix(&sr.pattern, lower_path) { continue; }
-            if let Some(ref when) = sr.row.when {
-                if let Some(min_depth) = when.depth {
-                    match depth {
-                        Some(d) if d < min_depth => continue,
-                        None => {}
-                        _ => {}
-                    }
-                }
-                if let Some(ref exe_pattern) = when.exe {
-                    match exe_lower {
-                        Some(exe) if path::pattern_matches_exact(&ensure_lower(exe_pattern), exe) => {}
-                        _ => continue,
-                    }
+        let path_segs: Vec<&str> = lower_path.split('\\').filter(|s| !s.is_empty()).collect();
+        let exe_segs: Option<Vec<&str>> = exe_lower.map(|e| e.split('\\').collect());
+        let candidates = self.index.candidate_indices(&path_segs);
+        let mut best: Option<(usize, usize)> = None;
+        for idx in candidates {
+            let cr = self.index.compiled(idx);
+            // Wildcard filter: trie candidates match by construction, but
+            // wildcard candidates are appended unconditionally by
+            // `candidate_indices` — re-check each against the request path
+            // here, using the precompiled FILTERED segments (same
+            // `prefix_match` backtracking the old per-rule glob ran).
+            if cr.wildcard && !path::prefix_match(&cr.segs, &path_segs) { continue; }
+            // Depth filter: skip ONLY when both the runtime depth and the
+            // rule minimum are Some and the depth is below the minimum. A
+            // None runtime depth never skips (old code's `None => {}` arm).
+            if let (Some(d), Some(min_depth)) = (depth, cr.when_min_depth) {
+                if d < min_depth { continue; }
+            }
+            if let Some(exe_pattern_segs) = &cr.when_exe_segs {
+                match exe_segs.as_deref() {
+                    Some(exe) if path::exact_match(exe_pattern_segs, exe) => {}
+                    _ => continue,
                 }
             }
-            let mut spec = path::pattern_specificity(&sr.pattern);
-            if sr.row.when.is_some() { spec += 1; }
-            if let Some(ref when) = sr.row.when {
-                if let Some(ref exe) = when.exe {
-                    spec += path::pattern_specificity(exe);
-                }
-            }
-            match &best {
-                None => best = Some((spec, &sr.row)),
-                Some((s, _)) if spec > *s => best = Some((spec, &sr.row)),
+            let spec = cr.spec;
+            match best {
+                None => best = Some((spec, idx)),
+                Some((s, i)) if spec > s || (spec == s && idx < i) => best = Some((spec, idx)),
                 _ => {}
             }
         }
-        best.map(|(_, r)| r)
+        best.map(|(_, idx)| &self.rules[idx].row)
     }
 }
 
@@ -340,6 +359,184 @@ pub(crate) fn path_contained_in(path_lower: &str, root_lower: &str) -> bool {
     path_lower.len() == n || path_lower.as_bytes().get(n) == Some(&b'\\')
 }
 
+/// Lowercase final DOS path of `p` via handle-based resolution
+/// (std::fs::canonicalize opens the object and asks the kernel for its final
+/// path, so junctions/symlinks in EVERY component are resolved). Strips the
+/// `\\?\` verbatim prefix; a `\\?\UNC\...` result is normalized to `\\...`
+/// form (it can then never segment-contain a DOS root). Returns None when the
+/// object cannot be resolved.
+fn canonical_dos_lower(p: &std::path::Path) -> Option<String> {
+    let canon = std::fs::canonicalize(p).ok()?;
+    let mut s = canon.to_string_lossy().into_owned();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        s = format!(r"\\{rest}");
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        s = rest.to_owned();
+    }
+    // Canonical NTFS-identity fold (see path::case_fold): the canonical
+    // form borrows `s`'s buffer untouched when it is already folded, so the
+    // common all-lowercase case stays allocation-free.
+    match crate::path::nt_case_fold(&s) {
+        std::borrow::Cow::Borrowed(_) => Some(s),
+        std::borrow::Cow::Owned(f) => Some(f),
+    }
+}
+
+/// `BY_HANDLE_FILE_INFORMATION` (win32 `fileapi.h`, laid out by hand to keep
+/// the policy crate free of winapi/windows crates — kernel32 is linked by
+/// every `*windows*` target anyway). FILETIME members are modeled as `u32`
+/// pairs: their real alignment is 4, so a `u64` field would pad the struct
+/// wrongly. Only `attributes` and `number_of_links` are ever read.
+#[repr(C)]
+struct ByHandleFileInfo {
+    attributes: u32,
+    creation_low: u32,
+    creation_high: u32,
+    access_low: u32,
+    access_high: u32,
+    write_low: u32,
+    write_high: u32,
+    volume_serial: u32,
+    size_high: u32,
+    size_low: u32,
+    number_of_links: u32,
+    index_high: u32,
+    index_low: u32,
+}
+
+unsafe extern "system" {
+    fn GetFileInformationByHandle(
+        file: std::os::windows::io::RawHandle,
+        info: *mut ByHandleFileInfo,
+    ) -> i32;
+}
+
+/// Link count of the file object named by `p`, or `None` when it cannot be
+/// determined. std's `MetadataExt::number_of_links()` would be exactly this,
+/// but that accessor is unstable (`windows_by_handle`) — hence the
+/// dependency-free kernel32 FFI above. The object is opened query-only
+/// (desired access 0 + `FILE_FLAG_BACKUP_SEMANTICS`): no data-access rights
+/// are needed and directories can be opened too.
+fn number_of_links(p: &std::path::Path) -> Option<u32> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let f = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(p)
+        .ok()?;
+    let mut info = ByHandleFileInfo {
+        attributes: 0,
+        creation_low: 0,
+        creation_high: 0,
+        access_low: 0,
+        access_high: 0,
+        write_low: 0,
+        write_high: 0,
+        volume_serial: 0,
+        size_high: 0,
+        size_low: 0,
+        number_of_links: 0,
+        index_high: 0,
+        index_low: 0,
+    };
+    // SAFETY: `f.as_raw_handle()` is a live handle for the duration of the
+    // call (owned by `f`, dropped only after this scope) and `info` is a
+    // correctly-sized, repr(C) mapping of the win32 struct the API writes.
+    let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) };
+    if ok == 0 { None } else { Some(info.number_of_links) }
+}
+
+/// S05 (docs/review-xa-2026-09-20): true when `dos_path` — already
+/// string-contained in `root_lower` — resolves, through the REAL filesystem,
+/// to an object outside the root, or shares its file object with names we
+/// cannot see. Such a pre-existing alias (junction/symlink/mount point in any
+/// component, or a multi-link file) must not inherit in-root write trust from
+/// its path string. WRITE-side decision input only; reads are globally
+/// authorized and never consult this.
+///
+/// Cases, in order:
+/// - Final component exists:
+///   - a multi-link FILE (link count > 1) is refused outright: a
+///     hardlink shares one underlying file object with its other names, so
+///     string containment of this name proves nothing about where writes
+///     land. Directories are exempt (NTFS cannot hardlink dirs and a dir's
+///     link count legitimately exceeds 1 via its children's `..` entries).
+///     An undeterminable link count on a file fails closed (refused).
+///   - otherwise the whole path is resolved by handle (canonicalize). If the
+///     final path is not segment-contained in `root_lower` — OR in the
+///     root's own canonical form, so a project root that is itself reached
+///     through a pre-existing alias keeps working — this is an escape. An
+///     unresolvable path fails closed (true).
+/// - Final component missing (create-new): the kernel will resolve the create
+///   through the deepest EXISTING ancestor. That ancestor is resolved by
+///   handle, the missing tail re-appended, and the joined result checked the
+///   same way. If nothing anywhere on the chain exists there is nothing to
+///   traverse — not an escape.
+pub(crate) fn path_aliases_outside_root(dos_path: &str, root_lower: &str) -> bool {
+    // Root anchor: containment is accepted against the configured string
+    // root OR its own canonical form, so a project root that is itself
+    // reached through a junction/subst drive keeps working. Canonicalizing
+    // the root fails → fall back to the string root alone.
+    let root_canon = canonical_dos_lower(std::path::Path::new(root_lower));
+    let contained = |c: &str| {
+        path_contained_in(c, root_lower)
+            || root_canon.as_deref().is_some_and(|rc| path_contained_in(c, rc))
+    };
+
+    let p = std::path::Path::new(dos_path);
+    match std::fs::symlink_metadata(p) {
+        // Final component exists.
+        Ok(md) => {
+            // Multi-link FILE: one underlying file object answers to names we
+            // cannot see — containment of THIS name proves nothing about
+            // where writes land. Undeterminable on a file fails closed.
+            // Directories are exempt (see doc comment).
+            if !md.is_dir() && number_of_links(p).is_none_or(|n| n > 1) {
+                return true;
+            }
+            match canonical_dos_lower(p) {
+                // Unresolvable in-root object: fail closed.
+                None => true,
+                Some(c) => !contained(&c),
+            }
+        }
+        // Final component missing (create-new): the kernel resolves the
+        // create through the deepest EXISTING ancestor — walk up to it,
+        // resolve it by handle, re-append the missing tail.
+        Err(_) => {
+            let mut tail: Vec<std::ffi::OsString> = Vec::new();
+            let mut cur = p;
+            loop {
+                if std::fs::symlink_metadata(cur).is_ok() {
+                    break; // deepest existing ancestor found
+                }
+                match cur.parent() {
+                    Some(parent) => {
+                        if let Some(name) = cur.file_name() {
+                            tail.push(name.to_os_string());
+                        }
+                        cur = parent;
+                    }
+                    // Popped past the drive root without finding anything
+                    // that exists: nothing to traverse — not an escape.
+                    None => return false,
+                }
+            }
+            // Fail closed when the ancestor cannot be resolved.
+            let Some(anc) = canonical_dos_lower(cur) else { return true };
+            // Re-append the missing tail in reverse pop order.
+            let mut joined = anc;
+            for seg in tail.iter().rev() {
+                joined.push('\\');
+                joined.push_str(&seg.to_string_lossy());
+            }
+            !contained(&joined)
+        }
+    }
+}
+
 // ── Policy decide methods (impl block lives here, Policy defined in lib.rs) ──
 
 use crate::Policy;
@@ -367,5 +564,6 @@ pub struct Decision {
 }
 
 mod overlay;
+mod rule_index;
 #[cfg(test)]
 mod tests;

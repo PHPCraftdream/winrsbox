@@ -558,11 +558,12 @@ fn build_case_map_empty_both_sources_returns_none() {
 //
 // `dir <exact-file>` and similar single-name lookups pass the target
 // name as NtQueryDirectoryFile's FileName filter. When the real disk has
-// no match, the real syscall fails (STATUS_NO_SUCH_FILE) BEFORE our
-// merge code ever runs (process_dir_output bails on non-zero status) —
-// so an overlay-only file that `dir /a` (unfiltered) already lists
-// showed "File Not Found" for a single-name query. These two functions
-// let process_dir_output recognize that case and synthesize a response.
+// no match, the real syscall fails (STATUS_NO_SUCH_FILE) BEFORE any real
+// page exists to merge into — so an overlay-only file that `dir /a`
+// (unfiltered) already lists showed "File Not Found" for a single-name
+// query. process_dir_output now records that status as "the real stream
+// is done" and the overlay phase merges mask matches into the stale
+// buffer from offset 0; these functions are the pattern matcher it uses.
 
 #[test]
 fn filename_matches_pattern_exact_match() {
@@ -652,4 +653,193 @@ fn extract_search_pattern_decodes_valid_string() {
     // SAFETY: ustr is a valid stack UNICODE_STRING backed by `storage`.
     let result = unsafe { extract_search_pattern(&ustr as *const UNICODE_STRING) };
     assert_eq!(result, Some("probe.txt".to_string()));
+}
+
+// ── buffer_live_size (Information re-report after hide-filtering) ──────
+
+/// The helper must report the UNPADDED tail record — the kernel's own
+/// Information convention ("last entry + actual length") — even though
+/// build_dir_info_buffer pads every entry to its aligned stride.
+#[test]
+fn buffer_live_size_reports_unpadded_tail() {
+    let buf = build_dir_info_buffer(&["a.txt"]); // padded to 0x50 by the builder
+    // SAFETY: buf is a valid class-1 buffer built above.
+    let live = unsafe { buffer_live_size(buf.as_ptr(), buf.len(), 1) };
+    assert_eq!(live, 0x4A, "0x40 header + 10 name bytes, unpadded");
+    assert_ne!(live, buf.len(), "the padded builder tail must not be reported");
+}
+
+#[test]
+fn buffer_live_size_multi_entry_chain() {
+    let buf = build_dir_info_buffer(&["a.txt", "bb.txt"]);
+    // SAFETY: buf is a valid class-1 buffer built above.
+    let live = unsafe { buffer_live_size(buf.as_ptr(), buf.len(), 1) };
+    // First record stride 0x50 + second record actual length 0x4C.
+    assert_eq!(live, 0x50 + 0x4C);
+}
+
+/// Defensive paths: unhandled class passes the original size through;
+/// null/empty and truncated inputs return a boundary without panicking
+/// or reading out of bounds.
+#[test]
+fn buffer_live_size_defensive_paths() {
+    let buf = build_dir_info_buffer(&["a.txt"]);
+    // SAFETY: valid buffer; unhandled class passes `max` through.
+    assert_eq!(unsafe { buffer_live_size(buf.as_ptr(), buf.len(), 999) }, buf.len());
+    // SAFETY: null/empty contract — never dereferenced.
+    assert_eq!(unsafe { buffer_live_size(std::ptr::null(), 128, 1) }, 0);
+    assert_eq!(unsafe { buffer_live_size(buf.as_ptr(), 0, 1) }, 0);
+    // Truncated: header can't fit inside 8 bytes → last verified boundary.
+    // SAFETY: buf is valid for buf.len() ≥ 8 bytes.
+    assert_eq!(unsafe { buffer_live_size(buf.as_ptr(), 8, 1) }, 0);
+}
+
+// ── generation-scoped snapshot tests (shared compact harness) ──────────
+//
+// process_dir_output caches the real-disk case map and the overlay-children
+// list per enumeration generation (DirEnumState.case_map/extras). The two
+// tests below drive it against a REAL temp directory so the real
+// build_case_map read_dir walk runs; the merge-side snapshot tests live in
+// merge_tests.rs and reuse the same harness.
+
+/// Knobs that vary between the harness-driven tests (class 1, no pattern,
+/// the dir always resolves).
+pub(crate) struct MergeCallCfg {
+    pub(crate) restart_scan: bool,
+    pub(crate) return_single_entry: bool,
+    /// Status the (simulated) kernel call returned: 0 = a fresh visible
+    /// real page is in the buffer (caller presets iosb.Information),
+    /// STATUS_NO_MORE_FILES = the real stream is exhausted.
+    pub(crate) original_status: NTSTATUS,
+}
+
+/// Drive ONE `process_dir_output` call — compact shared harness for the
+/// snapshot tests here and in merge_tests.rs. Returns the merge status;
+/// Status/Information land in `iosb`.
+pub(crate) fn drive_merge_call<A, B>(
+    buf: &mut [u8],
+    iosb: &mut IO_STATUS_BLOCK,
+    handle: HANDLE,
+    dir: &str,
+    cfg: &MergeCallCfg,
+    sources: (&A, &B),
+) -> NTSTATUS
+where
+    A: Fn(&str) -> Option<Vec<policy::OverlayChildMeta>>,
+    B: Fn(&str) -> Option<Vec<String>>,
+{
+    let mut requery = || -> NTSTATUS { STATUS_NO_MORE_FILES };
+    let sources = DirMergeSources { overlay_children: sources.0, whiteouts_under: sources.1 };
+    let mut ctx = DirQueryCtx {
+        file_information: buf.as_mut_ptr() as *mut c_void,
+        io_status_block: iosb,
+        class: 1,
+        capacity: buf.len(),
+        handle,
+        return_single_entry: cfg.return_single_entry,
+        restart_scan: cfg.restart_scan,
+        pattern_from_call: None,
+        dir_dos: Some(dir.to_string()),
+        original_status: cfg.original_status,
+        requery: &mut requery,
+        sources,
+    };
+    // SAFETY: buf is a valid writable class-1 buffer (caller-built via
+    // build_dir_info_buffer or zeroed scratch); iosb is valid stack
+    // memory; the sources are IPC-free test stubs.
+    unsafe { process_dir_output(&mut ctx) }
+}
+
+/// Case-map snapshot, reuse half: portion 1 rewrites the lowercase kernel
+/// page to the real-disk case; the file is then RENAMED on disk, but
+/// portion 2 (same generation) still shows the OLD case — the snapshot is
+/// reused, not re-read.
+#[test]
+fn case_map_snapshot_reused_across_portions() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap().to_string();
+    std::fs::write(dir.path().join("Alpha.txt"), b"").unwrap();
+    let handle = 0x0000_C020usize as HANDLE;
+    let no_children = |_: &str| -> Option<Vec<policy::OverlayChildMeta>> { Some(Vec::new()) };
+    let no_whiteouts = |_: &str| -> Option<Vec<String>> { Some(Vec::new()) };
+    let cfg = MergeCallCfg {
+        restart_scan: false,
+        return_single_entry: false,
+        original_status: 0,
+    };
+    let page = build_dir_info_buffer(&["alpha.txt"]);
+    let mut buf = page.clone();
+
+    let mut iosb1: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    iosb1.Information = page.len();
+    assert_eq!(
+        drive_merge_call(&mut buf, &mut iosb1, handle, &dir_str, &cfg,
+            (&no_children, &no_whiteouts)),
+        0
+    );
+    assert_eq!(collect_names(&buf[..iosb1.Information]),
+        vec!["Alpha.txt".to_string()], "portion 1 restores the real-disk case");
+
+    // Same generation, file renamed underneath: the cached map still wins.
+    std::fs::rename(dir.path().join("Alpha.txt"), dir.path().join("ALPHA.TXT")).unwrap();
+    let mut iosb2: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    iosb2.Information = page.len();
+    assert_eq!(
+        drive_merge_call(&mut buf, &mut iosb2, handle, &dir_str, &cfg,
+            (&no_children, &no_whiteouts)),
+        0
+    );
+    assert_eq!(collect_names(&buf[..iosb2.Information]),
+        vec!["Alpha.txt".to_string()],
+        "snapshot reused — the on-disk rename is NOT observed this generation");
+    let _ = take_enum_state(handle as usize);
+}
+
+/// Case-map snapshot, restart half: portion 2 carries restart_scan, the
+/// fresh generation RE-SNAPSHOTS, and the rename from the reuse test
+/// becomes visible.
+#[test]
+fn case_map_resnapshot_on_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir_str = dir.path().to_str().unwrap().to_string();
+    std::fs::write(dir.path().join("Alpha.txt"), b"").unwrap();
+    let handle = 0x0000_C021usize as HANDLE;
+    let no_children = |_: &str| -> Option<Vec<policy::OverlayChildMeta>> { Some(Vec::new()) };
+    let no_whiteouts = |_: &str| -> Option<Vec<String>> { Some(Vec::new()) };
+    let page = build_dir_info_buffer(&["alpha.txt"]);
+    let mut buf = page.clone();
+
+    let mut iosb1: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    iosb1.Information = page.len();
+    let cfg1 = MergeCallCfg {
+        restart_scan: false,
+        return_single_entry: false,
+        original_status: 0,
+    };
+    assert_eq!(
+        drive_merge_call(&mut buf, &mut iosb1, handle, &dir_str, &cfg1,
+            (&no_children, &no_whiteouts)),
+        0
+    );
+    assert_eq!(collect_names(&buf[..iosb1.Information]),
+        vec!["Alpha.txt".to_string()]);
+
+    // Restart: a fresh generation rebuilds the map from the renamed disk.
+    std::fs::rename(dir.path().join("Alpha.txt"), dir.path().join("ALPHA.TXT")).unwrap();
+    let mut iosb2: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    iosb2.Information = page.len();
+    let cfg2 = MergeCallCfg {
+        restart_scan: true,
+        return_single_entry: false,
+        original_status: 0,
+    };
+    assert_eq!(
+        drive_merge_call(&mut buf, &mut iosb2, handle, &dir_str, &cfg2,
+            (&no_children, &no_whiteouts)),
+        0
+    );
+    assert_eq!(collect_names(&buf[..iosb2.Information]),
+        vec!["ALPHA.TXT".to_string()],
+        "generation restart re-snapshots the case map");
+    let _ = take_enum_state(handle as usize);
 }

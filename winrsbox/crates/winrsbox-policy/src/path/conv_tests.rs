@@ -66,6 +66,16 @@ fn nt_to_dos_lower_casefold() {
     let raw: Vec<u16> = r"\??\C:\Users\ALICE\FOO.TXT".encode_utf16().collect();
     let result = nt_to_dos_lower(&raw).unwrap();
     assert_eq!(result, "c:\\users\\alice\\foo.txt");
+    // S11: case-paired non-ASCII now folds per the kernel upcase/downcase
+    // tables (Cyrillic АБВ → абв, ВОД → вод) — hardcoded expected literals.
+    let raw: Vec<u16> = r"\??\C:\АБВ\ВОД.txt".encode_utf16().collect();
+    let result = nt_to_dos_lower(&raw).unwrap();
+    assert_eq!(result, "c:\\абв\\вод.txt");
+    // Kernel-conservative letters pass through (kernel table identity):
+    // İ ı ς ß are NOT folded, unlike Rust's Unicode mappings.
+    let raw: Vec<u16> = r"\??\C:\İıςß\Straße.txt".encode_utf16().collect();
+    let result = nt_to_dos_lower(&raw).unwrap();
+    assert_eq!(result, "c:\\İıςß\\straße.txt");
 }
 
 #[test]
@@ -76,10 +86,14 @@ fn nt_to_dos_non_ascii_preserved() {
 }
 
 #[test]
-fn nt_to_dos_lower_non_ascii_preserved() {
+fn nt_to_dos_lower_non_ascii_folds() {
+    // S11: nt_to_dos_lower now folds case-paired non-ASCII — uppercase
+    // Cyrillic Ф and У fold to ф and у, and Greek Γ (U+0393) folds to Greek
+    // γ (U+03B3) — hardcoded expected literals (the old oracle pinned the
+    // mixed-script trio unchanged).
     let raw: Vec<u16> = r"\??\C:\ФУΓ.txt".encode_utf16().collect();
     let result = nt_to_dos_lower(&raw).unwrap();
-    assert!(result.contains("ФУΓ"));
+    assert_eq!(result, "c:\\фу\u{3b3}.txt");
 }
 
 // ── dos_to_nt ──────────────────────────────────────────────────────────
@@ -195,18 +209,19 @@ fn mirror_basic_pretty() {
 }
 
 #[test]
-fn ascii_lower_handles_surrogate_pairs() {
-    // U+1F600 (😀) = surrogate pair 0xD83D 0xDE00 in UTF-16
+fn kernel_fold_handles_surrogate_pairs() {
+    // U+1F600 (😀) = surrogate pair 0xD83D 0xDE00 in UTF-16 — folding is
+    // per-unit and surrogate units pass through, so astral chars survive.
     let input: [u16; 6] = [b'A' as u16, b'b' as u16, 0xD83D, 0xDE00, b'C' as u16, b'd' as u16];
-    let out = u16_slice_to_ascii_lower(&input, true);
+    let out = u16_slice_fold(&input, true);
     assert!(out.starts_with("ab"), "expected lowercase ab prefix: {:?}", out);
     assert!(out.ends_with("cd"), "expected lowercase cd suffix: {:?}", out);
     assert!(out.contains('\u{1F600}'), "emoji preserved: {:?}", out);
     assert_eq!(out, "ab\u{1F600}cd");
 
-    // Without lowercase flag — A and C stay uppercase
-    let out_no_lower = u16_slice_to_ascii_lower(&input, false);
-    assert_eq!(out_no_lower, "Ab\u{1F600}Cd");
+    // Without the fold flag — A and C stay uppercase
+    let out_no_fold = u16_slice_fold(&input, false);
+    assert_eq!(out_no_fold, "Ab\u{1F600}Cd");
 }
 
 // ── fold_dos_dots ──────────────────────────────────────────────────────

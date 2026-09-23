@@ -5,6 +5,7 @@ mod core_tests;
 mod project_tests;
 mod whiteout_tests;
 mod overlay_case_tests;
+mod s11_case_fold_tests;
 
 fn make_policy_with_project(project_name: &str) -> (tempfile::TempDir, Policy, PathBuf) {
     let dir = tempfile::tempdir().unwrap();

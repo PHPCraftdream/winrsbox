@@ -92,8 +92,45 @@ pub(crate) fn inject_dll(process: HANDLE, thread: HANDLE, dll_path: &str) -> Res
 
 // ─── Pre-launch code integrity scan ──────────────────────────────────────────
 
-/// Scan the main exe's .text section for direct syscall instructions before
-/// resuming the child process. Returns Err if syscall instructions are found.
+/// Bound per-read chunk for the remote image scan: it bounds MEMORY, not
+/// coverage — every byte of the requested range is read and decoded exactly
+/// once (plus the 15-byte instruction overlap below), regardless of section
+/// size. S06 gap 4 (XA review 2026-09-20): replaces the silent
+/// `min(64 MiB)` truncation whose tail of a large section went unscanned.
+/// Residual: a hostile image with an enormous claimed section size can cost
+/// scan TIME (the read fails closed at the first unmapped page), never
+/// unbounded scan memory.
+const REMOTE_SCAN_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Longest possible x86-64 instruction — chunk overlap so an instruction
+/// straddling a chunk boundary is still decoded by the earlier pass.
+const REMOTE_SCAN_CHUNK_OVERLAP: usize = 15;
+
+/// Read+decode `[base, base + size)` out of the target image in bounded
+/// chunks. Any read failure propagates — fail closed: the target must not
+/// run over an image we could not fully check.
+fn scan_remote_region(
+    process: HANDLE,
+    base: usize,
+    size: usize,
+) -> Result<Vec<policy::scan::SyscallHit>> {
+    let mut hits = Vec::new();
+    let mut off = 0usize;
+    while off < size {
+        let n = (size - off).min(REMOTE_SCAN_CHUNK_BYTES);
+        let ext = (n + REMOTE_SCAN_CHUNK_OVERLAP).min(size - off);
+        let mut buf = vec![0u8; ext];
+        read_remote_memory(process, base + off, &mut buf)?;
+        for h in policy::scan::find_direct_syscalls_multi_entry(&buf, (base + off) as u64) {
+            hits.push(policy::scan::SyscallHit { offset: off + h.offset, kind: h.kind });
+        }
+        off += n;
+    }
+    Ok(hits)
+}
+
+/// Scan the main exe's executable sections for direct syscall instructions
+/// before resuming the child process. Returns Err if syscall instructions are found.
 pub(crate) fn pre_launch_scan(
     process: HANDLE,
     target_exe: &str,
@@ -109,36 +146,37 @@ pub(crate) fn pre_launch_scan(
     let mut pe_headers = vec![0u8; 4096];
     read_remote_memory(process, image_base, &mut pe_headers)
         .context("read PE headers")?;
-    let text = policy::scan::pe_text_section(&pe_headers)
-        .context("no .text section in PE")?;
-
-    // Cap to a sane size to avoid pathological inputs
-    let scan_size = (text.virtual_size as usize).min(64 * 1024 * 1024);
-    let mut text_bytes = vec![0u8; scan_size];
-    read_remote_memory(
-        process,
-        image_base + text.virtual_address as usize,
-        &mut text_bytes,
-    )
-    .context("read .text section")?;
-
-    let text_base = (image_base + text.virtual_address as usize) as u64;
-    let hits = policy::scan::find_direct_syscalls(&text_bytes, text_base);
-    if hits.is_empty() {
-        return Ok(());
+    // S06 gap 3 (XA review 2026-09-20): scan EVERY executable section, not
+    // just ".text" — a target can carry additional IMAGE_SCN_MEM_EXECUTE
+    // sections. S06 gap 4: no size cap — the old `min(64 MiB)` silently
+    // left the tail of large sections unchecked; sections are read+decoded
+    // in bounded chunks instead (see `scan_remote_region`).
+    let exec_sections = policy::scan::pe_executable_sections(&pe_headers);
+    if exec_sections.is_empty() {
+        anyhow::bail!("no executable section in PE");
     }
 
-    // Log violation
-    log_pre_launch_violation(violations_log, target_pid, target_exe, &hits);
-    eprintln!(
-        "[VIOLATION] pre-launch scan: {} direct syscall(s) in {} (.text)",
-        hits.len(),
-        target_exe,
-    );
-    for h in hits.iter().take(5) {
-        eprintln!("  - {} at offset 0x{:x}", h.kind, h.offset);
+    for section in &exec_sections {
+        let sec_base = image_base + section.virtual_address as usize;
+        let hits = scan_remote_region(process, sec_base, section.virtual_size as usize)?;
+        if hits.is_empty() {
+            continue;
+        }
+
+        // Log violation
+        log_pre_launch_violation(violations_log, target_pid, target_exe, &hits);
+        eprintln!(
+            "[VIOLATION] pre-launch scan: {} direct syscall(s) in {} (executable section at RVA 0x{:x})",
+            hits.len(),
+            target_exe,
+            section.virtual_address,
+        );
+        for h in hits.iter().take(5) {
+            eprintln!("  - {} at offset 0x{:x}", h.kind, h.offset);
+        }
+        anyhow::bail!("direct syscall instructions found in target executable section");
     }
-    anyhow::bail!("direct syscall instructions found in target .text");
+    Ok(())
 }
 
 pub(crate) fn log_pre_launch_violation(
@@ -242,6 +280,190 @@ pub(crate) fn read_remote_memory(process: HANDLE, addr: usize, buf: &mut [u8]) -
     }
     Ok(())
 }
+
+// ─── Locate and verify hook.dll before injection ───────────────────────────
+// Moved here from sandbox/mod.rs (layout-guard: that file was over the
+// 1000-line limit) — "find hook.dll and verify its staged integrity before
+// injecting it" belongs with the rest of this file's DLL-injection concerns.
+
+pub(crate) fn find_hook_dll() -> Result<String> {
+    let exe = std::env::current_exe()?;
+    let dll = exe
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("hook.dll");
+    anyhow::ensure!(
+        dll.exists(),
+        "hook.dll not found at {}",
+        dll.display()
+    );
+    let dll = dll.to_string_lossy().into_owned();
+    // Defense-in-depth before injection: refuse self-installs inside the
+    // guest's project tree (no policy rule can protect them there), then
+    // verify the staged exe/DLL digests against the installer's integrity
+    // manifest so a trojanized artifact becomes a loud refusal instead of a
+    // silent injection of attacker-controlled code.
+    verify_not_inside_guest_project_node_modules(&dll)?;
+    verify_staged_artifacts(&dll)?;
+    Ok(dll)
+}
+
+/// SHA-256 of a file via CNG's one-shot `BCryptHash` (no streaming state to
+/// manage). Used by the staged-artifact integrity check below.
+pub(super) fn sha256_file(path: &Path) -> Result<[u8; 32]> {
+    use windows::Win32::Security::Cryptography::{
+        BCryptCloseAlgorithmProvider, BCryptHash, BCryptOpenAlgorithmProvider,
+        BCRYPT_ALG_HANDLE, BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS, BCRYPT_SHA256_ALGORITHM,
+    };
+
+    let mut alg = BCRYPT_ALG_HANDLE::default();
+    // SAFETY: alg is a valid out handle pointer; BCRYPT_SHA256_ALGORITHM is a
+    //         static null-terminated wide string; no implementation pin needed.
+    let status = unsafe {
+        BCryptOpenAlgorithmProvider(
+            &mut alg,
+            BCRYPT_SHA256_ALGORITHM,
+            PCWSTR::null(),
+            BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS(0),
+        )
+    };
+    if status.0 < 0 {
+        anyhow::bail!("BCryptOpenAlgorithmProvider failed: 0x{:08X}", status.0);
+    }
+    let data = std::fs::read(path)
+        .with_context(|| format!("read {} for hashing", path.display()))?;
+    let mut out = [0u8; 32];
+    // SAFETY: alg was opened above; out is a valid 32-byte buffer (the
+    //         SHA-256 digest size).
+    let status = unsafe { BCryptHash(alg, None, &data, &mut out) };
+    // SAFETY: alg was opened above and is not used after this point.
+    unsafe { let _ = BCryptCloseAlgorithmProvider(alg, 0); }
+    if status.0 < 0 {
+        anyhow::bail!("BCryptHash failed: 0x{:08X}", status.0);
+    }
+    Ok(out)
+}
+
+/// Lowercase-hex encoding of a 32-byte digest (the manifest's format).
+pub(super) fn digest_to_hex(d: &[u8; 32]) -> String {
+    d.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Verify the launcher exe and the hook.dll it is about to inject still match
+/// the digests recorded in `integrity.json` next to the exe (written by the
+/// npm installer at deploy time). A MISSING manifest is fine — that is an
+/// unmanaged deployment (e.g. a dev `cargo build`) with nothing to verify.
+/// A present-but-mismatched manifest fails closed: a silently swapped
+/// exe/DLL turns into a loud refusal instead of an injection of
+/// attacker-controlled code.
+pub(super) fn verify_staged_artifacts_in(exe_path: &Path, dll_path: &Path) -> Result<()> {
+    let manifest_path = exe_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("integrity.json");
+    if !manifest_path.exists() {
+        return Ok(());
+    }
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("read integrity manifest {}", manifest_path.display()))?,
+    )
+    .with_context(|| format!("parse integrity manifest {}", manifest_path.display()))?;
+
+    anyhow::ensure!(
+        manifest.get("algorithm").and_then(|v| v.as_str()) == Some("sha256"),
+        "integrity manifest {} must declare algorithm == \"sha256\"",
+        manifest_path.display()
+    );
+    let files = manifest
+        .get("files")
+        .and_then(|v| v.as_object())
+        .with_context(|| format!("integrity manifest {} has no `files` object", manifest_path.display()))?;
+    let expected = |name: &str| -> Result<String> {
+        let v = files
+            .get(name)
+            .and_then(|v| v.as_str())
+            .with_context(|| format!("integrity manifest files[\"{name}\"] missing or not a string"))?;
+        // Fail closed on anything that is not a 64-char lowercase-hex digest —
+        // a manifest we cannot strictly parse is a manifest we cannot trust.
+        anyhow::ensure!(
+            v.len() == 64 && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "integrity manifest files[\"{name}\"] is not a 64-char lowercase-hex SHA-256 digest"
+        );
+        Ok(v.to_ascii_lowercase())
+    };
+    let want_exe = expected("winrsbox.exe")?;
+    let want_dll = expected("hook.dll")?;
+
+    let actual_exe = digest_to_hex(&sha256_file(exe_path)?);
+    anyhow::ensure!(
+        actual_exe == want_exe,
+        "integrity check FAILED for {}: expected sha256 {}…, actual {}… — \
+         the launcher binary was modified after install; refusing to run",
+        exe_path.display(),
+        &want_exe[..16],
+        &actual_exe[..16]
+    );
+    let actual_dll = digest_to_hex(&sha256_file(dll_path)?);
+    anyhow::ensure!(
+        actual_dll == want_dll,
+        "integrity check FAILED for {}: expected sha256 {}…, actual {}… — \
+         hook.dll was modified after install; refusing to inject it",
+        dll_path.display(),
+        &want_dll[..16],
+        &actual_dll[..16]
+    );
+    Ok(())
+}
+
+/// `verify_staged_artifacts_in` bound to the real launcher exe.
+fn verify_staged_artifacts(dll_path: &str) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    verify_staged_artifacts_in(&exe, Path::new(dll_path))
+}
+
+/// Refuse to run when the launcher itself is installed inside the sandboxed
+/// project's `node_modules`. There the project_root passthrough short-circuits
+/// every policy rule (policy/src/decide.rs compute()), so a guest could
+/// trojanize winrsbox.exe/hook.dll for the NEXT run — no deny rule can fix
+/// that. The only remedy is refusing to launch from such a location.
+fn verify_not_inside_guest_project_node_modules(dll_path: &str) -> Result<()> {
+    // Canonical form for comparison: backslash separators, lowercased,
+    // `\\?\` device prefix stripped (current_exe can return it).
+    let normalize = |p: &Path| -> String {
+        // S11: kernel-identity fold — ASCII folds byte-identically to the old
+        // ASCII-only lowercase, non-ASCII compares by NTFS identity too.
+        let lossy = p.to_string_lossy();
+        let folded = policy::path::nt_case_fold(&lossy);
+        let s = folded.replace('/', "\\");
+        s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+    };
+    let exe = std::env::current_exe()?;
+    let exe_dir = match exe.parent() {
+        Some(d) => normalize(d),
+        // No parent dir → cannot be inside anything.
+        None => return Ok(()),
+    };
+    let nm_root = normalize(&std::env::current_dir()?.join("node_modules"));
+    // Containment mirrors policy/src/decide.rs path_contained_in: prefix
+    // match + separator boundary, so `...\node_modules` does not match a
+    // sibling like `...\node_modules_bak`.
+    let contained = exe_dir.starts_with(&nm_root)
+        && (exe_dir.len() == nm_root.len()
+            || exe_dir.as_bytes().get(nm_root.len()) == Some(&b'\\'));
+    anyhow::ensure!(
+        !contained,
+        "refusing to launch: the winrsbox install itself ({}, containing {}) sits inside \
+         the sandboxed project's node_modules, where the guest's project_root passthrough \
+         makes every policy rule moot — a sandboxed process could trojanize winrsbox.exe \
+         for the next run. Run the sandbox from a different directory or install winrsbox \
+         globally.",
+        exe_dir,
+        dll_path
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

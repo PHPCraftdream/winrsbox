@@ -9,6 +9,11 @@
 // Also rewrites entry names from lowercase overlay storage back to their
 // original case (the physical overlay stores everything lowercase; callers
 // need to see the original mixed-case names from the real host disk).
+//
+// Review XA 2026-09-20 R03: the real syscall is given a hook-private
+// staging buffer, never the caller's FileInformation — raw kernel output
+// never lands in guest-readable memory, and only the filtered bytes are
+// published back (DirQueryStaging in supervision.rs).
 
 use std::sync::OnceLock;
 // Only the test modules (split out into sibling files) reach for these.
@@ -46,7 +51,8 @@ type FnNtQueryDirectoryFile = unsafe extern "system" fn(
 
 /// NtQueryDirectoryFileEx — same as NtQueryDirectoryFile but replaces
 /// ReturnSingleEntry+RestartScan with a single QueryFlags ULONG.
-/// SL_RESTART_SCAN = 0x00000001, SL_RETURN_SINGLE_ENTRY = 0x00000002.
+/// SL_RESTART_SCAN = 0x00000001, SL_RETURN_SINGLE_ENTRY = 0x00000002
+/// (see the constants below).
 type FnNtQueryDirectoryFileEx = unsafe extern "system" fn(
     HANDLE,                  // FileHandle
     HANDLE,                  // Event
@@ -134,11 +140,20 @@ pub(crate) const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 /// doesn't matter here, only "not a suspicious 0 next to a nonzero size".
 pub(crate) const ASSUMED_CLUSTER_SIZE: u64 = 4096;
 
+mod enum_state;
 mod r#match;
 mod supervision;
 
+pub(crate) use enum_state::*;
 pub(crate) use r#match::*;
 pub(crate) use supervision::*;
+
+/// QueryFlags bit for NtQueryDirectoryFileEx: restart the enumeration from
+/// the beginning (the classic ABI passes this as a separate BOOLEAN).
+pub(crate) const SL_RESTART_SCAN: u32 = 0x0000_0001;
+/// QueryFlags bit for NtQueryDirectoryFileEx: at most one entry per call
+/// (the classic ABI passes this as a separate BOOLEAN).
+pub(crate) const SL_RETURN_SINGLE_ENTRY: u32 = 0x0000_0002;
 
 /// Shared post-processing: filter hidden entries, then rewrite entry case.
 ///
@@ -156,9 +171,15 @@ pub(crate) use supervision::*;
 /// this distinctly from "enumeration exhausted" (`STATUS_NO_MORE_FILES`,
 /// 0x80000006) — only `STATUS_NO_SUCH_FILE` means "the given name/pattern
 /// has zero real matches", which is exactly the case where an overlay-only
-/// match must be synthesized. Gating on this specific code (rather than any
+/// match must be merged in. Gating on this specific code (rather than any
 /// non-zero status) means a genuine end-of-enumeration or an unrelated error
-/// is never misread as "try synthesizing".
+/// is never misread as "try merging". There is no longer a dedicated
+/// synthesis block for it: `process_dir_output` treats it uniformly as
+/// "the real stream is done", and the overlay phase merges matches into
+/// the stale buffer from offset 0. The kernel has already written
+/// Status = STATUS_NO_SUCH_FILE into the IOSB for such a call; the end
+/// phase passes it through unchanged whenever nothing is delivered on top
+/// of it.
 pub(crate) const STATUS_NO_SUCH_FILE: NTSTATUS = 0xC000000Fu32 as NTSTATUS;
 
 /// The real STATUS_NO_MORE_FILES — error severity (0x8…), "the enumeration is
@@ -213,13 +234,24 @@ unsafe extern "system" fn hook_nt_query_directory_file(
         );
     };
 
+    // Degenerate call (null output buffer): nothing can be written or
+    // leaked, and the kernel rejects it synchronously (the buffer probe
+    // fails before the IRP starts) — pass it through unchanged.
+    if file_information.is_null() {
+        return nt_call_original!(
+            &HOOK_NT_QUERY_DIRECTORY_FILE,
+            "NtQueryDirectoryFile",
+            (file_handle, event, apc_routine, apc_context, io_status_block,
+             file_information, length, file_information_class,
+             return_single_entry, file_name, restart_scan)
+        );
+    }
+
     // Async-supervision gate: a query on a handle opened for asynchronous
-    // I/O used to return STATUS_PENDING here, fell through
-    // process_dir_output's `original_status != 0` early-return, and the
-    // guest later read an unfiltered listing once the I/O completed.
-    // Substitute our own event so completion cannot be observed before
-    // filtering; on STATUS_PENDING block until completion and hand the
-    // filter the final status.
+    // I/O used to return STATUS_PENDING here and the guest later read an
+    // unfiltered listing once the I/O completed. Substitute our own event
+    // so completion cannot be observed before filtering; on STATUS_PENDING
+    // block until completion and hand the filter the final status.
     let Some(supervision) = DirQuerySupervision::new(event) else {
         // Fail-closed: never run a query we cannot supervise.
         if hooks::is_trace() {
@@ -229,14 +261,34 @@ unsafe extern "system" fn hook_nt_query_directory_file(
         return STATUS_INSUFFICIENT_RESOURCES;
     };
 
+    // R03 (review XA 2026-09-20): the kernel must never write its raw
+    // enumeration into the caller's buffer — a second guest thread that
+    // can name the address could read it before the filter runs, and an
+    // IOCP wake-up (not routed through the Event argument) would observe
+    // the same raw bytes. Hand the syscall a private staging buffer
+    // instead and publish only the filtered bytes afterwards
+    // (DirQueryStaging::publish).
+    let staging = match DirQueryStaging::new(file_information, length as usize) {
+        Some(s) => s,
+        None => {
+            if hooks::is_trace() {
+                hooks::ipc_log(ipc::LogLevel::Trace,
+                    "fs_enum_staging_refused: staging allocation failed".to_string());
+            }
+            // Fail-closed: never run the query against the guest's own buffer.
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    };
+
     // SAFETY: detour2 trampoline matches FnNtQueryDirectoryFile ABI; the
-    // caller's Event handle is replaced by supervision.query_event() (see
-    // DirQuerySupervision) — every other argument passes through unchanged.
+    // caller's Event handle is replaced by supervision.query_event() and
+    // FileInformation by staging.kernel_ptr() (see DirQuerySupervision /
+    // DirQueryStaging) — every other argument passes through unchanged.
     let status = nt_call_original!(
         &HOOK_NT_QUERY_DIRECTORY_FILE,
         "NtQueryDirectoryFile",
         (file_handle, supervision.query_event(), apc_routine, apc_context,
-         io_status_block, file_information, length, file_information_class,
+         io_status_block, staging.kernel_ptr(), length, file_information_class,
          return_single_entry, file_name, restart_scan)
     );
 
@@ -248,18 +300,57 @@ unsafe extern "system" fn hook_nt_query_directory_file(
     // SAFETY: file_name is the same UNICODE_STRING pointer ntdll passed us;
     // valid (or null) per the NT contract at hook entry.
     let search_pattern = extract_search_pattern(file_name);
-    // `supervision` drops only AFTER the process_dir_output tail expression
-    // below is evaluated: Drop signals the caller's event strictly after the
-    // buffer has been filtered, so pre-filter data is never observable.
-    process_dir_output(
-        file_information,
+    // Re-invokes the original with RestartScan cleared (0): the merge uses
+    // this to pull further real pages past a fully hidden page — a
+    // hidden-only page must not be reported as end-of-enumeration.
+    let mut requery = || -> NTSTATUS {
+        // SAFETY: same trampoline/ABI as the primary call above; same
+        // substitute event and IOSB, so the requery is supervised too.
+        let s = nt_call_original!(
+            &HOOK_NT_QUERY_DIRECTORY_FILE,
+            "NtQueryDirectoryFile",
+            (file_handle, supervision.query_event(), apc_routine, apc_context,
+             io_status_block, staging.kernel_ptr(), length, file_information_class,
+             return_single_entry, file_name, 0u8)
+        );
+        // SAFETY: io_status_block is the same pointer the original call was
+        // given (or null, which passes through untouched).
+        supervision.wait_if_pending(s, io_status_block)
+    };
+    // Production merge sources are the IPC client functions themselves;
+    // unit tests substitute stub closures (see dir_filter::tests).
+    let sources = DirMergeSources {
+        overlay_children: &crate::ipc_client::ipc_overlay_children,
+        whiteouts_under: &crate::ipc_client::ipc_whiteouts_under,
+    };
+    let mut ctx = DirQueryCtx {
+        file_information: staging.kernel_ptr(),
         io_status_block,
-        file_information_class,
-        dir_dos.as_deref(),
-        status,
-        length as usize,
-        search_pattern.as_deref(),
-    )
+        class: file_information_class,
+        capacity: length as usize,
+        handle: file_handle,
+        return_single_entry: return_single_entry != 0,
+        restart_scan: restart_scan != 0,
+        pattern_from_call: search_pattern,
+        dir_dos,
+        original_status: status,
+        requery: &mut requery,
+        sources,
+    };
+    // `supervision` is declared BEFORE requery/ctx, so Drop order
+    // (ctx → requery → staging → supervision) deallocates the staging
+    // buffer and only then signals the caller's event — and the explicit
+    // `staging.publish` above runs before both, so the event-gated
+    // observation is always the post-filter, post-copy state.
+    let status = process_dir_output(&mut ctx);
+    // R03: publish (copy the filtered bytes into the caller's buffer) runs
+    // here, still inside the hook frame and BEFORE supervision's Drop
+    // signals the caller's event — the event-gated observation is always
+    // the post-filter state, with buffer and IOSB rewritten together.
+    // SAFETY: io_status_block is the pointer the original call was given;
+    // the caller buffer was validated non-null above and outlives this call.
+    staging.publish(io_status_block);
+    status
 }
 
 // SAFETY: Called by detour2 dispatcher with ntdll!NtQueryDirectoryFileEx ABI.
@@ -285,13 +376,24 @@ unsafe extern "system" fn hook_nt_query_directory_file_ex(
         );
     };
 
+    // Degenerate call (null output buffer): nothing can be written or
+    // leaked, and the kernel rejects it synchronously (the buffer probe
+    // fails before the IRP starts) — pass it through unchanged.
+    if file_information.is_null() {
+        return nt_call_original!(
+            &HOOK_NT_QUERY_DIRECTORY_FILE_EX,
+            "NtQueryDirectoryFileEx",
+            (file_handle, event, apc_routine, apc_context, io_status_block,
+             file_information, length, file_information_class,
+             query_flags, file_name)
+        );
+    }
+
     // Async-supervision gate: a query on a handle opened for asynchronous
-    // I/O used to return STATUS_PENDING here, fell through
-    // process_dir_output's `original_status != 0` early-return, and the
-    // guest later read an unfiltered listing once the I/O completed.
-    // Substitute our own event so completion cannot be observed before
-    // filtering; on STATUS_PENDING block until completion and hand the
-    // filter the final status.
+    // I/O used to return STATUS_PENDING here and the guest later read an
+    // unfiltered listing once the I/O completed. Substitute our own event
+    // so completion cannot be observed before filtering; on STATUS_PENDING
+    // block until completion and hand the filter the final status.
     let Some(supervision) = DirQuerySupervision::new(event) else {
         // Fail-closed: never run a query we cannot supervise.
         if hooks::is_trace() {
@@ -301,14 +403,34 @@ unsafe extern "system" fn hook_nt_query_directory_file_ex(
         return STATUS_INSUFFICIENT_RESOURCES;
     };
 
+    // R03 (review XA 2026-09-20): the kernel must never write its raw
+    // enumeration into the caller's buffer — a second guest thread that
+    // can name the address could read it before the filter runs, and an
+    // IOCP wake-up (not routed through the Event argument) would observe
+    // the same raw bytes. Hand the syscall a private staging buffer
+    // instead and publish only the filtered bytes afterwards
+    // (DirQueryStaging::publish).
+    let staging = match DirQueryStaging::new(file_information, length as usize) {
+        Some(s) => s,
+        None => {
+            if hooks::is_trace() {
+                hooks::ipc_log(ipc::LogLevel::Trace,
+                    "fs_enum_staging_refused: staging allocation failed".to_string());
+            }
+            // Fail-closed: never run the query against the guest's own buffer.
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    };
+
     // SAFETY: detour2 trampoline matches FnNtQueryDirectoryFileEx ABI; the
-    // caller's Event handle is replaced by supervision.query_event() (see
-    // DirQuerySupervision) — every other argument passes through unchanged.
+    // caller's Event handle is replaced by supervision.query_event() and
+    // FileInformation by staging.kernel_ptr() (see DirQuerySupervision /
+    // DirQueryStaging) — every other argument passes through unchanged.
     let status = nt_call_original!(
         &HOOK_NT_QUERY_DIRECTORY_FILE_EX,
         "NtQueryDirectoryFileEx",
         (file_handle, supervision.query_event(), apc_routine, apc_context,
-         io_status_block, file_information, length, file_information_class,
+         io_status_block, staging.kernel_ptr(), length, file_information_class,
          query_flags, file_name)
     );
 
@@ -320,18 +442,57 @@ unsafe extern "system" fn hook_nt_query_directory_file_ex(
     // SAFETY: file_name is the same UNICODE_STRING pointer ntdll passed us;
     // valid (or null) per the NT contract at hook entry.
     let search_pattern = extract_search_pattern(file_name);
-    // `supervision` drops only AFTER the process_dir_output tail expression
-    // below is evaluated: Drop signals the caller's event strictly after the
-    // buffer has been filtered, so pre-filter data is never observable.
-    process_dir_output(
-        file_information,
+    // Re-invokes the original with SL_RESTART_SCAN cleared: the merge uses
+    // this to pull further real pages past a fully hidden page — a
+    // hidden-only page must not be reported as end-of-enumeration.
+    let mut requery = || -> NTSTATUS {
+        // SAFETY: same trampoline/ABI as the primary call above; same
+        // substitute event and IOSB, so the requery is supervised too.
+        let s = nt_call_original!(
+            &HOOK_NT_QUERY_DIRECTORY_FILE_EX,
+            "NtQueryDirectoryFileEx",
+            (file_handle, supervision.query_event(), apc_routine, apc_context,
+             io_status_block, staging.kernel_ptr(), length, file_information_class,
+             query_flags & !SL_RESTART_SCAN, file_name)
+        );
+        // SAFETY: io_status_block is the same pointer the original call was
+        // given (or null, which passes through untouched).
+        supervision.wait_if_pending(s, io_status_block)
+    };
+    // Production merge sources are the IPC client functions themselves;
+    // unit tests substitute stub closures (see dir_filter::tests).
+    let sources = DirMergeSources {
+        overlay_children: &crate::ipc_client::ipc_overlay_children,
+        whiteouts_under: &crate::ipc_client::ipc_whiteouts_under,
+    };
+    let mut ctx = DirQueryCtx {
+        file_information: staging.kernel_ptr(),
         io_status_block,
-        file_information_class,
-        dir_dos.as_deref(),
-        status,
-        length as usize,
-        search_pattern.as_deref(),
-    )
+        class: file_information_class,
+        capacity: length as usize,
+        handle: file_handle,
+        return_single_entry: (query_flags & SL_RETURN_SINGLE_ENTRY) != 0,
+        restart_scan: (query_flags & SL_RESTART_SCAN) != 0,
+        pattern_from_call: search_pattern,
+        dir_dos,
+        original_status: status,
+        requery: &mut requery,
+        sources,
+    };
+    // `supervision` is declared BEFORE requery/ctx, so Drop order
+    // (ctx → requery → staging → supervision) deallocates the staging
+    // buffer and only then signals the caller's event — and the explicit
+    // `staging.publish` above runs before both, so the event-gated
+    // observation is always the post-filter, post-copy state.
+    let status = process_dir_output(&mut ctx);
+    // R03: publish (copy the filtered bytes into the caller's buffer) runs
+    // here, still inside the hook frame and BEFORE supervision's Drop
+    // signals the caller's event — the event-gated observation is always
+    // the post-filter state, with buffer and IOSB rewritten together.
+    // SAFETY: io_status_block is the pointer the original call was given;
+    // the caller buffer was validated non-null above and outlives this call.
+    staging.publish(io_status_block);
+    status
 }
 
 // ---------------------------------------------------------------------------
@@ -372,5 +533,7 @@ pub unsafe fn uninstall() {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod match_tests;
+#[cfg(test)]
+mod merge_tests;
 #[cfg(test)]
 mod tests;

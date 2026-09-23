@@ -3,17 +3,20 @@
 mod conn;
 mod ownership;
 mod records;
-mod security;
+// pub(crate): sandbox::launch_prep (R04-1b) reuses current_user_string_sid
+// and the raw ConvertStringSecurityDescriptorToSecurityDescriptorW binding
+// for the init-handshake events' explicit SDDL, following the same
+// technique this module proved for the IPC pipe.
+pub(crate) mod security;
 #[cfg(test)]
 mod inflight_budget_tests;
 #[cfg(test)]
 mod tests;
 
-use ipc::{read_msg, write_msg, LogLevel, Req, Resp};
+use ipc::{LogLevel, Req, Resp};
 use policy::Policy;
 use std::{
     ffi::OsStr,
-    io::Read,
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::{
@@ -36,11 +39,20 @@ use winrsbox::observe::hot_stats::{HotStats, ThrottledFlusher};
 use winrsbox::observe::jsonl_log;
 
 pub(crate) use conn::{
-    create_pipe_instance, ByteBudget, PipeConnGuard, PrefixedReader, BYTE_BUDGET_WAIT,
-    MAX_CONCURRENT_HANDLERS, MAX_INFLIGHT_MSG_BYTES, PIPE_ACCEPT_POOL_SIZE,
+    create_pipe_instance, ByteBudget, PipeConnGuard, MAX_CONCURRENT_HANDLERS,
+    MAX_INFLIGHT_MSG_BYTES, PIPE_ACCEPT_POOL_SIZE,
 };
+// Only the in-file tests use these via `use super::*`; the request-read path
+// now lives in conn.rs (read_request_with_budget), which uses them directly.
+#[cfg(test)]
+pub(crate) use conn::PrefixedReader;
+// The in-file test modules glob-import `super::*` and relied on the `Read`
+// trait being in scope here (inflight_budget_tests calls read_to_end).
+#[cfg(test)]
+use std::io::Read;
 pub(crate) use ownership::{
-    is_owned_client_pid, process_create_time_from_handle, query_process_create_time,
+    decide_context, hello_exe_context, is_owned_client_pid, process_create_time_from_handle,
+    query_process_create_time, query_process_image_path, spawned_child_kinship,
 };
 pub(crate) use records::{
     append_violation_record, escape_violation_record, handle_net_decide, handle_record_overlay,
@@ -384,6 +396,10 @@ fn handle_connection(
     // Track the PID associated with this pipe connection
     let mut conn_pid: Option<u32> = None;
 
+    // Connection-local reusable IPC scratch buffers — capacity persists across messages on this connection, ipc-side shrink policy caps retained capacity.
+    let mut recv_buf = Vec::new();
+    let mut enc_buf = Vec::new();
+
     loop {
         if let Some(ref ph) = proc_handle {
             let mut exit_code = 0u32;
@@ -394,37 +410,14 @@ fn handle_connection(
             }
         }
 
-        // Audit: the guest declares the body length in the 4-byte prefix,
-        // and read_msg allocates exactly that much. Read the prefix here,
-        // reserve the declared size against the process-wide in-flight
-        // byte budget BEFORE the body is read (so declared-size x
-        // concurrency is capped at MAX_INFLIGHT_MSG_BYTES), then hand the
-        // prefix back to read_msg via PrefixedReader so parsing stays in
-        // the ipc crate.
-        let mut len_buf = [0u8; 4];
-        if file.read_exact(&mut len_buf).is_err() {
+        // Read one request with the in-flight byte budget applied (prefix
+        // read, budget reservation and PrefixedReader replay live in conn.rs).
+        // None → drop the connection; the reservation stays bound for the rest
+        // of this iteration, released at the next rebind / loop exit.
+        let Some((req, _budget)) =
+            conn::read_request_with_budget(&mut file, byte_budget, &mut recv_buf, client_pid)
+        else {
             break;
-        }
-        let declared = u32::from_le_bytes(len_buf) as usize;
-        // read_msg rejects oversized (and empty) bodies before allocating,
-        // so they never need budget.
-        let _budget = if declared > 0 && declared <= ipc::MAX_MSG_LEN {
-            match byte_budget.reserve_timeout(declared, BYTE_BUDGET_WAIT) {
-                Some(r) => Some(r),
-                None => {
-                    eprintln!(
-                        "[pipe] pid={client_pid}: in-flight byte budget exhausted ({declared}B declared) - dropping connection"
-                    );
-                    break;
-                }
-            }
-        } else {
-            None
-        };
-        let mut prefixed = PrefixedReader { prefix: len_buf, pos: 0, inner: &mut file };
-        let req: Req = match read_msg(&mut prefixed) {
-            Ok(r) => r,
-            Err(_) => break,
         };
 
         let resp = match req {
@@ -454,34 +447,71 @@ fn handle_connection(
                 }
                 hot_stats.totals.hellos.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 jsonl_log::log(jsonl_log::Event::hello(client_pid, &exe_path));
-                let exe_lower = exe_path.to_ascii_lowercase();
-                // Fingerprint the connecting process from the kernel. The client
-                // is alive on this connection, so this normally succeeds; 0
-                // fail-closes later connections (see tracked_entry_still_owned).
-                let live_ct = query_process_create_time(client_pid).unwrap_or(0);
-                if live_ct == 0 {
-                    eprintln!("[pipe] hello pid={client_pid}: creation-time probe failed — \
-                               entry stored with unknown fingerprint");
+                // SECURITY (S09): the claimed exe_path is diagnostics-only —
+                // policy context must come from the kernel's image path.
+                match hello_exe_context(client_pid, &exe_path) {
+                    Ok((exe_lower, claimed_mismatch)) => {
+                        if claimed_mismatch {
+                            eprintln!(
+                                "[pipe] WARN: Hello exe_path={exe_path} != kernel image path — \
+                                 using kernel path (possible spoof)",
+                            );
+                            stats.violations.fetch_add(1, Ordering::Relaxed);
+                            hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            jsonl_log::log_immediate(jsonl_log::Event::violation(
+                                client_pid,
+                                "HelloExeSpoof",
+                                &format!("claimed_exe={exe_path}"),
+                            ));
+                        }
+                        // Fingerprint the connecting process from the kernel. The client
+                        // is alive on this connection, so this normally succeeds; 0
+                        // fail-closes later connections (see tracked_entry_still_owned).
+                        let live_ct = query_process_create_time(client_pid).unwrap_or(0);
+                        if live_ct == 0 {
+                            eprintln!("[pipe] hello pid={client_pid}: creation-time probe failed — \
+                                       entry stored with unknown fingerprint");
+                        }
+                        let map = crate::sandbox::proc_table::global_proc_info().pin();
+                        if let Some(existing) = map.get(&client_pid) {
+                            // Already have entry (e.g., root target or SpawnedChild) — keep depth, update exe
+                            let updated = crate::sandbox::proc_table::ProcInfo {
+                                depth: existing.depth,
+                                exe_lower: Arc::from(exe_lower.as_str()),
+                                create_time: if live_ct != 0 { live_ct } else { existing.create_time },
+                            };
+                            map.insert(client_pid, updated);
+                        } else {
+                            // New process — insert with depth 0 (updated by SpawnedChild if child)
+                            map.insert(client_pid, crate::sandbox::proc_table::ProcInfo {
+                                depth: 0,
+                                exe_lower: Arc::from(exe_lower.as_str()),
+                                create_time: live_ct,
+                            });
+                        }
+                        conn_pid = Some(client_pid);
+                        Resp::Ok
+                    }
+                    Err(()) => {
+                        // SECURITY (S09, fail closed): kernel image query failed — leave the
+                        // proc table untouched (never overwrite an existing root entry) and
+                        // the connection un-Hello'd. The hook treats any non-matching
+                        // response as an IPC failure and fails closed (Deny) on later
+                        // decides, so an unresolved path can't purchase policy context.
+                        eprintln!(
+                            "[pipe] WARN: hello pid={client_pid}: kernel image path query \
+                             failed — refusing Hello (fail closed)",
+                        );
+                        stats.violations.fetch_add(1, Ordering::Relaxed);
+                        hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        jsonl_log::log_immediate(jsonl_log::Event::violation(
+                            client_pid,
+                            "HelloExeUnresolved",
+                            &format!("claimed_exe={exe_path}"),
+                        ));
+                        Resp::Err("hello: kernel image path unavailable".to_string())
+                    }
                 }
-                let map = crate::sandbox::proc_table::global_proc_info().pin();
-                if let Some(existing) = map.get(&client_pid) {
-                    // Already have entry (e.g., root target or SpawnedChild) — keep depth, update exe
-                    let updated = crate::sandbox::proc_table::ProcInfo {
-                        depth: existing.depth,
-                        exe_lower: Arc::from(exe_lower.as_str()),
-                        create_time: if live_ct != 0 { live_ct } else { existing.create_time },
-                    };
-                    map.insert(client_pid, updated);
-                } else {
-                    // New process — insert with depth 0 (updated by SpawnedChild if child)
-                    map.insert(client_pid, crate::sandbox::proc_table::ProcInfo {
-                        depth: 0,
-                        exe_lower: Arc::from(exe_lower.as_str()),
-                        create_time: live_ct,
-                    });
-                }
-                conn_pid = Some(client_pid);
-                Resp::Ok
             }
             Req::SpawnedChild { parent_pid, child_pid, child_exe } => {
                 // SECURITY (audit E1 cont.): a SpawnedChild report arrives on the
@@ -505,74 +535,160 @@ fn handle_connection(
                         &format!("claimed_parent={parent_pid} child={child_pid}"),
                     ));
                 }
-                if jsonl_log::console_verbose() {
-                    println!("[sandbox] child spawned: parent={client_pid} child={child_pid} exe={child_exe}");
+                // SECURITY (S09, handshake gate): the hook always Hellos first on
+                // a fresh connection (ipc_client.rs sends Hello before anything
+                // else), so SpawnedChild without Hello is hostile — refuse fail closed.
+                if conn_pid.is_none() {
+                    eprintln!(
+                        "[pipe] WARN: SpawnedChild before Hello from pid={client_pid} — \
+                         refused (fail closed)",
+                    );
+                    stats.violations.fetch_add(1, Ordering::Relaxed);
+                    hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    jsonl_log::log_immediate(jsonl_log::Event::violation(
+                        client_pid,
+                        "SpawnedChildBeforeHello",
+                        &format!("child={child_pid}"),
+                    ));
+                    Resp::Err("spawned_child: handshake required".to_string())
+                } else if !spawned_child_kinship(child_pid, client_pid) {
+                    // SECURITY (S09, kinship proof): kernel parentage is the trust
+                    // anchor — the creator PID the kernel records at CreateProcess is
+                    // immutable and survives parent death, so a hostile parent naming
+                    // an unrelated PID fails (the kernel records the real creator);
+                    // child_pid reuse is handled by the create-time fingerprint below.
+                    eprintln!(
+                        "[pipe] WARN: SpawnedChild child={child_pid} is not a kernel child of \
+                         client={client_pid} — rejected (possible spoof)",
+                    );
+                    stats.violations.fetch_add(1, Ordering::Relaxed);
+                    hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    jsonl_log::log_immediate(jsonl_log::Event::violation(
+                        client_pid,
+                        "SpawnedChildNotKin",
+                        &format!("child={child_pid}"),
+                    ));
+                    Resp::Err("spawned_child: kinship unverified".to_string())
+                } else {
+                    // Kinship proven — only now count the report as child telemetry.
+                    if jsonl_log::console_verbose() {
+                        println!("[sandbox] child spawned: parent={client_pid} child={child_pid} exe={child_exe}");
+                    }
+                    hot_stats.totals.children.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    jsonl_log::log(jsonl_log::Event::child(client_pid, child_pid, &child_exe));
+                    // Bounded, validated push; throttled log — a hostile loop
+                    // must not flood the immediate log path via rejections.
+                    if !crate::sandbox::child_drain::queue_child_pid(child_pids, child_pid) {
+                        stats.violations.fetch_add(1, Ordering::Relaxed);
+                        hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        jsonl_log::log(jsonl_log::Event::violation(
+                            client_pid,
+                            "ChildPidQueueRejected",
+                            &format!("child={child_pid}"),
+                        ));
+                    }
+                    // Fingerprint the freshly spawned child from the kernel so the
+                    // gate can pin its identity. If the probe fails (child died
+                    // already) the entry is stored with 0 and fail-closes; the
+                    // child's own Hello would refresh it if it ever connects.
+                    let child_ct = query_process_create_time(child_pid).unwrap_or(0);
+                    if child_ct == 0 {
+                        eprintln!("[pipe] SpawnedChild pid={child_pid}: creation-time probe failed — \
+                                   entry stored with unknown fingerprint");
+                    }
+                    let map = crate::sandbox::proc_table::global_proc_info().pin();
+                    let parent_depth = map.get(&client_pid).map(|p| p.depth).unwrap_or(0);
+                    // SECURITY (S09): verify the child's image path from the kernel
+                    // too. On probe failure the claimed exe is stored, but is inert
+                    // until the child's own Hello overwrites it with kernel truth
+                    // (Decide context only ever comes from the child's own
+                    // kernel-verified Hello connection).
+                    let (exe_lower, claimed_mismatch) = match query_process_image_path(child_pid) {
+                        Some(k) => {
+                            // S11: canonical NTFS-identity fold, matching the db's when.exe key fold.
+                            let kl = crate::fold_published(&k);
+                            let mismatch = kl != crate::fold_published(&child_exe);
+                            (kl, mismatch)
+                        }
+                        None => (crate::fold_published(&child_exe), false),
+                    };
+                    if claimed_mismatch {
+                        stats.violations.fetch_add(1, Ordering::Relaxed);
+                        hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        jsonl_log::log_immediate(jsonl_log::Event::violation(
+                            client_pid,
+                            "SpawnedChildExeSpoof",
+                            &format!("claimed_exe={child_exe}"),
+                        ));
+                    }
+                    map.insert(child_pid, crate::sandbox::proc_table::ProcInfo {
+                        depth: crate::sandbox::proc_table::child_depth(parent_depth),
+                        exe_lower: Arc::from(exe_lower.as_str()),
+                        create_time: child_ct,
+                    });
+                    Resp::Ok
                 }
-                hot_stats.totals.children.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                jsonl_log::log(jsonl_log::Event::child(client_pid, child_pid, &child_exe));
-                child_pids.push(child_pid);
-                // Fingerprint the freshly spawned child from the kernel so the
-                // gate can pin its identity. If the probe fails (child died
-                // already) the entry is stored with 0 and fail-closes; the
-                // child's own Hello would refresh it if it ever connects.
-                let child_ct = query_process_create_time(child_pid).unwrap_or(0);
-                if child_ct == 0 {
-                    eprintln!("[pipe] SpawnedChild pid={child_pid}: creation-time probe failed — \
-                               entry stored with unknown fingerprint");
-                }
-                let map = crate::sandbox::proc_table::global_proc_info().pin();
-                let parent_depth = map.get(&client_pid).map(|p| p.depth).unwrap_or(0);
-                let exe_lower = child_exe.to_ascii_lowercase();
-                map.insert(child_pid, crate::sandbox::proc_table::ProcInfo {
-                    depth: parent_depth + 1,
-                    exe_lower: Arc::from(exe_lower.as_str()),
-                    create_time: child_ct,
-                });
-                Resp::Ok
             }
             Req::Decide { dos_path, write } => {
                 stats.decide.fetch_add(1, Ordering::Relaxed);
-                // Look up depth/exe for this connection's PID
-                let (depth, exe_lower) = if let Some(pid) = conn_pid {
-                    let map = crate::sandbox::proc_table::global_proc_info().pin();
-                    map.get(&pid)
-                        .map(|info| (Some(info.depth), Some(Arc::clone(&info.exe_lower))))
-                        .unwrap_or((None, None))
-                } else {
-                    (None, None)
-                };
-                let d = policy.decide_with_context(
-                    &dos_path,
-                    write,
-                    depth,
-                    exe_lower.as_deref(),
-                );
-                hot_stats.totals.fs_decides.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let denied = matches!(d.mode, policy::Mode::Deny);
-                match d.mode {
-                    policy::Mode::Deny => {
-                        stats.deny.fetch_add(1, Ordering::Relaxed);
-                        hot_stats.totals.fs_denies.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        jsonl_log::log(jsonl_log::Event::deny(&dos_path, write));
-                    }
-                    policy::Mode::Cow => {
-                        stats.cow.fetch_add(1, Ordering::Relaxed);
-                        hot_stats.totals.fs_cows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    policy::Mode::Mock => {
-                        stats.mock_.fetch_add(1, Ordering::Relaxed);
-                        hot_stats.totals.fs_mocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    policy::Mode::Hidden => {
-                        // Whiteout hit — path is hidden from the sandbox view.
-                        // No dedicated stat counter; trace it for diagnostics.
+                // SECURITY (S09): Hello-first state machine. The old code served
+                // pre-Hello Decides with (None, None), and exe=None makes
+                // exe-scoped rules be SKIPPED — a permissive fall-through. Err
+                // also covers a Hello'd connection whose entry was pruned
+                // (identity broke between Hello and Decide).
+                match decide_context(conn_pid) {
+                    Ok((depth, exe_lower)) => {
+                        let d = policy.decide_with_context(
+                            &dos_path,
+                            write,
+                            Some(depth),
+                            Some(&*exe_lower),
+                        );
                         hot_stats.totals.fs_decides.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let denied = matches!(d.mode, policy::Mode::Deny);
+                        match d.mode {
+                            policy::Mode::Deny => {
+                                stats.deny.fetch_add(1, Ordering::Relaxed);
+                                hot_stats.totals.fs_denies.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                jsonl_log::log(jsonl_log::Event::deny(&dos_path, write));
+                            }
+                            policy::Mode::Cow => {
+                                stats.cow.fetch_add(1, Ordering::Relaxed);
+                                hot_stats.totals.fs_cows.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            policy::Mode::Mock => {
+                                stats.mock_.fetch_add(1, Ordering::Relaxed);
+                                hot_stats.totals.fs_mocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            policy::Mode::Hidden => {
+                                // Whiteout hit — path is hidden from the sandbox view.
+                                // No dedicated stat counter; trace it for diagnostics.
+                                hot_stats.totals.fs_decides.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            policy::Mode::Passthrough => {}
+                        }
+                        hot_stats.record_fs(&dos_path, write, denied);
+                        flusher.maybe_flush();
+                        Resp::Decision(d)
                     }
-                    policy::Mode::Passthrough => {}
+                    Err(()) => {
+                        eprintln!(
+                            "[pipe] WARN: decide before hello (or identity lost) from \
+                             pid={client_pid} — refused (fail closed)",
+                        );
+                        stats.violations.fetch_add(1, Ordering::Relaxed);
+                        hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        jsonl_log::log_immediate(jsonl_log::Event::violation(
+                            client_pid,
+                            "DecideBeforeHello",
+                            &format!("path={dos_path} write={write}"),
+                        ));
+                        // The hook counts a non-Decision response as an IPC
+                        // failure and fails closed (Deny), self-terminating at
+                        // its threshold — this cannot be spammed indefinitely.
+                        Resp::Err("decide: handshake required".to_string())
+                    }
                 }
-                hot_stats.record_fs(&dos_path, write, denied);
-                flusher.maybe_flush();
-                Resp::Decision(d)
             }
             Req::RecordOverlay { orig, overlay } => {
                 handle_record_overlay(policy, stats, hot_stats, client_pid, &orig, &overlay)
@@ -600,17 +716,15 @@ fn handle_connection(
                     Resp::Ok
                 }
             }
+            // R05: cap listings before encoding — see conn::resp_* / MAX_OVERLAY_LISTING_ENTRIES.
             Req::WhiteoutsUnder { dir } => {
-                let names = policy.whiteouts_under(&dir);
-                Resp::Whiteouts(names)
+                conn::resp_whiteouts(policy, &dir, client_pid, stats, hot_stats)
             }
             Req::OverlayChildrenWithCase { dir } => {
-                let pairs = policy.overlay_children_with_case(&dir);
-                Resp::OverlayChildrenWithCase(pairs)
+                conn::resp_overlay_children_with_case(policy, &dir, client_pid, stats, hot_stats)
             }
             Req::OverlayChildren { dir } => {
-                let entries = policy.overlay_children(&dir);
-                Resp::OverlayChildren(entries)
+                conn::resp_overlay_children(policy, &dir, client_pid, stats, hot_stats)
             }
             Req::Log { pid, level, msg } => {
                 let level_str = match level {
@@ -641,7 +755,18 @@ fn handle_connection(
                 if jsonl_log::console_verbose() {
                     println!("[sandbox] child registered: pid={pid}");
                 }
-                child_pids.push(pid);
+                // Bounded, validated push (S09): the queue feeds only grace-window
+                // supervision + stale-entry pruning — never trust — so this suffices.
+                // Throttled log: a hostile loop must not flood the immediate path.
+                if !crate::sandbox::child_drain::queue_child_pid(child_pids, pid) {
+                    stats.violations.fetch_add(1, Ordering::Relaxed);
+                    hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    jsonl_log::log(jsonl_log::Event::violation(
+                        client_pid,
+                        "ChildPidQueueRejected",
+                        &format!("child={pid}"),
+                    ));
+                }
                 Resp::Ok
             }
             Req::PreLaunchViolation { launcher_pid: _, target_exe: _, hits: _ } => {
@@ -847,7 +972,7 @@ fn handle_connection(
             }
         };
 
-        if write_msg(&mut file, &resp).is_err() {
+        if ipc::write_msg_with_buf(&mut file, &resp, &mut enc_buf).is_err() {
             break;
         }
     }

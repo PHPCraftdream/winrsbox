@@ -8,7 +8,7 @@
     "url": "https://github.com/PHPCraftdream/winrsbox.git"
   },
   "winrsboxSource": {
-    "commit": "9d73d34edb321a50fa4c2b7eefda355b34cdccfc"
+    "commit": "e491803294db85b1ed2276340defe2c928d91bc7"
   },
   "homepage": "https://github.com/PHPCraftdream/winrsbox",
   "keywords": ["sandbox", "windows", "security", "filesystem", "hooks"],

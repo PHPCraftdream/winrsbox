@@ -12,9 +12,9 @@ use windows::{
         System::{
             Console::GetConsoleWindow,
             Threading::{
-                CreateProcessW, DeleteProcThreadAttributeList,
+                CreateProcessAsUserW, DeleteProcThreadAttributeList,
                 InitializeProcThreadAttributeList, TerminateProcess,
-                UpdateProcThreadAttribute, CREATE_SUSPENDED,
+                UpdateProcThreadAttribute, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
                 EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
                 PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROCESS_INFORMATION,
                 STARTUPINFOEXW, STARTUPINFOW,
@@ -24,6 +24,7 @@ use windows::{
     },
 };
 
+use winrsbox::contain::guest::{self as guest_token, GuestToken};
 use winrsbox::contain::mitigations::{self, v1 as miti_v1};
 
 // Raw FFI declaration for IsWow64Process2 — avoids pulling in the
@@ -363,6 +364,52 @@ pub(crate) fn launch_suspended(cwd: &Path, target_args: &[String], guard: crate:
     // reads from the pointer stored in the attribute list, not a copy).
     let bytes = mitigations::to_bytes(create_v1, v2);
 
+    // ─── R04-1c: derive the guest's privilege-reduced token ────────────────
+    //
+    // Root guest only (see this function's doc comment) — children spawned
+    // BY the guest go through winrsbox-hook's NtCreateUserProcess hook,
+    // which inherits its caller's (already-restricted) token via normal
+    // Windows process-creation semantics and needs no separate handling.
+    //
+    // Fail closed: any error here aborts the launch. There is no fallback to
+    // CreateProcessW / an unrestricted token — per the task's explicit
+    // instruction, ambiguity about a Win32 error path must never silently
+    // preserve the old unrestricted-token behavior.
+    let own_token = launch_prep::open_own_token_for_restriction()
+        .context("failed to open launcher's own primary token for guest-token derivation")?;
+    // Capture the source token's admin signal BEFORE the token is derived —
+    // point 6 needs this same value again after launch, to know which shape
+    // (admin-restricted vs. near-no-op) the child's real token must match.
+    let admin_state_result = guest_token::administrators_state(own_token);
+    let build_result = guest_token::build_guest_token(own_token);
+    // SAFETY: own_token was opened by us above via OpenProcessToken;
+    // administrators_state/build_guest_token only borrow the handle, never
+    // close it — we own its lifetime and close it here regardless of outcome.
+    unsafe { CloseHandle(own_token).ok() };
+    let source_admin_enabled = admin_state_result
+        .context("failed to inspect launcher token's Administrators state")?
+        .0;
+    let guest: GuestToken = build_result.context(
+        "failed to build restricted guest token (R04-1c) — aborting launch, \
+         not falling back to an unrestricted token",
+    )?;
+
+    // ─── R04-1c: explicit environment block for CreateProcessAsUserW ───────
+    //
+    // CreateProcessAsUserW's documented lpEnvironment=NULL behavior is NOT
+    // "inherit the caller's environment" the way CreateProcessW's is — MSDN
+    // documents NULL there as "the new process uses an environment created
+    // from the profile of the user specified by hToken", a PROFILE-derived
+    // block. The launcher sets process-specific environment (e.g.
+    // FS_SANDBOX_SECTION in main.rs, read by hook.dll via inheritance)
+    // shortly before this call; a profile-derived block would silently drop
+    // it. So this always passes an EXPLICIT block copied from this process's
+    // actual current environment (correct for the guest too, since source
+    // and derived token share the same TokenUser) together with
+    // CREATE_UNICODE_ENVIRONMENT.
+    let env_block = launch_prep::copy_caller_environment_block()
+        .context("failed to capture launcher environment block for guest process")?;
+
     let mut pi = PROCESS_INFORMATION::default();
 
     // ─── Build the attribute list (only if we have any mitigation bits) ────
@@ -374,7 +421,11 @@ pub(crate) fn launch_suspended(cwd: &Path, target_args: &[String], guard: crate:
     // both. `attr_list` is a raw pointer into `attr_buf`'s backing storage.
     let mut attr_buf: Vec<u8> = Vec::new();
     let mut attr_list = LPPROC_THREAD_ATTRIBUTE_LIST::default();
-    let mut creation_flags = CREATE_SUSPENDED;
+    // CREATE_UNICODE_ENVIRONMENT is always set: this function always passes
+    // an explicit Unicode environment block (see copy_caller_environment_block)
+    // to CreateProcessAsUserW rather than NULL — required whenever an
+    // explicit lpEnvironment is supplied to CreateProcessAsUserW/CreateProcessW.
+    let mut creation_flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT;
 
     if has_mitigations {
         // First call: query required buffer size. Expected to fail with
@@ -445,14 +496,18 @@ pub(crate) fn launch_suspended(cwd: &Path, target_args: &[String], guard: crate:
 
     // SAFETY: cmdline_wide and cwd_wide are valid null-terminated UTF-16 strings.
     //         attr_list (if used) is initialized and was populated above.
-    //         si_ex stays alive for the duration of this call.
+    //         si_ex stays alive for the duration of this call. env_block is
+    //         alive on this stack frame past this call. guest.handle() is a
+    //         valid derived token handle owned by `guest`, alive past this
+    //         call (GuestToken is not dropped until this function returns).
     let create_result = unsafe {
-        CreateProcessW(
+        CreateProcessAsUserW(
+            Some(guest.handle()),
             PCWSTR::null(),
             Some(windows::core::PWSTR(cmdline_wide.as_mut_ptr())),
             None, None, false,
             creation_flags,
-            None,
+            Some(env_block.as_ptr() as *const std::ffi::c_void),
             PCWSTR(cwd_wide.as_ptr()),
             si_ptr,
             &mut pi,
@@ -460,21 +515,53 @@ pub(crate) fn launch_suspended(cwd: &Path, target_args: &[String], guard: crate:
     };
 
     // Free the attribute list — kernel has copied what it needs from it by
-    // the time CreateProcessW returns (success OR failure). Per MSDN,
+    // the time CreateProcessAsUserW returns (success OR failure). Per MSDN,
     // DeleteProcThreadAttributeList does NOT free the buffer pointers we
     // attached (bytes); we manage their lifetime ourselves via Rust's stack.
     if has_mitigations {
         // SAFETY: attr_list was Initialize'd; safe to Delete exactly once.
         unsafe { DeleteProcThreadAttributeList(attr_list); }
     }
-    // Touch si_ex AFTER CreateProcessW to ensure the compiler doesn't move
-    // the drop earlier. (Defensive — repr(C) on-stack lifetime already covers
-    // the syscall, but the read is free and documents intent.)
+    // Touch si_ex AFTER CreateProcessAsUserW to ensure the compiler doesn't
+    // move the drop earlier. (Defensive — repr(C) on-stack lifetime already
+    // covers the syscall, but the read is free and documents intent.)
     let _ = si_ex.StartupInfo.cb;
-    // Touch attr_buf to assert it stayed alive past the syscall.
+    // Touch attr_buf/env_block to assert both stayed alive past the syscall.
     let _ = attr_buf.len();
+    let _ = env_block.len();
 
-    create_result.context("CreateProcessW failed")?;
+    // Fail closed: any CreateProcessAsUserW error (including the documented
+    // risk of ERROR_PRIVILEGE_NOT_HELD when SeIncreaseQuotaPrivilege is not
+    // held by the launcher) aborts the launch here. No retry with a
+    // different token or API — the guest token (and the process it would
+    // have been used to create) is simply never used.
+    create_result.context(
+        "CreateProcessAsUserW failed — if this is ERROR_PRIVILEGE_NOT_HELD, the launcher \
+         process does not hold a privilege CreateProcessAsUserW needs (commonly \
+         SeIncreaseQuotaPrivilege) to create a process under the derived, privilege-reduced \
+         guest token; aborting launch rather than falling back to CreateProcessW/an \
+         unrestricted token",
+    )?;
+
+    // ─── R04-1c point 6: verify the REAL child token, not the request ──────
+    //
+    // Don't trust that CreateProcessAsUserW did what was asked — open the
+    // actual suspended child's primary token and check its shape matches
+    // what build_guest_token derived. Any mismatch (or any error reading the
+    // child's token) terminates the still-suspended child (no guest code has
+    // run yet — TerminateProcess is safe) and aborts; the child is never
+    // resumed with an unverified token.
+    if let Err(e) = launch_prep::verify_child_token(pi.hProcess, source_admin_enabled) {
+        // SAFETY: pi.hProcess/pi.hThread are valid handles from the
+        // CreateProcessAsUserW that just succeeded above; the process is
+        // still CREATE_SUSPENDED, so terminating it runs no guest code.
+        unsafe {
+            let _ = TerminateProcess(pi.hProcess, STATUS_DLL_INIT_FAILED);
+            CloseHandle(pi.hThread).ok();
+            CloseHandle(pi.hProcess).ok();
+        }
+        return Err(e);
+    }
 
     // ─── Refuse 32-bit (WoW64) children ─────────────────────────────────────
     //
@@ -490,8 +577,8 @@ pub(crate) fn launch_suspended(cwd: &Path, target_args: &[String], guard: crate:
     // safe: no user code has executed yet.
     if let Err(e) = enforce_native_x64(pi.hProcess, pi.dwProcessId) {
         // SAFETY: pi.hProcess / pi.hThread are valid handles from the
-        // CreateProcessW that just succeeded above. Close both so we don't
-        // leak; the suspended target is already terminated by enforce_*.
+        // CreateProcessAsUserW that just succeeded above. Close both so we
+        // don't leak; the suspended target is already terminated by enforce_*.
         unsafe {
             CloseHandle(pi.hThread).ok();
             CloseHandle(pi.hProcess).ok();
@@ -543,180 +630,6 @@ fn enforce_native_x64(child_handle: HANDLE, child_pid: u32) -> Result<()> {
 }
 
 /// Find hook.dll alongside the launcher executable.
-pub(crate) fn find_hook_dll() -> Result<String> {
-    let exe = std::env::current_exe()?;
-    let dll = exe
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("hook.dll");
-    anyhow::ensure!(
-        dll.exists(),
-        "hook.dll not found at {}",
-        dll.display()
-    );
-    let dll = dll.to_string_lossy().into_owned();
-    // Defense-in-depth before injection: refuse self-installs inside the
-    // guest's project tree (no policy rule can protect them there), then
-    // verify the staged exe/DLL digests against the installer's integrity
-    // manifest so a trojanized artifact becomes a loud refusal instead of a
-    // silent injection of attacker-controlled code.
-    verify_not_inside_guest_project_node_modules(&dll)?;
-    verify_staged_artifacts(&dll)?;
-    Ok(dll)
-}
-
-/// SHA-256 of a file via CNG's one-shot `BCryptHash` (no streaming state to
-/// manage). Used by the staged-artifact integrity check below.
-fn sha256_file(path: &Path) -> Result<[u8; 32]> {
-    use windows::Win32::Security::Cryptography::{
-        BCryptCloseAlgorithmProvider, BCryptHash, BCryptOpenAlgorithmProvider,
-        BCRYPT_ALG_HANDLE, BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS, BCRYPT_SHA256_ALGORITHM,
-    };
-
-    let mut alg = BCRYPT_ALG_HANDLE::default();
-    // SAFETY: alg is a valid out handle pointer; BCRYPT_SHA256_ALGORITHM is a
-    //         static null-terminated wide string; no implementation pin needed.
-    let status = unsafe {
-        BCryptOpenAlgorithmProvider(
-            &mut alg,
-            BCRYPT_SHA256_ALGORITHM,
-            PCWSTR::null(),
-            BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS(0),
-        )
-    };
-    if status.0 < 0 {
-        anyhow::bail!("BCryptOpenAlgorithmProvider failed: 0x{:08X}", status.0);
-    }
-    let data = std::fs::read(path)
-        .with_context(|| format!("read {} for hashing", path.display()))?;
-    let mut out = [0u8; 32];
-    // SAFETY: alg was opened above; out is a valid 32-byte buffer (the
-    //         SHA-256 digest size).
-    let status = unsafe { BCryptHash(alg, None, &data, &mut out) };
-    // SAFETY: alg was opened above and is not used after this point.
-    unsafe { let _ = BCryptCloseAlgorithmProvider(alg, 0); }
-    if status.0 < 0 {
-        anyhow::bail!("BCryptHash failed: 0x{:08X}", status.0);
-    }
-    Ok(out)
-}
-
-/// Lowercase-hex encoding of a 32-byte digest (the manifest's format).
-fn digest_to_hex(d: &[u8; 32]) -> String {
-    d.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-/// Verify the launcher exe and the hook.dll it is about to inject still match
-/// the digests recorded in `integrity.json` next to the exe (written by the
-/// npm installer at deploy time). A MISSING manifest is fine — that is an
-/// unmanaged deployment (e.g. a dev `cargo build`) with nothing to verify.
-/// A present-but-mismatched manifest fails closed: a silently swapped
-/// exe/DLL turns into a loud refusal instead of an injection of
-/// attacker-controlled code.
-fn verify_staged_artifacts_in(exe_path: &Path, dll_path: &Path) -> Result<()> {
-    let manifest_path = exe_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("integrity.json");
-    if !manifest_path.exists() {
-        return Ok(());
-    }
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&manifest_path)
-            .with_context(|| format!("read integrity manifest {}", manifest_path.display()))?,
-    )
-    .with_context(|| format!("parse integrity manifest {}", manifest_path.display()))?;
-
-    anyhow::ensure!(
-        manifest.get("algorithm").and_then(|v| v.as_str()) == Some("sha256"),
-        "integrity manifest {} must declare algorithm == \"sha256\"",
-        manifest_path.display()
-    );
-    let files = manifest
-        .get("files")
-        .and_then(|v| v.as_object())
-        .with_context(|| format!("integrity manifest {} has no `files` object", manifest_path.display()))?;
-    let expected = |name: &str| -> Result<String> {
-        let v = files
-            .get(name)
-            .and_then(|v| v.as_str())
-            .with_context(|| format!("integrity manifest files[\"{name}\"] missing or not a string"))?;
-        // Fail closed on anything that is not a 64-char lowercase-hex digest —
-        // a manifest we cannot strictly parse is a manifest we cannot trust.
-        anyhow::ensure!(
-            v.len() == 64 && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
-            "integrity manifest files[\"{name}\"] is not a 64-char lowercase-hex SHA-256 digest"
-        );
-        Ok(v.to_ascii_lowercase())
-    };
-    let want_exe = expected("winrsbox.exe")?;
-    let want_dll = expected("hook.dll")?;
-
-    let actual_exe = digest_to_hex(&sha256_file(exe_path)?);
-    anyhow::ensure!(
-        actual_exe == want_exe,
-        "integrity check FAILED for {}: expected sha256 {}…, actual {}… — \
-         the launcher binary was modified after install; refusing to run",
-        exe_path.display(),
-        &want_exe[..16],
-        &actual_exe[..16]
-    );
-    let actual_dll = digest_to_hex(&sha256_file(dll_path)?);
-    anyhow::ensure!(
-        actual_dll == want_dll,
-        "integrity check FAILED for {}: expected sha256 {}…, actual {}… — \
-         hook.dll was modified after install; refusing to inject it",
-        dll_path.display(),
-        &want_dll[..16],
-        &actual_dll[..16]
-    );
-    Ok(())
-}
-
-/// `verify_staged_artifacts_in` bound to the real launcher exe.
-fn verify_staged_artifacts(dll_path: &str) -> Result<()> {
-    let exe = std::env::current_exe()?;
-    verify_staged_artifacts_in(&exe, Path::new(dll_path))
-}
-
-/// Refuse to run when the launcher itself is installed inside the sandboxed
-/// project's `node_modules`. There the project_root passthrough short-circuits
-/// every policy rule (policy/src/decide.rs compute()), so a guest could
-/// trojanize winrsbox.exe/hook.dll for the NEXT run — no deny rule can fix
-/// that. The only remedy is refusing to launch from such a location.
-fn verify_not_inside_guest_project_node_modules(dll_path: &str) -> Result<()> {
-    // Canonical form for comparison: backslash separators, lowercased,
-    // `\\?\` device prefix stripped (current_exe can return it).
-    let normalize = |p: &Path| -> String {
-        let s = p.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
-        s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
-    };
-    let exe = std::env::current_exe()?;
-    let exe_dir = match exe.parent() {
-        Some(d) => normalize(d),
-        // No parent dir → cannot be inside anything.
-        None => return Ok(()),
-    };
-    let nm_root = normalize(&std::env::current_dir()?.join("node_modules"));
-    // Containment mirrors policy/src/decide.rs path_contained_in: prefix
-    // match + separator boundary, so `...\node_modules` does not match a
-    // sibling like `...\node_modules_bak`.
-    let contained = exe_dir.starts_with(&nm_root)
-        && (exe_dir.len() == nm_root.len()
-            || exe_dir.as_bytes().get(nm_root.len()) == Some(&b'\\'));
-    anyhow::ensure!(
-        !contained,
-        "refusing to launch: the winrsbox install itself ({}, containing {}) sits inside \
-         the sandboxed project's node_modules, where the guest's project_root passthrough \
-         makes every policy rule moot — a sandboxed process could trojanize winrsbox.exe \
-         for the next run. Run the sandbox from a different directory or install winrsbox \
-         globally.",
-        exe_dir,
-        dll_path
-    );
-    Ok(())
-}
-
 /// Symlink/reparse-safe replacement for `create_dir_all` over an
 /// attacker-influenced path chain.
 ///
@@ -819,12 +732,52 @@ pub(crate) fn discover_state_dir(project_root: &Path) -> Result<PathBuf> {
     Ok(parent.join(".winrsbox").join(name))
 }
 
+/// Stable per-project key component for the shared %LOCALAPPDATA%\.winrsbox\
+/// overlay tree, derived from the FULL project path — the same identity the
+/// per-project state dir / policy DB already use (`ensure_state` keys on
+/// `<parent>/.winrsbox/<name>`: the distinguishing component is the whole
+/// parent chain, not the basename). Review S07: keying the C: root by the
+/// basename alone made two different projects sharing a last path component
+/// (e.g. `D:\a\app` vs `D:\b\app`) read and overwrite each other's C:
+/// overlay, and re-runs saw the last colliding project's stale data.
+///
+/// Hash: xxh3, the crate's existing identity hash (`cli::id::generate_id`).
+/// generate_id truncates to 32 bits for short rule IDs; a filesystem key
+/// keeps the full 64-bit digest. The basename prefix is cosmetic only.
+fn c_overlay_key(project_root: &Path) -> String {
+    let name = project_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    hasher.update(project_root.to_string_lossy().as_bytes());
+    format!("{}-{:016x}", name, hasher.digest())
+}
+
+/// Ensure the per-project C: overlay root under `local_appdata` exists and
+/// return it: `<local_appdata>/.winrsbox/<c_overlay_key>/workdir`. Created
+/// with the same no-reparse contract as the state dir (review S07): a
+/// pre-existing junction/symlink at any component of the chain must fail
+/// loudly instead of silently redirecting where the C: overlay lands.
+pub(crate) fn ensure_c_overlay_root(
+    local_appdata: &Path,
+    project_root: &Path,
+) -> Result<PathBuf> {
+    let key = c_overlay_key(project_root);
+    let rel = Path::new(".winrsbox").join(&key).join("workdir");
+    let c_root = local_appdata.join(&rel);
+    create_dir_tree_no_reparse(local_appdata, &rel)
+        .with_context(|| format!("create C: overlay root {}", c_root.display()))?;
+    Ok(c_root)
+}
+
 /// Assign `process` to a new Job Object with given limits; returns the Job handle.
 /// The caller must keep the returned HANDLE alive for the duration of the child.
 pub(crate) fn setup_job_object(
     process: HANDLE,
     memory_limit: Option<u64>,
     strict_clipboard: bool,
+    strict_ui: bool,
 ) -> Result<HANDLE> {
     use windows::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW,
@@ -868,12 +821,19 @@ pub(crate) fn setup_job_object(
     // UI restrictions entirely (GLOBALATOMS / SYSTEMPARAMS / DESKTOP /
     // EXITWINDOWS). Suspected to break per-process keyboard-layout switching
     // because the Win32 WM_INPUTLANGCHANGEREQUEST broadcast uses global atoms
-    // via RegisterWindowMessage.
+    // via RegisterWindowMessage. This overrides `--strict-ui` too — the env
+    // var always wins, regardless of which CLI UI-restriction flag was passed.
     if std::env::var("FS_SANDBOX_NO_UI_LIMITS").is_err() {
-        let mut ui = winrsbox::contain::jobctl::UiRestrictions::default();
-        if strict_clipboard {
-            ui = ui.with_strict_clipboard();
-        }
+        // `--strict-ui` (0xFF) is a strict superset of `--strict-clipboard`
+        // (0x06), so when both are passed strict-ui wins outright — no need
+        // to also apply with_strict_clipboard() first.
+        let ui = if strict_ui {
+            winrsbox::contain::jobctl::UiRestrictions::default().with_all_restrictions()
+        } else if strict_clipboard {
+            winrsbox::contain::jobctl::UiRestrictions::default().with_strict_clipboard()
+        } else {
+            winrsbox::contain::jobctl::UiRestrictions::default()
+        };
         let ui_info = JOBOBJECT_BASIC_UI_RESTRICTIONS {
             UIRestrictionsClass: JOB_OBJECT_UILIMIT(ui.limit_flags()),
         };
@@ -900,6 +860,12 @@ pub(crate) mod proc_table;
 pub(crate) mod launch_prep;
 pub(crate) mod child_drain;
 pub(crate) mod inject;
+
+// find_hook_dll (and the staged-artifact integrity check it runs before
+// returning) moved into inject.rs (layout-guard: this file was over the
+// 1000-line limit) — thematically "locate and verify hook.dll before
+// injecting it" belongs with the rest of inject.rs's DLL-injection concerns.
+pub(crate) use inject::find_hook_dll;
 
 #[cfg(test)]
 mod tests;

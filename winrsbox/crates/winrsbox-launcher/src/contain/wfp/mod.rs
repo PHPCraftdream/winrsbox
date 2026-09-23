@@ -635,27 +635,46 @@ impl Drop for WfpEngine {
 }
 
 // ---------------------------------------------------------------------------
-// Tests (pure functions only — WFP engine needs runtime, skip)
+// Install entry point (fail-closed)
 // ---------------------------------------------------------------------------
 
-/// WFP kernel-level network filtering (best-effort — needs fwpuclnt.dll).
+/// Outcome of `install_outbound_filters`.
+pub enum WfpInstall {
+    /// Guarded network was not requested — no filters installed; launch may proceed.
+    NotRequested,
+    /// Guarded network requested and every filter installed. The caller must
+    /// keep the engine alive for the run; dropping it removes the filters.
+    Installed(WfpEngine),
+    /// Guarded network was requested but the kernel-level guarantee could not
+    /// be established. The caller must fail closed (refuse the launch).
+    Refused(String),
+}
+
+/// WFP kernel-level network filtering (needs fwpuclnt.dll).
 ///
 /// Every filter is scoped by `FWPM_CONDITION_ALE_APP_ID`, an exact match on
 /// the image the kernel records for a process. A `.bat`/`.cmd` target has
 /// no such image: kernel32 rewrites it to `%COMSPEC% /c <script>`, so the
 /// root process is cmd.exe and the script is merely an argument. An app id
 /// built from the script path would therefore match no process at all —
-/// filters would install successfully and silently do nothing. Refuse
-/// instead, in the same spirit as `add_filter` refusing an unverifiable
-/// path, and say so once. (Scoping to cmd.exe instead would be worse: it
-/// would look like coverage while the program that actually opens sockets
-/// runs as its child, which APP_ID scoping never reaches either way.)
+/// filters would install successfully and silently do nothing. (Scoping to
+/// cmd.exe instead would be worse: it would look like coverage while the
+/// program that actually opens sockets runs as its child, which APP_ID
+/// scoping never reaches either way.)
+///
+/// Fail-closed: when guarded network is requested (`net_guarded &&
+/// guard_enabled`) the caller must get the kernel layer the security policy
+/// promises or not launch at all. Every failure — engine unavailable,
+/// `.bat`/`.cmd` target, any single filter add — comes back as
+/// [`WfpInstall::Refused`], and the install is all-or-nothing: on a failed
+/// add the engine is dropped and its `Drop` deletes every filter registered
+/// so far, so a partial filter set never persists.
 pub fn install_outbound_filters(
     net_guarded: bool,
     guard_enabled: bool,
     block_localhost: bool,
     target: &Path,
-) -> Option<WfpEngine> {
+) -> WfpInstall {
     let target_is_script = target
         .extension()
         .map(|e| {
@@ -663,327 +682,79 @@ pub fn install_outbound_filters(
             e == "bat" || e == "cmd"
         })
         .unwrap_or(false);
-    if net_guarded
-        && target_is_script
-        && guard_enabled
-        && crate::observe::jsonl_log::console_verbose()
-    {
-        eprintln!(
-            "[sandbox] WFP: no kernel network filters for a .bat/.cmd target — the root \
-             process is cmd.exe, so APP_ID scoping cannot bind to '{}'. Hook-level network \
-             policy still applies.",
-            target.display(),
-        );
-    }
     // `net_guarded` first: with network containment off the engine is never
     // opened, so not one `winrsbox-block-*` filter is registered and the
     // sandbox leaves no trace in the system's network configuration.
-    if net_guarded && guard_enabled && !target_is_script {
-        match WfpEngine::open() {
-            Ok(mut engine) => {
-                let target_path = target;
-                // Block lateral movement to RFC1918 private ranges
-                for cidr_str in RFC1918 {
-                    if let Some(cidr) = CidrV4::parse(cidr_str) {
-                        match engine.block_outbound_cidr(target_path, &cidr) {
-                            Ok(_) => {}
-                            Err(e) => eprintln!("[sandbox] WFP filter {cidr_str} failed: {e}"),
-                        }
-                    }
-                }
-                // Block lateral movement to IPv6 private/local ranges
-                for cidr_str in IPV6_PRIVATE {
-                    if let Some(cidr) = CidrV6::parse(cidr_str) {
-                        match engine.block_outbound_cidr_v6(target_path, &cidr) {
-                            Ok(_) => {}
-                            Err(e) => eprintln!("[sandbox] WFP v6 filter {cidr_str} failed: {e}"),
-                        }
-                    }
-                }
-                // Block localhost connections (opt-in — breaks MCP/LSP).
-                if block_localhost {
-                    if let Some(lo) = CidrV4::parse("127.0.0.0/8") {
-                        match engine.block_outbound_cidr(target_path, &lo) {
-                            Ok(_) => {}
-                            Err(e) => eprintln!("[sandbox] WFP localhost block failed: {e}"),
-                        }
-                    }
-                }
-                // Block SMB/NetBIOS egress (IPv4 + IPv6) — prevents DFS UNC
-                // exfiltration to remote servers.
-                for port in SMB_PORTS {
-                    if let Err(e) = engine.block_outbound_port(target_path, *port) {
-                        eprintln!("[sandbox] WFP SMB block port {port} (v4) failed: {e}");
-                    }
-                    if let Err(e) = engine.block_outbound_port_v6(target_path, *port) {
-                        eprintln!("[sandbox] WFP SMB block port {port} (v6) failed: {e}");
-                    }
-                }
-                let fc = engine.filter_count();
-                if crate::observe::jsonl_log::console_verbose() {
-                    println!("[sandbox] WFP: {fc} outbound filters registered");
-                }
-                crate::observe::jsonl_log::log(crate::observe::jsonl_log::Event::wfp(fc));
-                Some(engine)
-            }
-            Err(e) => {
-                eprintln!("[sandbox] WFP unavailable: {e}");
-                None
-            }
-        }
-    } else {
-        None
+    if !(net_guarded && guard_enabled) {
+        return WfpInstall::NotRequested;
     }
+    if target_is_script {
+        return WfpInstall::Refused(format!(
+            "a .bat/.cmd target ('{}') has no image of its own — kernel32 rewrites it to \
+             %COMSPEC% /c <script>, so the root process is cmd.exe and the script is merely \
+             an argument; an APP_ID built from the script path would match no process at all, \
+             so the promised kernel-level network layer cannot exist — refusing the launch \
+             rather than running unprotected",
+            target.display(),
+        ));
+    }
+    let mut engine = match WfpEngine::open() {
+        Ok(engine) => engine,
+        Err(e) => return WfpInstall::Refused(format!("WFP engine unavailable: {e}")),
+    };
+    match add_all_filters(&mut engine, target, block_localhost) {
+        Ok(()) => {
+            let fc = engine.filter_count();
+            if crate::observe::jsonl_log::console_verbose() {
+                println!("[sandbox] WFP: {fc} outbound filters registered");
+            }
+            crate::observe::jsonl_log::log(crate::observe::jsonl_log::Event::wfp(fc));
+            WfpInstall::Installed(engine)
+        }
+        Err(e) => {
+            // All-or-nothing: Drop deletes every filter registered before the
+            // failure, so a partial filter set never persists.
+            drop(engine);
+            WfpInstall::Refused(format!("WFP filter installation incomplete: {e}"))
+        }
+    }
+}
+
+/// Add every containment filter the guarded network promises: RFC1918,
+/// private IPv6, optional localhost, SMB/NetBIOS egress. Every failure
+/// propagates — the caller drops the engine on `Err`, which deletes the
+/// filters already added, so a run never continues on a partial set.
+fn add_all_filters(engine: &mut WfpEngine, target: &Path, block_localhost: bool) -> Result<()> {
+    // Block lateral movement to RFC1918 private ranges
+    for cidr_str in RFC1918 {
+        let Some(cidr) = CidrV4::parse(cidr_str) else {
+            anyhow::bail!("cannot parse hardcoded CIDR {cidr_str}");
+        };
+        engine.block_outbound_cidr(target, &cidr)?;
+    }
+    // Block lateral movement to IPv6 private/local ranges
+    for cidr_str in IPV6_PRIVATE {
+        let Some(cidr) = CidrV6::parse(cidr_str) else {
+            anyhow::bail!("cannot parse hardcoded CIDR {cidr_str}");
+        };
+        engine.block_outbound_cidr_v6(target, &cidr)?;
+    }
+    // Block localhost connections (opt-in — breaks MCP/LSP).
+    if block_localhost {
+        let Some(lo) = CidrV4::parse("127.0.0.0/8") else {
+            anyhow::bail!("cannot parse hardcoded CIDR 127.0.0.0/8");
+        };
+        engine.block_outbound_cidr(target, &lo)?;
+    }
+    // Block SMB/NetBIOS egress (IPv4 + IPv6) — prevents DFS UNC
+    // exfiltration to remote servers.
+    for port in SMB_PORTS {
+        engine.block_outbound_port(target, *port)?;
+        engine.block_outbound_port_v6(target, *port)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
+mod tests;
 
-    #[test]
-    fn cidr_parse_basic() {
-        let c = CidrV4::parse("192.168.0.0/16").unwrap();
-        assert_eq!(c.addr, 0xC0A80000);
-        assert_eq!(c.prefix, 16);
-        assert_eq!(c.mask(), 0xFFFF0000);
-    }
-
-    #[test]
-    fn cidr_parse_8() {
-        let c = CidrV4::parse("10.0.0.0/8").unwrap();
-        assert_eq!(c.addr, 0x0A000000);
-        assert_eq!(c.mask(), 0xFF000000);
-    }
-
-    #[test]
-    fn cidr_parse_32() {
-        let c = CidrV4::parse("1.2.3.4/32").unwrap();
-        assert_eq!(c.addr, 0x01020304);
-        assert_eq!(c.mask(), 0xFFFFFFFF);
-    }
-
-    #[test]
-    fn cidr_parse_0() {
-        let c = CidrV4::parse("0.0.0.0/0").unwrap();
-        assert_eq!(c.addr, 0);
-        assert_eq!(c.mask(), 0);
-    }
-
-    #[test]
-    fn cidr_parse_masks_low_bits() {
-        let c = CidrV4::parse("192.168.1.5/24").unwrap();
-        assert_eq!(c.addr, 0xC0A80100); // .5 masked out
-    }
-
-    #[test]
-    fn cidr_parse_invalid_prefix_33() {
-        assert!(CidrV4::parse("1.2.3.4/33").is_none());
-    }
-
-    #[test]
-    fn cidr_parse_no_slash() {
-        assert!(CidrV4::parse("192.168.0.0").is_none());
-    }
-
-    #[test]
-    fn cidr_parse_too_many_octets() {
-        assert!(CidrV4::parse("1.2.3.4.5/8").is_none());
-    }
-
-    #[test]
-    fn cidr_contains_match() {
-        let c = CidrV4::parse("10.0.0.0/8").unwrap();
-        assert!(c.contains(0x0A010203)); // 10.1.2.3
-        assert!(c.contains(0x0AFFFFFF)); // 10.255.255.255
-        assert!(!c.contains(0x0B000001)); // 11.0.0.1
-    }
-
-    #[test]
-    fn cidr_contains_exact() {
-        let c = CidrV4::parse("8.8.8.8/32").unwrap();
-        assert!(c.contains(0x08080808));
-        assert!(!c.contains(0x08080809));
-    }
-
-    #[test]
-    fn cidr_contains_all() {
-        let c = CidrV4::parse("0.0.0.0/0").unwrap();
-        assert!(c.contains(0));
-        assert!(c.contains(0xFFFFFFFF));
-    }
-
-    #[test]
-    fn cidr_v6_parse_basic() {
-        let c = CidrV6::parse("fc00::/7").unwrap();
-        assert_eq!(c.prefix, 7);
-        assert_eq!(c.addr[0], 0xfc);
-        assert_eq!(c.addr[1], 0x00);
-    }
-
-    #[test]
-    fn cidr_v6_parse_loopback() {
-        let c = CidrV6::parse("::1/128").unwrap();
-        assert_eq!(c.prefix, 128);
-        assert_eq!(c.addr[15], 1);
-        assert_eq!(c.addr[0], 0);
-    }
-
-    #[test]
-    fn cidr_v6_parse_link_local() {
-        let c = CidrV6::parse("fe80::/10").unwrap();
-        assert_eq!(c.prefix, 10);
-        assert_eq!(c.addr[0], 0xfe);
-        assert_eq!(c.addr[1], 0x80);
-    }
-
-    #[test]
-    fn cidr_v6_mask_bytes() {
-        let m = CidrV6::mask_bytes(10);
-        assert_eq!(m[0], 0xFF);
-        assert_eq!(m[1], 0xC0); // 1100_0000
-        assert_eq!(m[2], 0x00);
-    }
-
-    #[test]
-    fn cidr_v6_parse_invalid_prefix() {
-        assert!(CidrV6::parse("::1/129").is_none());
-    }
-
-    // ----- audit Medium "WFP": APP_ID scoping + loud non-elevated failure -----
-
-    fn unique_temp_file(name: &str) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join(name);
-        std::fs::write(&p, b"").unwrap();
-        (dir, p)
-    }
-
-    #[test]
-    fn app_id_blob_is_nt_path_of_image() {
-        let (_dir, p) = unique_temp_file("wfp_probe_image.exe");
-        let blob = app_id_from_path(&p).unwrap();
-        assert!(!blob.is_empty());
-        // The WFP app id blob is the NT path as UTF-16 wide chars,
-        // NUL-terminated (the producer includes the terminator).
-        assert_eq!(blob.len() % 2, 0, "wide-char blob must be even-sized");
-        let wide: Vec<u16> = blob
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        let s = String::from_utf16(&wide)
-            .unwrap()
-            .trim_end_matches('\0')
-            .to_lowercase();
-        assert!(s.starts_with('\\'), "app id must be an NT device path, got: {s}");
-        assert!(s.ends_with("wfp_probe_image.exe"), "got: {s}");
-    }
-
-    #[test]
-    fn app_id_blob_rejects_missing_file() {
-        // The image path must be verifiable BEFORE any filter is installed --
-        // an unverifiable path must never degrade into machine-wide filters.
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("does_not_exist.exe");
-        let err = app_id_from_path(&p).unwrap_err().to_string();
-        assert!(
-            err.contains("canonicalize"),
-            "must fail before touching the engine, got: {err}"
-        );
-    }
-
-    #[test]
-    fn strip_verbatim_prefix_local_unc_and_plain() {
-        assert_eq!(
-            strip_verbatim_prefix(Path::new(r"\\?\C:\x\y.exe")),
-            PathBuf::from(r"C:\x\y.exe")
-        );
-        assert_eq!(
-            strip_verbatim_prefix(Path::new(r"\\?\UNC\srv\share\x.exe")),
-            PathBuf::from(r"\\srv\share\x.exe")
-        );
-        assert_eq!(
-            strip_verbatim_prefix(Path::new(r"C:\already\plain.exe")),
-            PathBuf::from(r"C:\already\plain.exe")
-        );
-    }
-
-    /// The loud-failure contract for a refused filter add: the message must
-    /// name the lost guarantee ("NOT ENFORCED") so an operator grepping the
-    /// log finds it, and must carry the OS status text. Deliberately does NOT
-    /// guess the cause -- unelevation was the historical suspect, but
-    /// unelevated dynamic-session adds are observed to succeed on Win10 19045.
-    #[test]
-    fn probe_failure_message_names_lost_guarantee() {
-        let msg = probe_failure_message("WIN32_ERROR(5)");
-        assert!(msg.contains("NOT ENFORCED"), "got: {msg}");
-        assert!(msg.contains("WIN32_ERROR(5)"), "must carry the status, got: {msg}");
-    }
-
-    /// Live smoke test: the engine accepts the canary add and it is deleted
-    /// again (dynamic-session objects also die with the session regardless).
-    /// Requires the Base Filtering Engine service; where it is stopped this
-    /// test fails with the containment-lost error -- exactly the condition
-    /// the canary exists to surface.
-    #[test]
-    fn open_smoke_engine_accepts_probe_and_cleans_up() {
-        let engine = WfpEngine::open()
-            .expect("WfpEngine::open failed -- is the Base Filtering Engine service running?");
-        assert_eq!(engine.filter_count(), 0);
-    }
-
-    /// Audit Medium "WFP" fix verification, live path: the engine must accept
-    /// an APP_ID-scoped CIDR filter. FwpmFilterAdd0 validates every condition
-    /// against the layer schema, so a structurally wrong APP_ID condition
-    /// (wrong GUID, wrong value type, dangling blob) is rejected here instead
-    /// of silently installed. Engine-side enumeration to re-read the stored
-    /// conditions was attempted and is NOT possible for this token
-    /// (FwpmFilterCreateEnumHandle0 -> ERROR_ACCESS_DENIED with a UAC-filtered
-    /// admin token; FwpmFilterAdd0 leaves its out-param id at 0 in a dynamic
-    /// session, so FwpmFilterGetById0 has nothing to look up).
-    #[test]
-    fn add_filter_installs_app_id_and_cidr_conditions_live() {
-        let (_dir, image) = unique_temp_file("wfp_live_image.exe");
-        let cidr = CidrV4::parse("127.0.0.0/8").unwrap();
-        let mut engine = WfpEngine::open()
-            .expect("WfpEngine::open failed -- is the Base Filtering Engine service running?");
-        engine
-            .block_outbound_cidr(&image, &cidr)
-            .expect("APP_ID-scoped block filter rejected by the engine");
-        assert_eq!(engine.filter_count(), 1);
-        // Dynamic-session objects die with the engine session, so dropping
-        // here is the cleanup path; nothing persists beyond this process.
-        drop(engine);
-    }
-
-    /// Every containment filter must be bound to the sandboxed image.
-    ///
-    /// `block_outbound_cidr_v6`, `block_outbound_port` and
-    /// `block_outbound_port_v6` were each built with a single condition and no
-    /// `FWPM_CONDITION_ALE_APP_ID`, so they matched EVERY process on the
-    /// machine: while any sandbox ran, the whole host lost SMB egress on
-    /// 445/139 and connectivity to the private IPv6 ranges. A sandbox must
-    /// not reconfigure the operator's network.
-    ///
-    /// Source-level because building a filter needs a live WFP engine and
-    /// elevation-dependent state; the property to protect is structural — a
-    /// new `block_outbound_*` helper added without an `app_path` parameter is
-    /// the regression, and it is visible in the signature.
-    #[test]
-    fn every_block_filter_is_scoped_to_an_app_path() {
-        let src = include_str!("wfp.rs");
-        let mut unscoped: Vec<&str> = Vec::new();
-        for line in src.lines() {
-            let line = line.trim();
-            let Some(rest) = line.strip_prefix("pub fn block_outbound_") else { continue };
-            // `app_path: &Path` is what carries the APP_ID condition.
-            if !rest.contains("app_path: &Path") {
-                unscoped.push(line);
-            }
-        }
-        assert!(
-            unscoped.is_empty(),
-            "these filter helpers take no app_path, so they would match every              process on the machine: {unscoped:#?}",
-        );
-    }
-}

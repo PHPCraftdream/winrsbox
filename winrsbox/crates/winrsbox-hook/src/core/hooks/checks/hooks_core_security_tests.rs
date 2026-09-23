@@ -160,13 +160,15 @@
     #[test]
     fn child_scan_enabled_matches_launcher_guard_levels() {
         // launcher/src/main.rs scans the root under Full | Static only.
-        assert!(child_scan_enabled(Some("full")));
-        assert!(child_scan_enabled(Some("static")));
-        assert!(!child_scan_enabled(Some("scan")));
-        assert!(!child_scan_enabled(Some("none")));
-        assert!(!child_scan_enabled(Some("FULL")), "exact match only — launcher writes lowercase");
-        assert!(!child_scan_enabled(Some("")));
-        assert!(!child_scan_enabled(None), "unset guard (unit-test context) must not scan");
+        // Typed ipc::GuardLevel now — the case-sensitive string compare this
+        // test used to pin ("FULL" must NOT scan) was exactly the S02 #2
+        // bug shape: the spawn gate was case-insensitive while this executor
+        // was case-sensitive. GuardLevel::parse_loose normalizes case once
+        // at the section boundary; after that the enum cannot disagree.
+        assert!(child_scan_enabled(ipc::GuardLevel::Full));
+        assert!(child_scan_enabled(ipc::GuardLevel::Static));
+        assert!(!child_scan_enabled(ipc::GuardLevel::Scan));
+        assert!(!child_scan_enabled(ipc::GuardLevel::None));
     }
 
     #[test]
@@ -178,8 +180,17 @@
         // be asserted here — so only the pipeline outcome is.
         // SAFETY: GetCurrentProcess is a constant pseudo-handle call.
         let h = unsafe { winapi::um::processthreadsapi::GetCurrentProcess() };
-        let result = scan_image_for_direct_syscalls(h);
-        assert!(result.is_ok(), "scan pipeline failed on own image: {result:?}");
+        match scan_image_for_direct_syscalls(h) {
+            Ok(()) => {}
+            // S06 widened the scan to every executable section with a
+            // multi-entry decode (XA review 2026-09-20) — sensitive enough
+            // that std/runtime code linked into the TEST BINARY itself can
+            // legitimately trip it. That is a content finding, not a
+            // pipeline failure, and is exactly what the comment above says
+            // this smoke test does not assert about.
+            Err(e) if e.contains("direct syscall instruction") => {}
+            Err(e) => panic!("scan pipeline failed on own image: {e}"),
+        }
     }
 
     // ── P0-04 + P1-01 structural pins ──────────────────────────────────────
@@ -244,6 +255,82 @@
     }
 
     #[test]
+    fn spawn_hook_acks_child_bootstrap_after_resume_before_registration() {
+        // S02 #3 (review XA 2026-09-20) orderings inside
+        // hook_nt_create_user_process, pinned textually because the detour
+        // cannot run in a unit test:
+        //   1. the per-child ack event is created BEFORE injection — its
+        //      unguessable name rides into the child through inject_via_apc's
+        //      cross-process env patch, so it must exist first;
+        //   2. the ack-create failure path terminates the child and returns
+        //      the original status — no unguessable name, no child (fail
+        //      closed);
+        //   3. NtResumeThread happens BEFORE the bounded ack wait — the queued
+        //      APC cannot fire before resume, so waiting first would deadlock;
+        //   4. the ack wait happens BEFORE the two registration IPC calls, and
+        //      the timeout branch terminates the child — a no-ack child is
+        //      never registered with the launcher and never left running;
+        //   5. registration is keyed on BOTH inject_failed and ack_failed.
+        let body = spawn_hook_body();
+        let create_off = body
+            .find("create_child_init_ack(")
+            .expect("spawn hook must create the per-child bootstrap ack event");
+        let inject_off = body
+            .find("inject::inject_via_apc(")
+            .expect("spawn hook must call inject::inject_via_apc");
+        let resume_off = body
+            .find("NtResumeThread")
+            .expect("spawn hook must resume the child thread");
+        let wait_off = body
+            .find("wait_for_ack(")
+            .expect("spawn hook must wait bounded for the per-child bootstrap ack");
+        let register_off = body
+            .find("ipc_register_child(")
+            .expect("spawn hook must call ipc_register_child");
+        assert!(
+            create_off < inject_off,
+            "the per-child ack event must be created BEFORE inject_via_apc — its name \
+             is delivered through the injection env patch, which happens inside the \
+             inject call"
+        );
+        let create_to_inject = &body[create_off..inject_off];
+        assert!(
+            create_to_inject.contains("TerminateProcess") && create_to_inject.contains("return status"),
+            "an ack-event creation failure must terminate the child and return the \
+             original syscall status (fail closed, launcher-failure precedent)"
+        );
+        assert!(
+            resume_off < wait_off,
+            "the bootstrap ack wait must be ordered AFTER NtResumeThread — the queued \
+             APC cannot fire before the initial thread runs, so waiting before resume \
+             would deadlock every spawn for the full timeout"
+        );
+        assert!(
+            wait_off < register_off,
+            "the ack wait must be ordered BEFORE the registration IPC — a child that \
+             never confirms its own guard must be terminated (timeout branch) before \
+             the launcher ever hears about it"
+        );
+        let wait_to_register = &body[wait_off..register_off];
+        assert!(
+            wait_to_register.contains("TerminateProcess"),
+            "the ack-timeout branch must terminate the child: a spawn whose hook.dll \
+             never confirmed (e.g. the known cmd.exe DllMain limitation) must not be \
+             left running unconfirmed"
+        );
+        assert!(
+            wait_to_register.contains("ack_failed = true"),
+            "the ack timeout must raise the ack_failed flag that gates registration"
+        );
+        assert!(
+            body.contains("!inject_failed && !ack_failed"),
+            "registration must be skipped for BOTH inject-failed and ack-failed \
+             children (dead/never-going-to-run child: nothing for the launcher to \
+             act on)"
+        );
+    }
+
+    #[test]
     fn spawn_hook_scans_child_image_and_gates_on_guard() {
         let body = spawn_hook_body();
         assert!(
@@ -296,9 +383,15 @@
         let got = resolve_abs(r"\??\D:\proj\..\..\outside.exe")
             .expect("absolute DOS-form path must resolve");
         assert_eq!(got.0, r"d:\outside.exe");
-        // Absolute opens keep pre_resolved = None (kernel gets the original
-        // ObjectName verbatim; unmirror carve-out + sans-reparse equivalence).
-        assert!(got.1.is_none());
+        // S04: absolute opens carry the FOLDED snapshot — the kernel opens
+        // exactly the bytes policy decided on, never a re-read of the guest
+        // buffer (unmirror carve-out + sans-reparse equivalence preserved:
+        // policy's dos may be the virtual view, the snapshot stays the
+        // folded physical form).
+        assert_eq!(
+            got.1.as_deref(),
+            Some(r"\??\D:\outside.exe".encode_utf16().collect::<Vec<u16>>().as_slice()),
+        );
     }
 
     #[test]
@@ -393,18 +486,18 @@
     /// Pin the canonical install-time snapshot the guard tests assert
     /// against. The OnceLocks can only be set once per test-binary process;
     /// every caller must use these exact values so parallel tests agree.
+    ///
+    /// Since review XA 2026-09-20, S02 the snapshot carries only the two
+    /// non-config inputs (section name + no_track); guard/allow_rwx/
+    /// disable_hooks live in trusted_boot's EffectiveConfig and are never
+    /// consulted from the environment.
     fn seed_guard_snapshot() {
         let _ = GUARD_ENV.set(GuardEnvSnapshot {
-            guard: "full".into(),
-            disabled: "reg".into(),
-            allow_rwx: false,
             no_track: false,
             section: TRUSTED_SECTION.into(),
         });
         let snap = GUARD_ENV.get().expect("GUARD_ENV seeded above");
-        assert_eq!(snap.guard, "full", "GUARD_ENV seeded with a conflicting guard level");
-        assert_eq!(snap.disabled, "reg", "GUARD_ENV seeded with a conflicting disable list");
-        assert!(!snap.allow_rwx, "GUARD_ENV seeded with a conflicting RWX allowance");
+        assert!(!snap.no_track, "GUARD_ENV seeded with a conflicting no_track");
         assert_eq!(
             snap.section,
             TRUSTED_SECTION,
@@ -460,26 +553,80 @@
     }
 
     /// The spawn gate must deny any spawn whose inherited environment
-    /// carries guard settings that differ from the trusted snapshot — that
-    /// forgery is how a guest booted its children with the memory guard
-    /// off. Absence of the variables and equivalent restatements of the
-    /// trusted values must stay allowed (no false positives).
+    /// carries a security-config variable AT ALL (deny-on-presence, review
+    /// XA 2026-09-20, S02): the trusted session section is the only config
+    /// source, so an inherited FS_SANDBOX_GUARD/ALLOW_RWX/DISABLE_HOOKS/
+    /// PIPE/DLL/CWD/ROOT value has no honest explanation. The old
+    /// compare-to-snapshot semantics (a "trusted value re-cased passes")
+    /// died with the env config source. Absence and unrelated variables
+    /// stay allowed; section and no_track keep their compare-to-snapshot
+    /// rules.
     #[test]
     fn guard_env_mismatch_denies_forged_child_guard_env() {
         let trusted = GuardEnvSnapshot {
-            guard: "full".into(),
-            disabled: "reg".into(),
-            allow_rwx: false,
             no_track: false,
             section: TRUSTED_SECTION.into(),
         };
 
-        // FS_SANDBOX_NO_TRACK is gated like the rest. It makes mark_spawned
-        // skip the child, which makes the injector's own cross-process writes
-        // look foreign to memory_guard — injection then fails and the child is
+        // The three guard-level knobs are now denied on ANY presence —
+        // including the old "matches the trusted value" and "reads like a
+        // denial" spellings that used to pass.
+        for (name, value) in [
+            ("FS_SANDBOX_GUARD", "full"),       // the trusted value itself: still denied
+            ("fs_sandbox_guard", "FULL"),       // re-cased trusted value: still denied
+            ("FS_SANDBOX_GUARD", "none"),       // downgrade
+            ("fs_sandbox_allow_rwx", "0"),      // presence-only enable: denied
+            ("FS_SANDBOX_ALLOW_RWX", "1"),      // even when RWX would be allowed: denied
+            ("FS_SANDBOX_DISABLE_HOOKS", "memory"), // the exact audit attack
+            ("FS_SANDBOX_DISABLE_HOOKS", "reg"), // the trusted list itself: still denied
+            ("FS_SANDBOX_DISABLE_HOOKS", " REG , reg "), // equivalent re-spelling: still denied
+        ] {
+            let reason = guard_env_mismatch(
+                &[(name.to_string(), value.to_string())],
+                &trusted,
+            );
+            assert!(
+                reason.as_ref().is_some_and(|m| m.contains(&name.to_ascii_uppercase())),
+                "inherited {name}={value:?} must be denied on presence alone, got {reason:?}"
+            );
+        }
+
+        // The four config-path variables joined the deny list with S02:
+        // an inherited pipe/dll/cwd/root has no legitimate source either.
+        for (name, value) in [
+            ("FS_SANDBOX_PIPE", r"\\.\pipe\winrsbox-ipc"),
+            ("FS_SANDBOX_DLL", r"D:\evil\hook.dll"),
+            ("FS_SANDBOX_CWD", r"D:\sandbox"),
+            ("FS_SANDBOX_ROOT", r"D:\overlay"),
+        ] {
+            let reason = guard_env_mismatch(
+                &[(name.to_string(), value.to_string())],
+                &trusted,
+            );
+            assert!(
+                reason.as_ref().is_some_and(|m| m.contains(name)),
+                "inherited {name} must be denied on presence alone, got {reason:?}"
+            );
+        }
+
+        // Every deny message carries the single-source-of-truth explanation.
+        let reason = guard_env_mismatch(
+            &[("FS_SANDBOX_GUARD".to_string(), "none".to_string())],
+            &trusted,
+        )
+        .expect("guard presence must be denied");
+        assert!(
+            reason.contains("trusted session section"),
+            "deny reason must name the trusted section as the only config channel: {reason}"
+        );
+
+        // FS_SANDBOX_NO_TRACK keeps its compare-to-snapshot rule: denied
+        // unless the snapshot carries it. It makes mark_spawned skip the
+        // child, which makes the injector's own cross-process writes look
+        // foreign to memory_guard — injection then fails and the child is
         // terminated before resume. That is a guest self-DoS rather than an
-        // escape, but a guard-relevant variable outside the gate is precisely
-        // the drift the gate exists to catch, so forging it is refused.
+        // escape, but a guard-relevant variable outside the gate is
+        // precisely the drift the gate exists to catch.
         assert!(
             guard_env_mismatch(
                 &[("FS_SANDBOX_NO_TRACK".to_string(), "1".to_string())],
@@ -491,9 +638,6 @@
         // When the launcher itself set it (integration tests do), a child
         // inheriting the same value matches the snapshot and is allowed.
         let trusted_no_track = GuardEnvSnapshot {
-            guard: "full".into(),
-            disabled: "reg".into(),
-            allow_rwx: false,
             no_track: true,
             section: TRUSTED_SECTION.into(),
         };
@@ -505,8 +649,8 @@
             None,
         );
 
-        // No guard variables at all: the child's hook boots with fail-safe
-        // defaults (guard "full", nothing disabled, RWX off) — allowed.
+        // No guard variables at all: the child's hook boots with the
+        // fail-closed trusted-section defaults — allowed.
         assert_eq!(guard_env_mismatch(&[], &trusted), None);
         assert_eq!(
             guard_env_mismatch(&[("PATH".to_string(), r"C:\Windows".to_string())], &trusted),
@@ -514,68 +658,21 @@
             "non-guard variables must not trip the gate"
         );
 
-        // Forged disable list — the exact attack from the audit finding.
-        let reason = guard_env_mismatch(
-            &[("FS_SANDBOX_DISABLE_HOOKS".to_string(), "memory".to_string())],
-            &trusted,
-        );
-        assert!(
-            reason.is_some(),
-            "a child inheriting FS_SANDBOX_DISABLE_HOOKS=memory must be denied"
-        );
-        assert!(reason.unwrap().contains("forged"));
-
-        // An equivalent re-spelling of the trusted list passes (case,
-        // whitespace, order and duplicates are normalized on both sides).
+        // Retired-but-unrelated variables are ignored this chunk (trace, the
+        // init-event / diagnostic escapes, and the per-child ack var — which
+        // trusted parent code appends into the child's env AFTER this gate
+        // ran — are not security config).
         assert_eq!(
             guard_env_mismatch(
-                &[("FS_SANDBOX_DISABLE_HOOKS".to_string(), " REG , reg ".to_string())],
+                &[
+                    ("FS_SANDBOX_TRACE".to_string(), "1".to_string()),
+                    ("FS_SANDBOX_INIT_EVENT".to_string(), "some-event".to_string()),
+                    ("FS_SANDBOX_CHILD_INIT_EVENT".to_string(), "some-child-ack-event".to_string()),
+                ],
                 &trusted,
             ),
             None,
-            "an equivalent restatement of the trusted disable list is not a forgery"
-        );
-
-        // Forged RWX enable: presence-only semantics — ANY value counts as
-        // an enable, including one that reads like a denial.
-        let reason = guard_env_mismatch(
-            &[("fs_sandbox_allow_rwx".to_string(), "0".to_string())],
-            &trusted,
-        );
-        assert!(
-            reason.is_some(),
-            "FS_SANDBOX_ALLOW_RWX=0 still means present; the hook treats existence as enable"
-        );
-
-        // With RWX genuinely allowed by the snapshot, the variable passes.
-        let trusted_rwx = GuardEnvSnapshot {
-            guard: "full".into(),
-            disabled: "reg".into(),
-            allow_rwx: true,
-            no_track: false,
-            section: TRUSTED_SECTION.into(),
-        };
-        assert_eq!(
-            guard_env_mismatch(
-                &[("FS_SANDBOX_ALLOW_RWX".to_string(), "1".to_string())],
-                &trusted_rwx,
-            ),
-            None,
-        );
-
-        // Forged guard-level downgrade.
-        let reason = guard_env_mismatch(
-            &[("FS_SANDBOX_GUARD".to_string(), "none".to_string())],
-            &trusted,
-        );
-        assert!(
-            reason.is_some(),
-            "a child inheriting FS_SANDBOX_GUARD=none must be denied"
-        );
-        assert_eq!(
-            guard_env_mismatch(&[("FS_SANDBOX_GUARD".to_string(), "FULL".to_string())], &trusted),
-            None,
-            "the trusted guard level, re-cased, passes"
+            "non-config, non-guard variables stay ignored"
         );
 
         // One forged variable among legitimate ones is still caught.
@@ -605,9 +702,6 @@
     #[test]
     fn guard_env_mismatch_denies_forged_section_name() {
         let trusted = GuardEnvSnapshot {
-            guard: "full".into(),
-            disabled: "reg".into(),
-            allow_rwx: false,
             no_track: false,
             section: TRUSTED_SECTION.into(),
         };
@@ -631,9 +725,6 @@
             "a forged session-section name must be denied"
         );
         let trusted_no_name = GuardEnvSnapshot {
-            guard: "full".into(),
-            disabled: "reg".into(),
-            allow_rwx: false,
             no_track: false,
             section: String::new(),
         };
@@ -654,5 +745,231 @@
             guard_env_mismatch(&[], &trusted_no_name),
             None,
             "absence of the section name must stay allowed"
+        );
+    }
+
+    // ── S02 (review XA 2026-09-20): trusted-section-only security config ──
+    //
+    // Structural pins for the chunk-2 fix. The shared-memory session section
+    // (read via trusted_boot::resolve_effective_config) is the ONLY source of
+    // install-time security config; the guest-forgeable environment carries
+    // only the opaque section name (FS_SANDBOX_SECTION) plus the two test
+    // aids (FS_SANDBOX_INIT_EVENT, FS_SANDBOX_NO_TRACK). The guard level is
+    // the typed ipc::GuardLevel, never a String compared by bytes.
+
+    /// The eight retired env-var names, in their quoted literal form.
+    /// `FS_SANDBOX_SECTION`, `FS_SANDBOX_INIT_EVENT` and `FS_SANDBOX_NO_TRACK`
+    /// are ALLOWED and must never join this list.
+    const RETIRED_CONFIG_ENV_VARS: [&str; 8] = [
+        "FS_SANDBOX_PIPE",
+        "FS_SANDBOX_DLL",
+        "FS_SANDBOX_CWD",
+        "FS_SANDBOX_ROOT",
+        "FS_SANDBOX_GUARD",
+        "FS_SANDBOX_ALLOW_RWX",
+        "FS_SANDBOX_DISABLE_HOOKS",
+        "FS_SANDBOX_TRACE",
+    ];
+
+    /// W1: no hooks-module source may read security config from the
+    /// environment — not via `env::var("FS_SANDBOX_PIPE")` nor by naming any
+    /// retired variable as a quoted literal anywhere in the module. Env reads
+    /// happened BEFORE the section loaded and `OnceLock::set` could never
+    /// overwrite env-accepted values, so a forged variable permanently
+    /// overrode the trusted config (review XA 2026-09-20, S02 #1).
+    #[test]
+    fn install_hooks_never_reads_security_config_from_env() {
+        let src = crate::hooks::module_source("hooks");
+        for name in RETIRED_CONFIG_ENV_VARS {
+            let quoted = format!("\"{name}\"");
+            assert!(
+                !src.contains(&quoted),
+                "hooks module must not reference security-config env var {name} — \
+                 config is delivered ONLY through the trusted session section"
+            );
+        }
+    }
+
+    /// W2: the guard level is the typed `ipc::GuardLevel`, not a String
+    /// compared by bytes. The ad-hoc String was compared case-insensitively
+    /// at the spawn gate but case-sensitively at executors, so "FULL" passed
+    /// the gate and then failed every `== "static"`-style executor check
+    /// (review XA 2026-09-20, S02 #2). Exact byte sequences only — the words
+    /// legitimately occur inside doc comments.
+    #[test]
+    fn guard_level_is_typed_not_string_compared() {
+        let src = crate::hooks::module_source("hooks");
+        assert!(
+            src.contains("GuardLevel"),
+            "hooks module must use the typed ipc::GuardLevel for the guard level"
+        );
+        for cmp in ["== \"full\"", "== \"static\"", "!= \"none\""] {
+            assert!(
+                !src.contains(cmp),
+                "guard level must be compared as ipc::GuardLevel, not by string: found {cmp}"
+            );
+        }
+    }
+
+    /// W3: the spawn gate must deny the retired config variables on PRESENCE
+    /// alone. Since the section is the only config source, an inherited
+    /// FS_SANDBOX_* config value has no legitimate explanation left — the
+    /// gate's match list must name all seven (lowercase; entries are
+    /// normalized on read).
+    #[test]
+    fn spawn_gate_denies_config_env_on_presence() {
+        let src = crate::hooks::module_source("spawn");
+        for name in [
+            "fs_sandbox_pipe",
+            "fs_sandbox_dll",
+            "fs_sandbox_cwd",
+            "fs_sandbox_root",
+            "fs_sandbox_guard",
+            "fs_sandbox_allow_rwx",
+            "fs_sandbox_disable_hooks",
+        ] {
+            assert!(
+                src.contains(name),
+                "spawn gate must deny inherited {name} on presence alone: security \
+                 config is delivered only through the trusted session section"
+            );
+        }
+    }
+
+    /// RED WITNESS (chunk 3, review XA 2026-09-20 S02 #1 remainder): the IPC
+    /// client must verify WHO owns the pipe server before trusting any
+    /// answer. The pipe name arrives via the (hook-only) session section, but
+    /// a hostile parent — or anything that can set the child's environment
+    /// before hook install — can otherwise point the child at an attacker
+    /// pipe answering `Decision::Passthrough` to everything. The defence is
+    /// two-fold and BOTH halves are pinned here, structurally:
+    ///   1. the raw server-PID query (`GetNamedPipeServerProcessId`) appears
+    ///      in ipc_client's module source, and
+    ///   2. the connect path actually calls
+    ///      `trusted_boot::verify_pipe_server_identity`.
+    /// `module_source("ipc_client")` resolves src/ipc/ipc_client.rs (unique
+    /// file stem under src/ — same runtime-read mechanism as the W1/W2/W3
+    /// pins above, immune to the include_str! file-vs-directory trap).
+    #[test]
+    fn ipc_connect_verifies_pipe_server_identity() {
+        let src = crate::hooks::module_source("ipc_client");
+        assert!(
+            src.contains("GetNamedPipeServerProcessId"),
+            "ipc_client must query the pipe server's owning PID \
+             (GetNamedPipeServerProcessId) — without it any process that can \
+             create a pipe with the session's name can impersonate the launcher"
+        );
+        assert!(
+            src.contains("verify_pipe_server_identity"),
+            "ipc_client must run trusted_boot::verify_pipe_server_identity on \
+             every fresh connection — a connected pipe whose server is not the \
+             pinned launcher (PID + kernel creation time) must be discarded \
+             like a failed connect"
+        );
+    }
+
+    // ── S10: fail-closed required hook categories + mitigation checks ──────
+
+    /// Extract the `install_hooks` body from the hooks module source (same
+    /// runtime-read mechanism as `spawn_hook_body` above): from the fn
+    /// signature to the next `pub unsafe fn` (`uninstall_hooks`, which
+    /// follows it in mod.rs).
+    fn install_hooks_body() -> String {
+        let src = crate::hooks::module_source("hooks");
+        let src = src.as_str();
+        let fn_start = src
+            .find("pub unsafe fn install_hooks")
+            .expect("install_hooks must exist in the hooks module");
+        let rest = &src[fn_start..];
+        let body_end = rest
+            .find("pub unsafe fn uninstall_hooks")
+            .expect("uninstall_hooks must follow install_hooks in hooks/mod.rs");
+        rest[..body_end].to_string()
+    }
+
+    /// S10: each REQUIRED hook category (reg/net/alpc/service/shell/system)
+    /// must propagate its install failure with `install()?` — Err escapes
+    /// install_hooks, DllMain returns FALSE and the launcher kills the child
+    /// — and ui must remain the ONLY buffered (optional) site.
+    #[test]
+    fn install_hooks_fails_closed_on_required_category_errors() {
+        let body = install_hooks_body();
+        for site in [
+            "crate::reg_hooks::install()?;",
+            "crate::net_hooks::install()?;",
+            "crate::alpc_guard::install()?;",
+            "crate::service_guard::install()?;",
+            "crate::shell_guard::install()?;",
+            "crate::system_guard::install()?;",
+        ] {
+            assert!(
+                body.contains(site),
+                "REQUIRED category site `{site}` is missing from install_hooks — \
+                 its install failure must abort the install (Err → DllMain FALSE → \
+                 launcher kills the child), not be buffered away"
+            );
+        }
+        let buffered = body.match_indices("buffer_install_error").count();
+        assert_eq!(
+            buffered, 1,
+            "exactly one buffered install site may remain in install_hooks — \
+             the OPTIONAL ui category; every other category must fail closed"
+        );
+        assert!(
+            body.contains("if let Err(e) = crate::ui_guard::install()"),
+            "the single buffered site must be the ui category's if-let — \
+             ui_guard is the one OPTIONAL category (no SECURITY.md containment \
+             promise depends on it) and degrades loudly-but-gracefully"
+        );
+    }
+
+    /// R04 F4: the OPTIONAL ui category must keep buffering every failure
+    /// mode — detour init, detour enable, missing user32 export, missing
+    /// win32u.dll — so each surfaces as the S10 degraded-init signal instead
+    /// of being silently swallowed or aborting the install.
+    #[test]
+    fn ui_guard_failures_buffer_into_the_degraded_init_signal() {
+        let src = crate::hooks::module_source("ui_guard");
+        for needle in [
+            "ui_guard: detour init ",
+            "ui_guard: detour enable ",
+            "ui_guard: export not found: ",
+            "ui_guard: win32u.dll not loaded",
+        ] {
+            assert!(
+                src.contains(needle),
+                "ui_guard install must buffer `{needle}` — the ui category is \
+                 OPTIONAL and degrades via the S10 degraded-init event"
+            );
+        }
+    }
+
+    /// S10: the init_ack module (moved out of hooks/mod.rs) must keep the
+    /// verify-after-set mitigation machinery, the `Result`-returning
+    /// apply_mitigations signature, and the degraded-init env name the
+    /// launcher (chunk 3, launch_prep.rs) shares as a cross-crate contract.
+    #[test]
+    fn init_ack_verifies_mitigations_and_pins_degraded_event_env() {
+        let src = crate::hooks::module_source("init_ack");
+        for needle in [
+            "GetProcessMitigationPolicy",
+            "mitigation_failure_is_fatal",
+            "-> Result<(), String>",
+            "FS_SANDBOX_INIT_DEGRADED_EVENT",
+            "install_errors_pending",
+        ] {
+            assert!(
+                src.contains(needle),
+                "init_ack module source must contain `{needle}` — apply_mitigations \
+                 must check every SetProcessMitigationPolicy BOOL and verify-after-set \
+                 policies 2/8, and the degraded-event env name is a pinned \
+                 hook↔launcher contract"
+            );
+        }
+        assert!(
+            src.contains("FS_SANDBOX_CHILD_INIT_EVENT"),
+            "init_ack module source must contain `FS_SANDBOX_CHILD_INIT_EVENT` — \
+             the per-child bootstrap-ack env name is the same cross-side pinned \
+             hook↔launcher contract as the degraded-event literal above"
         );
     }

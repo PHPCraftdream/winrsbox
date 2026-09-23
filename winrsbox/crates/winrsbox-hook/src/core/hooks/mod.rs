@@ -26,12 +26,13 @@ use policy::Mode;
 use winapi::um::processthreadsapi::{GetCurrentProcessId, GetProcessId};
 
 use crate::anti_rec;
+use crate::init_ack::apply_mitigations;
 use crate::inject;
 
 // ---------------------------------------------------------------------------
 // Re-exports from ipc_client — keep existing call sites working.
 // (crate::hooks::ipc_log, is_trace, ipc_log_violation, ipc_send_and_recv,
-//  ntdll_export, flush_install_errors, SANDBOX_CWD, etc.)
+//  ntdll_export, buffer_install_error, SANDBOX_CWD, etc.)
 // ---------------------------------------------------------------------------
 pub(crate) use crate::ipc_client::{
     buffer_install_error,
@@ -49,10 +50,8 @@ pub(crate) use crate::ipc_client::{
     ipc_spawned_child,
     is_trace,
     DLL_PATH,
-    PIPE_NAME,
     SANDBOX_CWD,
     SANDBOX_ROOT,
-    TRACE_ENABLED,
 };
 
 // Split-out submodules (mechanical move from this file). Plain `mod` lines only:
@@ -71,7 +70,7 @@ pub(crate) use denylist::{canonical_denylist_status, canonicalize_for_denylist, 
 pub(crate) use device::{classify_device_open, is_fs_device_path, needs_short_name_resolve, DeviceVerdict};
 pub(crate) use overlay::{materialize_mock_overlay, prepare_overlay};
 #[cfg(test)] pub(crate) use overlay::overlay_dest_in_roots;
-#[cfg(test)] use overlay::{overlay_roots_lower, prepare_overlay_in_roots};
+#[cfg(test)] use overlay::{materialize_mock_overlay_in_roots, overlay_roots_lower, prepare_overlay_in_roots};
 pub(crate) use spawn::{GuardEnvSnapshot, hook_category_disabled};
 use spawn::{DISABLED_HOOK_CATS, FnNtCreateUserProcess, GUARD_ENV, HOOK_NT_CREATE_USER_PROCESS, extract_child_exe, hook_nt_create_user_process};
 #[cfg(test)] use spawn::{child_guard_env_violation, child_scan_enabled, guard_env_mismatch, scan_image_for_direct_syscalls};
@@ -150,6 +149,10 @@ pub const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
 pub const DELETE: u32 = 0x0001_0000;
 pub const WRITE_DAC: u32 = 0x0004_0000;
 pub const WRITE_OWNER: u32 = 0x0008_0000;
+/// Potential write: asks the kernel for every right the DACL grants,
+/// which can include WRITE. See [`is_write_access`] for why this is in
+/// the write mask despite being a common read-probe pattern.
+pub const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
 
 pub const FILE_CREATE: u32 = 0x0000_0002;
 pub const FILE_OPEN: u32 = 0x0000_0001;
@@ -182,11 +185,16 @@ pub const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
 ///    file outside project_root (audit 2026-09-19, Medium).
 ///  - FILE_WRITE_EA: extended-attribute mutation.
 ///
-/// MAXIMUM_ALLOWED is deliberately NOT a write here: it resolves per-DACL
-/// and is a probe-heavy pattern, so classifying it as a write would
-/// CoW-copy every probed file. The registry classifier
-/// (reg_hooks::nt_create_key_is_write_access) made the opposite trade —
-/// its overlay cost is a redb row, not a full file copy.
+/// MAXIMUM_ALLOWED is a POTENTIAL write: it asks the kernel for every
+/// right the DACL grants, which can include WRITE. Classifying it as a
+/// read let a read decision hand out a real write-capable handle — the
+/// Mode::Passthrough arm and the CoW read-passthrough both forward the
+/// caller's ORIGINAL desired_access, and a subsequent NtWriteFile through
+/// that handle is not hooked (review XA 2026-09-20, S01, P0). Such opens
+/// therefore take the CoW/Deny path instead of passthrough; the CoW cost
+/// for probe-heavy callers is intended. The registry classifier
+/// (reg_hooks::nt_create_key_is_write_access) makes the same trade — its
+/// overlay cost is a redb row, not a full file copy.
 pub fn is_write_access(desired: ACCESS_MASK, disposition: u32) -> bool {
     let write_bits = GENERIC_ALL
         | GENERIC_WRITE
@@ -196,7 +204,8 @@ pub fn is_write_access(desired: ACCESS_MASK, disposition: u32) -> bool {
         | FILE_WRITE_ATTRIBUTES
         | DELETE
         | WRITE_DAC
-        | WRITE_OWNER;
+        | WRITE_OWNER
+        | MAXIMUM_ALLOWED;
     desired & write_bits != 0
         || matches!(
             disposition,
@@ -557,30 +566,16 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         hook_nt_query_attributes_file, hook_nt_query_full_attributes_file,
     };
 
-    if let Ok(pipe) = std::env::var("FS_SANDBOX_PIPE") {
-        let _ = PIPE_NAME.set(pipe);
-    }
-    if let Ok(dll) = std::env::var("FS_SANDBOX_DLL") {
-        let _ = DLL_PATH.set(dll);
-    }
-    if std::env::var("FS_SANDBOX_TRACE").is_ok() {
-        TRACE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-    if let Ok(cwd) = std::env::var("FS_SANDBOX_CWD") {
-        // Store project_root for the boundary checks (delete-hook, decide).
-        // Do NOT call SetCurrentDirectoryW here: install_hooks runs in DllMain
-        // of EVERY hooked process, including children. Forcing CWD to
-        // project_root would clobber the CWD a parent shell established via
-        // `cd` (e.g. `cd /d/e2e_external && git init`), so git would discover
-        // project_root as the worktree and create .git in the wrong place.
-        // The root process's CWD is already set by the launcher via
-        // CreateProcessW(lpCurrentDirectory); children inherit it normally.
-        let _ = SANDBOX_CWD.set(cwd);
-    }
-    if let Ok(sb_root) = std::env::var("FS_SANDBOX_ROOT") {
-        let _ = crate::ipc_client::SANDBOX_ROOT.set(sb_root);
-    }
-
+    // SECURITY CONFIG SOURCE OF TRUTH (review XA 2026-09-20, S02): the
+    // trusted session section is the ONLY source of install-time security
+    // config. The environment is consulted for the opaque section-name
+    // identifier alone; every retired config variable
+    // (FS_SANDBOX_PIPE/DLL/CWD/ROOT/GUARD/ALLOW_RWX/DISABLE_HOOKS/TRACE) is
+    // neither read here nor accepted anywhere else — reading them BEFORE the
+    // section loaded (the old order) let one SetEnvironmentVariable pin the
+    // hook's whole config forever, because `OnceLock::set` can never
+    // overwrite an env-accepted value.
+    //
     // The per-session random section name arrives through the injection
     // channel (launcher-authored for the root, spawn-hook-patched into every
     // child's env block before it runs). Capture it BEFORE the session
@@ -590,16 +585,16 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         crate::ipc_client::set_session_section_name(section);
     }
 
-    // Always load the session section from the shared memory mapping, EVEN
-    // when env vars are present. Env vars cover pipe_name/dll_path/cwd/trace/
-    // sandbox_root (legacy single-root), but the multi-root overlay layout
-    // (overlay_roots) is ONLY published via the session section — there is no
-    // env var for it. Without this call, the hook never learns about the C:
-    // overlay root, and multi-root path masking (path_info_guard /
-    // unmirror_overlay_handle_relative / the .winrsbox self-access carve-out)
-    // all fail to match C: overlay paths → raw overlay path leaks → git clone
-    // self-DoS.
-    let _ = crate::ipc_client::try_load_session_config_from_section();
+    // Load the trusted section by name and derive the effective config from
+    // it. The section (not the environment) carries pipe_name/dll_path/cwd/
+    // trace/sandbox_root AND the multi-root overlay layout (overlay_roots),
+    // which has no env equivalent at all. An absent section fails closed in
+    // trusted_boot: everything empty/off, guard Static (strongest tier),
+    // nothing permitted — and no pipe name means every IPC decision denies.
+    let section = crate::ipc_client::session_section_name()
+        .and_then(crate::ipc_client::try_load_session_config_named);
+    let effective = crate::trusted_boot::resolve_effective_config(section.as_ref());
+    crate::trusted_boot::apply_effective_config(&effective);
 
     macro_rules! install {
         ($lock:expr, $sym:literal, $hook_fn:expr, $fn_ty:ty) => {{
@@ -621,22 +616,21 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         }};
     }
 
-    // Audit 2026-09-19 High: snapshot EVERY guard input once, here, before
-    // any hook is enabled and before any guest code has run. After this
-    // point nothing re-reads the environment for guard configuration —
-    // decision code reads the GUARD_ENV / DISABLED_HOOK_CATS snapshots only,
-    // and hook_nt_create_user_process denies any spawn whose inherited
-    // environment carries forged guard values (child_guard_env_violation).
-    // This generalizes the P1-01 SPAWN_SCAN_GUARD snapshot to all inputs.
-    let guard = std::env::var("FS_SANDBOX_GUARD").unwrap_or_else(|_| "full".into());
-    let disabled = std::env::var("FS_SANDBOX_DISABLE_HOOKS").unwrap_or_default();
-    let allow_rwx_env = std::env::var("FS_SANDBOX_ALLOW_RWX").is_ok();
+    // Audit 2026-09-19 High + review XA 2026-09-20 S02: snapshot every guard
+    // input once, here, before any hook is enabled and before any guest code
+    // has run. After this point nothing re-reads the environment for guard
+    // configuration — guard/allow_rwx/disable_hooks come from the TRUSTED
+    // session section via `effective` (never the env), decision code reads
+    // the GUARD_ENV / DISABLED_HOOK_CATS / TRUSTED_GUARD snapshots only, and
+    // hook_nt_create_user_process denies any spawn whose inherited
+    // environment carries a config variable at all (deny-on-presence,
+    // child_guard_env_violation).
+    let guard = effective.guard;
+    let allow_rwx = effective.allow_rwx;
+    let disabled = effective.disable_hooks;
     let no_track_env = std::env::var_os("FS_SANDBOX_NO_TRACK").is_some();
     let section_env = std::env::var(crate::inject::SECTION_ENV_VAR).unwrap_or_default();
     let _ = GUARD_ENV.set(GuardEnvSnapshot {
-        guard: guard.clone(),
-        disabled: disabled.clone(),
-        allow_rwx: allow_rwx_env,
         no_track: no_track_env,
         section: section_env,
     });
@@ -657,37 +651,51 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         crate::path_info_guard::install()?;
     }
 
-    if guard != "none" {
+    if guard != ipc::GuardLevel::None {
         // Hold anti_rec during guard installation so detour's internal
         // VirtualProtect calls (to patch ntdll stubs) pass through the
         // NtProtectVirtualMemory hook without triggering content scans
         // on ntdll's legitimate syscall instructions.
         let _install_guard = anti_rec::enter();
+        // R04 F4 capability manifest: the install policy below is explicit.
+        // MANDATORY categories propagate any install failure with `?` — the
+        // launch aborts (DllMain FALSE, launcher kills the child) rather than
+        // running without promised containment: SECURITY.md lists COM
+        // activation, service-SCM and ShellExecute escapes as in-scope under
+        // scan/full/static, and each guard's install() additionally fails
+        // closed on a missing required export (com: CoCreateInstance/
+        // CoCreateInstanceEx/CoGetClassObject; service: OpenSCManagerW/
+        // OpenServiceW; shell: the four ShellExecute* exports). The single
+        // OPTIONAL category is ui (see below): its failures are buffered and
+        // surface as the S10 degraded-init event the launcher warns about.
         if !skip("memory") {
-            crate::memory_guard::install(&guard, &disabled_cats, allow_rwx_env)?;
+            // memory_guard still speaks &str THIS CHUNK: pass the canonical
+            // lowercase Display spelling. Chunk 4 converts memory_guard to
+            // the typed ipc::GuardLevel and retires the string entirely.
+            crate::memory_guard::install(&guard.to_string(), &disabled_cats, allow_rwx)?;
         }
         if !skip("inject") {
             crate::inject_guard::install()?;
         }
         if !skip("reg") {
-            if let Err(e) = crate::reg_hooks::install() {
-                buffer_install_error(format!("reg_hooks install failed: {:?}", e));
-            }
+            // S10 REQUIRED category: an install failure aborts install_hooks
+            // (Err → DllMain FALSE → launcher kills the child), fail-closed.
+            crate::reg_hooks::install()?;
         }
         if !skip("net") {
-            if let Err(e) = crate::net_hooks::install() {
-                buffer_install_error(format!("net_hooks install failed: {:?}", e));
-            }
+            crate::net_hooks::install()?;
         }
         if !skip("alpc") {
-            if let Err(e) = crate::alpc_guard::install() {
-                buffer_install_error(format!("alpc_guard install failed: {:?}", e));
-            }
+            crate::alpc_guard::install()?;
         }
         if !skip("token") {
             crate::token_guard::install()?;
         }
         if !skip("ui") {
+            // ui_guard is the one OPTIONAL category: no SECURITY.md containment
+            // promise depends on it (SetWindowsHookEx-class injection is covered
+            // by ExtensionPointDisablePolicy), so it degrades
+            // loudly-but-gracefully.
             if let Err(e) = crate::ui_guard::install() {
                 buffer_install_error(format!("ui_guard install failed: {:?}", e));
             }
@@ -699,23 +707,19 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
             crate::com_guard::install()?;
         }
         if !skip("service") {
-            if let Err(e) = crate::service_guard::install() {
-                buffer_install_error(format!("service_guard install failed: {:?}", e));
-            }
+            crate::service_guard::install()?;
         }
         if !skip("shell") {
-            if let Err(e) = crate::shell_guard::install() {
-                buffer_install_error(format!("shell_guard install failed: {:?}", e));
-            }
+            crate::shell_guard::install()?;
         }
         if !skip("system") {
-            if let Err(e) = crate::system_guard::install() {
-                buffer_install_error(format!("system_guard install failed: {:?}", e));
-            }
+            crate::system_guard::install()?;
         }
 
         if !skip("mitigations") {
-            apply_mitigations(&guard);
+            // S10: apply_mitigations now returns Result — a static-tier
+            // DynamicCode/Signature set-or-verify failure aborts the install.
+            apply_mitigations(guard)?;
         }
 
         // Arm the inject_guard deterministically now that every hook (incl.
@@ -731,114 +735,22 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
         // arm() is a single `AtomicBool::store(true, Release)` — no allocation,
         // no LoadLibrary, no syscall — so it is safe in this DllMain/loader-lock-
         // adjacent context and idempotent. The ensure_ipc_and() call is kept as
-        // belt-and-suspenders for the `guard == "none"` path (where inject_guard
-        // is not installed, arming is a harmless no-op flag flip).
+        // belt-and-suspenders for the `guard == GuardLevel::None` path (where
+        // inject_guard is not installed, arming is a harmless no-op flag flip).
         if !skip("inject") {
             crate::inject_guard::arm();
         }
     }
 
     // Signal launcher that hook.dll initialized successfully via kernel Event.
-    // If this env var is absent, we're in a context that doesn't need signaling
-    // (e.g. unit tests running hook code directly).
-    if let Ok(event_name) = std::env::var("FS_SANDBOX_INIT_EVENT") {
-        let wide: Vec<u16> = event_name.encode_utf16().chain(Some(0)).collect();
-        unsafe {
-            let h = winapi::um::synchapi::OpenEventW(
-                0x0002, // EVENT_MODIFY_STATE — needed for SetEvent
-                0,      // bInheritHandle = FALSE
-                wide.as_ptr(),
-            );
-            if !h.is_null() {
-                winapi::um::synchapi::SetEvent(h);
-                winapi::um::handleapi::CloseHandle(h);
-            }
-        }
-    }
+    // If the env var is absent, we're in a context that doesn't need signaling
+    // (e.g. unit tests running hook code directly). S10: signal_init_events
+    // ADDITIONALLY fires the FS_SANDBOX_INIT_DEGRADED_EVENT event when
+    // buffered install errors exist at init-signal time, so the launcher can
+    // tell a degraded init from a clean one.
+    crate::init_ack::signal_init_events();
 
     Ok(())
-}
-
-/// Apply kernel-enforced process mitigations from within the sandboxed process.
-/// Called after all hooks are installed so our detour patching is already done.
-fn apply_mitigations(guard: &str) {
-    if guard == "none" {
-        return;
-    }
-    use winapi::um::processthreadsapi::SetProcessMitigationPolicy;
-    use winapi::um::winnt::PROCESS_MITIGATION_POLICY;
-
-    // ExtensionPointDisablePolicy (6): blocks AppInit_DLLs, SetWindowsHookEx, IFEO.
-    // Applied in full and static — this is JIT-safe hardening (it blocks
-    // injection INTO us, not our own code generation).
-    // Diagnostic escape hatch: set FS_SANDBOX_NO_EXTPOINT_DISABLE=1 to skip
-    // this block (suspected to also break Text Services Framework / IME
-    // initialisation, including per-process keyboard layout switching).
-    if (guard == "full" || guard == "static")
-        && std::env::var("FS_SANDBOX_NO_EXTPOINT_DISABLE").is_err()
-    {
-        let ext_disable_flags: u32 = 1;
-        // SAFETY: ext_disable_flags is valid for PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY.
-        unsafe {
-            SetProcessMitigationPolicy(
-                6i32 as PROCESS_MITIGATION_POLICY,
-                &ext_disable_flags as *const u32 as *mut _,
-                std::mem::size_of::<u32>(),
-            );
-        }
-    }
-
-    // DynamicCode + Signature are the JIT/unsigned-code killers — they break
-    // node/V8, .NET, Python .pyd, Node .node. Applied ONLY in `static` (hard
-    // containment, opt-in for pure-static targets), never in `full`. This is
-    // the runtime half of the M4 split; the create-time half lives in
-    // launcher mitigations::Profile::Static. SignaturePolicy is applied here
-    // (not at create time) precisely because hook.dll is unsigned and must
-    // load first.
-    if guard == "static" {
-        // DynamicCodePolicy (2): blocks RWX/JIT
-        let dyn_code_flags: u32 = 1; // ProhibitDynamicCode = bit 0
-        // SAFETY: same — 4-byte struct with Flags DWORD.
-        unsafe {
-            SetProcessMitigationPolicy(
-                2i32 as PROCESS_MITIGATION_POLICY, // ProcessDynamicCodePolicy
-                &dyn_code_flags as *const u32 as *mut _,
-                std::mem::size_of::<u32>(),
-            );
-        }
-
-        // SignaturePolicy (8): only Microsoft-signed DLLs (subsequent loads)
-        let sig_flags: u32 = 1; // MicrosoftSignedOnly = bit 0
-        // SAFETY: same — PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY (4 bytes).
-        unsafe {
-            SetProcessMitigationPolicy(
-                8i32 as PROCESS_MITIGATION_POLICY, // ProcessSignaturePolicy
-                &sig_flags as *const u32 as *mut _,
-                std::mem::size_of::<u32>(),
-            );
-        }
-    }
-
-    // ImageLoadPolicy (10): PreferSystem32Images + NoRemoteImages.
-    // Applied in all enforcing tiers (scan/full/static) — DLL sideloading via CWD/PATH hijack
-    // is a critical sandbox-escape vector that affects all profiles.
-    // Safe to apply after hook installation: hook.dll is already loaded,
-    // and PreferSystem32Images only affects *subsequent* LoadLibrary calls.
-    // Diagnostic escape hatch: set FS_SANDBOX_NO_IMAGELOAD_LOCK=1 to skip.
-    if std::env::var("FS_SANDBOX_NO_IMAGELOAD_LOCK").is_err() {
-        // PROCESS_MITIGATION_IMAGE_LOAD_POLICY bit layout:
-        //   bit 0 = NoRemoteImages    (block UNC \\server\share\evil.dll)
-        //   bit 2 = PreferSystem32Images (System32 searched before CWD/PATH)
-        let image_load_flags: u32 = (1 << 0) | (1 << 2); // NoRemote | PreferSystem32
-        // SAFETY: image_load_flags is valid for PROCESS_MITIGATION_IMAGE_LOAD_POLICY (4 bytes).
-        unsafe {
-            SetProcessMitigationPolicy(
-                10i32 as PROCESS_MITIGATION_POLICY, // ProcessImageLoadPolicy
-                &image_load_flags as *const u32 as *mut _,
-                std::mem::size_of::<u32>(),
-            );
-        }
-    }
 }
 
 /// Disable all detours. Called from DllMain(DLL_PROCESS_DETACH).

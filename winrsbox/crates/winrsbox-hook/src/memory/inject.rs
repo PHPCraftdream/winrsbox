@@ -46,13 +46,16 @@ type FnNtQueueApcThread = unsafe extern "system" fn(
 ///               PROCESS_VM_OPERATION | PROCESS_CREATE_THREAD).
 /// * `thread`  – handle to the initial (suspended) thread of the target process.
 /// * `dll_path` – absolute Windows path to hook.dll (e.g. `C:\path\hook.dll`).
+/// * `extra_env` – NAME=VALUE pairs appended to the child's environment
+///   block before any guest code runs (session section name, per-child
+///   ack event name).
 ///
 /// Returns `Ok(())` on success or an error string for logging.
 pub fn inject_via_apc(
     process: HANDLE,
     thread: HANDLE,
     dll_path: &str,
-    section_name: Option<&str>,
+    extra_env: &[(&str, &str)],
 ) -> Result<(), String> {
     // Encode the DLL path as null-terminated UTF-16.
     let mut wide: Vec<u16> = dll_path.encode_utf16().collect();
@@ -112,23 +115,25 @@ pub fn inject_via_apc(
         return Err("WriteProcessMemory failed".into());
     }
 
-    // Deliver the session-section name through the injection channel:
-    // append FS_SANDBOX_SECTION to the suspended child's environment block.
-    // This runs before any guest code executes, so the value cannot be
-    // intercepted or forged, and it reaches env-scrubbed children (MSYS2
-    // first-run helpers) exactly like the DLL path above does. On failure
-    // the APC is never queued and the caller terminates the child: a hooked
-    // process without the session name could only fail closed later (no
-    // pipe name ⇒ self-termination), so failing early is strictly cleaner.
-    if let Some(name) = section_name {
-        if let Err(e) = patch_child_env_section(process, name) {
+    // Deliver injected variables through the injection channel: append them
+    // to the suspended child's environment block. This runs before any guest
+    // code executes, so the values cannot be intercepted or forged, and they
+    // reach env-scrubbed children (MSYS2 first-run helpers) exactly like the
+    // DLL path above does. Today's callers inject the per-session section
+    // name (re-asserted by every spawn) and the per-child bootstrap ack event
+    // name (review XA 2026-09-20, S02 #3). On failure the APC is never queued
+    // and the caller terminates the child: a hooked process without the
+    // session name could only fail closed later (no pipe name ⇒
+    // self-termination), so failing early is strictly cleaner.
+    if !extra_env.is_empty() {
+        if let Err(e) = patch_child_env_pairs(process, extra_env) {
             unsafe {
                 // SAFETY: remote_buf was successfully allocated above; the
                 //         APC was never queued, so nothing in the child can
                 //         still be reading it.
                 VirtualFreeEx(process, remote_buf, 0, MEM_RELEASE);
             }
-            return Err(format!("session-name env patch failed: {e}"));
+            return Err(format!("env patch failed: {e}"));
         }
     }
 
@@ -211,7 +216,7 @@ pub fn inject_via_apc(
 
 /// Environment variable carrying the per-session random section name. The
 /// launcher authors it for the root target; the spawn hook re-asserts it into
-/// every child through [`patch_child_env_section`].
+/// every child through [`patch_child_env_pairs`].
 pub(crate) const SECTION_ENV_VAR: &str = "FS_SANDBOX_SECTION";
 
 /// x64 layout constants. Documented, stable since Win7; the spawn hook's
@@ -230,33 +235,57 @@ const PARAMS_X64_LENGTH: usize = 0x400;
 /// unbounded cross-process read.
 const MAX_ENV_BLOCK_CHARS: usize = 1 << 20; // 1 MiB of UTF-16
 
-/// Build the replacement environment block: the existing entries (if any),
-/// then `NAME=VALUE`, then the double-NUL terminator.
+/// Build the replacement environment block: the surviving existing entries,
+/// then the `entries` NAME=VALUE pairs in order, then the double-NUL
+/// terminator.
 ///
 /// Pure function so the wire format the child's environment consumers will
 /// parse is unit-testable without a real child process. `existing` is the
-/// block exactly as read from the child (terminator-inclusive); trailing
-/// terminator units are stripped, a single NUL separator is kept between the
-/// existing entries and the appended one, and the result ends in exactly one
-/// `\0\0`.
-fn env_block_bytes(existing: Option<&[u16]>, name: &str, value: &str) -> Vec<u8> {
+/// block exactly as read from the child (terminator-inclusive). Inherited
+/// entries whose NAME (case-insensitive) equals one of the appended names are
+/// DROPPED: the appended pair is the freshest, parent-authored value, and
+/// environment consumers return the FIRST match — for the per-child ack event
+/// name a stale inherited copy must never shadow it. The result keeps one NUL
+/// between entries and ends in exactly one `\0\0`.
+fn env_block_bytes(existing: Option<&[u16]>, entries: &[(&str, &str)]) -> Vec<u8> {
+    let appended_names: Vec<String> = entries
+        .iter()
+        .map(|(name, _)| name.to_ascii_lowercase())
+        .collect();
     let mut chars: Vec<u16> = Vec::new();
     if let Some(existing) = existing {
-        chars.extend_from_slice(existing);
-        while chars.last() == Some(&0) {
-            chars.pop();
-        }
-        // The NUL that ended the last surviving entry is also the separator
-        // before the entry appended below — keep exactly one.
-        if !chars.is_empty() {
-            chars.push(0);
+        // Walk NAME=VALUE entries split on single NULs; re-emit only the
+        // survivors, each with its terminator NUL. An empty slice ends the
+        // walk (double-NUL).
+        let mut start = 0usize;
+        while start < existing.len() {
+            let Some(rel_end) = existing[start..].iter().position(|&c| c == 0) else {
+                break; // unterminated tail — ignore, same as before
+            };
+            let entry = &existing[start..start + rel_end];
+            start += rel_end + 1;
+            if entry.is_empty() {
+                break;
+            }
+            let keep = match entry.iter().position(|&c| c == '=' as u16) {
+                Some(eq) => {
+                    let name = String::from_utf16_lossy(&entry[..eq]).to_ascii_lowercase();
+                    !appended_names.contains(&name)
+                }
+                None => true,
+            };
+            if keep {
+                chars.extend_from_slice(entry);
+                chars.push(0);
+            }
         }
     }
-    let mut entry: Vec<u16> = name.encode_utf16().collect();
-    entry.push('=' as u16);
-    entry.extend(value.encode_utf16());
-    chars.extend_from_slice(&entry);
-    chars.push(0); // entry terminator
+    for (name, value) in entries {
+        chars.extend(name.encode_utf16());
+        chars.push('=' as u16);
+        chars.extend(value.encode_utf16());
+        chars.push(0); // entry terminator
+    }
     chars.push(0); // block terminator
     let mut bytes = Vec::with_capacity(chars.len() * 2);
     for c in chars {
@@ -289,8 +318,8 @@ fn read_remote_bytes(process: HANDLE, addr: usize, buf: &mut [u8]) -> Result<(),
     Ok(())
 }
 
-/// Append `FS_SANDBOX_SECTION=<section_name>` to the SUSPENDED child's
-/// environment block, cross-process.
+/// Append the `entries` NAME=VALUE pairs to the SUSPENDED child's
+/// environment block, cross-process, in order.
 ///
 /// This is the delivery channel for the per-session random section name
 /// (audit 2026-09-19, Critical #3): every child — including env-scrubbed
@@ -299,6 +328,13 @@ fn read_remote_bytes(process: HANDLE, addr: usize, buf: &mut [u8]) -> Result<(),
 /// The hook reads the variable at DllMain install time via
 /// GetEnvironmentVariableW, which walks PEB->ProcessParameters->Environment
 /// live — exactly the pointer this function rewrites.
+///
+/// Inherited entries whose name equals one being appended are dropped first
+/// (see env_block_bytes): the appended pair is the freshest, parent-authored
+/// value, and GetEnvironmentVariableW / `std::env::var` return the FIRST
+/// match in the block. Without the drop, a nested child could keep the stale
+/// per-child ack name it inherited from ITS parent, signal a dead event, and
+/// its own parent would time out.
 ///
 /// Mechanics: read the child's PEB -> ProcessParameters -> Environment,
 /// allocate a replacement block in the child, write old entries + our
@@ -311,7 +347,7 @@ fn read_remote_bytes(process: HANDLE, addr: usize, buf: &mut [u8]) -> Result<(),
 /// Returns Ok(()) without doing anything when the child does not look like a
 /// 64-bit process (struct Length mismatch): such a child cannot load this
 /// x64 hook DLL anyway, so there is no config to deliver.
-fn patch_child_env_section(process: HANDLE, section_name: &str) -> Result<(), String> {
+fn patch_child_env_pairs(process: HANDLE, entries: &[(&str, &str)]) -> Result<(), String> {
     #[allow(dead_code)] // reserved fields mirror the kernel struct layout
     #[repr(C)]
     struct PROCESS_BASIC_INFORMATION {
@@ -423,7 +459,7 @@ fn patch_child_env_section(process: HANDLE, section_name: &str) -> Result<(), St
         Some(chars)
     };
 
-    let new_block = env_block_bytes(existing.as_deref(), SECTION_ENV_VAR, section_name);
+    let new_block = env_block_bytes(existing.as_deref(), entries);
     let new_size = new_block.len();
 
     // SAFETY: process is a live child handle with full access; commit+reserve
@@ -847,6 +883,8 @@ mod object_name_parsing_tests {
 mod env_delivery_tests {
     use super::*;
 
+    const CHILD_INIT_EVENT_ENV_FOR_TEST: &str = "FS_SANDBOX_CHILD_INIT_EVENT";
+
     fn decode_block(block: &[u8]) -> String {
         let chars: Vec<u16> = block
             .chunks_exact(2)
@@ -864,8 +902,7 @@ mod env_delivery_tests {
             .collect();
         let block = env_block_bytes(
             Some(&existing),
-            SECTION_ENV_VAR,
-            r"Local\WinRsBoxSession-abcd",
+            &[(SECTION_ENV_VAR, r"Local\WinRsBoxSession-abcd")],
         );
         let text = decode_block(&block);
         assert!(
@@ -889,7 +926,7 @@ mod env_delivery_tests {
     /// the MSYS2 first-run case the section fallback exists for.
     #[test]
     fn env_block_handles_scrubbed_child() {
-        let block = env_block_bytes(None, SECTION_ENV_VAR, "Local\\WinRsBoxSession-x");
+        let block = env_block_bytes(None, &[(SECTION_ENV_VAR, "Local\\WinRsBoxSession-x")]);
         assert_eq!(
             decode_block(&block),
             "FS_SANDBOX_SECTION=Local\\WinRsBoxSession-x\0\0"
@@ -901,8 +938,36 @@ mod env_delivery_tests {
     #[test]
     fn env_block_strips_trailing_terminators_before_append() {
         let existing: Vec<u16> = "A=B\0\0\0".encode_utf16().collect();
-        let block = env_block_bytes(Some(&existing), "K", "V");
+        let block = env_block_bytes(Some(&existing), &[("K", "V")]);
         assert_eq!(decode_block(&block), "A=B\0K=V\0\0");
+    }
+
+    /// A nested child inherits its PARENT's per-child ack env var; the spawn
+    /// hook must overwrite it, not append a second entry — env consumers
+    /// return the FIRST match, so a stale shadow would make the grandchild
+    /// signal a dead event and its own parent time out.
+    #[test]
+    fn env_block_replaces_inherited_same_name_entry() {
+        let existing: Vec<u16> = "FS_SANDBOX_CHILD_INIT_EVENT=Local\\stale\0PATH=C:\\x\0\0"
+            .encode_utf16()
+            .collect();
+        let block = env_block_bytes(
+            Some(&existing),
+            &[(CHILD_INIT_EVENT_ENV_FOR_TEST, "Local\\fresh")],
+        );
+        assert_eq!(
+            decode_block(&block),
+            "PATH=C:\\x\0FS_SANDBOX_CHILD_INIT_EVENT=Local\\fresh\0\0",
+            "the stale inherited ack entry must be dropped, not shadowed"
+        );
+    }
+
+    /// Multiple pairs ride one remote write pass, in caller order.
+    #[test]
+    fn env_block_appends_pairs_in_order() {
+        let existing: Vec<u16> = "A=B\0\0".encode_utf16().collect();
+        let block = env_block_bytes(Some(&existing), &[("K1", "V1"), ("K2", "V2")]);
+        assert_eq!(decode_block(&block), "A=B\0K1=V1\0K2=V2\0\0");
     }
 }
 

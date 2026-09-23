@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use policy::net;
+use winrsbox_policy::net;
 
 fn bench_match_host(c: &mut Criterion) {
     let mut group = c.benchmark_group("net");

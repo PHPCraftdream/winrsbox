@@ -1,5 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
-use policy::reg;
+use winrsbox_policy::reg;
+use std::time::Duration;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 fn bench_nt_to_friendly(c: &mut Criterion) {
@@ -64,9 +65,9 @@ fn bench_reg_decide(c: &mut Criterion) {
     let workreg = dir.path().join("workreg");
     std::fs::create_dir_all(&workreg).unwrap();
     let rdb = redb::Database::create(&db_path).unwrap();
-    { let txn = rdb.begin_write().unwrap(); txn.open_table(policy::db::REG_RULES).unwrap(); txn.open_table(policy::db::REG_MOCKS).unwrap(); txn.commit().unwrap(); }
+    { let txn = rdb.begin_write().unwrap(); txn.open_table(winrsbox_policy::db::REG_RULES).unwrap(); txn.open_table(winrsbox_policy::db::REG_MOCKS).unwrap(); txn.commit().unwrap(); }
     let db = std::sync::Arc::new(rdb);
-    let rp = policy::RegistryPolicy::open(db, workreg).unwrap();
+    let rp = winrsbox_policy::RegistryPolicy::open(db, workreg).unwrap();
 
     rp.decide(r"hklm\software\foo", Some("bar"), false);
 
@@ -94,7 +95,7 @@ fn bench_overlay_ops(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("workreg");
     std::fs::create_dir_all(&root).unwrap();
-    let mut ov = policy::reg_overlay::RegOverlay::new(root.clone());
+    let mut ov = winrsbox_policy::reg_overlay::RegOverlay::new(root.clone());
 
     group.bench_function("set_single", |b| {
         let counter = AtomicU64::new(0);
@@ -102,14 +103,14 @@ fn bench_overlay_ops(c: &mut Criterion) {
             let i = counter.fetch_add(1, Ordering::Relaxed);
             ov.set(
                 &format!("hklm\\bench\\key{i}"), "val",
-                policy::reg::RegValue { typ: policy::reg::RegType::Dword, data: policy::reg::RegData::U32(i as u32) },
+                winrsbox_policy::reg::RegValue { typ: winrsbox_policy::reg::RegType::Dword, data: winrsbox_policy::reg::RegData::U32(i as u32) },
             ).unwrap();
         })
     });
 
     group.bench_function("get_hit", |b| {
         ov.set("hklm\\bench\\static", "val",
-            policy::reg::RegValue { typ: policy::reg::RegType::Dword, data: policy::reg::RegData::U32(1) },
+            winrsbox_policy::reg::RegValue { typ: winrsbox_policy::reg::RegType::Dword, data: winrsbox_policy::reg::RegData::U32(1) },
         ).unwrap();
         b.iter(|| ov.get(black_box("hklm\\bench\\static"), black_box("val")))
     });
@@ -125,16 +126,16 @@ fn bench_overlay_ops(c: &mut Criterion) {
         let dir2 = tempfile::tempdir().unwrap();
         let root2 = dir2.path().join("workreg");
         std::fs::create_dir_all(&root2).unwrap();
-        let mut ov2 = policy::reg_overlay::RegOverlay::new(root2.clone());
+        let mut ov2 = winrsbox_policy::reg_overlay::RegOverlay::new(root2.clone());
         for i in 0..n {
             ov2.set(
                 &format!("hklm\\bench\\key{i}"), &format!("val{i}"),
-                policy::reg::RegValue { typ: policy::reg::RegType::Sz, data: policy::reg::RegData::String(format!("data{i}")) },
+                winrsbox_policy::reg::RegValue { typ: winrsbox_policy::reg::RegType::Sz, data: winrsbox_policy::reg::RegData::String(format!("data{i}")) },
             ).unwrap();
         }
         drop(ov2);
         group2.bench_function(format!("load_from_disk_n={n}"), |b| {
-            b.iter(|| policy::reg_overlay::RegOverlay::load_from_disk(black_box(root2.clone())).unwrap())
+            b.iter(|| winrsbox_policy::reg_overlay::RegOverlay::load_from_disk(black_box(root2.clone())).unwrap())
         });
     }
     group2.finish();
@@ -148,16 +149,16 @@ fn bench_reg_decide_scale(c: &mut Criterion) {
         let workreg = dir.path().join("workreg");
         std::fs::create_dir_all(&workreg).unwrap();
         let rdb = redb::Database::create(&db_path).unwrap();
-        { let txn = rdb.begin_write().unwrap(); txn.open_table(policy::db::REG_RULES).unwrap(); txn.open_table(policy::db::REG_MOCKS).unwrap(); txn.commit().unwrap(); }
+        { let txn = rdb.begin_write().unwrap(); txn.open_table(winrsbox_policy::db::REG_RULES).unwrap(); txn.open_table(winrsbox_policy::db::REG_MOCKS).unwrap(); txn.commit().unwrap(); }
         let db = std::sync::Arc::new(rdb);
         for i in 0..n {
-            policy::db::reg_rule_upsert(&db, &policy::db::RuleRow {
+            winrsbox_policy::db::reg_rule_upsert(&db, &winrsbox_policy::db::RuleRow {
                 id: format!("r{i}"), prefix: format!("hklm\\rule{i:04}"),
-                mode_read: policy::db::RuleMode::Passthrough, mode_write: policy::db::RuleMode::Deny,
+                mode_read: winrsbox_policy::db::RuleMode::Passthrough, mode_write: winrsbox_policy::db::RuleMode::Deny,
                 when: None,
             }).unwrap();
         }
-        let rp = policy::RegistryPolicy::open(db, workreg).unwrap();
+        let rp = winrsbox_policy::RegistryPolicy::open(db, workreg).unwrap();
         let counter = AtomicU64::new(0);
         group.bench_function(format!("cache_miss_n={n}"), |b| {
             b.iter_batched(
@@ -170,5 +171,82 @@ fn bench_reg_decide_scale(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_nt_to_friendly, bench_values_json, bench_reg_decide, bench_overlay_ops, bench_reg_decide_scale);
+fn bench_overlay_many_keys(c: &mut Criterion) {
+    // Perf-finding workload: writes to many INDEPENDENT keys. Before the
+    // per-key restructure every set() prefix-scanned all values accumulated
+    // so far (O(T) per write, O(T²) per batch); after, each write touches
+    // only its own key's values. Disk I/O (tmp+rename per set) is included
+    // on purpose — this is the end-to-end number.
+    let mut group = c.benchmark_group("reg_overlay_many_keys");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+    for n in [100, 400] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workreg");
+        std::fs::create_dir_all(&root).unwrap();
+        group.bench_function(format!("independent_key_writes_n={n}"), |b| {
+            b.iter_batched(
+                || winrsbox_policy::reg_overlay::RegOverlay::new(root.clone()),
+                |mut ov| {
+                    for i in 0..n {
+                        ov.set(
+                            &format!("hklm\\bulk\\key{i}"), "val",
+                            winrsbox_policy::reg::RegValue {
+                                typ: winrsbox_policy::reg::RegType::Dword,
+                                data: winrsbox_policy::reg::RegData::U32(i as u32),
+                            },
+                        ).unwrap();
+                    }
+                },
+                BatchSize::PerIteration,
+            )
+        });
+    }
+    group.finish();
+}
+
+fn bench_overlay_read_scale(c: &mut Criterion) {
+    // In-memory read cost at scale (no disk in the timed section): with T
+    // values across T distinct keys, the old flat-map enumerate was O(T) per
+    // key touched; the per-key map is O(Vk). get() no longer allocates a
+    // composite key string.
+    let mut group = c.benchmark_group("reg_overlay_read_scale");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+    for t in [1_000usize, 5_000] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workreg");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut ov = winrsbox_policy::reg_overlay::RegOverlay::new(root.clone());
+        for i in 0..t {
+            ov.set(
+                &format!("hklm\\scale\\key{i}"), "val",
+                winrsbox_policy::reg::RegValue {
+                    typ: winrsbox_policy::reg::RegType::Dword,
+                    data: winrsbox_policy::reg::RegData::U32(i as u32),
+                },
+            ).unwrap();
+        }
+        let keys: Vec<String> = (0..t).map(|i| format!("hklm\\scale\\key{i}")).collect();
+        group.bench_function(format!("enumerate_all_keys_t={t}"), |b| {
+            b.iter(|| {
+                for k in &keys {
+                    black_box(ov.enumerate_overlay_values(black_box(k)));
+                }
+            })
+        });
+        group.bench_function(format!("get_each_key_t={t}"), |b| {
+            b.iter(|| {
+                for k in &keys {
+                    black_box(ov.get(black_box(k), black_box("val")));
+                }
+            })
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_nt_to_friendly, bench_values_json, bench_reg_decide, bench_overlay_ops, bench_reg_decide_scale, bench_overlay_many_keys, bench_overlay_read_scale);
 criterion_main!(benches);

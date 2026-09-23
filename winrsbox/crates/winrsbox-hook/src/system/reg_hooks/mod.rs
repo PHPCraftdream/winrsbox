@@ -32,8 +32,12 @@ use crate::anti_rec;
 use crate::hooks::{nt_call_original, STATUS_ACCESS_DENIED, STATUS_NOT_SUPPORTED};
 
 mod resolve;
+mod persistence;
+mod transacted;
 
 use resolve::{log_open_existing_only, log_resolve_failed, log_silent_ok_downgrade, resolve_attrs_friendly, resolve_handle_friendly, ustr_to_string};
+use persistence::{hook_nt_rename_key, hook_nt_save_key, hook_nt_save_key_ex, hook_nt_restore_key, hook_nt_load_key, hook_nt_load_key_ex, hook_nt_unload_key, hook_nt_unload_key_2, hook_nt_unload_key_ex, hook_nt_replace_key};
+use transacted::{hook_nt_create_key_transacted, hook_nt_open_key_transacted, hook_nt_open_key_transacted_ex};
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -201,6 +205,18 @@ static NT_QUERY_KEY: OnceLock<FnNtQueryKey> = OnceLock::new();
 
 const KEY_NAME_INFORMATION: u32 = 3;
 
+// Test-only policy-mode override for `check_write_mode`. Unit tests run
+// without the launcher pipe, so the live IPC consult fails closed to
+// `Mode::Deny` and the Cow arms would be unreachable from tests. Thread
+// local + `Cell` so the consult can never block: a `Mutex` would
+// self-deadlock, because the forced test itself re-enters
+// `check_write_mode` on the same thread. `None` keeps the production path.
+#[cfg(test)]
+thread_local! {
+    static TEST_MODE_OVERRIDE: std::cell::Cell<Option<policy::Mode>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Send RegDecide IPC and return the mode string.
 /// "deny"        → return STATUS_ACCESS_DENIED
 /// "silent_ok"   → currently downgraded to STATUS_ACCESS_DENIED with a
@@ -216,6 +232,14 @@ const KEY_NAME_INFORMATION: u32 = 3;
 /// self-terminates after repeated IPC failures); a hostile process must not be
 /// able to bypass registry policy by severing the pipe.
 fn check_write_mode(friendly_key: &str, value_name: Option<String>) -> policy::Mode {
+    #[cfg(test)]
+    {
+        let forced = TEST_MODE_OVERRIDE.with(|c| c.replace(None));
+        if let Some(mode) = forced.clone() {
+            TEST_MODE_OVERRIDE.with(|c| c.set(forced));
+            return mode;
+        }
+    }
     let req = ipc::Req::RegDecide {
         key_path: friendly_key.to_owned(),
         value_name,
@@ -234,8 +258,10 @@ fn check_write_mode(friendly_key: &str, value_name: Option<String>) -> policy::M
 /// change owner / DACL, or — via the generic / maximum aliases — the kernel
 /// could grant any of the above). When NONE of these bits is set, the
 /// handle can't mutate values, so only the deny-policy check applies —
-/// the silent_ok downgrade is skipped (denying read-only NtCreateKey on
-/// CoW prefixes broke dnsapi; see `nt_create_key_action`).
+/// the silent_ok downgrade is skipped, and the read-only CoW arm routes
+/// to `NtOpenKey` instead of proceeding (S13: proceeding would create
+/// real host keys) or denying outright (broke dnsapi; see
+/// `nt_create_key_action`).
 ///
 /// Public for tests; not exported beyond the crate.
 pub(crate) const NT_CREATE_KEY_WRITE_BITS: u32 = {
@@ -276,9 +302,11 @@ pub(crate) fn nt_create_key_is_write_access(desired_access: u32) -> bool {
 ///   the key in the real hive even when called with KEY_READ, and creation
 ///   is the mutation that must be gated (audit 2026-09-19, Medium).
 /// - `Mode::Cow` + write-intent access → deny (silent_ok downgrade, H4).
-/// - `Mode::Cow` + read-only access → proceed: a KEY_READ handle can't write
-///   values, and denying here breaks dnsapi's `RegCreateKeyEx(KEY_READ)` on
-///   `HKLM\System\…` — the compat the old early-bypass existed for.
+/// - `Mode::Cow` + read-only access → OpenExistingOnly (S13,
+///   review-xa-2026-09-20): proceeding would reach the real create-or-open
+///   and CREATE host keys under CoW prefixes; routing through `NtOpenKey`
+///   keeps existing keys readable (the dnsapi compat below) without ever
+///   creating.
 /// - everything else → proceed (call original).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CreateKeyAction {
@@ -310,6 +338,13 @@ pub(crate) enum CreateKeyAction {
 /// persistence key is not a mutation, and a read-only handle cannot become
 /// one — any later call asking for write rights consults policy again and is
 /// denied.
+///
+/// `Mode::Cow` + read-only takes the same route (S13,
+/// review-xa-2026-09-20, P1): NtCreateKey creates the key regardless of the
+/// mask, and a CoW prefix is supposed to overlay writes, not mutate the
+/// host hive — proceeding there created real keys (e.g. under
+/// `HKCU\Software`). Open-if-present preserves what the old proceed did
+/// for existing keys while refusing the create side-effect.
 pub(crate) fn nt_create_key_action(desired_access: u32, mode: policy::Mode) -> CreateKeyAction {
     match mode {
         policy::Mode::Deny if nt_create_key_is_write_access(desired_access) => {
@@ -317,6 +352,14 @@ pub(crate) fn nt_create_key_action(desired_access: u32, mode: policy::Mode) -> C
         }
         policy::Mode::Deny => CreateKeyAction::OpenExistingOnly,
         policy::Mode::Cow if nt_create_key_is_write_access(desired_access) => CreateKeyAction::Deny,
+        // S13 (review-xa-2026-09-20, P1): NtCreateKey is create-or-open and
+        // creates the key even under a read-only mask, so proceeding here
+        // planted real host keys under CoW prefixes. A CoW prefix overlays
+        // writes; a read-only open must never touch the host hive. Route it
+        // through NtOpenKey exactly like the deny case: an existing key
+        // opens (dnsapi-style RegCreateKeyEx(KEY_READ) stays compatible),
+        // a missing key returns OBJECT_NAME_NOT_FOUND, nothing is created.
+        policy::Mode::Cow => CreateKeyAction::OpenExistingOnly,
         _ => CreateKeyAction::Proceed,
     }
 }
@@ -403,14 +446,14 @@ unsafe extern "system" fn hook_nt_create_key(
                 return STATUS_ACCESS_DENIED;
             }
             CreateKeyAction::OpenExistingOnly => {
-                // The launcher logged this as a deny — it decides on the key
-                // path alone and cannot see the access mask. Record what
-                // actually happened so the audit trail is not a lie.
+                // The launcher's decision ignored the access mask — it
+                // decides on the key path alone. Record what actually
+                // happened so the audit trail is not a lie.
                 log_open_existing_only(&friendly, desired_access);
-                // Read-only mask under a deny prefix: open if it exists,
-                // never create. Without a resolvable NtOpenKey we cannot
-                // honour "open but do not create", so fail closed rather
-                // than fall through to the creating syscall.
+                // Read-only mask under a deny or CoW prefix: open if it
+                // exists, never create. Without a resolvable NtOpenKey we
+                // cannot honour "open but do not create", so fail closed
+                // rather than fall through to the creating syscall.
                 let Some(open) = nt_open_key() else {
                     if !key_handle.is_null() {
                         *key_handle = std::ptr::null_mut();
@@ -579,293 +622,6 @@ unsafe extern "system" fn hook_nt_delete_key(key_handle: HANDLE) -> NTSTATUS {
 }
 
 // ---------------------------------------------------------------------------
-// Persistence-escape hook handlers (unconditional deny)
-//
-// These syscalls bypass the regular Nt(Create|Set|Delete)Key path:
-//   * NtRenameKey                — moves a key under a new name
-//   * NtSaveKey / NtSaveKeyEx    — dumps a live hive to disk
-//   * NtRestoreKey               — replaces a hive with on-disk contents
-//   * NtLoadKey / NtLoadKeyEx    — mounts an arbitrary on-disk hive
-//   * NtUnloadKey / 2 / Ex       — unmounts a hive (DoS / persistence)
-//   * NtReplaceKey               — atomic hive replace at the next boot
-//
-// They aren't gated by the launcher's regrules policy and there's no
-// sensible "overlay" semantics — fail-closed.
-// ---------------------------------------------------------------------------
-
-/// Emit a violation log if tracing is on.
-fn log_persistence_blocked(syscall: &str, target: Option<String>) {
-    if !crate::ipc_client::is_trace() {
-        return;
-    }
-    // SAFETY: GetCurrentProcessId never fails / never dereferences a pointer.
-    let pid = unsafe { winapi::um::processthreadsapi::GetCurrentProcessId() };
-    let msg = match target {
-        Some(t) if !t.is_empty() => format!(
-            "reg_persistence_blocked: syscall={syscall} target={t}",
-        ),
-        _ => format!("reg_persistence_blocked: syscall={syscall}"),
-    };
-    let _ = crate::ipc_client::ipc_log_violation(ipc::Req::Log {
-        pid,
-        level: ipc::LogLevel::Warn,
-        msg,
-    });
-}
-
-// SAFETY: Called by detour2 dispatcher with the NtRenameKey ABI.
-unsafe extern "system" fn hook_nt_rename_key(
-    key_handle: HANDLE,
-    new_name: *mut UNICODE_STRING,
-) -> NTSTATUS {
-    let Some(_guard) = anti_rec::enter() else {
-        return nt_call_original!(&HOOK_RENAME_KEY, "NtRenameKey", (key_handle, new_name));
-    };
-    let target = if !key_handle.is_null() {
-        resolve_handle_friendly(key_handle).or_else(|| ustr_to_string(new_name as *const _))
-    } else {
-        ustr_to_string(new_name as *const _)
-    };
-    log_persistence_blocked("NtRenameKey", target);
-    STATUS_ACCESS_DENIED
-}
-
-// SAFETY: Called by detour2 dispatcher with the NtSaveKey ABI.
-unsafe extern "system" fn hook_nt_save_key(
-    key_handle: HANDLE,
-    file_handle: HANDLE,
-) -> NTSTATUS {
-    let Some(_guard) = anti_rec::enter() else {
-        return nt_call_original!(&HOOK_SAVE_KEY, "NtSaveKey", (key_handle, file_handle));
-    };
-    let target = resolve_handle_friendly(key_handle);
-    log_persistence_blocked("NtSaveKey", target);
-    STATUS_ACCESS_DENIED
-}
-
-// SAFETY: Called by detour2 dispatcher with the NtSaveKeyEx ABI.
-unsafe extern "system" fn hook_nt_save_key_ex(
-    key_handle: HANDLE,
-    file_handle: HANDLE,
-    format: usize,
-) -> NTSTATUS {
-    let Some(_guard) = anti_rec::enter() else {
-        return nt_call_original!(&HOOK_SAVE_KEY_EX, "NtSaveKeyEx", (key_handle, file_handle, format));
-    };
-    let target = resolve_handle_friendly(key_handle);
-    log_persistence_blocked("NtSaveKeyEx", target);
-    STATUS_ACCESS_DENIED
-}
-
-// SAFETY: Called by detour2 dispatcher with the NtRestoreKey ABI.
-unsafe extern "system" fn hook_nt_restore_key(
-    key_handle: HANDLE,
-    file_handle: HANDLE,
-    flags: usize,
-) -> NTSTATUS {
-    let Some(_guard) = anti_rec::enter() else {
-        return nt_call_original!(&HOOK_RESTORE_KEY, "NtRestoreKey", (key_handle, file_handle, flags));
-    };
-    let target = resolve_handle_friendly(key_handle);
-    log_persistence_blocked("NtRestoreKey", target);
-    STATUS_ACCESS_DENIED
-}
-
-// SAFETY: Called by detour2 dispatcher with the NtLoadKey ABI.
-unsafe extern "system" fn hook_nt_load_key(
-    target_key: *mut OBJECT_ATTRIBUTES,
-    source_file: *mut OBJECT_ATTRIBUTES,
-) -> NTSTATUS {
-    let Some(_guard) = anti_rec::enter() else {
-        return nt_call_original!(&HOOK_LOAD_KEY, "NtLoadKey", (target_key, source_file));
-    };
-    let target = resolve_attrs_friendly(target_key as *const _);
-    log_persistence_blocked("NtLoadKey", target);
-    STATUS_ACCESS_DENIED
-}
-
-// SAFETY: Called by detour2 dispatcher with the NtLoadKeyEx ABI.
-unsafe extern "system" fn hook_nt_load_key_ex(
-    target_key: *mut OBJECT_ATTRIBUTES,
-    source_file: *mut OBJECT_ATTRIBUTES,
-    flags: usize,
-    trust_class_key: HANDLE,
-    event: HANDLE,
-    desired_access: usize,
-    root_handle: *mut HANDLE,
-    io_status: *mut c_void,
-) -> NTSTATUS {
-    let Some(_guard) = anti_rec::enter() else {
-        return nt_call_original!(
-            &HOOK_LOAD_KEY_EX,
-            "NtLoadKeyEx",
-            (target_key, source_file, flags, trust_class_key,
-             event, desired_access, root_handle, io_status)
-        );
-    };
-    let target = resolve_attrs_friendly(target_key as *const _);
-    log_persistence_blocked("NtLoadKeyEx", target);
-    // Defensive: caller may inspect *RootHandle on failure. Null it so they
-    // can't accidentally use a stale or uninitialised HANDLE.
-    if !root_handle.is_null() {
-        *root_handle = std::ptr::null_mut();
-    }
-    STATUS_ACCESS_DENIED
-}
-
-// SAFETY: Called by detour2 dispatcher with the NtUnloadKey ABI.
-unsafe extern "system" fn hook_nt_unload_key(
-    target_key: *mut OBJECT_ATTRIBUTES,
-) -> NTSTATUS {
-    let Some(_guard) = anti_rec::enter() else {
-        return nt_call_original!(&HOOK_UNLOAD_KEY, "NtUnloadKey", (target_key));
-    };
-    let target = resolve_attrs_friendly(target_key as *const _);
-    log_persistence_blocked("NtUnloadKey", target);
-    STATUS_ACCESS_DENIED
-}
-
-// SAFETY: Called by detour2 dispatcher with the NtUnloadKey2 ABI.
-unsafe extern "system" fn hook_nt_unload_key_2(
-    target_key: *mut OBJECT_ATTRIBUTES,
-    flags: usize,
-) -> NTSTATUS {
-    let Some(_guard) = anti_rec::enter() else {
-        return nt_call_original!(&HOOK_UNLOAD_KEY_2, "NtUnloadKey2", (target_key, flags));
-    };
-    let target = resolve_attrs_friendly(target_key as *const _);
-    log_persistence_blocked("NtUnloadKey2", target);
-    STATUS_ACCESS_DENIED
-}
-
-// SAFETY: Called by detour2 dispatcher with the NtUnloadKeyEx ABI.
-unsafe extern "system" fn hook_nt_unload_key_ex(
-    target_key: *mut OBJECT_ATTRIBUTES,
-    event: HANDLE,
-) -> NTSTATUS {
-    let Some(_guard) = anti_rec::enter() else {
-        return nt_call_original!(&HOOK_UNLOAD_KEY_EX, "NtUnloadKeyEx", (target_key, event));
-    };
-    let target = resolve_attrs_friendly(target_key as *const _);
-    log_persistence_blocked("NtUnloadKeyEx", target);
-    STATUS_ACCESS_DENIED
-}
-
-// SAFETY: Called by detour2 dispatcher with the NtReplaceKey ABI.
-unsafe extern "system" fn hook_nt_replace_key(
-    new_file: *mut OBJECT_ATTRIBUTES,
-    target_handle: HANDLE,
-    old_file: *mut OBJECT_ATTRIBUTES,
-) -> NTSTATUS {
-    let Some(_guard) = anti_rec::enter() else {
-        return nt_call_original!(&HOOK_REPLACE_KEY, "NtReplaceKey", (new_file, target_handle, old_file));
-    };
-    let target = resolve_handle_friendly(target_handle)
-        .or_else(|| resolve_attrs_friendly(new_file as *const _));
-    log_persistence_blocked("NtReplaceKey", target);
-    STATUS_ACCESS_DENIED
-}
-
-// ---------------------------------------------------------------------------
-// KTM transacted variants — STATUS_NOT_SUPPORTED.
-//
-// CLR / RegOpenKeyTransacted go through these. Returning NOT_SUPPORTED
-// matches the kernel's behaviour on systems where KTM is disabled and is
-// less suspicious to the caller than ACCESS_DENIED.
-// ---------------------------------------------------------------------------
-
-fn log_transacted_blocked(syscall: &str, target: Option<String>) {
-    if !crate::ipc_client::is_trace() {
-        return;
-    }
-    // SAFETY: GetCurrentProcessId is always safe.
-    let pid = unsafe { winapi::um::processthreadsapi::GetCurrentProcessId() };
-    let msg = match target {
-        Some(t) if !t.is_empty() => format!(
-            "reg_transacted_blocked: syscall={syscall} target={t}",
-        ),
-        _ => format!("reg_transacted_blocked: syscall={syscall}"),
-    };
-    let _ = crate::ipc_client::ipc_log_violation(ipc::Req::Log {
-        pid,
-        level: ipc::LogLevel::Warn,
-        msg,
-    });
-}
-
-// SAFETY: Called by detour2 dispatcher with the NtCreateKeyTransacted ABI.
-unsafe extern "system" fn hook_nt_create_key_transacted(
-    key_handle: *mut HANDLE,
-    desired_access: usize,
-    object_attributes: *mut OBJECT_ATTRIBUTES,
-    title_index: usize,
-    class: *mut UNICODE_STRING,
-    create_options: usize,
-    transaction: HANDLE,
-    disposition: *mut u32,
-) -> NTSTATUS {
-    let Some(_guard) = anti_rec::enter() else {
-        return nt_call_original!(
-            &HOOK_CREATE_KEY_TRANSACTED,
-            "NtCreateKeyTransacted",
-            (key_handle, desired_access, object_attributes,
-             title_index, class, create_options, transaction, disposition)
-        );
-    };
-    let target = resolve_attrs_friendly(object_attributes as *const _);
-    log_transacted_blocked("NtCreateKeyTransacted", target);
-    if !key_handle.is_null() {
-        *key_handle = std::ptr::null_mut();
-    }
-    STATUS_NOT_SUPPORTED
-}
-
-// SAFETY: Called by detour2 dispatcher with the NtOpenKeyTransacted ABI.
-unsafe extern "system" fn hook_nt_open_key_transacted(
-    key_handle: *mut HANDLE,
-    desired_access: usize,
-    object_attributes: *mut OBJECT_ATTRIBUTES,
-    transaction: HANDLE,
-) -> NTSTATUS {
-    let Some(_guard) = anti_rec::enter() else {
-        return nt_call_original!(
-            &HOOK_OPEN_KEY_TRANSACTED,
-            "NtOpenKeyTransacted",
-            (key_handle, desired_access, object_attributes, transaction)
-        );
-    };
-    let target = resolve_attrs_friendly(object_attributes as *const _);
-    log_transacted_blocked("NtOpenKeyTransacted", target);
-    if !key_handle.is_null() {
-        *key_handle = std::ptr::null_mut();
-    }
-    STATUS_NOT_SUPPORTED
-}
-
-// SAFETY: Called by detour2 dispatcher with the NtOpenKeyTransactedEx ABI.
-unsafe extern "system" fn hook_nt_open_key_transacted_ex(
-    key_handle: *mut HANDLE,
-    desired_access: usize,
-    object_attributes: *mut OBJECT_ATTRIBUTES,
-    open_options: usize,
-    transaction: HANDLE,
-) -> NTSTATUS {
-    let Some(_guard) = anti_rec::enter() else {
-        return nt_call_original!(
-            &HOOK_OPEN_KEY_TRANSACTED_EX,
-            "NtOpenKeyTransactedEx",
-            (key_handle, desired_access, object_attributes, open_options, transaction)
-        );
-    };
-    let target = resolve_attrs_friendly(object_attributes as *const _);
-    log_transacted_blocked("NtOpenKeyTransactedEx", target);
-    if !key_handle.is_null() {
-        *key_handle = std::ptr::null_mut();
-    }
-    STATUS_NOT_SUPPORTED
-}
-
-// ---------------------------------------------------------------------------
 // Install / Uninstall
 // ---------------------------------------------------------------------------
 
@@ -899,9 +655,14 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     install_reg!(HOOK_DELETE_VALUE_KEY, "NtDeleteValueKey\0", hook_nt_delete_value_key, FnNtDeleteValueKey);
     install_reg!(HOOK_DELETE_KEY,       "NtDeleteKey\0",      hook_nt_delete_key,       FnNtDeleteKey);
 
-    // Best-effort installs for persistence-escape + KTM hooks. Don't fail the
-    // whole reg_hooks install if a single Ex variant isn't exported by the
-    // running ntdll (e.g. NtUnloadKey2 only exists on Win8+).
+    // Best-effort installs for persistence-escape + KTM hooks. A MISSING
+    // ntdll export stays a soft-skip (e.g. NtUnloadKey2 only exists on
+    // Win8+ — there is nothing to hook if the API doesn't exist). But a
+    // PRESENT export whose detour init or enable fails means active ntdll
+    // interference (AV/EDR tampering/unhooking): containment can't be
+    // trusted, and reg is a REQUIRED category, so the error propagates out
+    // of install() → install_hooks() → DllMain FALSE → launcher kills the
+    // child.
     macro_rules! install_best_effort {
         ($lock:expr, $sym:literal, $hook_fn:expr, $fn_ty:ty) => {{
             match crate::hooks::ntdll_export($sym.as_bytes()) {
@@ -914,15 +675,11 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
                             let _ = $lock.set(detour);
                             if let Some(h) = $lock.get() {
                                 if let Err(e) = h.enable() {
-                                    crate::hooks::buffer_install_error(
-                                        format!("detour enable {}: {:?}", $sym, e),
-                                    );
+                                    return Err(format!("detour enable {}: {:?}", $sym, e).into());
                                 }
                             }
                         }
-                        Err(e) => crate::hooks::buffer_install_error(
-                            format!("detour init {}: {:?}", $sym, e),
-                        ),
+                        Err(e) => return Err(format!("detour init {}: {:?}", $sym, e).into()),
                     }
                 }
                 None => crate::hooks::buffer_install_error(

@@ -102,15 +102,16 @@ pub(crate) fn make_overlay_nt_buf(overlay_dos: &str) -> Vec<u16> {
 /// Resolve OBJECT_ATTRIBUTES for an FS hook in ONE pass, reading any
 /// `RootDirectory` directory handle **exactly once**. Returns:
 ///   - the DOS path (lowercased) used for the policy decision, AND
-///   - `Some(absolute_nt_path)` when the open was RootDirectory-RELATIVE — the
-///     single resolution, owned by us, to be reused verbatim for the kernel
-///     passthrough (`HookedAttrs::copy_passthrough_inner`). Reusing it instead
-///     of re-resolving the handle in `copy_passthrough` closes the H5
+///   - `Some(absolute_nt_path)` — the single resolution, owned by us, to be
+///     reused verbatim for the kernel passthrough
+///     (`HookedAttrs::copy_passthrough_inner`). Returned for BOTH the
+///     RootDirectory-RELATIVE case (H5) and the ABSOLUTE-path case (S04):
+///     policy decides on the DOS view, the kernel passthrough opens the
+///     snapshot verbatim. For relative opens this closes the H5
 ///     double-resolve window: a concurrent `NtClose`+reopen of the directory
 ///     handle between the decision and the kernel call can no longer make the
-///     path policy approved differ from the path the kernel opens.
-///   - `None` for the absolute-path case (no `RootDirectory` handle, hence no
-///     race) — the caller keeps the existing verbatim-copy passthrough.
+///     path policy approved differ from the path the kernel opens. (The
+///     bare-relative-CWD branch below already returned this snapshot.)
 ///
 /// Returns `None` overall when no DOS path can be derived (caller then passes
 /// through / device-blocks). This is the single path-resolution entry point for
@@ -203,11 +204,19 @@ pub(crate) unsafe fn resolve_for_hook(
     // decides on the path the kernel will resolve (audit Critical #1:
     // `\??\d:\<root>\..\..\payload.exe` used to prefix-match the
     // root while the kernel created the file outside the sandbox).
-    // `pre_resolved` deliberately stays None: the kernel keeps the ORIGINAL
-    // ObjectName, which the unmirror self-overlay carve-out below requires
-    // (when the caller names the overlay path absolutely, the kernel must
-    // open the REAL overlay path, not the virtual form). Without reparse
-    // points the original resolves to exactly the folded target.
+    // Review S04 (docs/review-xa-2026-09-20): the kernel passthrough
+    // consumes the snapshot too. The decision (via `dos`) and the kernel
+    // open (via the returned snapshot) read the guest ObjectName buffer
+    // exactly once, here; a concurrent swap of the buffer bytes or the
+    // ObjectName pointer between classification and syscall cannot
+    // retarget the open.
+    // Self-overlay unmirror carve-out PRESERVED: `dos` (policy) may be the
+    // VIRTUAL overlay path while the returned snapshot stays the PHYSICAL
+    // overlay path the caller named — the virtual/physical distinction now
+    // lives between the two return values instead of in a second read of
+    // guest memory. Without reparse points the folded path resolves to
+    // exactly the target the original buffer named (the kernel folds
+    // `.`/`..` itself).
     let folded = policy::path::fold_nt_dots(name_slice);
     if let Some(dos) = policy::path::nt_to_dos_lower(&folded) {
         // Self-block guard (class #64 for ABSOLUTE paths, symmetric with the
@@ -220,14 +229,14 @@ pub(crate) unsafe fn resolve_for_hook(
         // rule and returns NAME_NOT_FOUND — a self-DoS that breaks the
         // sandboxed process's own CoW files. Unmirror the overlay path back
         // to its virtual form for the POLICY decision; the kernel-open path
-        // (`pre_resolved = None`) stays on the absolute overlay path so the
+        // (`pre_resolved`) stays on the absolute overlay path so the
         // real file under the overlay is opened. Control files (policy.redb,
         // session-config inside .winrsbox but NOT under workdir\) remain
         // denied — unmirror only succeeds for paths under a known overlay
         // workdir root.
         let sb_root = SANDBOX_ROOT.get().map(|s| s.as_str());
         let dos = unmirror_overlay_handle_relative(&dos, sb_root).unwrap_or(dos);
-        return Some((dos, None));
+        return Some((dos, Some(folded.into_owned())));
     }
 
     // Bare relative path (no NT prefix, no RootDirectory). cmd.exe's
@@ -352,7 +361,9 @@ pub(crate) fn unmirror_overlay_handle_relative(
         _ => sandbox_root.into_iter().collect(),
     };
     for sb in roots {
-        let sb_lower = sb.to_lowercase();
+        // S11: canonical NTFS-identity fold (overlay roots are matched against
+        // kernel-folded paths), not Unicode to_lowercase.
+        let sb_lower = policy::path::nt_case_fold(sb);
         let sb_trimmed = sb_lower.trim_end_matches('\\');
         if sb_trimmed.is_empty() {
             continue;
@@ -424,7 +435,7 @@ pub(crate) fn unmirror_overlay_handle_relative(
             &overlay_pbuf,
             std::path::Path::new(sb_trimmed),
         ) {
-            return Some(virtual_dos.to_ascii_lowercase());
+            return Some(policy::path::nt_case_fold(&virtual_dos).into_owned());
         }
     }
     None
@@ -460,7 +471,9 @@ pub(crate) unsafe fn extract_raw_nt_path(attrs: *const OBJECT_ATTRIBUTES) -> Opt
 /// Returns `None` when:
 ///  - `attrs` is null or has no ObjectName
 ///  - The path is empty or ends with a separator (directory-open trailing `\`)
-///  - The basename is all-ASCII-lowercase (no case to preserve)
+///  - The basename is already in its canonical (kernel-folded) form — no case
+///    to preserve (S11: fold-relative, so non-ASCII case pairs like `Секрет`
+///    are returned too)
 ///
 /// # SAFETY
 /// `attrs` must be valid for reads for the duration of this call (same
@@ -471,10 +484,12 @@ pub(crate) unsafe fn extract_nt_basename(attrs: *const OBJECT_ATTRIBUTES) -> Opt
     let trimmed = raw.trim_end_matches(|c| c == '\\' || c == '/');
     let basename = trimmed.rsplit(|c| c == '\\' || c == '/').next()?;
     if basename.is_empty() { return None; }
-    // Only return when there is at least one uppercase ASCII letter — if the
-    // basename is already all-lowercase, ipc_record_overlay_case would skip it
-    // anyway (its own guard), so avoid the IPC round-trip entirely.
-    if basename.bytes().any(|b| b.is_ascii_uppercase()) {
+    // Only return when the kernel fold would CHANGE the basename — if it is
+    // already in canonical folded form, ipc_record_overlay_case would skip it
+    // anyway (its own fold-relative guard), so avoid the IPC round-trip
+    // entirely. S11: fold-relative instead of ASCII-only, so non-ASCII case
+    // pairs (Секрет) keep their case records.
+    if policy::path::nt_case_fold(basename) != basename {
         Some(basename.to_owned())
     } else {
         None

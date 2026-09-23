@@ -154,8 +154,13 @@ you do.
 
 With `network: guarded`, winrsbox installs WFP filters (RFC1918 and
 private-IPv6 egress, SMB ports 445/139) that the kernel enforces, so a direct
-syscall cannot bypass them. Their scope is narrower than "the sandbox", and
-the boundary is worth stating because it is invisible at runtime:
+syscall cannot bypass them. Guarded never starts a run it cannot protect: if
+the WFP engine is unavailable, the target's app id cannot be built, any single
+filter add fails, or the target is a `.bat` / `.cmd` script, the launcher
+terminates the still-suspended child and exits non-zero instead of launching,
+and a partially installed filter set is deleted again. Their scope is narrower
+than "the sandbox", and the boundary is worth stating because it is invisible
+at runtime:
 
 - **Every filter is bound to one image** via `FWPM_CONDITION_ALE_APP_ID`, an
   exact match on the NT device path of the process image. A filter whose app
@@ -165,12 +170,14 @@ the boundary is worth stating because it is invisible at runtime:
   run under a different image and are not matched by these filters. Network
   containment for the whole tree rests on the in-process hooks, with WFP as
   defence in depth for the root.
-- **A `.bat` / `.cmd` target gets no WFP filters at all**, and the launcher
-  says so on stderr. Such a target has no image of its own: kernel32 rewrites
-  it to `%COMSPEC% /c <script>`, so the root process is `cmd.exe` and the
-  script is an argument. Binding an app id to the script path would install
-  filters that match no process, and binding to `cmd.exe` would look like
-  coverage while the program that actually opens sockets runs as its child.
+- **A `.bat` / `.cmd` target is refused under `network: guarded`.** Such a
+  target has no image of its own: kernel32 rewrites it to `%COMSPEC% /c
+  <script>`, so the root process is `cmd.exe` and the script is an argument.
+  Binding an app id to the script path would install filters that match no
+  process, and binding to `cmd.exe` would look like coverage while the program
+  that actually opens sockets runs as its child — so there is no kernel layer
+  to install and the launcher refuses the launch rather than run without it.
+  A run without `network: guarded` is unaffected.
 
 ## Disclosure process
 

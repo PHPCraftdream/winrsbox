@@ -6,13 +6,14 @@ use winapi::ctypes::c_void;
 
 use super::{
     anti_rec, decide_post_delete, hooks, nt_call_original, query_handle_dos_path,
-    resolve_dest_path, UNICODE_STRING, WhiteoutAction,
-    FILE_DISPOSITION_EX_INFO_CLASS, FILE_DISPOSITION_INFO_CLASS, FILE_LINK_EX_INFO_CLASS,
-    FILE_LINK_INFO_CLASS, FILE_RENAME_EX_INFO_CLASS, FILE_RENAME_INFO_CLASS,
-    FSCTL_DELETE_REPARSE_POINT, FSCTL_PIPE_IMPERSONATE, FSCTL_SET_REPARSE_POINT,
-    FSCTL_SET_REPARSE_POINT_EX, HOOK_NT_DELETE_FILE, HOOK_NT_FS_CONTROL_FILE,
-    HOOK_NT_SET_INFO_FILE, MAX_OBJECT_NAME_BYTES, STATUS_ACCESS_DENIED,
-    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_REPARSE_POINT_ENCOUNTERED, STATUS_SUCCESS,
+    resolve_dest_path, snapshot_delete_request, snapshot_rename_request, UNICODE_STRING,
+    WhiteoutAction, FILE_DISPOSITION_EX_INFO_CLASS, FILE_DISPOSITION_INFO_CLASS,
+    FILE_LINK_EX_INFO_CLASS, FILE_LINK_INFO_CLASS, FILE_RENAME_EX_INFO_CLASS,
+    FILE_RENAME_INFO_CLASS, FSCTL_DELETE_REPARSE_POINT, FSCTL_PIPE_IMPERSONATE,
+    FSCTL_SET_REPARSE_POINT, FSCTL_SET_REPARSE_POINT_EX, build_kernel_rename_buffer,
+    DeleteRequest, HOOK_NT_DELETE_FILE, HOOK_NT_FS_CONTROL_FILE, HOOK_NT_SET_INFO_FILE,
+    RenameRequest, STATUS_ACCESS_DENIED, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_REPARSE_POINT_ENCOUNTERED, STATUS_SUCCESS,
 };
 
 /// Returns true if a rename/hardlink destination is an escape vector and must
@@ -49,93 +50,15 @@ fn dest_is_escape(dest_lower: &str) -> bool {
 // Hook implementations
 // ---------------------------------------------------------------------------
 
-/// Parsed header of a FILE_RENAME_INFORMATION / FILE_LINK_INFORMATION buffer
-/// (or their Ex variants): the RootDirectory handle and the decoded FileName.
-///
-/// Every field read is unaligned: the buffer is caller-owned memory handed to
-/// NtSetInformationFile by the sandboxed process, so neither its base
-/// alignment nor any field offset within it is guaranteed — a caller can pass
-/// a buffer at an odd address, leaving RootDirectory (0x08), FileNameLength
-/// (0x10) and FileName[] (0x14) misaligned. Plain dereferences there are UB
-/// (and abort under the debug alignment check).
-///
-/// Returns `None` — the hook must then pass the call through to the original
-/// syscall untouched — when the buffer is shorter than the fixed header, the
-/// name length is zero or absurd (> 0x8000 bytes, the same sanity cap the
-/// NtDeleteFile path applies), or the name would run past the declared
-/// buffer length.
-///
-/// # SAFETY
-/// `info` must be readable for `len` bytes (the NtSetInformationFile contract
-/// at hook entry).
+/// Test-facing wrapper around [`snapshot_rename_request`], kept for the
+/// alignment/passthrough contract tests below. Production reads the snapshot
+/// directly (review S04): `hook_nt_set_information_file` snapshots the
+/// caller's buffer ONCE before classification and consumes that owned copy
+/// everywhere; this wrapper only re-shapes the snapshot into the
+/// (root, name) pair the contract tests pin.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) unsafe fn parse_rename_info(info: *const u8, len: usize) -> Option<(HANDLE, String)> {
-    // Layout for non-Ex (RENAME/LINK):
-    //   0x00: ReplaceIfExists (BOOLEAN)
-    //   0x08: RootDirectory (HANDLE)
-    //   0x10: FileNameLength (ULONG)
-    //   0x14: FileName[] (WCHAR)
-    // Layout for Ex (RENAME_EX/LINK_EX):
-    //   0x00: Flags (ULONG)
-    //   0x08: RootDirectory (HANDLE)
-    //   0x10: FileNameLength (ULONG)
-    //   0x14: FileName[] (WCHAR)
-    // Both variants share RootDirectory at 0x08, FileNameLength at 0x10, FileName at 0x14.
-    const OFF_ROOT: usize = 0x08;
-    const OFF_NAMELEN: usize = 0x10;
-    const OFF_NAME: usize = 0x14;
-    if len < OFF_NAME {
-        return None;
-    }
-
-    let root = (info.add(OFF_ROOT) as *const HANDLE).read_unaligned();
-    let name_len = (info.add(OFF_NAMELEN) as *const u32).read_unaligned() as usize;
-    if name_len == 0 || name_len > 0x8000 {
-        return None;
-    }
-    // Bounds check: FileName buffer must fit within declared Length
-    if OFF_NAME + name_len > len {
-        return None;
-    }
-    let name_ptr = info.add(OFF_NAME) as *const u16;
-    let chars = name_len / 2;
-    let name: Vec<u16> = (0..chars)
-        .map(|i| {
-            // SAFETY: i < chars and OFF_NAME + name_len <= len, so every
-            // read stays inside the caller's buffer.
-            unsafe { name_ptr.add(i).read_unaligned() }
-        })
-        .collect();
-    Some((root, String::from_utf16_lossy(&name)))
-}
-
-/// Build a caller-independent FILE_RENAME_INFORMATION-family buffer whose
-/// RootDirectory is NULL and whose FileName is the ABSOLUTE NT form of the
-/// resolved + policy-approved destination.
-///
-/// Layout (rename and link, non-Ex and Ex — byte-identical from 0x08 up):
-///   0x00: ReplaceIfExists / Flags (8 bytes, copied verbatim from `orig`)
-///   0x08: RootDirectory = NULL
-///   0x10: FileNameLength (bytes, excluding the terminator)
-///   0x14: FileName[] (UTF-16, NUL-terminated)
-///
-/// Returns the new buffer and its total length. `None` when `orig` is
-/// shorter than the fixed header — the caller must fail closed, never
-/// fall back to the caller's relative buffer.
-pub(crate) fn build_absolute_rename_buffer(orig: &[u8], dest_dos_lower: &str) -> Option<(Vec<u8>, u32)> {
-    if orig.len() < 0x14 {
-        return None;
-    }
-    let nt_name = policy::path::dos_to_nt(dest_dos_lower);
-    debug_assert!(nt_name.last() == Some(&0), "dos_to_nt NUL-terminates");
-    let mut out = Vec::with_capacity(0x14 + nt_name.len() * 2);
-    out.extend_from_slice(&orig[..8]); // ReplaceIfExists / Flags verbatim
-    out.extend_from_slice(&0u64.to_ne_bytes()); // RootDirectory = NULL
-    // FileNameLength counts the name bytes only, not the NUL terminator.
-    out.extend_from_slice(&(((nt_name.len() - 1) * 2) as u32).to_le_bytes());
-    for w in &nt_name {
-        out.extend_from_slice(&w.to_le_bytes());
-    }
-    Some((out, (0x14 + nt_name.len() * 2) as u32))
+    snapshot_rename_request(info, len).map(|s| (s.root, s.name()))
 }
 
 /// Decode a FILE_DISPOSITION_INFORMATION (non-Ex) or
@@ -188,17 +111,22 @@ pub(crate) unsafe extern "system" fn hook_nt_set_information_file(
     match class {
         FILE_RENAME_INFO_CLASS | FILE_RENAME_EX_INFO_CLASS
         | FILE_LINK_INFO_CLASS | FILE_LINK_EX_INFO_CLASS => {
-            // Buffer parsing (RootDirectory, FileNameLength, FileName) lives
-            // in parse_rename_info — every field is read UNALIGNED there,
-            // because the caller-owned buffer has no base-alignment
-            // guarantee. `None` means "malformed / too short" and passes the
-            // call through to the original syscall.
-            let Some((root, dest_name)) = parse_rename_info(info as *const u8, len as usize)
+            // Buffer snapshotting (RootDirectory, FileNameLength, FileName,
+            // header word) lives in snapshot_rename_request — every field is
+            // read UNALIGNED there, because the caller-owned buffer has no
+            // base-alignment guarantee. The SNAPSHOT is taken BEFORE
+            // classification (review S04): everything below — the policy
+            // decision AND every kernel call — consumes this owned copy,
+            // never a second read of the guest buffer. `None` means
+            // "malformed / too short" and passes the call through to the
+            // original syscall.
+            let Some(snap) = snapshot_rename_request(info as *const u8, len as usize)
             else {
                 return call_original();
             };
+            let dest_name = snap.name();
 
-            let Some(dest) = resolve_dest_path(root, &dest_name) else {
+            let Some(dest) = resolve_dest_path(snap.root, &dest_name) else {
                 if hooks::is_trace() {
                     hooks::ipc_log(ipc::LogLevel::Trace,
                         format!("fs_setinfo_unresolvable_dest class={class} raw={dest_name}"));
@@ -254,7 +182,9 @@ pub(crate) unsafe extern "system" fn hook_nt_set_information_file(
             //              repo is unusable.
             let mut decision = hooks::decide(&dest, true);
             if decision.mode == policy::Mode::Hidden {
-                let lower = dest.to_ascii_lowercase();
+                // S11: kernel fold — the clear/invalidate keys must match the
+                // keys policy recorded (Unicode to_lowercase diverged there).
+                let lower = policy::path::nt_case_fold(&dest);
                 hooks::ipc_clear_whiteout(&lower);
                 hooks::cache().invalidate(&lower);
                 if hooks::is_trace() {
@@ -265,29 +195,19 @@ pub(crate) unsafe extern "system" fn hook_nt_set_information_file(
             }
             match decision.mode {
                 policy::Mode::Passthrough => {
-                    if root.is_null() {
-                        return call_original();
-                    }
-                    // Relative rename (RootDirectory != NULL): `dest` was
-                    // resolved from ONE query of the root handle, and the
-                    // decision above approved exactly that path. Handing the
-                    // caller's buffer back to the original syscall makes the
-                    // kernel re-resolve the same handle VALUE at call time —
-                    // a concurrent NtClose + handle-recycle between the two
-                    // resolutions retargets the rename at a directory we
-                    // never approved (the H5 double-resolve class fixed in
-                    // hooks::resolve_for_hook; audit 2026-09-19 Low:
-                    // rename-Passthrough keeps a racy RootDirectory).
-                    // Rewrite the buffer to the absolute NT form with
-                    // RootDirectory = NULL so the kernel acts on exactly the
-                    // approved path; fail closed if it cannot be rebuilt.
-                    // SAFETY: `info` is readable for `len` bytes per the
-                    // NtSetInformationFile contract at hook entry (the same
-                    // guarantee parse_rename_info relies on).
-                    let orig_bytes =
-                        std::slice::from_raw_parts(info as *const u8, len as usize);
+                    // Review S04 (docs/review-xa-2026-09-20): the decision
+                    // above read the caller's buffer ONCE
+                    // (snapshot_rename_request). The old null-root shortcut
+                    // handed the LIVE guest buffer back to the kernel — a
+                    // concurrent swap of the bytes / RootDirectory between
+                    // the decision and the syscall retargeted the rename at
+                    // a path policy never approved. Rebuild the kernel
+                    // buffer from the owned snapshot for BOTH root cases
+                    // (this is what the relative branch already did; the
+                    // absolute case now gets the same discipline, closing
+                    // the racy-handle H5 window for relative opens too).
                     let Some((rewritten, rewritten_len)) =
-                        build_absolute_rename_buffer(orig_bytes, &dest)
+                        build_kernel_rename_buffer(&snap, &dest)
                     else {
                         if hooks::is_trace() {
                             hooks::ipc_log(
@@ -326,7 +246,10 @@ pub(crate) unsafe extern "system" fn hook_nt_set_information_file(
                             return STATUS_ACCESS_DENIED;
                         }
                     };
-                    let dest_lower = dest.to_ascii_lowercase();
+                    // S11: kernel fold for the overlay record keys (both the
+                    // OVERLAY_IDX key and the case-record key) — policy re-folds
+                    // lookups with the same fold (ensure_lower).
+                    let dest_lower = policy::path::nt_case_fold(&dest);
                     let is_link = class == FILE_LINK_INFO_CLASS
                         || class == FILE_LINK_EX_INFO_CLASS;
                     // Source-side bookkeeping. For a *rename* (not hardlink),
@@ -342,7 +265,7 @@ pub(crate) unsafe extern "system" fn hook_nt_set_information_file(
                         let sb_root = hooks::SANDBOX_ROOT.get().map(|s| s.as_str());
                         let src = hooks::unmirror_overlay_handle_relative(&src_raw_for_check, sb_root)
                             .unwrap_or_else(|| src_raw_for_check.clone());
-                        let src_lower = src.to_ascii_lowercase();
+                        let src_lower = policy::path::nt_case_fold(&src);
                         if hooks::is_trace() {
                             let fsize = std::fs::metadata(&src_raw_for_check).map(|m| m.len()).unwrap_or(u64::MAX);
                             hooks::ipc_log(ipc::LogLevel::Trace,
@@ -362,7 +285,11 @@ pub(crate) unsafe extern "system" fn hook_nt_set_information_file(
                     {
                         let trimmed = dest_name.trim_end_matches(|c| c == '\\' || c == '/');
                         if let Some(basename) = trimmed.rsplit(|c| c == '\\' || c == '/').next() {
-                            if !basename.is_empty() && basename.bytes().any(|b: u8| b.is_ascii_uppercase()) {
+                            // S11: fold-relative "has case to preserve" gate —
+                            // non-ASCII case pairs (Секрет) keep their case
+                            // records too, mirroring the policy-side guard in
+                            // decide/overlay.rs::record_overlay_case.
+                            if !basename.is_empty() && policy::path::nt_case_fold(basename) != basename {
                                 hooks::ipc_record_overlay_case(&dest_lower, basename);
                             }
                         }
@@ -370,7 +297,7 @@ pub(crate) unsafe extern "system" fn hook_nt_set_information_file(
                     hooks::cache().invalidate(&dest_lower);
 
                     let status = setinfo_rename_to_overlay(
-                        handle, iosb, info, len, class, &overlay_dos,
+                        handle, iosb, &snap, class, &overlay_dos,
                     );
                     if hooks::is_trace() {
                         // Post-rename: check if SOURCE file (config.lock) was actually
@@ -417,7 +344,7 @@ pub(crate) unsafe extern "system" fn hook_nt_set_information_file(
                 // second pointer dereference.
                 if let Some(path) = query_handle_dos_path(handle) {
                     let in_project = hooks::SANDBOX_CWD.get().map_or(false, |cwd| {
-                        policy::path::pattern_matches_prefix(&cwd.to_lowercase(), &path)
+                        policy::path::pattern_matches_prefix(&policy::path::nt_case_fold(&cwd), &path)
                     });
                     if in_project {
                         // Inside the agent's own project_root: real delete as
@@ -452,7 +379,7 @@ pub(crate) unsafe extern "system" fn hook_nt_set_information_file(
                     };
                     let mut matched_overlay = false;
                     for sb in &overlay_roots {
-                        let sb_lower = sb.to_lowercase();
+                        let sb_lower = policy::path::nt_case_fold(sb);
                         let sb_trimmed = sb_lower.trim_end_matches('\\');
                         if sb_trimmed.is_empty() { continue; }
                         if !policy::path::pattern_matches_prefix(sb_trimmed, &path) { continue; }
@@ -465,7 +392,11 @@ pub(crate) unsafe extern "system" fn hook_nt_set_information_file(
                         let virtual_dos = hooks::unmirror_overlay_handle_relative(&path, sb_root_opt)
                             .unwrap_or_else(|| path.clone());
                         let status = call_original();
-                        let lower = virtual_dos.to_lowercase();
+                        // S11: kernel fold — these whiteout keys are the exact
+                        // strings policy's ensure_lower folds lookups to; the old
+                        // Unicode to_lowercase created divergent (unfindable)
+                        // whiteouts for non-ASCII paths.
+                        let lower = policy::path::nt_case_fold(&virtual_dos);
                         // Diagnostic: always log STATUS_REPARSE_POINT_ENCOUNTERED
                         // (os error 4395) regardless of trace level so it
                         // appears in sandbox.log and is easy to find when
@@ -515,7 +446,7 @@ pub(crate) unsafe extern "system" fn hook_nt_set_information_file(
                     // (b) real external file: do NOT delete it. Record the
                     // whiteout and return SUCCESS so the caller sees a
                     // successful virtual delete. The real disk is untouched.
-                    let lower = path.to_lowercase();
+                    let lower = policy::path::nt_case_fold(&path);
                     hooks::ipc_record_whiteout(&lower);
                     hooks::cache().invalidate(&lower);
                     if hooks::is_trace() {
@@ -562,37 +493,36 @@ pub(crate) unsafe extern "system" fn hook_nt_set_information_file(
     call_original()
 }
 
-/// Rewrite a FileRenameInfo(Ex)/FileLinkInfo(Ex) buffer to name the overlay
+/// Rewrite a FileRenameInfo(Ex)/FileLinkInfo(Ex) request to name the overlay
 /// path instead of the caller's virtual destination, then call the original
 /// `NtSetInformationFile` with RootDirectory=NULL (absolute overlay path).
 ///
 /// Both the non-Ex (ReplaceIfExists at 0x00, BOOLEAN) and Ex (Flags at 0x00,
 /// ULONG) variants keep RootDirectory at 0x08, FileNameLength at 0x10, and the
-/// WCHAR FileName[] at 0x14. We preserve the leading header word so
-/// ReplaceIfExists / Flags semantics are unchanged, set RootDirectory=NULL,
-/// and append the UTF-16 overlay path.
+/// WCHAR FileName[] at 0x14. We preserve the leading header word from the
+/// OWNED pre-classification snapshot (review S04 — the guest buffer is never
+/// re-read here) so ReplaceIfExists / Flags semantics are unchanged, set
+/// RootDirectory=NULL, and append the UTF-16 overlay path.
 ///
 /// # SAFETY
-/// `info`/`len` are the original NtSetInformationFile buffer; `iosb` may be
-/// null. Caller holds the anti_rec guard (we are mid-hook).
+/// `snap` is the owned rename snapshot taken before classification; `iosb`
+/// may be null. Caller holds the anti_rec guard (we are mid-hook).
 unsafe fn setinfo_rename_to_overlay(
     handle: HANDLE,
     iosb: *mut IO_STATUS_BLOCK,
-    info: *const c_void,
-    len: u32,
+    snap: &RenameRequest,
     class: u32,
     overlay_dos: &str,
 ) -> NTSTATUS {
-    let off_root = 0x08usize;
     let off_name = 0x14usize;
 
     // Build a replacement info buffer. The first 0x08 bytes carry either
-    // ReplaceIfExists (non-Ex) or Flags (Ex); copy verbatim so the caller's
-    // replace/replace-if-exists behavior is preserved. Zero RootDirectory,
-    // set FileNameLength, and write the UTF-16 NT-form overlay path
-    // (`\??\<overlay_dos>`). The kernel's FileRenameInfo FileName expects an
-    // NT object name, not a bare DOS path; passing the DOS form yields
-    // STATUS_INVALID_PARAMETER.
+    // ReplaceIfExists (non-Ex) or Flags (Ex), copied verbatim from the
+    // snapshot so the caller's replace/replace-if-exists behavior is
+    // preserved. Zero RootDirectory, set FileNameLength, and write the
+    // UTF-16 NT-form overlay path (`\??\<overlay_dos>`). The kernel's
+    // FileRenameInfo FileName expects an NT object name, not a bare DOS
+    // path; passing the DOS form yields STATUS_INVALID_PARAMETER.
     let overlay_nt = hooks::make_overlay_nt_buf(overlay_dos);
     // make_overlay_nt_buf returns `\??\<path>\0` (WITH trailing NUL).
     // FileNameLength counts bytes EXCLUDING the trailing NUL (matches the
@@ -602,17 +532,7 @@ unsafe fn setinfo_rename_to_overlay(
     let new_len = off_name + file_name_bytes;
     let mut buf: Vec<u8> = Vec::with_capacity(new_len);
     // Header [0x00, 0x08): preserve ReplaceIfExists/Flags verbatim.
-    let header = if (len as usize) >= off_root {
-        std::slice::from_raw_parts(info as *const u8, off_root)
-    } else {
-        // Defensive: caller already validated len >= off_name (0x14) before
-        // invoking us, but do not assume a malformed buffer.
-        if !iosb.is_null() {
-            hooks::set_io_status(iosb, STATUS_ACCESS_DENIED);
-        }
-        return STATUS_ACCESS_DENIED;
-    };
-    buf.extend_from_slice(header);
+    buf.extend_from_slice(&snap.header8);
     // RootDirectory (HANDLE, 8 bytes) = NULL — we pass an absolute overlay path.
     buf.extend_from_slice(&[0u8; 8]);
     // FileNameLength (ULONG, 4 bytes, little-endian).
@@ -737,49 +657,21 @@ pub(crate) enum DeleteResult {
     },
 }
 
-/// Resolve the delete target of an `NtDeleteFile` OBJECT_ATTRIBUTES into the
-/// lowercase DOS path used for the policy decision. Reuses the same
-/// resolution helper as the rename/link path (`resolve_dest_path`: absolute
-/// NT names, RootDirectory-relative joins, overlay unmirroring).
-///
-/// Returns `None` when the name is malformed (null `ObjectName`/`Buffer`,
-/// zero/odd/oversized `Length`) or cannot be mapped to a DOS path (device
-/// namespace, UNC, ...). Callers MUST fail closed on `None`: a delete whose
-/// containment cannot be proven must never reach the kernel. The
-/// UNICODE_STRING parsing here is local to this hook and validates every
-/// field before dereference.
-///
-/// No alignment is assumed anywhere: `attrs`, `ObjectName` and `Buffer` are
-/// the hooked caller's addresses and a hostile caller controls all three.
-/// `&*attrs` would assert OBJECT_ATTRIBUTES' pointer alignment, `&*ustr` /
-/// `slice::from_raw_parts::<u16>` would assert UNICODE_STRING/u16 alignment —
-/// so both headers are read field-wise with unaligned loads and the name
-/// bytes are read unaligned too. Validity (non-null, Length bytes readable)
-/// remains the caller's obligation, exactly as before.
+/// Test-facing wrapper (review S04): production consumes the snapshot
+/// directly — `hook_nt_delete_file` snapshots the caller's attrs ONCE before
+/// classification and every branch below works from that owned copy. This
+/// wrapper re-shapes the same two steps (snapshot, then dest resolution) for
+/// the misaligned-chain regression tests, which pin that a fully hostile
+/// (attrs, UNICODE_STRING, Buffer) address chain resolves like an aligned one.
+/// Returns `None` exactly when [`snapshot_delete_request`] rejects the
+/// request (malformed UNICODE_STRINGs) or [`resolve_dest_path`] cannot map
+/// it to a DOS path (device namespace, UNC, ...) — callers MUST fail closed
+/// on `None`: a delete whose containment cannot be proven must never reach
+/// the kernel.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) unsafe fn resolve_delete_target(attrs: *const OBJECT_ATTRIBUTES) -> Option<String> {
-    if attrs.is_null() {
-        return None;
-    }
-    // SAFETY: read_unaligned of a non-null OBJECT_ATTRIBUTES pointer —
-    // validity per the SAFETY contract, alignment never assumed.
-    let obj = (attrs as *const OBJECT_ATTRIBUTES).read_unaligned();
-    if obj.ObjectName.is_null() {
-        return None;
-    }
-    // SAFETY: read_unaligned of the caller's non-null UNICODE_STRING pointer.
-    let ustr = (obj.ObjectName as *const UNICODE_STRING).read_unaligned();
-    let byte_len = ustr.Length as usize;
-    if byte_len == 0 || byte_len % 2 != 0 || byte_len > MAX_OBJECT_NAME_BYTES || ustr.Buffer.is_null() {
-        return None;
-    }
-    // SAFETY: Buffer is non-null and at least Length bytes long per the
-    // UNICODE_STRING contract, validated above; each WCHAR is read with
-    // read_unaligned, so an odd Buffer address stays well-defined.
-    let chars: Vec<u16> = (0..byte_len / 2)
-        .map(|i| (ustr.Buffer.cast::<u8>().add(i * 2) as *const u16).read_unaligned())
-        .collect();
-    let name = String::from_utf16_lossy(&chars);
-    resolve_dest_path(obj.RootDirectory, &name)
+    let snap = snapshot_delete_request(attrs)?;
+    resolve_dest_path(snap.root, &snap.name())
 }
 
 /// Apply the policy decision for a delete of `dest_lower` (the lowercase
@@ -787,7 +679,8 @@ pub(crate) unsafe fn resolve_delete_target(attrs: *const OBJECT_ATTRIBUTES) -> O
 /// `hook_nt_set_information_file`:
 ///
 /// - Passthrough → inside project_root, the one place a real delete may
-///   happen: forward the caller's attrs to the original.
+///   happen: forward an OWNED attrs rebuilt from the pre-decision snapshot
+///   (same logical request, no live guest pointer — S04).
 /// - Deny        → block.
 /// - Hidden      → the path is already whiteouted; report NOT_FOUND (same
 ///   Mode::Hidden mapping as the create/open hooks in fs_hooks.rs).
@@ -798,21 +691,45 @@ pub(crate) unsafe fn resolve_delete_target(attrs: *const OBJECT_ATTRIBUTES) -> O
 ///   then do the same post-delete bookkeeping as the disposition path
 ///   (`decide_post_delete`).
 ///
-/// `original` is the real `NtDeleteFile`: it receives the caller's attrs on
+/// `original` is the real `NtDeleteFile`: it receives the rebuilt attrs on
 /// Passthrough and the rewritten attrs for the overlay-copy delete.
 ///
 /// # SAFETY
-/// `attrs` (non-null) must be the live caller OBJECT_ATTRIBUTES; it is
-/// dereferenced read-only on the overlay-delete branch. `original` must be
-/// the installed detour's original target. Caller holds the anti_rec guard.
+/// `snap` is the OWNED snapshot taken before classification (S04): this
+/// function never touches guest memory. `original` must be the installed
+/// detour's original target. Caller holds the anti_rec guard.
 pub(crate) unsafe fn apply_delete_decision(
-    attrs: *mut OBJECT_ATTRIBUTES,
+    snap: &DeleteRequest,
     dest_lower: &str,
     decision: &policy::Decision,
     original: impl FnOnce(*mut OBJECT_ATTRIBUTES) -> NTSTATUS,
 ) -> DeleteResult {
     match decision.mode {
-        policy::Mode::Passthrough => DeleteResult::Status(original(attrs)),
+        policy::Mode::Passthrough => {
+            // Build an OWNED OBJECT_ATTRIBUTES from the pre-decision
+            // snapshot: the same logical request as the caller's (root,
+            // flags, name, security pointers), but no live guest pointer
+            // survives — a post-decision swap of the caller's buffer cannot
+            // retarget the delete (S04).
+            // RootDirectory is copied verbatim: the numeric
+            // handle-recycle race on that value is the separate H5 class,
+            // out of S04 scope.
+            let mut nt = snap.name_utf16.clone();
+            let mut ustr = UNICODE_STRING {
+                Length: (nt.len() * 2) as u16,
+                MaximumLength: snap.maximum_length.max((nt.len() * 2) as u16),
+                Buffer: nt.as_mut_ptr(),
+            };
+            let mut oa = OBJECT_ATTRIBUTES {
+                Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+                RootDirectory: snap.root,
+                ObjectName: &mut ustr,
+                Attributes: snap.attributes,
+                SecurityDescriptor: snap.security_descriptor,
+                SecurityQualityOfService: snap.sqos,
+            };
+            DeleteResult::Status(original(&mut oa))
+        }
         policy::Mode::Deny => DeleteResult::Status(STATUS_ACCESS_DENIED),
         policy::Mode::Hidden => DeleteResult::Status(STATUS_OBJECT_NAME_NOT_FOUND),
         policy::Mode::Cow | policy::Mode::Mock => {
@@ -846,20 +763,17 @@ pub(crate) unsafe fn apply_delete_decision(
                 MaximumLength: (nt.len() * 2) as u16,
                 Buffer: nt.as_mut_ptr(),
             };
-            // SAFETY: read_unaligned — `attrs` is the live caller OBJECT_
-            // ATTRIBUTES (validity contract above); the caller chose its
-            // address, so read_unaligned is the only well-defined access.
-            let o = (attrs as *const OBJECT_ATTRIBUTES).read_unaligned();
             let mut oa = OBJECT_ATTRIBUTES {
                 Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
                 RootDirectory: std::ptr::null_mut(),
                 ObjectName: &mut ustr,
                 // Keep the caller's flags (OBJ_CASE_INSENSITIVE governs name
-                // resolution) and security pointers verbatim; only the root
-                // and name are rewritten.
-                Attributes: o.Attributes,
-                SecurityDescriptor: o.SecurityDescriptor,
-                SecurityQualityOfService: o.SecurityQualityOfService,
+                // resolution) and security pointers verbatim — read from the
+                // pre-decision snapshot, never a second read of guest
+                // memory (S04); only the root and name are rewritten.
+                Attributes: snap.attributes,
+                SecurityDescriptor: snap.security_descriptor,
+                SecurityQualityOfService: snap.sqos,
             };
             let status = original(&mut oa);
             match decide_post_delete(status) {
@@ -907,11 +821,20 @@ pub(crate) unsafe extern "system" fn hook_nt_delete_file(
         return call_original();
     }
 
-    let Some(dest) = resolve_delete_target(attrs) else {
-        // Fail closed (same convention as unresolvable rename destinations):
-        // a delete whose containment cannot be proven is never forwarded to
-        // the kernel. Covers malformed UNICODE_STRINGs, device-namespace
-        // names and UNC paths.
+    // Snapshot the request ONCE, before classification (review S04). Both
+    // failure shapes below fail closed (same convention as unresolvable
+    // rename destinations): a delete whose request cannot be read, or whose
+    // containment cannot be proven, is never forwarded to the kernel.
+    // Covers malformed OBJECT_ATTRIBUTES/UNICODE_STRINGs (snapshot None),
+    // device-namespace names and UNC paths (dest None).
+    let Some(snap) = snapshot_delete_request(attrs) else {
+        if hooks::is_trace() {
+            hooks::ipc_log(ipc::LogLevel::Trace,
+                format!("fs_delete_unresolvable_target attrs={:?}", attrs));
+        }
+        return STATUS_ACCESS_DENIED;
+    };
+    let Some(dest) = resolve_dest_path(snap.root, &snap.name()) else {
         if hooks::is_trace() {
             hooks::ipc_log(ipc::LogLevel::Trace,
                 format!("fs_delete_unresolvable_target attrs={:?}", attrs));
@@ -928,10 +851,10 @@ pub(crate) unsafe extern "system" fn hook_nt_delete_file(
         return STATUS_ACCESS_DENIED;
     }
 
-    let dest_lower = dest.to_ascii_lowercase();
+    let dest_lower = policy::path::nt_case_fold(&dest);
     let decision = hooks::decide(&dest, true);
     let result = apply_delete_decision(
-        attrs,
+        &snap,
         &dest_lower,
         &decision,
         |a| nt_call_original!(&HOOK_NT_DELETE_FILE, "NtDeleteFile", (a)),

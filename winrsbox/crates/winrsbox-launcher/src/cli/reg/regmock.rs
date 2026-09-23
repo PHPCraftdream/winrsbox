@@ -55,8 +55,8 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     let db = crate::cli::open_db(state_dir)?;
     let path = find_arg(args, "--path=")
-        .ok_or_else(|| anyhow::anyhow!("regmock add: --path required"))?
-        .to_lowercase();
+        .ok_or_else(|| anyhow::anyhow!("regmock add: --path required"))
+        .map(|s| policy::path::nt_case_fold(s).into_owned())?;
     let type_str = find_arg(args, "--type=")
         .ok_or_else(|| anyhow::anyhow!("regmock add: --type required"))?;
     let data_str = find_arg(args, "--data=").unwrap_or("");
@@ -87,8 +87,8 @@ fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
 fn run_remove(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     let db = crate::cli::open_db(state_dir)?;
     let path = find_arg(args, "--path=")
-        .ok_or_else(|| anyhow::anyhow!("regmock remove: --path required"))?
-        .to_lowercase();
+        .ok_or_else(|| anyhow::anyhow!("regmock remove: --path required"))
+        .map(|s| policy::path::nt_case_fold(s).into_owned())?;
     if !db::reg_mock_remove(&db, &path)? {
         bail!("regmock: mock '{}' not found", path);
     }

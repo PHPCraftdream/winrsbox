@@ -77,3 +77,69 @@
 Для каждого этапа обязательны: unit tests для преобразования флагов/масок, реальные Windows integration tests для полученного токена и side effects, ручной acceptance Claude Code/Codex там, где требуется UX, затем `cargo test`/Clippy по затронутым crates. Поскольку обычный CI сейчас запускает только `--lib --bins`, адресные Windows integration tests нужно включить отдельным обязательным job или явно отмечать release как непроверенный по R04. Нагрузочные прогоны этому плану не нужны.
 
 План не требует изменения пользовательского clipboard на рабочем хосте ради тестов: clipboard fixtures запускаются в отдельной test-среде с сохранением/восстановлением данных. Если эта среда недоступна, четыре UI-флага остаются выключенными по умолчанию до получения результатов. Отсутствие ответа на прежний вопрос о `--keep-admin` не блокирует реализацию: безопасный профиль запуска не сохраняет admin права у гостя.
+
+## R04-0: probe и матрица сценариев (Этап 0, выполнено)
+
+Добавлен `winrsbox probe [--spawn-child]` (`winrsbox-launcher/src/cli/diag/probe.rs`) — read-only diagnostic subcommand: печатает `TokenUser`, `TokenOwner`, `TokenIntegrityLevel`, `TokenElevation`+`TokenElevationType` (обе метрики, т.к. `ElevationType` сам по себе ненадёжен — `Default` не означает non-admin при выключенном UAC или built-in Administrator), `TokenGroups` (SID + enabled/deny-only + человекочитаемое имя через `LookupAccountSidW`, отдельно ground-truth строка по `S-1-5-32-544`), `TokenPrivileges` (имя через `LookupPrivilegeNameW` + enabled), `TokenDefaultDacl` (trustee SID/имя + access mask), Job membership (`IsProcessInJob`) и, если процесс сам в Job, фактическую `JobObjectBasicUIRestrictions` маску с расшифровкой битов. `--spawn-child` дополнительно создаёт suspended `cmd.exe`, читает его primary token тем же кодом, затем `TerminateProcess` + закрытие handles — дочерний процесс никогда не возобновляется, не оставляет следов. Ничего не мутирует: только `TOKEN_QUERY`, только собственные throwaway-объекты.
+
+### Гипотеза «Administrators как owner по умолчанию»
+
+Проверено эмпирически: `winrsbox-launcher/src/cli/diag/probe.rs`, тест `tests::default_security_object_owner_and_dacl` — создаёт throwaway named event (`Local\winrsbox-r04-probe-<pid>-<nanos>`) с `SECURITY_ATTRIBUTES = NULL` (тот же паттерн, что `launch_prep.rs` и `init_ack.rs` используют для своих named events), читает owner+DACL через `GetSecurityInfo` (read-only), закрывает handle (объект исчезает сразу — единственная ссылка).
+
+Результат прогона на текущем токене (elevated-аккаунт, но текущий процесс — **filtered/non-elevated** сторона split-token: `TokenElevationType=Limited`, `Administrators` deny-only, integrity=Medium — full/elevated токен той же учётки протестировать в этой headless-среде не удалось, UAC-consent требует интерактивного desktop, которого здесь нет):
+
+```
+owner: S-1-5-21-...-1001 (PC\Computer) — специфичный SID пользователя, НЕ Administrators-группа
+owner is BUILTIN\Administrators group: false
+DACL (3 ACE, mask 0x001f0003 = EVENT_ALL_ACCESS у каждого): SYSTEM, PC\Computer (сам пользователь), NT AUTHORITY\LogonSessionId_0_844066
+```
+
+**Вывод: гипотеза ОПРОВЕРГНУТА для протестированного (filtered) токена** — владелец нового объекта с `SECURITY_ATTRIBUTES=NULL` это `TokenOwner`, а `TokenOwner` в отчёте probe совпадает с `TokenUser` (`S-1-5-21-...-1001`), не с `S-1-5-32-544`. Это согласуется с задокументированным алгоритмом Windows: `TokenOwner` по умолчанию равен `TokenUser`, если ни у одной из enabled-групп токена нет атрибута `SE_GROUP_OWNER` (обычные токены его не имеют — это специальный случай, а не стандартное поведение). Поскольку `TokenOwner` определяется LSA при создании токена независимо от integrity level, тот же вывод should hold и для full/elevated токена той же учётки — но это **derived, not empirically observed on the elevated token**: полной эмпирической проверки на `TokenElevationType=Full` не было, доступный desktop для UAC consent отсутствовал.
+
+Практическое следствие для этапа 1c: конкретные объекты, названные в задаче (именованные events `launch_prep.rs:154,170`, `init_ack.rs:407` — все создаются с `lpEventAttributes=None`, т.е. default SD), получат владельцем SID пользователя, а не Administrators-группу — блокер, которого боялась гипотеза, эмпирически не подтверждён для filtered-токена и по документированному поведению не ожидается и для full-токена. `session_section.rs` использует явный SDDL (`D:(D;;0x0002;;;WD)(A;;0x0005;;;OW)`), это владельца объекта не назначает явно (SDDL начинается с `D:`, без `O:`), поэтому для него действует тот же вывод об owner, а DACL там уже explicit и её content не зависит от deny-only статуса Administrators в токене-читателе, кроме OWNER_RIGHTS (`OW`) ACE — она резолвится в owner-SID на момент создания, т.е. в SID пользователя, что по этому же выводу не сломается при переходе Administrators в deny-only.
+
+### Пример полного вывода probe (текущий процесс + spawned child, elevated-аккаунт, filtered/non-elevated текущий токен)
+
+```
+winrsbox probe — R04 Этап 0 token/Job observation (read-only)
+================================================================
+--- current process (self) ---
+TokenUser: S-1-5-21-716976243-447150123-4053037466-1001 (PC\Computer)
+TokenOwner: S-1-5-21-716976243-447150123-4053037466-1001 (PC\Computer)
+TokenIntegrityLevel: RID=0x2000 (Medium)
+TokenElevation (IsElevated): false
+TokenElevationType: 3 (Limited) — NOTE: Default does not imply non-admin (UAC off / built-in Administrator case); ground truth below is the Administrators group state
+TokenGroups (16 entries):
+  S-1-5-32-544 (BUILTIN\Administrators) enabled=false deny_only=true raw_attrs=0x00000010
+  ... (см. полный вывод в отчёте задачи R04-0)
+  ground-truth Administrators(S-1-5-32-544): enabled=false deny_only=true
+TokenPrivileges (7 entries):
+  SeChangeNotifyPrivilege enabled=true raw_attrs=0x00000003
+  ... остальные 6 (SeAssignPrimaryToken/SeLockMemory/SeShutdown/SeUndock/SeIncreaseWorkingSet/SeTimeZone) enabled=false
+TokenDefaultDacl (3 ACEs):
+  type=0 trustee=S-1-5-21-...-1001 (PC\Computer) mask=0x10000000
+  type=0 trustee=S-1-5-32-544 (BUILTIN\Administrators) mask=0x10000000
+  type=0 trustee=S-1-5-18 (NT AUTHORITY\SYSTEM) mask=0x10000000
+--- current process Job membership ---
+IsProcessInJob: true
+JobObjectBasicUIRestrictions: mask=0x00 (все 8 флагов false — подтверждает текущий default в jobctl.rs)
+--- child (suspended cmd.exe, primary token) ---
+(идентичен current process — токен наследуется потомком без изменений)
+--- child Job membership ---
+IsProcessInJob: true
+JobObjectBasicUIRestrictions: <n/a — no job handle for child process>
+```
+
+Замечание: `TokenDefaultDacl` (в отличие от owner throwaway-объекта выше) **действительно содержит** `BUILTIN\Administrators` как отдельный ACE с `GENERIC_ALL` (0x10000000) — это отдельный канал (`TokenDefaultDacl` применяется, когда объект создаётся с `SECURITY_ATTRIBUTES=NULL` и ОС берёт DACL из токена, что отличается от owner-присвоения). Если этап 1 переведёт Administrators в deny-only, эта ACE перестанет резолвиться для гостя как allow (deny-only группы не матчатся в allow ACE), т.е. объекты, полагающиеся на `TokenDefaultDacl` для доступа НЕ-владельца, могут потерять один из трёх грантов (SYSTEM и владелец остаются). Ни один из трёх файлов, упомянутых в задаче (`launch_prep.rs`, `session_section.rs`, `init_ack.rs`), не полагается на `TokenDefaultDacl` — `launch_prep.rs`/`init_ack.rs` используют `lpSecurityAttributes=NULL`, что определяет и owner (не проблема, см. выше), и DACL из `TokenDefaultDacl` (SYSTEM + user + logon-session — тоже не проблема, доступ идёт от того же самого пользователя/потомка, не от «постороннего Administrators-члена»); `session_section.rs` — explicit SDDL, `TokenDefaultDacl` не участвует вообще.
+
+### Матрица сценариев запуска
+
+| Сценарий | Token elevation | Integrity | Administrators в TokenGroups | UI mask (Job) | Clipboard/browser/credential |
+|---|---|---|---|---|---|
+| Обычный (non-admin) терминал, `winrsbox -- <target>` | not elevated, `TokenElevationType=Default` (не split-token учётка) | Medium | отсутствует или enabled (не split-token) | `0x00` (все биты off, подтверждено `jobctl.rs::UiRestrictions::default()` и probe-выводом) | все работают — читает/пишет clipboard, ShellExecute для browser login, GCM-окно (чужой HWND) — ничего из этого Job UI-флагами не блокируется по умолчанию |
+| Elevated (Administrator) терминал, `winrsbox -- <target>` | `IsElevated=true`, `TokenElevationType=Full` (не протестировано эмпирически в этой headless-среде — нет desktop для UAC; наблюдался только filtered/Limited-конец того же split-token, см. вывод выше) | High (по документации; Medium наблюдался только у filtered-токена) | enabled (в full-токене; в наблюдённом filtered-токене — deny-only) | `0x00` (та же логика — план ещё не переводит токен/маску, этап 0 baseline не меняет поведение) | ожидаемо работают (полный токен = более широкие права), не проверено вручную в этой сессии — весь ручной UX acceptance out of scope для Этапа 0 |
+| `winrsbox shell` (WezTerm внутри Job) | как у launcher, что его запустил | как у launcher | как у launcher | `0x00` по умолчанию, известны исторические поломки при включении любых доп. битов (см. bisect-комментарии `jobctl.rs`) | не проверялось в рамках Этапа 0 — GUI-терминал не запускается из automated контекста, только фиксируется, что режим существует |
+| Вложенный запуск (`winrsbox` изнутри уже sandboxed сессии) | наследует токен родителя-гостя (на сегодня — тот же токен, что и launcher: этап 1 ещё не реализован) | как у родителя | как у родителя | вложенный процесс попадает в тот же Job (kill-on-close уже кросс-generational по конструкции Job Objects) — `IsProcessInJob`/потомок в probe подтверждает наследование Job-принадлежности на дочернем процессе | не проверялось предметно; probe подтверждает лишь механику Job-наследования, не UX |
+| Node/Python/PowerShell/Git дочерние процессы под ТЕКУЩИМ (неограниченным) токеном | наследуют родительский токен без изменений (probe: `child (suspended cmd.exe)` токен идентичен `current process`) | как у родителя | как у родителя | как у родителя (тот же Job) | baseline-only: без токен-ограничения (Этап 1 ещё не реализован) все действия доступны этим процессам в той же мере, что и самому launcher-у — нет отдельной проверки, т.к. ограничивать пока нечего |
+
+Baseline-подтверждение: `UiRestrictions::default()` в `jobctl.rs` сегодня даёт маску `0x00` (все 8 битов off) — подтверждено и статическим чтением кода, и live-выводом `probe` (`JobObjectBasicUIRestrictions: mask=0x00`) на реальном текущем Job. Ничего в этой задаче не меняет `setup_job_object`, `jobctl.rs` defaults или `CreateProcessW`.

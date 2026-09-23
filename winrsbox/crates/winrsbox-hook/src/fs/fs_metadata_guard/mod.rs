@@ -20,6 +20,9 @@ use crate::hooks::{nt_call_original, STATUS_ACCESS_DENIED, STATUS_OBJECT_NAME_NO
 mod setinfo;
 pub(crate) use setinfo::*;
 
+mod snapshot;
+pub(crate) use snapshot::*;
+
 // ---------------------------------------------------------------------------
 // Type aliases
 // ---------------------------------------------------------------------------
@@ -186,7 +189,9 @@ pub(crate) unsafe fn query_handle_dos_path(handle: HANDLE) -> Option<String> {
         return None;
     }
     let s = String::from_utf16_lossy(&buf[..len as usize]);
-    let lower = s.to_ascii_lowercase();
+    // S11: canonical NTFS-identity fold (matches the policy's ensure_lower
+    // keys for non-ASCII paths), not ASCII-only lowercase.
+    let lower = policy::path::nt_case_fold(&s);
     let stripped = lower.strip_prefix(r"\\?\").unwrap_or(&lower).to_string();
     Some(stripped)
 }
@@ -211,7 +216,9 @@ unsafe fn resolve_dest_path(root: HANDLE, name: &str) -> Option<String> {
         } else {
             format!("{}\\{}", base, name)
         };
-        full.to_ascii_lowercase()
+        // S11: kernel-fold the joined relative path so it keys identically
+        // to the policy's folded lookups.
+        policy::path::nt_case_fold(&full).into_owned()
     };
     // Unmirror: if the resolved path is under an overlay root (because the
     // root handle lives in the overlay), convert it back to its virtual form
@@ -287,3 +294,6 @@ pub unsafe fn uninstall() {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod snapshot_tests;

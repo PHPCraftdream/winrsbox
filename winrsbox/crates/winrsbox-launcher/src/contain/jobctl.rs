@@ -89,8 +89,10 @@ impl Default for UiRestrictions {
             // while all-off restores it. Their documented effects
             // (SystemParametersInfo SET, ChangeDisplaySettings) are mild
             // UX nuisances rather than escape vectors — sandbox-AI doing
-            // SPI_SETCURSORS is annoying but recoverable. Strip-bits
-            // available via `--strict-clipboard` for headless mode.
+            // SPI_SETCURSORS is annoying but recoverable. `--strict-clipboard`
+            // does NOT touch these two bits (it sets only READCLIPBOARD |
+            // WRITECLIPBOARD, 0x06); the full 8-bit profile is `--strict-ui`
+            // (R04-2a), not yet measured for compatibility (R04-2b/2c).
             no_system_params: false,
             no_display_settings: false,
             // GLOBALATOMS off by default: blocking the global atom table breaks
@@ -107,8 +109,10 @@ impl Default for UiRestrictions {
             // privileges this bit revokes. SwitchDesktop itself isn't a
             // meaningful escape vector against the kind of agents we sandbox
             // (interactive sessions where the user is already in front of
-            // the screen) — strip-bit available via `--strict-clipboard`
-            // for headless deployments that really want hard isolation.
+            // the screen). `--strict-clipboard` does NOT set this bit (it
+            // sets only READCLIPBOARD | WRITECLIPBOARD, 0x06); this bit is
+            // only set by the full 8-bit `--strict-ui` profile (R04-2a),
+            // not yet measured for compatibility (R04-2b/2c).
             no_desktop: false,
             // EXITWINDOWS off by default — bisected as the empirical
             // blocker for cross-process clipboard PASTE. Docs describe
@@ -119,8 +123,10 @@ impl Default for UiRestrictions {
             // sees the format. The lost logoff/shutdown protection is
             // re-added at user-mode level by `ui_guard`'s hook on
             // user32!ExitWindowsEx (anti-Win+R-style escape from a
-            // sandboxed agent that synthesizes Alt+F4 etc.). Strip-bit
-            // available via `--strict-clipboard` for headless hardening.
+            // sandboxed agent that synthesizes Alt+F4 etc.). `--strict-clipboard`
+            // does NOT set this bit (it sets only READCLIPBOARD | WRITECLIPBOARD,
+            // 0x06); this bit is only set by the full 8-bit `--strict-ui`
+            // profile (R04-2a), not yet measured for compatibility (R04-2b/2c).
             no_exit_windows: false,
         }
     }
@@ -132,6 +138,28 @@ impl UiRestrictions {
     pub fn with_strict_clipboard(mut self) -> Self {
         self.no_read_clipboard = true;
         self.no_write_clipboard = true;
+        self
+    }
+
+    /// Enable all 8 Job UI restriction bits (`limit_flags() == 0xFF`). Used
+    /// when the `--strict-ui` CLI flag is set (R04-2a) — an explicit,
+    /// opt-in hardening profile, not a default. This is NOT claimed safe
+    /// or compatibility-tested: it may break clipboard, browser OAuth, and
+    /// credential-manager workflows that rely on the bits this project's
+    /// default deliberately leaves off (see `Default` impl comments above
+    /// for the empirical clipboard-paste breakage this was bisected from).
+    /// Measuring which of the 4 non-clipboard candidates are safe to enable
+    /// individually or in combination is a separate, not-yet-started task
+    /// (R04-2b/2c).
+    pub fn with_all_restrictions(mut self) -> Self {
+        self.no_foreign_handles = true;
+        self.no_read_clipboard = true;
+        self.no_write_clipboard = true;
+        self.no_system_params = true;
+        self.no_display_settings = true;
+        self.no_global_atoms = true;
+        self.no_desktop = true;
+        self.no_exit_windows = true;
         self
     }
 
@@ -249,6 +277,42 @@ mod tests {
         // (mouse/display settings) and don't warrant the clipboard
         // regression.
         assert_eq!(ui.limit_flags(), 0);
+    }
+
+    #[test]
+    fn with_all_restrictions_sets_all_eight_bits() {
+        let ui = UiRestrictions::default().with_all_restrictions();
+        assert!(ui.no_foreign_handles);
+        assert!(ui.no_read_clipboard);
+        assert!(ui.no_write_clipboard);
+        assert!(ui.no_system_params);
+        assert!(ui.no_display_settings);
+        assert!(ui.no_global_atoms);
+        assert!(ui.no_desktop);
+        assert!(ui.no_exit_windows);
+        assert_eq!(ui.limit_flags(), 0xFF);
+    }
+
+    #[test]
+    fn default_unaffected_by_with_all_restrictions_regression_pin() {
+        // UiRestrictions::default() must stay all-false regardless of the
+        // new `with_all_restrictions` builder — this is the regression pin
+        // for R04-2a: the default UI-restriction mask never changes.
+        let ui = UiRestrictions::default();
+        assert_eq!(ui.limit_flags(), 0x00);
+    }
+
+    #[test]
+    fn with_all_restrictions_is_superset_of_strict_clipboard() {
+        // `--strict-ui` (0xFF) must dominate `--strict-clipboard` (0x06)
+        // when both are requested together: applying strict-clipboard
+        // first and then all_restrictions still yields 0xFF, i.e. the
+        // "all restrictions" profile is a strict superset and the
+        // composition order doesn't matter.
+        let ui = UiRestrictions::default()
+            .with_strict_clipboard()
+            .with_all_restrictions();
+        assert_eq!(ui.limit_flags(), 0xFF);
     }
 
     #[test]

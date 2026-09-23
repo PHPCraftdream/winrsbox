@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use policy::path;
+use winrsbox_policy::path;
 use std::path::Path;
 
 fn bench_nt_to_dos_with_prefix(c: &mut Criterion) {

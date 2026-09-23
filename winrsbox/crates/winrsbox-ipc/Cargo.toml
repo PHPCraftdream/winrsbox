@@ -13,6 +13,25 @@ serde = { workspace = true }
 bincode = { workspace = true }
 policy = { package = "winrsbox-policy", path = "../winrsbox-policy" }
 thiserror = "1"
+# Deadline-bounded synchronous client I/O (timed_pipe): overlapped ReadFile/
+# WriteFile + GetOverlappedResult/CancelIoEx, plus the in-test named-pipe
+# server (CreateNamedPipeW/ConnectNamedPipe/DisconnectNamedPipe).
+# NB: winapi 0.3 features do NOT imply each other beyond the dependency lists
+# in its build.rs — "ioapiset", "winbase" (WAIT_*/FILE_FLAG_OVERLAPPED/PIPE_*)
+# and "namedpipeapi" are NOT reachable from the base set below and are needed
+# as-is; see timed_pipe.rs / sync_client.rs tests.
+winapi = { version = "0.3", features = [
+    "fileapi",        # CreateFileW/ReadFile/WriteFile
+    "synchapi",       # CreateEventW/WaitForSingleObject
+    "handleapi",      # CloseHandle/INVALID_HANDLE_VALUE
+    "minwinbase",     # OVERLAPPED/SECURITY_ATTRIBUTES
+    "minwindef",      # DWORD/TRUE/FALSE
+    "winerror",       # ERROR_*/WAIT_TIMEOUT
+    "errhandlingapi", # GetLastError
+    "ioapiset",       # GetOverlappedResult/CancelIoEx
+    "winbase",        # WAIT_OBJECT_0/WAIT_FAILED/INFINITE/FILE_FLAG_OVERLAPPED/PIPE_*
+    "namedpipeapi",   # in-test pipe server (CreateNamedPipeW et al.)
+] }
 
 [dev-dependencies]
 criterion = { workspace = true }

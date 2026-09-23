@@ -104,6 +104,11 @@ fn supervised_final_status_is_read_from_misaligned_iosb() {
 
 /// The only-hidden path zeroes Information in the caller's IOSB — the
 /// old plain `*((iosb + 8) as *mut usize) = 0` aborted on an odd IOSB.
+/// Now a full DirQueryCtx: the hidden-only page triggers a requery (the
+/// stub reports kernel exhaustion on the next page), and the end phase
+/// must leave BOTH Information = 0 and Status = STATUS_NO_MORE_FILES in
+/// the misaligned IOSB — the Status write is the defect-#6 fix and itself
+/// a new odd-address probe.
 #[test]
 fn only_hidden_zeroes_information_in_misaligned_iosb() {
     let built = build_dir_info_buffer(&[".winrsbox"]);
@@ -122,16 +127,45 @@ fn only_hidden_zeroes_information_in_misaligned_iosb() {
         let stale = (built.len() as u64).to_le_bytes();
         std::ptr::copy_nonoverlapping(stale.as_ptr(), (iosb_ptr as *mut u8).add(8), 8);
     }
+
+    // Unique handle key: tests share the process-global enumeration
+    // registry, so every test owns a distinct key and cleans up after.
+    let handle = 0x0000_C001usize as HANDLE;
+    let key = handle as usize;
+    let requery_calls = std::cell::Cell::new(0usize);
+    let mut requery = || -> NTSTATUS {
+        requery_calls.set(requery_calls.get() + 1);
+        STATUS_NO_MORE_FILES // kernel exhaustion on the next real page
+    };
+    let no_children = |_: &str| -> Option<Vec<policy::OverlayChildMeta>> { Some(Vec::new()) };
+    let no_whiteouts = |_: &str| -> Option<Vec<String>> { Some(Vec::new()) };
+    let sources = DirMergeSources {
+        overlay_children: &no_children,
+        whiteouts_under: &no_whiteouts,
+    };
+    let mut ctx = DirQueryCtx {
+        // SAFETY: off ≤ 1 and the built buffer fits the backing; the odd
+        // base address is the point of the probe.
+        file_information: unsafe { backing.as_mut_ptr().add(off) } as *mut c_void,
+        io_status_block: iosb_ptr,
+        class: 1,
+        capacity: built.len(),
+        handle,
+        return_single_entry: false,
+        restart_scan: false,
+        pattern_from_call: None,
+        dir_dos: None,
+        original_status: 0,
+        requery: &mut requery,
+        sources,
+    };
     // SAFETY: buf is a valid writable class-1 buffer at an odd base; the
     // iosb is the (misaligned) caller IOSB stand-in. dir_dos None keeps
     // the fn off IPC entirely.
-    let status = unsafe {
-        process_dir_output(
-            backing.as_mut_ptr().add(off) as *mut c_void,
-            iosb_ptr, 1, None, 0, built.len(), None,
-        )
-    };
+    let status = unsafe { process_dir_output(&mut ctx) };
     assert_eq!(status, STATUS_NO_MORE_FILES);
+    assert_eq!(requery_calls.get(), 1,
+        "a hidden-only real page must pull one further page, not report EOF");
     // SAFETY: read the Information field back byte-wise from the backing.
     let mut info_bytes = [0u8; 8];
     unsafe {
@@ -139,6 +173,18 @@ fn only_hidden_zeroes_information_in_misaligned_iosb() {
     }
     assert_eq!(usize::from_le_bytes(info_bytes), 0,
         "stale Information must be zeroed even in a misaligned IOSB");
+    // SAFETY: Status sits at offset 0; a 4-byte byte-wise read keeps the
+    // odd-address probe honest.
+    let mut status_bytes = [0u8; 4];
+    unsafe {
+        std::ptr::copy_nonoverlapping(iosb_ptr as *const u8, status_bytes.as_mut_ptr(), 4);
+    }
+    assert_eq!(u32::from_le_bytes(status_bytes), STATUS_NO_MORE_FILES as u32,
+        "IOSB.Status must match the return value even on the hidden-only EOF path");
+    // dir is None → the overlay phase is skipped and overlay_done stays
+    // false, so the state is stored back; drop it to keep the shared
+    // registry clean for other tests.
+    let _ = take_enum_state(key);
 }
 
 // ── overlay-entry injection (enum-merge fix: ghost-file listing bug) ───
@@ -513,18 +559,53 @@ fn process_dir_output_only_hidden_zeroes_information_and_reports_no_more_files()
     let mut buf = build_dir_info_buffer(&[".winrsbox"]);
     let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
     iosb.Information = buf.len();
-    // SAFETY: buf is a valid writable class-1 buffer; iosb is a valid
-    // stack IO_STATUS_BLOCK. dir_dos None keeps the fn off IPC entirely;
-    // original_status 0; unhandled-class safe.
-    let status = unsafe {
-        process_dir_output(buf.as_mut_ptr() as *mut c_void, &mut iosb, 1, None, 0, buf.len(), None)
+
+    let handle = 0x0000_C002usize as HANDLE;
+    let key = handle as usize;
+    let requery_calls = std::cell::Cell::new(0usize);
+    let mut requery = || -> NTSTATUS {
+        requery_calls.set(requery_calls.get() + 1);
+        STATUS_NO_MORE_FILES // kernel exhaustion on the next real page
     };
-    assert_eq!(status, 0x8000_0006_u32 as NTSTATUS);
+    let no_children = |_: &str| -> Option<Vec<policy::OverlayChildMeta>> { Some(Vec::new()) };
+    let no_whiteouts = |_: &str| -> Option<Vec<String>> { Some(Vec::new()) };
+    let sources = DirMergeSources {
+        overlay_children: &no_children,
+        whiteouts_under: &no_whiteouts,
+    };
+    let mut ctx = DirQueryCtx {
+        file_information: buf.as_mut_ptr() as *mut c_void,
+        io_status_block: &mut iosb,
+        class: 1,
+        capacity: buf.len(),
+        handle,
+        return_single_entry: false,
+        restart_scan: false,
+        pattern_from_call: None,
+        dir_dos: None,
+        original_status: 0,
+        requery: &mut requery,
+        sources,
+    };
+    // SAFETY: buf is a valid writable class-1 buffer; iosb is a valid
+    // stack IO_STATUS_BLOCK. dir_dos None keeps the fn off IPC entirely.
+    let status = unsafe { process_dir_output(&mut ctx) };
+    assert_eq!(status, STATUS_NO_MORE_FILES);
     // Stale pre-filter bytes must not be readable as a live record via
     // FindNextFile.
     assert_eq!(iosb.Information, 0);
+    // Defect #6: the hidden-only EOF path must also write Status — the
+    // return value and the IOSB must agree for callers that inspect the
+    // IOSB directly.
+    // SAFETY: Status (NTSTATUS) sits at offset 0 of the IOSB.
+    let iosb_status = unsafe {
+        (std::ptr::addr_of!(iosb) as *const NTSTATUS).read_unaligned()
+    };
+    assert_eq!(iosb_status, STATUS_NO_MORE_FILES);
+    assert_eq!(requery_calls.get(), 1,
+        "the hidden-only page must drive one requery before exhaustion");
+    let _ = take_enum_state(key);
 }
-
 #[test]
 fn event_api_resolves_and_round_trips() {
     let api = event_api().expect(
@@ -705,4 +786,204 @@ fn rewrite_entry_case_on_odd_base() {
         vec!["MiXeD".to_string()],
         "case rewrite must be byte-exact on an odd buffer base",
     );
+}
+
+// ── R03 staging pins (review XA 2026-09-20) ─────────────────────────────
+//
+// The hook bodies cannot be invoked without a live ntdll detour, so the
+// "kernel never receives the caller's buffer" invariant is pinned
+// textually (same technique as fs_hooks/tests.rs).
+
+/// Slice of one hook fn body from concatenated module source, bounded by
+/// the next top-level item.
+fn hook_body(src: &str, sig: &str, end_marker: &str) -> String {
+    let start = src.find(sig).unwrap_or_else(|| panic!("fn signature missing: {sig}"));
+    let rest = &src[start..];
+    let end = rest.find(end_marker).unwrap_or_else(|| panic!("end marker missing: {end_marker}"));
+    rest[..end].to_string()
+}
+
+/// The real syscall must never receive the caller's FileInformation: both
+/// hooks must target the private staging buffer on the primary call AND the
+/// requery, and the merge ctx must run against the staging buffer too. In
+/// the window between the staging allocation and the publish call, the
+/// caller's pointer may appear only as the staging-allocation argument and
+/// as the ctx field bound to staging.kernel_ptr() (`file_information_class`
+/// remains as a parameter name; the null-buffer pass-through precedes the
+/// window and is the other sanctioned raw use).
+#[test]
+fn directory_hooks_never_hand_the_caller_buffer_to_the_kernel() {
+    let src = crate::hooks::module_source("dir_filter");
+    for (sig, end_marker, tag) in [
+        ("fn hook_nt_query_directory_file(", "fn hook_nt_query_directory_file_ex", "query"),
+        ("fn hook_nt_query_directory_file_ex(", "pub unsafe fn install", "query_ex"),
+    ] {
+        let body = hook_body(&src, sig, end_marker);
+        assert!(
+            body.contains("if file_information.is_null()"),
+            "{tag}: null-buffer degenerate pass-through gate missing"
+        );
+        assert!(
+            body.contains("fs_enum_staging_refused"),
+            "{tag}: staging-allocation failure must be fail-closed and logged"
+        );
+        let supervised = body
+            .split_once("DirQueryStaging::new")
+            .expect("staging allocation missing")
+            .1;
+        let cut = supervised
+            .find("staging.publish(io_status_block);")
+            .expect("publish must run in the hook frame after the merge");
+        let supervised = &supervised[..cut];
+        assert!(
+            supervised.matches("staging.kernel_ptr()").count() >= 2,
+            "{tag}: primary and requery calls must both target staging.kernel_ptr()"
+        );
+        assert!(
+            !supervised.contains("io_status_block, file_information"),
+            "{tag}: the raw caller buffer must never be an argument to the \
+             original syscall once the staging buffer exists"
+        );
+        let raw_uses = supervised.matches("file_information").count()
+            - supervised.matches("file_information_class").count();
+        assert!(
+            raw_uses == 2
+                && supervised.starts_with("(file_information,")
+                && supervised.contains("file_information: staging.kernel_ptr()"),
+            "{tag}: between staging allocation and publish, the caller's buffer \
+             pointer may appear only as the staging-allocation argument and \
+             the ctx field bound to staging.kernel_ptr()"
+        );
+    }
+}
+
+/// The staging buffer handed to the kernel must be 8-byte aligned (the
+/// strictest field alignment of the FILE_*_INFORMATION layouts) and must
+/// cover the declared capacity for every size, including zero.
+#[test]
+fn staging_allocation_is_aligned_and_covers_capacity() {
+    for cap in [0usize, 1, 7, 8, 9, 0x58, 0x1000] {
+        let backing = vec![0u8; cap];
+        let st = DirQueryStaging::new(backing.as_ptr() as *mut c_void, cap)
+            .expect("small fixed allocations must succeed");
+        assert_eq!(
+            st.kernel_ptr() as usize % 8,
+            0,
+            "staging buffer must be 8-byte aligned (cap={cap})"
+        );
+    }
+}
+
+/// publish copies exactly the IOSB's live byte count out of the staging
+/// buffer, leaves the caller's bytes past it untouched, clamps a
+/// hostile/stale Information above the declared capacity, and is a no-op
+/// on a null IOSB.
+#[test]
+fn publish_copies_live_bytes_and_never_exceeds_capacity() {
+    // (a) exact live copy
+    let mut caller = [0xEEu8; 16];
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    iosb.Information = 10;
+    let st = DirQueryStaging::new(caller.as_mut_ptr() as *mut c_void, 16)
+        .expect("fixed 16-byte allocation must succeed");
+    // SAFETY: staging is 16 writable bytes owned by this test.
+    unsafe { std::ptr::write_bytes(st.kernel_ptr() as *mut u8, 0xA5, 16) };
+    // SAFETY: caller and iosb are valid stack memory outliving the call.
+    unsafe { st.publish(&mut iosb) };
+    assert!(caller[..10].iter().all(|&b| b == 0xA5), "live bytes must be copied");
+    assert!(caller[10..].iter().all(|&b| b == 0xEE), "bytes past Information stay untouched");
+
+    // (b) hostile/stale Information above capacity is clamped
+    let mut caller2 = [0xEEu8; 16];
+    let mut iosb2: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    iosb2.Information = 0xFFFF;
+    let st2 = DirQueryStaging::new(caller2.as_mut_ptr() as *mut c_void, 16)
+        .expect("fixed 16-byte allocation must succeed");
+    // SAFETY: as (a).
+    unsafe { std::ptr::write_bytes(st2.kernel_ptr() as *mut u8, 0xA5, 16) };
+    // SAFETY: as (a).
+    unsafe { st2.publish(&mut iosb2) };
+    assert!(
+        caller2.iter().all(|&b| b == 0xA5),
+        "Information above capacity must clamp to the declared 16 bytes"
+    );
+
+    // (c) null IOSB: publish is a no-op
+    let mut caller3 = [0xEEu8; 16];
+    let st3 = DirQueryStaging::new(caller3.as_mut_ptr() as *mut c_void, 16)
+        .expect("fixed 16-byte allocation must succeed");
+    // SAFETY: as (a).
+    unsafe { std::ptr::write_bytes(st3.kernel_ptr() as *mut u8, 0xA5, 16) };
+    // SAFETY: null IOSB is an explicitly supported no-op input.
+    unsafe { st3.publish(std::ptr::null_mut()) };
+    assert!(caller3.iter().all(|&b| b == 0xEE), "null IOSB must copy nothing");
+}
+
+/// R03 round-trip: the kernel "writes" a raw page (one hidden + one
+/// visible class-1 entry) into the private staging buffer, the merge
+/// filters it there, and publish copies ONLY the filtered bytes into the
+/// caller's small buffer — byte count and content both exact, and the
+/// caller's bytes past the live record stay untouched.
+#[test]
+fn staging_round_trip_publishes_only_filtered_bytes() {
+    const CAP: usize = 0xB0; // exactly two class-1 records of 0x58
+    let raw = build_dir_info_buffer(&[".winrsbox", "visible.txt"]);
+    assert_eq!(raw.len(), CAP);
+    let mut caller = vec![0xEEu8; CAP];
+    let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    // The kernel reports the raw page size in Information; without it the
+    // merge would see a zero-byte page and never filter.
+    iosb.Information = raw.len();
+    // Unique handle key: tests share the process-global enumeration
+    // registry (0x0000_C001..C00B are taken by the other tests).
+    let handle = 0x0000_C00Cusize as HANDLE;
+    let staging = DirQueryStaging::new(caller.as_mut_ptr() as *mut c_void, CAP)
+        .expect("fixed 0xB0 allocation must succeed");
+    // Simulated kernel write: the raw page lands in the private buffer only.
+    // SAFETY: staging holds ≥ raw.len() writable bytes owned by this test.
+    unsafe {
+        std::ptr::copy_nonoverlapping(raw.as_ptr(), staging.kernel_ptr() as *mut u8, raw.len());
+    }
+    let no_children = |_: &str| -> Option<Vec<policy::OverlayChildMeta>> { Some(Vec::new()) };
+    let no_whiteouts = |_: &str| -> Option<Vec<String>> { Some(Vec::new()) };
+    let mut requery = || -> NTSTATUS { STATUS_NO_MORE_FILES };
+    let sources = DirMergeSources {
+        overlay_children: &no_children,
+        whiteouts_under: &no_whiteouts,
+    };
+    let mut ctx = DirQueryCtx {
+        file_information: staging.kernel_ptr(),
+        io_status_block: &mut iosb,
+        class: 1,
+        capacity: CAP,
+        handle,
+        return_single_entry: false,
+        restart_scan: false,
+        pattern_from_call: None,
+        dir_dos: Some(r"C:\proj\staged".to_string()),
+        original_status: 0,
+        requery: &mut requery,
+        sources,
+    };
+    // SAFETY: staging is a valid writable class-1 buffer of CAP bytes;
+    // iosb and the stub sources are test-owned.
+    let status = unsafe { process_dir_output(&mut ctx) };
+    assert_eq!(status, 0, "the visible record must be delivered");
+    // Live size is the UNPADDED tail (0x40 + 22 name bytes = 0x56) — the
+    // kernel/merge never count trailing alignment padding.
+    assert_eq!(iosb.Information, 0x56, "only the visible record stays live");
+    // SAFETY: caller buffer and iosb are valid test-owned memory.
+    unsafe { staging.publish(&mut iosb) };
+    assert_eq!(
+        collect_names(&caller[..0x56]),
+        vec!["visible.txt".to_string()],
+        "the published page must contain exactly the filtered record"
+    );
+    assert!(
+        caller[0x56..].iter().all(|&b| b == 0xEE),
+        "publish must not write past the live bytes"
+    );
+    // Both streams are exhausted and delivered: the state was stored back;
+    // drop it to keep the shared registry clean for other tests.
+    let _ = take_enum_state(handle as usize);
 }

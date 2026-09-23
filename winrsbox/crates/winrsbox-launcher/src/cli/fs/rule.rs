@@ -258,7 +258,7 @@ mod tests {
     fn run_add_return_id(args: &[String], state: &std::path::Path) -> String {
         let db = crate::cli::open_db(state).unwrap();
         let prefix = find_arg(args, "--prefix=").unwrap();
-        let prefix_lower = prefix.to_lowercase();
+        let prefix_lower = policy::path::nt_case_fold(prefix).into_owned();
         let write_mode = find_arg(args, "--write=").map(parse_mode).transpose().unwrap_or(None).unwrap_or(RuleMode::Cow);
         let id = crate::cli::id::generate_id("rule", &[&prefix_lower]);
         let row = db::RuleRow { id: id.clone(), prefix: prefix_lower, mode_read: RuleMode::Passthrough, mode_write: write_mode, when: None };

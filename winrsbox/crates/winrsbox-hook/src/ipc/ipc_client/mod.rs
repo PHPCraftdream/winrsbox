@@ -2,6 +2,8 @@
 // IPC_CONSECUTIVE_FAILURES counter, fail-closed self-terminate logic, TRACE_ENABLED, is_trace().
 // Everything that talks to the launcher pipe.
 
+use std::cell::{Cell, RefCell};
+
 use policy::{Decision, Mode};
 use winapi::um::processthreadsapi::GetCurrentProcessId;
 
@@ -15,7 +17,7 @@ pub(crate) static CACHE: std::sync::OnceLock<HookCache> = std::sync::OnceLock::n
 
 // Per-thread IPC connection + hello-sent flag.
 //
-// WHY TlsAlloc AND NOT Rust `thread_local!`: this crate is injected late via
+// WHY NOT Rust `thread_local!`: this crate is injected late via
 // APC `LoadLibraryW`. Rust `thread_local!` on MSVC compiles to native
 // `__declspec(thread)` TLS, whose slot read (`gs:[0x58]` → indexed deref)
 // intermittently faults on threads that existed before the load
@@ -23,18 +25,25 @@ pub(crate) static CACHE: std::sync::OnceLock<HookCache> = std::sync::OnceLock::n
 // `iwr`/`irm` ~1/3 of the time and that we fixed in `anti_rec.rs`. `IPC_CLIENT`
 // is on the cache-miss IPC path and uses the exact same native-TLS mechanism;
 // leaving it as `thread_local!` is a residual instance of the same bug class.
-// `TlsAlloc` stores the slot in `TEB.TlsSlots` (`gs:0x1480`), which the loader
-// initializes for EVERY thread (including pre-existing ones), so it is safe for
-// a late-injected DLL. Precedent: `memory_guard.rs` and `anti_rec.rs` already
-// use `TlsAlloc` for this reason.
 //
-// Lifetime: the `Box<PerThread>` is leaked on thread exit (no cleanup callback,
-// unlike FlsAlloc). This is acceptable: `SyncClient` has no custom `Drop`
-// (it just holds a `std::fs::File`, whose handle the OS reclaims at process
-// exit), Schannel reuses thread-pool workers rather than spawning/tearing them
-// down, and the launcher detects broken pipes via `try_send` clearing dead
-// clients. Handle leak is bounded by the (small) thread count.
-use std::cell::{Cell, RefCell};
+// WHY FlsAlloc AND NOT TlsAlloc: `FlsAlloc` keeps TlsAlloc's late-injection
+// safety — per-thread `TEB.FlsData` is allocated lazily by ntdll on the
+// thread's first FLS API call (an explicit API call, no compiler-generated
+// TLS dereference, no thread-creation-time setup), so threads that existed
+// before the DLL loaded are safe — but unlike TlsAlloc it accepts a
+// `PFLS_CALLBACK_FUNCTION`, which the loader dispatches unconditionally from
+// the thread-exit path (LdrShutdownThread → RtlProcessFlsData) for any thread
+// holding a non-NULL value in the slot, fibers or not (this is literally how
+// ucrtbase/msvcrt clean up their per-thread CRT state). The callback here
+// only drops the `Box<PerThread>` — whose `Drop` closes the pipe handle via
+// the `SyncClient`'s `File`; `CloseHandle` does no loader-lock work, so it is
+// safe during LdrShutdownThread. Our DLL is never unloaded, so the callback
+// pointer can never dangle. Consequence: one pipe handle is held per LIVE
+// thread instead of per ever-seen thread, so the per-connection handler slot
+// on the launcher's 128-connection pipe server is released at thread exit
+// rather than process exit. This is the fix for review C02 (the previous
+// TlsAlloc scheme leaked the box until process exit, letting a long-lived
+// sandboxed process with thread churn starve the launcher's handler slots).
 
 #[derive(Default)]
 struct PerThread {
@@ -44,41 +53,89 @@ struct PerThread {
     /// Whether Hello has been sent on this thread's connection (one-shot side
     /// effects: arm inject_guard, flush install errors).
     hello_sent: Cell<bool>,
+    /// Test-only drop observability: lets `fls_tests` assert that the PFLS
+    /// callback really released each exiting thread's `PerThread` (and with it
+    /// the pipe handle) instead of leaking it until process exit.
+    #[cfg(test)]
+    _drop_probe: DropProbe,
 }
 
-static PT_TLS_SLOT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-const TLS_OUT_OF_INDEXES: u32 = 0xFFFFFFFF;
+/// Test-only marker whose `Drop` increments `FLS_DROPPED`.
+#[cfg(test)]
+#[derive(Default)]
+struct DropProbe;
 
-/// Resolve the runtime TLS slot for the per-thread struct (allocating once).
+#[cfg(test)]
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        FLS_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+static FLS_DROPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+static PT_FLS_SLOT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+/// `FlsAlloc` returns this on failure.
+const FLS_OUT_OF_INDEXES: u32 = 0xFFFFFFFF;
+
+/// PFLS callback: drops the exiting thread's `PerThread`.
+///
+/// Runs on the exiting thread itself, during `LdrShutdownThread` →
+/// `RtlProcessFlsData`, whenever the thread holds a non-NULL value in our FLS
+/// slot (fibers or not — this is how ucrtbase cleans up per-thread state).
+/// A NULL `raw` means the slot was never set on this thread; nothing to do.
+/// It must ONLY drop the box: the `Drop` chain closes the pipe handle via the
+/// `SyncClient`'s `File`, and `CloseHandle` does no loader-lock work, so it is
+/// safe during `LdrShutdownThread`. Our DLL is never unloaded, so this
+/// function pointer can never dangle.
+///
+/// `winapi::ctypes::c_void` (not `std::ffi::c_void`) because that is the
+/// pointer type winapi's `PFLS_CALLBACK_FUNCTION` (`PVOID`) is built from —
+/// fn pointers are only ABI-compatible, not type-compatible.
+unsafe extern "system" fn per_thread_fls_callback(raw: *mut winapi::ctypes::c_void) {
+    if raw.is_null() {
+        return;
+    }
+    drop(Box::from_raw(raw as *mut PerThread));
+}
+
+/// Resolve the runtime FLS slot for the per-thread struct (allocating once).
 fn pt_slot() -> u32 {
-    *PT_TLS_SLOT.get_or_init(|| unsafe { winapi::um::processthreadsapi::TlsAlloc() })
+    *PT_FLS_SLOT.get_or_init(|| unsafe {
+        winapi::um::fibersapi::FlsAlloc(Some(per_thread_fls_callback))
+    })
 }
 
 /// Lazily initialize (once per thread) and return the thread's `PerThread`.
 ///
-/// Returns `None` only if `TlsAlloc` failed (`TLS_OUT_OF_INDEXES` — essentially
-/// impossible; ~1000 slots available) or `TlsSetValue` failed. Callers treat
+/// Returns `None` only if `FlsAlloc` failed (`FLS_OUT_OF_INDEXES` — essentially
+/// impossible; 128 slots guaranteed) or `FlsSetValue` failed. Callers treat
 /// `None` as "IPC unavailable" → fail-closed (self-terminate), which is the
-/// safe disposition for an unrecoverable TLS failure.
+/// safe disposition for an unrecoverable FLS failure.
 fn per_thread() -> Option<&'static PerThread> {
     let s = pt_slot();
-    if s == TLS_OUT_OF_INDEXES {
+    if s == FLS_OUT_OF_INDEXES {
         return None;
     }
     unsafe {
-        let p = winapi::um::processthreadsapi::TlsGetValue(s);
+        let p = winapi::um::fibersapi::FlsGetValue(s);
         if !p.is_null() {
             return Some(&*(p as *const PerThread));
         }
         let raw = Box::into_raw(Box::<PerThread>::default());
-        if winapi::um::processthreadsapi::TlsSetValue(s, raw as *mut _) == 0 {
-            // TlsSetValue failed — reclaim the box (don't leak) and fail-closed.
+        if winapi::um::fibersapi::FlsSetValue(s, raw as *mut _) == 0 {
+            // FlsSetValue failed — reclaim the box (don't leak) and fail-closed.
             let _ = Box::from_raw(raw);
             return None;
         }
         Some(&*raw)
     }
 }
+
+/// FLS-mechanism tests (`per_thread` / PFLS callback) — review C02.
+#[cfg(test)]
+mod fls_tests;
 
 pub(crate) static PIPE_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 pub(crate) static DLL_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -108,6 +165,17 @@ pub(crate) fn buffer_install_error(msg: String) {
     }
 }
 
+/// Whether any install-time errors are buffered, WITHOUT draining them.
+/// Used by init_ack::signal_init_events to decide whether the degraded-init
+/// event must be signaled (S10); flush_install_errors below still drains
+/// later, on the first successful Hello.
+pub(crate) fn install_errors_pending() -> bool {
+    match INSTALL_ERRORS.get() {
+        Some(buf) => buf.lock().map(|v| !v.is_empty()).unwrap_or(false),
+        None => false,
+    }
+}
+
 pub(crate) fn flush_install_errors() {
     if let Some(buf) = INSTALL_ERRORS.get() {
         if let Ok(mut v) = buf.lock() {
@@ -130,7 +198,7 @@ pub(crate) static TRACE_ENABLED: std::sync::atomic::AtomicBool =
 /// (authored before any guest code runs). Every hooked child is injected by
 /// its parent's spawn hook, which appends the same variable to the child's
 /// environment block cross-process while the child is still suspended — see
-/// `inject::patch_child_env_section`. At DllMain install time this process's
+/// `inject::patch_child_env_pairs`. At DllMain install time this process's
 /// own `FS_SANDBOX_SECTION` is captured here (hooks.rs), and the section
 /// fallback below opens ONLY this name.
 ///
@@ -210,7 +278,11 @@ pub(crate) fn try_load_session_config_from_section() -> Option<()> {
 /// with a unique per-process name without poisoning the shared `OnceLock`s
 /// for the rest of the test binary (see the `ensure_pipe_name_loaded` split
 /// below for why that poisoning was a real 7-test flake).
-fn try_load_session_config_named(name: &str) -> Option<ipc::SessionConfig> {
+///
+/// `pub(crate)` because install_hooks resolves the effective config through
+/// it directly — the trusted section is the ONLY source of security config
+/// (review XA 2026-09-20, S02).
+pub(crate) fn try_load_session_config_named(name: &str) -> Option<ipc::SessionConfig> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use winapi::shared::minwindef::FALSE;
@@ -355,7 +427,7 @@ pub(crate) fn ensure_ipc_and<R>(f: impl FnOnce(&mut Option<ipc::SyncClient>) -> 
     // a missing section means the launcher really is gone.
     ensure_pipe_name_loaded();
     let Some(pt) = per_thread() else {
-        // TlsAlloc/TlsSetValue failure (degenerate) — IPC unavailable, fail-closed.
+        // FlsAlloc/FlsSetValue failure (degenerate) — IPC unavailable, fail-closed.
         return None;
     };
     let result = {
@@ -368,7 +440,24 @@ pub(crate) fn ensure_ipc_and<R>(f: impl FnOnce(&mut Option<ipc::SyncClient>) -> 
                 }
                 Some(name) => {
                     match ipc::SyncClient::connect(name) {
-                        Ok(c) => *opt = Some(c),
+                        Ok(c) => {
+                            // S02 #1 remainder: verify WHO owns the pipe server
+                            // (GetNamedPipeServerProcessId + kernel creation
+                            // time vs the launcher identity pinned in
+                            // trusted_boot) before trusting anything it says.
+                            // A rejected server is treated exactly like a
+                            // failed connect — the client stays unset and the
+                            // IPC_CONSECUTIVE_FAILURES fail-closed threshold
+                            // applies unchanged.
+                            match crate::trusted_boot::verify_pipe_server_identity(&c) {
+                                Ok(()) => *opt = Some(c),
+                                Err(e) => {
+                                    fail_log(&format!(
+                                        "IPC connect rejected: pipe server identity mismatch: {e}"
+                                    ));
+                                }
+                            }
+                        }
                         Err(e) => {
                             fail_log(&format!("IPC connect failed: {e}"));
                         }
@@ -433,6 +522,26 @@ pub(crate) fn try_send(opt: &mut Option<ipc::SyncClient>, req: &ipc::Req) -> Opt
     }
 }
 
+/// PERF-cow: fold `ensure_ipc_and`'s `Option<bool>` (None = IPC unavailable)
+/// into the "request delivered" signal the overlay record fns return.
+#[cfg(not(test))]
+fn overlay_delivery(sent: Option<bool>) -> bool {
+    sent.unwrap_or(false)
+}
+
+/// Test seam — assume delivery so publish-skip logic is exercisable:
+/// `ensure_ipc_and` yields None in test builds (PIPE_NAME is unset, there is
+/// no launcher), but a test that configured a real transport still gets the
+/// real signal. Same shim pattern as `ensure_pipe_name_loaded` above.
+#[cfg(test)]
+fn overlay_delivery(sent: Option<bool>) -> bool {
+    if PIPE_NAME.get().is_none() {
+        true
+    } else {
+        sent.unwrap_or(false)
+    }
+}
+
 pub(crate) fn ipc_decide(dos_lower: &str, write: bool) -> Decision {
     let result = ensure_ipc_and(|opt| {
         let req = ipc::Req::Decide {
@@ -477,13 +586,17 @@ pub(crate) fn ipc_decide(dos_lower: &str, write: bool) -> Decision {
     }
 }
 
-pub(crate) fn ipc_record_overlay(orig: &str, overlay: &str) {
-    let _ = ensure_ipc_and(|opt| {
-        let _ = try_send(opt, &ipc::Req::RecordOverlay {
+/// PERF-cow: true = the request was handed to the transport; false = IPC
+/// unavailable or the send failed (the caller must not treat the publish as
+/// done).
+pub(crate) fn ipc_record_overlay(orig: &str, overlay: &str) -> bool {
+    overlay_delivery(ensure_ipc_and(|opt| {
+        try_send(opt, &ipc::Req::RecordOverlay {
             orig: orig.to_owned(),
             overlay: overlay.to_owned(),
-        });
-    });
+        })
+        .is_some()
+    }))
 }
 
 /// Record the original-case basename for an overlay entry.
@@ -495,20 +608,24 @@ pub(crate) fn ipc_record_overlay(orig: &str, overlay: &str) {
 /// is nothing to preserve — the overlay's lowercase storage is already
 /// correct). Sends `RecordOverlayCase` IPC to the policy daemon which
 /// writes to the `OVERLAY_CASE` table.
-pub(crate) fn ipc_record_overlay_case(lower_path: &str, original_basename: &str) {
+///
+/// Returns true when there was nothing to send or the request was handed to
+/// the transport; false = IPC unavailable or the send failed.
+pub(crate) fn ipc_record_overlay_case(lower_path: &str, original_basename: &str) -> bool {
     if original_basename.is_empty() {
-        return;
+        return true;
     }
     // Skip when case is already lowercase — nothing to preserve.
     if original_basename == original_basename.to_ascii_lowercase() {
-        return;
+        return true;
     }
-    let _ = ensure_ipc_and(|opt| {
-        let _ = try_send(opt, &ipc::Req::RecordOverlayCase {
+    overlay_delivery(ensure_ipc_and(|opt| {
+        try_send(opt, &ipc::Req::RecordOverlayCase {
             path: lower_path.to_owned(),
             original_basename: original_basename.to_owned(),
-        });
-    });
+        })
+        .is_some()
+    }))
 }
 
 /// Remove an OVERLAY_IDX entry (used after physically deleting an overlay
@@ -641,9 +758,15 @@ mod ipc_threshold_tests {
     /// harmful (PowerShell NativeCommandError) and never reaches the
     /// launcher's log. Fail-path diagnostics MUST go through `fail_log`
     /// (OutputDebugStringW) — pin the whole module stderr-free.
+    ///
+    /// Covers every file in this module directory: `session_section_tests`
+    /// was split out of mod.rs (layout-guard) but the pin must not narrow.
     #[test]
     fn fail_paths_use_debug_channel_not_stderr() {
-        let src = include_str!("ipc_client.rs");
+        let src = concat!(
+            include_str!("mod.rs"),
+            include_str!("session_section_tests.rs"),
+        );
         assert!(
             !src.contains(concat!("eprintln!", "(")),
             "ipc_client must not write the host process's stderr: use fail_log (OutputDebugStringW) for fail-path diagnostics"
@@ -744,176 +867,5 @@ mod ipc_threshold_tests {
 }
 
 #[cfg(test)]
-mod session_section_tests {
-    use super::*;
+mod session_section_tests;
 
-    fn unique_section_name(tag: &str) -> String {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static SEQ: AtomicU32 = AtomicU32::new(0);
-        format!(
-            r"Local\WinRsBoxSessionHookTest-{}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed),
-            tag
-        )
-    }
-
-    fn unique_cfg() -> ipc::SessionConfig {
-        ipc::SessionConfig {
-            pipe_name: format!(r"\\.\pipe\winrsbox-hook-section-test-{}", std::process::id()),
-            dll_path: r"D:\bin\hook.dll".into(),
-            cwd: r"D:\sandbox".into(),
-            sandbox_root: r"D:\sandbox_root".into(),
-            overlay_roots: vec![],
-            trace: false,
-            guard: "full".into(),
-            allow_rwx: false,
-            disable_hooks: String::new(),
-        }
-    }
-
-    /// RAII owner for the section object created by `publish_for_test`;
-    /// closing the last handle destroys the object so nothing leaks into
-    /// the ambient `Local\` namespace after the test.
-    struct SectionHandle(winapi::shared::ntdef::HANDLE);
-
-    impl Drop for SectionHandle {
-        fn drop(&mut self) {
-            // SAFETY: handle came from CreateFileMappingW, closed exactly once.
-            unsafe { winapi::um::handleapi::CloseHandle(self.0) };
-        }
-    }
-
-    /// Create a section under `name` and write `bytes` into it. Unique
-    /// per-process names keep this free of ambient-state coupling: a second
-    /// `cargo test` in a sibling worktree can never collide.
-    fn publish_for_test(name: &str, bytes: &[u8]) -> SectionHandle {
-        use std::ffi::OsStr;
-        use std::os::windows::ffi::OsStrExt;
-        use winapi::um::memoryapi::{CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_WRITE};
-        use winapi::um::winnt::PAGE_READWRITE;
-        let wide: Vec<u16> = OsStr::new(name).encode_wide().chain(Some(0)).collect();
-        let size = ipc::SESSION_CONFIG_SECTION_SIZE;
-        // SAFETY: pagefile-backed section (INVALID_HANDLE_VALUE); wide is a
-        //         null-terminated UTF-16 name; size fits u32.
-        let h = unsafe {
-            CreateFileMappingW(
-                winapi::um::handleapi::INVALID_HANDLE_VALUE,
-                std::ptr::null_mut(),
-                PAGE_READWRITE,
-                0,
-                size as u32,
-                wide.as_ptr(),
-            )
-        };
-        assert!(!h.is_null(), "CreateFileMappingW failed for {name}");
-        // SAFETY: h is the valid handle returned above; the view covers
-        //         `size` bytes and bytes.len() <= size by the ipc encoder.
-        unsafe {
-            let view = MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, size);
-            assert!(!view.is_null(), "MapViewOfFile failed");
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), view as *mut u8, bytes.len());
-            UnmapViewOfFile(view);
-        }
-        SectionHandle(h)
-    }
-
-    /// A name that does not exist must yield None without touching any
-    /// global. (The pre-fix behaviour opened the well-known constant
-    /// unconditionally and could read a LIVE launcher's config, poisoning
-    /// PIPE_NAME / OVERLAY_ROOTS for the whole test binary.)
-    #[test]
-    fn missing_section_yields_none_and_touches_no_globals() {
-        let name = unique_section_name("missing");
-        assert!(try_load_session_config_named(&name).is_none());
-        assert!(PIPE_NAME.get().is_none(), "a failed lookup must not set PIPE_NAME");
-        assert!(
-            session_section_name().is_none(),
-            "no injected name in the test binary ⇒ no section name"
-        );
-    }
-
-    /// Round-trip through the exact reader the hook uses at install time.
-    #[test]
-    fn named_section_roundtrip() {
-        let name = unique_section_name("roundtrip");
-        let cfg = unique_cfg();
-        let bytes = cfg.to_section_bytes().expect("config must encode");
-        let _owner = publish_for_test(&name, &bytes);
-        let got = try_load_session_config_named(&name).expect("config must decode");
-        assert_eq!(got.pipe_name, cfg.pipe_name);
-        assert_eq!(got.dll_path, cfg.dll_path);
-        assert_eq!(got.overlay_roots, cfg.overlay_roots);
-        assert!(!got.trace);
-    }
-
-    /// The guess-resistance core: with NO injected name, the install-time
-    /// entry point must not open ANY section. Against the old behaviour this
-    /// function opened `ipc::SESSION_CONFIG_SECTION_NAME` unconditionally —
-    /// this test pins that a process which never received the name through
-    /// the injection channel cannot even attempt a guess.
-    #[test]
-    fn no_injected_name_means_no_section_attempt() {
-        assert!(session_section_name().is_none());
-        assert_eq!(try_load_session_config_from_section(), None);
-        assert!(PIPE_NAME.get().is_none());
-    }
-
-    /// Pin: the runtime (non-test) part of this module must not reference
-    /// the retired legacy constant. Reintroducing a constant-name fallback
-    /// (the exact defect this change removes) fails here.
-    #[test]
-    fn module_never_references_the_legacy_constant() {
-        let src = include_str!("ipc_client.rs");
-        let runtime = &src[..src.find("#[cfg(test)]").expect("test module anchor")];
-        assert!(
-            !runtime.contains("SESSION_CONFIG_SECTION_NAME"),
-            "the hook must never open a well-known section name; the name can \
-             only come from the injection channel (FS_SANDBOX_SECTION)"
-        );
-    }
-
-    /// The guess-resistance core, made deterministic: even when a section
-    /// DOES exist under the retired well-known constant, a process that
-    /// never received the real session name must not read that decoy as its
-    /// config. Old behaviour opened `ipc::SESSION_CONFIG_SECTION_NAME`
-    /// unconditionally at fallback time, so this decoy would have been
-    /// consumed and PIPE_NAME poisoned with the decoy's pipe name.
-    #[test]
-    fn decoy_under_legacy_constant_is_not_consumed_without_injected_name() {
-        let legacy = ipc::SESSION_CONFIG_SECTION_NAME;
-
-        // Refuse to run against a live object: an old-build launcher may
-        // genuinely own the legacy name on this machine, and writing a decoy
-        // into ITS section is not ours to do. (Probe first, skip if taken.)
-        use std::ffi::OsStr;
-        use std::os::windows::ffi::OsStrExt;
-        use winapi::shared::minwindef::FALSE;
-        let wide: Vec<u16> = OsStr::new(legacy).encode_wide().chain(Some(0)).collect();
-        // SAFETY: wide is a null-terminated UTF-16 name; read-only probe.
-        let existing = unsafe {
-            winapi::um::memoryapi::OpenFileMappingW(
-                winapi::um::memoryapi::FILE_MAP_READ,
-                FALSE,
-                wide.as_ptr(),
-            )
-        };
-        if !existing.is_null() {
-            // SAFETY: existing is the valid handle just returned above.
-            unsafe { winapi::um::handleapi::CloseHandle(existing) };
-            return;
-        }
-
-        let cfg = unique_cfg();
-        let bytes = cfg.to_section_bytes().expect("config must encode");
-        let _decoy = publish_for_test(legacy, &bytes);
-
-        // The invariant: with NO injected name the fallback must not open
-        // ANY section — the decoy stays unread, PIPE_NAME stays unset.
-        assert_eq!(try_load_session_config_from_section(), None);
-        assert!(
-            PIPE_NAME.get().is_none(),
-            "a legacy-constant decoy must not poison PIPE_NAME when no name was injected"
-        );
-    }
-}

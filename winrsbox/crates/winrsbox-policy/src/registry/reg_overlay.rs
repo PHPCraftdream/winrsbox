@@ -3,13 +3,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::{Path, PathBuf};
 
 pub struct RegOverlay {
-    values: FxHashMap<String, RegEntry>,
+    values: FxHashMap<String, FxHashMap<String, RegEntry>>,
     deleted_keys: FxHashSet<String>,
     root: PathBuf,
-}
-
-fn composite_key(key: &str, name: &str) -> String {
-    format!("{key}|{name}")
 }
 
 impl RegOverlay {
@@ -45,7 +41,7 @@ impl RegOverlay {
                 let parsed = reg::parse_values_json(&raw)?;
                 let key = friendly_prefix.trim_end_matches('\\');
                 for (vname, ventry) in parsed {
-                    self.values.insert(composite_key(key, &vname), ventry);
+                    self.values.entry(key.to_owned()).or_default().insert(vname, ventry);
                 }
             } else if path.is_file() && name == "_deleted" {
                 let key = friendly_prefix.trim_end_matches('\\');
@@ -63,7 +59,7 @@ impl RegOverlay {
     }
 
     pub fn get(&self, key: &str, name: &str) -> Option<&RegEntry> {
-        self.values.get(&composite_key(key, name))
+        self.values.get(key).and_then(|inner| inner.get(name))
     }
 
     pub fn is_key_deleted(&self, key: &str) -> bool {
@@ -71,12 +67,12 @@ impl RegOverlay {
     }
 
     pub fn set(&mut self, key: &str, name: &str, value: RegValue) -> Result<(), String> {
-        self.values.insert(composite_key(key, name), RegEntry::Value(value));
+        self.values.entry(key.to_owned()).or_default().insert(name.to_owned(), RegEntry::Value(value));
         self.flush_key(key)
     }
 
     pub fn delete_value(&mut self, key: &str, name: &str) -> Result<(), String> {
-        self.values.insert(composite_key(key, name), RegEntry::Deleted);
+        self.values.entry(key.to_owned()).or_default().insert(name.to_owned(), RegEntry::Deleted);
         self.flush_key(key)
     }
 
@@ -90,13 +86,8 @@ impl RegOverlay {
     }
 
     pub fn enumerate_overlay_values(&self, key: &str) -> Vec<(String, RegEntry)> {
-        let prefix = format!("{key}|");
-        self.values.iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .map(|(k, v)| {
-                let vname = k[prefix.len()..].to_owned();
-                (vname, v.clone())
-            })
+        self.values.get(key).into_iter().flatten()
+            .map(|(vname, v)| (vname.clone(), v.clone()))
             .collect()
     }
 
@@ -104,16 +95,9 @@ impl RegOverlay {
         let dir = reg::friendly_to_overlay(key, &self.root);
         std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
 
-        let prefix = format!("{key}|");
-        let mut vals: FxHashMap<String, RegEntry> = FxHashMap::default();
-        for (k, v) in &self.values {
-            if k.starts_with(&prefix) {
-                let vname = k[prefix.len()..].to_owned();
-                vals.insert(vname, v.clone());
-            }
-        }
+        let empty: FxHashMap<String, RegEntry> = FxHashMap::default();
+        let json = reg::serialize_values_json(self.values.get(key).unwrap_or(&empty));
 
-        let json = reg::serialize_values_json(&vals);
         let target = reg::values_json_path(&dir);
         let tmp = target.with_extension("json.tmp");
         std::fs::write(&tmp, json.as_bytes()).map_err(|e| format!("write tmp: {e}"))?;
@@ -247,5 +231,58 @@ mod tests {
         ov.set("hklm\\test", "x", RegValue { typ: RegType::Dword, data: RegData::U32(99) }).unwrap();
         let entry = ov.get("hklm\\test", "x").unwrap();
         assert_eq!(*entry, RegEntry::Value(RegValue { typ: RegType::Dword, data: RegData::U32(99) }));
+    }
+
+    #[test]
+    fn pipe_char_keys_do_not_collide() {
+        let (_dir, root) = tmp_root();
+        let mut ov = RegOverlay::new(root.clone());
+        let va = RegValue { typ: RegType::Sz, data: RegData::String("a".into()) };
+        let vb = RegValue { typ: RegType::Dword, data: RegData::U32(7) };
+        ov.set("hklm\\a", "x", va.clone()).unwrap();
+        // A key path containing a literal '|': the old flat map keyed by
+        // "{key}|{name}" made this key's values leak into hklm\a's flush
+        // (prefix "hklm\a|"). Windows forbids '|' in NT directory names, so
+        // the flush to disk fails on this platform — tolerated, the
+        // in-memory isolation is what this test pins down.
+        let _ = ov.set("hklm\\a|b", "c", vb.clone());
+        let names: Vec<String> = ov.enumerate_overlay_values("hklm\\a").into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["x"]);
+        assert_eq!(*ov.get("hklm\\a", "x").unwrap(), RegEntry::Value(va));
+        assert_eq!(*ov.get("hklm\\a|b", "c").unwrap(), RegEntry::Value(vb));
+        let ov2 = RegOverlay::load_from_disk(root).unwrap();
+        assert_eq!(*ov2.get("hklm\\a", "x").unwrap(),
+            RegEntry::Value(RegValue { typ: RegType::Sz, data: RegData::String("a".into()) }));
+        #[cfg(not(windows))]
+        assert_eq!(*ov2.get("hklm\\a|b", "c").unwrap(), RegEntry::Value(vb));
+    }
+
+    #[test]
+    fn many_independent_keys_isolate_writes() {
+        let (_dir, root) = tmp_root();
+        let mut ov = RegOverlay::new(root.clone());
+        for i in 0..50u32 {
+            ov.set(&format!("hklm\\bulk\\key{i}"), "val",
+                RegValue { typ: RegType::Dword, data: RegData::U32(i) }).unwrap();
+            ov.set(&format!("hklm\\bulk\\key{i}"), "note",
+                RegValue { typ: RegType::Sz, data: RegData::String(format!("n{i}")) }).unwrap();
+        }
+        ov.delete_value("hklm\\bulk\\key7", "val").unwrap();
+        ov.delete_key("hklm\\bulk\\key13").unwrap();
+        assert_eq!(*ov.get("hklm\\bulk\\key7", "val").unwrap(), RegEntry::Deleted);
+        assert!(ov.is_key_deleted("hklm\\bulk\\key13"));
+        for i in 0..50u32 {
+            let vals = ov.enumerate_overlay_values(&format!("hklm\\bulk\\key{i}"));
+            assert_eq!(vals.len(), 2);
+        }
+        let ov2 = RegOverlay::load_from_disk(root).unwrap();
+        assert_eq!(*ov2.get("hklm\\bulk\\key0", "val").unwrap(),
+            RegEntry::Value(RegValue { typ: RegType::Dword, data: RegData::U32(0) }));
+        assert_eq!(*ov2.get("hklm\\bulk\\key49", "note").unwrap(),
+            RegEntry::Value(RegValue { typ: RegType::Sz, data: RegData::String("n49".into()) }));
+        assert_eq!(*ov2.get("hklm\\bulk\\key7", "val").unwrap(), RegEntry::Deleted);
+        assert_eq!(*ov2.get("hklm\\bulk\\key7", "note").unwrap(),
+            RegEntry::Value(RegValue { typ: RegType::Sz, data: RegData::String("n7".into()) }));
+        assert!(ov2.is_key_deleted("hklm\\bulk\\key13"));
     }
 }

@@ -164,11 +164,11 @@ pub unsafe fn create_time_from_handle(handle: winapi::shared::ntdef::HANDLE) -> 
 /// creation-time fingerprint captured by the caller (see `create_time_from_handle`
 /// — pass the value read from the spawn handle). `0` means "unknown" and falls
 /// back to membership-only ownership in `is_owned_child`.
-/// Honors FS_SANDBOX_NO_TRACK env var (testing aid — simulates external process).
+///
+/// This module never consults the environment (review XA 2026-09-20, S02):
+/// the FS_SANDBOX_NO_TRACK skip moved to the spawn hook, which gates the
+/// `mark_spawned` CALL on the install-time GUARD_ENV snapshot.
 pub fn mark_spawned(child_pid: u32, parent_pid: u32, exe_path: String, create_time: u64) {
-    if std::env::var_os("FS_SANDBOX_NO_TRACK").is_some() {
-        return;
-    }
     with_lock(|m| {
         m.insert(child_pid, SpawnedProcess {
             parent_pid,
@@ -237,10 +237,22 @@ mod tests {
     use super::*;
 
     // Tests share the global SPAWNED map; use sufficiently high distinct
-    // PIDs to avoid cross-test collisions when run in parallel.
+    // PIDs to avoid cross-test collisions when run in parallel. That is
+    // sufficient for membership-based assertions (a test only checks the
+    // PIDs it itself inserted), but `count()` is a global total — any test
+    // observing an ABSOLUTE count is racing every other test's concurrent
+    // mark_spawned/untrack regardless of PID disjointness. Tests that read
+    // `count()` serialize on this lock; same pattern as memory_guard's
+    // ENV_LOCK for its own class of global mutable test state.
+    static COUNT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn count_lock() -> std::sync::MutexGuard<'static, ()> {
+        COUNT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn mark_and_lookup() {
+        let _lock = count_lock();
         // create_time 0 → membership-only ownership (this test exercises map
         // mechanics, not the live fingerprint).
         mark_spawned(0x10001, 0x10000, "c:\\a.exe".into(), 0);
@@ -257,6 +269,7 @@ mod tests {
 
     #[test]
     fn untrack_removes_entry() {
+        let _lock = count_lock();
         mark_spawned(0x10002, 0x10000, "c:\\b.exe".into(), 0);
         assert!(is_owned_child(0x10002));
         untrack(0x10002);
@@ -265,6 +278,7 @@ mod tests {
 
     #[test]
     fn count_increments() {
+        let _lock = count_lock();
         let before = count();
         mark_spawned(0x10003, 0x10000, "c:\\c.exe".into(), 0);
         mark_spawned(0x10004, 0x10000, "c:\\d.exe".into(), 0);
@@ -275,6 +289,7 @@ mod tests {
 
     #[test]
     fn re_mark_overwrites() {
+        let _lock = count_lock();
         mark_spawned(0x10005, 0x10000, "c:\\old.exe".into(), 0);
         mark_spawned(0x10005, 0x10000, "c:\\new.exe".into(), 0);
         assert_eq!(info_of(0x10005).unwrap().exe_path, "c:\\new.exe");
@@ -286,6 +301,7 @@ mod tests {
 
     #[test]
     fn create_time_zero_falls_back_to_membership() {
+        let _lock = count_lock();
         // Fabricate an entry whose create_time is the "unknown" sentinel (0).
         // is_owned_child must then return the pure membership result without
         // attempting (or being able to fail) the live verification.
@@ -308,6 +324,7 @@ mod tests {
 
     #[test]
     fn mark_records_create_time() {
+        let _lock = count_lock();
         // Mark the *current* test process: it is alive, so query_process_create_time
         // succeeds and stores a non-zero fingerprint, and is_owned_child re-queries
         // the same live PID and the fingerprint matches.
@@ -349,6 +366,7 @@ mod tests {
         // non-deterministic and racy on Windows, so it is not attempted here.
         // We assert the security-relevant invariant instead: a stored
         // fingerprint that does not match the live process is never "owned".
+        let _lock = count_lock();
         let fake_pid = 0x7FFE_0001u32; // high, unlikely-to-be-live PID
         with_lock(|m| {
             m.insert(fake_pid, SpawnedProcess {
@@ -368,6 +386,7 @@ mod tests {
 
     #[test]
     fn concurrent_marks() {
+        let _lock = count_lock();
         use std::sync::Arc;
         let barrier = Arc::new(std::sync::Barrier::new(4));
         let mut handles = vec![];

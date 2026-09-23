@@ -243,7 +243,7 @@ pub fn run_import(args: &[String], state_dir: &std::path::Path) -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("reg_mock '{}': payload_json serialize error: {}", path, e))?,
                 None => Vec::new(),
             };
-            policy::db::reg_mock_upsert(&db, &path.to_lowercase(), &payload)?;
+            policy::db::reg_mock_upsert(&db, &policy::path::nt_case_fold(path), &payload)?;
         }
     }
 

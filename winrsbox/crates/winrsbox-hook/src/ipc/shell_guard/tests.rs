@@ -551,21 +551,21 @@ fn shell_execute_a_seam_classifies_like_the_w_chain() {
     // SAFETY: all pointers are valid NUL-terminated buffers or null.
     unsafe {
         assert_eq!(
-            shell_execute_a_deny_reason(verb_none, file_settings.as_ptr(), std::ptr::null()),
+            shell_execute_a_deny_reason(verb_none, file_settings.as_ptr(), std::ptr::null(), 0),
             Some("file")
         );
         assert_eq!(
-            shell_execute_a_deny_reason(verb_runas.as_ptr(), file_benign.as_ptr(), std::ptr::null()),
+            shell_execute_a_deny_reason(verb_runas.as_ptr(), file_benign.as_ptr(), std::ptr::null(), 0),
             Some("verb_escalation")
         );
         assert_eq!(
-            shell_execute_a_deny_reason(verb_none, file_benign.as_ptr(), params_store.as_ptr()),
+            shell_execute_a_deny_reason(verb_none, file_benign.as_ptr(), params_store.as_ptr(), 0),
             Some("params")
         );
         // Benign call: every classifier declines — the A hook would let
         // the original run (asserted via the seam, not the hook body).
         assert_eq!(
-            shell_execute_a_deny_reason(verb_none, file_benign.as_ptr(), std::ptr::null()),
+            shell_execute_a_deny_reason(verb_none, file_benign.as_ptr(), std::ptr::null(), 0),
             None
         );
     }
@@ -678,5 +678,281 @@ fn shell_a_exports_resolve_in_shell32() {
             let name_str = String::from_utf8_lossy(name);
             assert!(addr.is_some(), "shell32 export must resolve: {name_str}");
         }
+    }
+}
+
+// -----------------------------------------------------------------
+// F1 (R04) — the decision seams must CLOSE their anti_rec window
+// before the hook invokes the original ShellExecute*. ShellExecute*
+// can synchronously dispatch shell verb handlers (guest-reachable
+// application code); a hooked call made from inside them must run a
+// fresh policy check, not see stale suppression. Benign calls are
+// driven through the seams only — a None verdict through a hook body
+// would call the (uninstalled) trampoline.
+// -----------------------------------------------------------------
+
+/// NUL-terminated UTF-16 buffer for fabricating LPCWSTR arguments.
+fn wide(s: &str) -> Vec<u16> {
+    let mut v: Vec<u16> = s.encode_utf16().collect();
+    v.push(0);
+    v
+}
+
+#[test]
+fn shell_execute_w_deny_seam_closes_window_on_allow() {
+    assert!(!crate::anti_rec::in_hook(), "precondition: no window held");
+    let file_benign = wide(r"C:\Windows\notepad.exe");
+    // SAFETY: all pointers are valid NUL-terminated buffers or null.
+    let denied = unsafe {
+        shell_execute_w_deny(std::ptr::null(), file_benign.as_ptr(), std::ptr::null())
+    };
+    assert!(!denied, "benign target must not be denied");
+    assert!(
+        !crate::anti_rec::in_hook(),
+        "window must be closed at the call-original boundary"
+    );
+    // Decisive F1 assertion: a nested hook call starting now (simulating
+    // code dispatched inside the real ShellExecuteW) can open its own
+    // window and run a full policy check — under the pre-F1 code this
+    // returned None (stale suppression).
+    let nested = crate::anti_rec::enter().expect(
+        "nested hook call must not be suppressed after the seam closed the window",
+    );
+    drop(nested);
+}
+
+#[test]
+fn shell_execute_w_deny_seam_closes_window_on_deny() {
+    assert!(!crate::anti_rec::in_hook(), "precondition: no window held");
+    let file = wide("MS-Settings:network");
+    // SAFETY: all pointers are valid NUL-terminated buffers or null; the
+    // deny path logs in-window and returns before any trampoline use.
+    let denied = unsafe {
+        shell_execute_w_deny(std::ptr::null(), file.as_ptr(), std::ptr::null())
+    };
+    assert!(denied, "MS-Settings: target must be denied via lpFile");
+    assert!(
+        !crate::anti_rec::in_hook(),
+        "the deny path must not leak the seam's anti_rec window either"
+    );
+    let nested = crate::anti_rec::enter().expect(
+        "nested hook call must not be suppressed after the seam closed the window",
+    );
+    drop(nested);
+}
+
+#[test]
+fn shell_execute_a_deny_seam_closes_window_on_allow() {
+    assert!(!crate::anti_rec::in_hook(), "precondition: no window held");
+    let file_benign = ansi_buf(r"C:\Windows\notepad.exe");
+    // SAFETY: all pointers are valid NUL-terminated buffers or null.
+    let denied = unsafe {
+        shell_execute_a_deny(std::ptr::null(), file_benign.as_ptr(), std::ptr::null())
+    };
+    assert!(!denied, "benign target must not be denied");
+    assert!(
+        !crate::anti_rec::in_hook(),
+        "window must be closed at the call-original boundary"
+    );
+    let nested = crate::anti_rec::enter().expect(
+        "nested hook call must not be suppressed after the seam closed the window",
+    );
+    drop(nested);
+}
+
+#[test]
+fn shell_execute_w_deny_seam_passthrough_when_window_already_held() {
+    assert!(!crate::anti_rec::in_hook(), "precondition: no window held");
+    let outer = crate::anti_rec::enter().expect("test thread must not be re-entrant");
+    let file_benign = wide(r"C:\Windows\notepad.exe");
+    // SAFETY: all pointers are valid NUL-terminated buffers or null.
+    let denied = unsafe {
+        shell_execute_w_deny(std::ptr::null(), file_benign.as_ptr(), std::ptr::null())
+    };
+    // Recursion breaker preserved: a nested call under an outer window
+    // returns unchecked, so the hook still runs the original exactly as
+    // before the split.
+    assert!(!denied, "nested call must pass through unchecked");
+    drop(outer);
+    assert!(!crate::anti_rec::in_hook(), "outer window closed by drop");
+}
+
+// -----------------------------------------------------------------
+// F2 (R04) — fMask alternate-target-resolution classification.
+// Deny-path hook-body tests are safe here; allow verdicts go through
+// the seams only (a None through a hook body calls the trampoline).
+// -----------------------------------------------------------------
+
+/// Full-size W exec-info with a benign lpFile and a caller-chosen fMask;
+/// the buffer is returned alongside so it outlives every struct use.
+fn benign_ex_w_info(f_mask: u32) -> (SHELLEXECUTEINFOW, Vec<u16>) {
+    let file = wide(r"C:\Windows\notepad.exe");
+    let info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: f_mask,
+        hwnd: std::ptr::null_mut(),
+        lpVerb: std::ptr::null(),
+        lpFile: file.as_ptr(),
+        lpParameters: std::ptr::null(),
+        lpDirectory: std::ptr::null(),
+        nShow: 0,
+        hInstApp: std::ptr::null_mut(),
+    };
+    (info, file)
+}
+
+/// ANSI twin of `benign_ex_w_info` for the ExA hook body / seam.
+fn benign_ex_a_info(f_mask: u32) -> (SHELLEXECUTEINFOA, Vec<u8>) {
+    let file = ansi_buf(r"C:\Windows\notepad.exe");
+    let info = SHELLEXECUTEINFOA {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOA>() as u32,
+        fMask: f_mask,
+        hwnd: std::ptr::null_mut(),
+        lpVerb: std::ptr::null(),
+        lpFile: file.as_ptr(),
+        lpParameters: std::ptr::null(),
+        lpDirectory: std::ptr::null(),
+        nShow: 0,
+        hInstApp: std::ptr::null_mut(),
+    };
+    (info, file)
+}
+
+#[test]
+fn shell_fmask_deny_reason_classifies_in_scope_bits() {
+    assert_eq!(shell_fmask_deny_reason(SEE_MASK_CLASSNAME), Some("mask_classname"));
+    assert_eq!(shell_fmask_deny_reason(SEE_MASK_CLASSKEY), Some("mask_classkey"));
+    assert_eq!(shell_fmask_deny_reason(SEE_MASK_IDLIST), Some("mask_idlist"));
+    assert_eq!(shell_fmask_deny_reason(SEE_MASK_INVOKEIDLIST), Some("mask_invokeidlist"));
+    assert_eq!(shell_fmask_deny_reason(SEE_MASK_DOENVSUBST), Some("mask_doenvsubst"));
+    // Compound bits outrank their components.
+    assert_eq!(shell_fmask_deny_reason(SEE_MASK_CLASSKEY | SEE_MASK_CLASSNAME), Some("mask_classkey"));
+    assert_eq!(shell_fmask_deny_reason(SEE_MASK_INVOKEIDLIST | SEE_MASK_IDLIST), Some("mask_invokeidlist"));
+}
+
+#[test]
+fn shell_fmask_deny_reason_allows_resolution_preserving_masks() {
+    assert_eq!(shell_fmask_deny_reason(0), None);
+    // ICON|HOTKEY|NOCLOSEPROCESS|CONNECTNETDRV|NOASYNC|NO_UI|UNICODE|
+    // HMONITOR|LOG_USAGE — none moves resolution off lpFile/lpParameters.
+    let allowed = 0x40 | 0x80 | 0x100 | 0x400 | 0x4000 | 0x0020_0000 | 0x0400_0000;
+    assert_eq!(shell_fmask_deny_reason(allowed), None);
+    // Lone undefined values (0x2, 0x8) are ignored by the shell — allowed.
+    assert_eq!(shell_fmask_deny_reason(0x2), None);
+    assert_eq!(shell_fmask_deny_reason(0x8), None);
+}
+
+/// THE F2 regression: a PIDL-resolved target with a benign lpFile that
+/// alone would be allowed must be denied (the string checks never see
+/// what actually executes).
+#[test]
+fn shell_execute_ex_w_hook_denies_idlist_mask() {
+    let (mut info, _file) = benign_ex_w_info(SEE_MASK_IDLIST);
+    // SAFETY: deny path touches only our fabricated struct, not the trampoline.
+    let got = unsafe { hook_shell_execute_ex_w(&mut info) };
+    assert_eq!(got, FALSE, "SEE_MASK_IDLIST must deny despite a benign lpFile");
+    assert_eq!(
+        info.hInstApp as usize, SE_ERR_ACCESSDENIED,
+        "denial must be reported via hInstApp per the shellapi contract"
+    );
+}
+
+#[test]
+fn shell_execute_ex_w_seam_denies_idlist_mask_and_closes_window() {
+    assert!(!crate::anti_rec::in_hook(), "precondition: no window held");
+    let (mut info, _file) = benign_ex_w_info(SEE_MASK_IDLIST);
+    // SAFETY: our own fabricated struct; deny path never touches the trampoline.
+    let denied = unsafe { shell_execute_ex_w_deny(&mut info) };
+    assert!(denied, "SEE_MASK_IDLIST must deny despite a benign lpFile");
+    assert!(!crate::anti_rec::in_hook(), "deny path must close the seam's window");
+    let nested = crate::anti_rec::enter().expect(
+        "nested hook call must not be suppressed after the seam closed the window",
+    );
+    drop(nested);
+}
+
+#[test]
+fn shell_execute_ex_a_hook_denies_idlist_mask() {
+    let (mut info, _file) = benign_ex_a_info(SEE_MASK_IDLIST);
+    // SAFETY: deny path touches only our fabricated struct, not the trampoline.
+    let got = unsafe { hook_shell_execute_ex_a(&mut info) };
+    assert_eq!(got, FALSE, "SEE_MASK_IDLIST must deny despite a benign lpFile");
+    assert_eq!(info.hInstApp as usize, SE_ERR_ACCESSDENIED, "denied via hInstApp");
+}
+
+#[test]
+fn shell_execute_ex_a_seam_denies_idlist_mask_and_closes_window() {
+    assert!(!crate::anti_rec::in_hook(), "precondition: no window held");
+    let (mut info, _file) = benign_ex_a_info(SEE_MASK_IDLIST);
+    // SAFETY: our own fabricated struct; deny path never touches the trampoline.
+    let denied = unsafe { shell_execute_ex_a_deny(&mut info) };
+    assert!(denied, "SEE_MASK_IDLIST must deny despite a benign lpFile");
+    assert!(!crate::anti_rec::in_hook(), "deny path must close the seam's window");
+    let nested = crate::anti_rec::enter().expect(
+        "nested hook call must not be suppressed after the seam closed the window",
+    );
+    drop(nested);
+}
+
+/// Each other in-scope bit denies through the W Ex hook body with a
+/// benign lpFile (class/env-subst resolution likewise escapes the string).
+#[test]
+fn shell_execute_ex_w_hook_denies_other_alternate_resolution_masks() {
+    for mask in [SEE_MASK_CLASSNAME, SEE_MASK_CLASSKEY, SEE_MASK_INVOKEIDLIST, SEE_MASK_DOENVSUBST] {
+        let (mut info, _file) = benign_ex_w_info(mask);
+        // SAFETY: deny path returns before the trampoline is touched.
+        let got = unsafe { hook_shell_execute_ex_w(&mut info) };
+        assert_eq!(got, FALSE, "fMask {mask:#010x} must deny despite a benign lpFile");
+    }
+}
+
+/// No regression: masks that keep target resolution on lpFile/lpParameters
+/// must not deny a benign call; the seams must close their window on allow.
+#[test]
+fn shell_execute_ex_seams_allow_resolution_preserving_masks() {
+    assert!(!crate::anti_rec::in_hook(), "precondition: no window held");
+    // NOCLOSEPROCESS|CONNECTNETDRV|NOASYNC|NO_UI|UNICODE|HMONITOR|LOG_USAGE.
+    let allowed = 0x40 | 0x80 | 0x100 | 0x400 | 0x4000 | 0x0020_0000 | 0x0400_0000;
+    for mask in [0, allowed] {
+        let (mut info, _file) = benign_ex_w_info(mask);
+        // SAFETY: our own fabricated struct; the seam allow path never calls it.
+        let denied = unsafe { shell_execute_ex_w_deny(&mut info) };
+        assert!(!denied, "fMask {mask:#010x} with a benign lpFile must be allowed");
+        assert!(!crate::anti_rec::in_hook(), "allow path must close the seam's window");
+    }
+    // One A variant through the ExA seam.
+    let (mut info, _file) = benign_ex_a_info(allowed);
+    // SAFETY: our own fabricated struct; the seam allow path never calls it.
+    let denied = unsafe { shell_execute_ex_a_deny(&mut info) };
+    assert!(!denied, "allowed A mask with a benign lpFile must not be denied");
+    assert!(!crate::anti_rec::in_hook(), "allow path must close the seam's window");
+    // Decisive F1 assertion, mirrored: a nested hook call can open its own
+    // window after the seam closed it.
+    let nested = crate::anti_rec::enter().expect(
+        "nested hook call must not be suppressed after the seam closed the window",
+    );
+    drop(nested);
+}
+
+/// Precedence in the shared A reason helper: the fail-closed uninspected
+/// verdict outranks the fMask verdict, which outranks the string chain.
+#[test]
+fn shell_execute_a_deny_reason_fmask_precedence() {
+    let file_benign = ansi_buf(r"C:\Windows\notepad.exe");
+    let unterminated = vec![0x41u8; MAX_TARGET_CHARS + 8];
+    // SAFETY: valid NUL-terminated buffers, an over-cap buffer, or null.
+    unsafe {
+        assert_eq!(
+            shell_execute_a_deny_reason(std::ptr::null(), unterminated.as_ptr(), std::ptr::null(), SEE_MASK_IDLIST),
+            Some("uninspected_file")
+        );
+        assert_eq!(
+            shell_execute_a_deny_reason(std::ptr::null(), file_benign.as_ptr(), std::ptr::null(), SEE_MASK_IDLIST),
+            Some("mask_idlist")
+        );
+        assert_eq!(
+            shell_execute_a_deny_reason(std::ptr::null(), file_benign.as_ptr(), std::ptr::null(), 0),
+            None
+        );
     }
 }

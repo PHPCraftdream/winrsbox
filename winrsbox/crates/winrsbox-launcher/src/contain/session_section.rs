@@ -9,7 +9,7 @@
 //! the root target's environment, and every child spawned inside the sandbox
 //! has the same variable appended to its environment block cross-process by
 //! the spawn hook while the child is still suspended
-//! (`hook/src/inject.rs::patch_child_env_section`). A process that never
+//! (`hook/src/inject.rs::patch_child_env_pairs`). A process that never
 //! received the name cannot open the section — there is nothing left to
 //! guess. Env-scrubbed children stay covered because the patch lands before
 //! any guest code runs.
@@ -142,6 +142,26 @@ pub fn publish_named(section_name: &str, cfg: &ipc::SessionConfig) -> Result<Ses
     // rewrite primitive even when a guest learns the name.
     // The launcher itself needs no post-create write access: it writes the
     // config through the full-access handle CreateFileMappingW returns.
+    //
+    // R04-1b re-examination: is `OW` (OWNER_RIGHTS) still correct once the
+    // guest may run under R04-1c's restricted token (Administrators
+    // deny-only)? `OW` in an SDDL string resolves to the object's OWNER SID
+    // at the moment the SD is applied — it is NOT the same mechanism as
+    // `TokenDefaultDacl` (which copies GROUP ACEs, including Administrators,
+    // when `lpSecurityAttributes=NULL`). This SDDL is explicit (`D:` with no
+    // `O:`), so `CreateFileMappingW` assigns owner = the CALLER's
+    // `TokenOwner`. R04-0's probe (docs/R04-implementation-plan-t1-light-t2.md,
+    // "Гипотеза «Administrators как owner по умолчанию»") measured, and the
+    // documented `TokenOwner` algorithm confirms, that `TokenOwner` defaults
+    // to `TokenUser` — the specific user SID — unless an enabled token group
+    // carries `SE_GROUP_OWNER` (ordinary tokens, restricted or not, do not).
+    // So `OW` here resolves to the specific user SID today AND after R04-1c,
+    // regardless of whether Administrators is enabled or deny-only in the
+    // creating token — it was never gated on the Administrators group in the
+    // first place. Conclusion: left unchanged; `OW` already IS the
+    // specific-SID grant this task asks for, just spelled via the owner
+    // indirection instead of a literal SID. See `dacl_denies_write_and_allows_read_to_the_owner`
+    // below, which already asserts the resulting behaviour empirically.
     let sddl = w!("D:(D;;0x0002;;;WD)(A;;0x0005;;;OW)");
     let mut psd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
     // SAFETY: psd is a valid out-pointer; SDDL_REVISION_1 is the only
@@ -296,7 +316,9 @@ mod tests {
             sandbox_root: r"D:\sandbox_root".into(),
             overlay_roots: vec![],
             trace,
-            guard: "scan".into(),
+            guard: ipc::GuardLevel::Scan,
+            launcher_pid: 0,
+            launcher_create_time: 0,
             allow_rwx: false,
             disable_hooks: String::new(),
         }

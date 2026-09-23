@@ -228,7 +228,7 @@ pub fn run_what_if(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     // Parse hypothetical rule
     let prefix = find_arg(rule_part, "--prefix=")
         .ok_or_else(|| anyhow::anyhow!("what-if rule add: --prefix is required"))?;
-    let prefix_lower = prefix.to_lowercase();
+    let prefix_lower = policy::path::nt_case_fold(prefix).into_owned();
     let write_mode = find_arg(rule_part, "--write=").map(|s| match s {
         "passthrough" => policy::db::RuleMode::Passthrough,
         "deny" => policy::db::RuleMode::Deny,

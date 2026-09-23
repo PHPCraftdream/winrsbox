@@ -70,7 +70,7 @@ fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     let db = crate::cli::open_db(state_dir)?;
     let prefix = find_arg(args, "--prefix=")
         .ok_or_else(|| anyhow::anyhow!("regrule add: --prefix is required"))?;
-    let prefix_lower = prefix.to_lowercase();
+    let prefix_lower = policy::path::nt_case_fold(prefix).into_owned();
     let read_mode = find_arg(args, "--read=").map(parse_mode).transpose()?.unwrap_or(RuleMode::Passthrough);
     let write_mode = find_arg(args, "--write=").map(parse_mode).transpose()?.unwrap_or(RuleMode::Cow);
     let depth = find_arg(args, "--depth=").map(|s| s.parse::<u8>()).transpose()?;
@@ -96,9 +96,12 @@ fn run_remove(args: &[String], state_dir: &std::path::Path) -> Result<()> {
             bail!("regrule: rule with id '{}' not found", id);
         }
     } else if let Some(prefix) = find_arg(args, "--prefix=") {
-        let lower = prefix.to_lowercase();
+        // S11: fold with the same canonical NTFS-identity fold the db layer
+        // applies on upsert (policy::ensure_lower) — a locale to_lowercase
+        // diverges for İ/ß-class characters and the remove would miss the key.
+        let lower = policy::path::nt_case_fold(prefix);
         let txn = db.begin_write()?;
-        { let mut t = txn.open_table(db::REG_RULES)?; t.remove(lower.as_str())?; }
+        { let mut t = txn.open_table(db::REG_RULES)?; t.remove(lower.as_ref())?; }
         txn.commit()?;
     } else {
         bail!("regrule remove: --id or --prefix required");

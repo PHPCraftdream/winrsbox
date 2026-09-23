@@ -64,7 +64,7 @@ impl Drop for Guard {
 /// suppressed. The window must stay this wide: it covers the hook's own
 /// file/pipe I/O (e.g. ipc_client's named-pipe `CreateFileW` would
 /// otherwise re-enter the FS hooks and recurse into IPC until the stack is
-/// exhausted). Code inside the window therefore has two hard invariants:
+/// exhausted). Code inside the window therefore has three hard invariants:
 ///
 /// 1. Never invoke guest code — no guest function pointers, and no
 ///    alertable waits (`SleepEx`, `WaitForSingleObjectEx(TRUE)`, overlapped
@@ -73,14 +73,36 @@ impl Drop for Guard {
 ///    no such call exists anywhere in the hook today.)
 /// 2. Assume any fault raised in-window dispatches guest vectored/SEH
 ///    handlers on this thread while the flag is set. The guard cannot
-///    absorb that; it is mitigated at the source by probing
-///    caller-controlled buffers before reading them (VirtualQuery-based,
-///    see shell_guard / proc_guard / memory_guard). Do not clear the flag
-///    during exception dispatch to "fix" this — that re-opens invariant 1.
+///    absorb that, and a VirtualQuery probe does NOT close it — another
+///    thread can flip the page protection between the probe and the
+///    read (XA review S03). Caller-controlled ranges are therefore read
+///    only through a kernel-mediated guarded copy that returns an error
+///    instead of faulting (memory_guard's guarded_scan_region);
+///    in-window reads must stay confined to memory known readable.
+///    Do not clear the flag during exception dispatch to "fix" this —
+///    that re-opens invariant 1.
+/// 3. The window must close BEFORE a callback-capable original is invoked —
+///    any hooked API that can synchronously run application code on this
+///    thread: `ShellExecute*` (shell verb handlers), COM activation
+///    (`CoCreateInstance*`/`CoGetClassObject`/`RoGetActivationFactory`/
+///    `RoActivateInstance` — in-proc server DllMain/DllGetClassObject/
+///    QueryInterface), `SendMessage*` (the target window procedure runs in
+///    this thread's frame). That dispatched code is guest-reachable; a
+///    hooked call made from it while the flag was still set would be taken
+///    for our own service code and every policy check skipped (audit F1,
+///    R04). Affected guards therefore split into "decide under the window"
+///    (string/struct reads, classification, deny-path pipe I/O) and "invoke
+///    the original outside it"; the `enter() == None` passthrough remains
+///    the only sanctioned suppressed invocation, for calls made while an
+///    outer window is already held.
 ///
-/// System DLLs called from the window (ntdll/kernelbase, and the loader
-/// running system DllMains for install-time LoadLibraryW) are the same
-/// trusted system class every guard allow-lists elsewhere.
+/// System DLLs called from the window for the hook's OWN bookkeeping
+/// (ntdll/kernelbase calls, and the loader running system DllMains for the
+/// install-time LoadLibraryW held open by `install_hooks`) are the trusted
+/// system class every guard allow-lists elsewhere. That trust does NOT
+/// extend to the callback-capable originals of invariant 3: shell32,
+/// combase and user32 dispatching into verb handlers, in-proc servers or
+/// window procedures runs APPLICATION code, whatever DLL it ships in.
 /// True when this thread is already inside a hook window, without entering
 /// one. Lets a guard that keeps its own re-entry counter (memory_guard's
 /// allocation path) still honour the shared window — notably the install

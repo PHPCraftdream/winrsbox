@@ -9,6 +9,34 @@ use windows::{
     },
 };
 
+/// S09: the pipe server pushes every SpawnedChild/RegisterChild PID into the
+/// queue; drain_registered_children is its only consumer (grace-window wait +
+/// stale proc-table pruning). The queue is soft bookkeeping, never a trust
+/// input, but an unbounded hostile push loop would still be a launcher memory
+/// DoS — cap it. 4096 slots ≈ 2000 buffered spawns (SpawnedChild and
+/// RegisterChild both push the same PID).
+pub(crate) const CHILD_PID_QUEUE_CAP: usize = 4096;
+
+/// Validate + bounded-push a guest-reported child PID. Rejects pid == 0 and
+/// pushes beyond CHILD_PID_QUEUE_CAP. Returns false when rejected so the
+/// caller can count a violation; the queue itself stays uncorrupted. The cap
+/// check uses `SegQueue::len` (crossbeam-queue 0.3.12: a constant number of
+/// SeqCst atomic index loads, not proportional to queue length), so calling
+/// it on every push is fine at this cap. Both pipe-server arms register
+/// through this helper — SpawnedChild (pipe_server/mod.rs ~589) and
+/// RegisterChild (pipe_server/mod.rs ~771) — so every guest-reported PID
+/// passes the 4096 cap and pid != 0 checks here.
+pub(crate) fn queue_child_pid(q: &crossbeam_queue::SegQueue<u32>, pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if q.len() >= CHILD_PID_QUEUE_CAP {
+        return false;
+    }
+    q.push(pid);
+    true
+}
+
 /// Hard limit of WaitForMultipleObjects: a call naming more handles than
 /// this fails with WAIT_FAILED instead of waiting.
 const MAXIMUM_WAIT_OBJECTS: usize = 64;
@@ -297,5 +325,46 @@ mod child_drain_tests {
 
         fast.wait().unwrap();
         slow.wait().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod child_queue_tests {
+    use super::*;
+
+    /// pid 0 is rejected outright (no live process ever has PID 0) and the
+    /// queue is left untouched.
+    #[test]
+    fn queue_child_pid_rejects_zero() {
+        let q = crossbeam_queue::SegQueue::<u32>::new();
+        assert!(!queue_child_pid(&q, 0));
+        assert_eq!(q.len(), 0);
+    }
+
+    /// Nonzero PIDs are accepted one by one and popped back in FIFO order,
+    /// with `len` tracking the count.
+    #[test]
+    fn queue_child_pid_accepts_and_pushes() {
+        let q = crossbeam_queue::SegQueue::<u32>::new();
+        assert!(queue_child_pid(&q, 4100));
+        assert!(queue_child_pid(&q, 4101));
+        assert!(queue_child_pid(&q, 4102));
+        assert_eq!(q.len(), 3);
+        assert_eq!(q.pop(), Some(4100));
+        assert_eq!(q.pop(), Some(4101));
+        assert_eq!(q.pop(), Some(4102));
+    }
+
+    /// The cap holds: CHILD_PID_QUEUE_CAP distinct PIDs fill the queue, the
+    /// next push is rejected, and the length stays exactly at the cap — a
+    /// hostile push loop cannot grow launcher memory past this bound.
+    #[test]
+    fn queue_child_pid_enforces_cap() {
+        let q = crossbeam_queue::SegQueue::<u32>::new();
+        for pid in 1..=CHILD_PID_QUEUE_CAP as u32 {
+            assert!(queue_child_pid(&q, pid), "pid {pid} below the cap must be accepted");
+        }
+        assert!(!queue_child_pid(&q, CHILD_PID_QUEUE_CAP as u32 + 1));
+        assert_eq!(q.len(), CHILD_PID_QUEUE_CAP);
     }
 }

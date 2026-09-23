@@ -74,7 +74,7 @@ fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     let db = crate::cli::open_db(state_dir)?;
     let prefix = find_arg(args, "--prefix=")
         .ok_or_else(|| anyhow::anyhow!("devrule add: --prefix required"))?;
-    let prefix_lower = prefix.to_lowercase();
+    let prefix_lower = policy::path::nt_case_fold(prefix).into_owned();
     let read_mode = find_arg(args, "--read=").map(parse_mode).transpose()?.unwrap_or(RuleMode::Deny);
     let write_mode = find_arg(args, "--write=").map(parse_mode).transpose()?.unwrap_or(RuleMode::Deny);
     let explicit_id = find_arg(args, "--id=").map(String::from);
@@ -93,8 +93,12 @@ fn run_remove(args: &[String], state_dir: &std::path::Path) -> Result<()> {
             bail!("devrule: rule '{}' not found", id);
         }
     } else if let Some(prefix) = find_arg(args, "--prefix=") {
+        // S11: fold with the same canonical NTFS-identity fold the db layer
+        // applies on upsert (policy::ensure_lower) — a locale to_lowercase
+        // diverges for İ/ß-class characters and the remove would miss the key.
+        let lower = policy::path::nt_case_fold(prefix);
         let txn = db.begin_write()?;
-        { let mut t = txn.open_table(db::DEV_RULES)?; t.remove(prefix.to_lowercase().as_str())?; }
+        { let mut t = txn.open_table(db::DEV_RULES)?; t.remove(lower.as_ref())?; }
         txn.commit()?;
     } else {
         bail!("devrule remove: --id or --prefix required");

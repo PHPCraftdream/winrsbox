@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use policy::dev;
+use winrsbox_policy::dev;
 
 fn bench_nt_to_device_path(c: &mut Criterion) {
     let mut group = c.benchmark_group("dev");

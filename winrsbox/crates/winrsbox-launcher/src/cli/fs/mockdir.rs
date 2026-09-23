@@ -48,7 +48,7 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     let db = crate::cli::open_db(state_dir)?;
     let prefix = find_arg(args, "--prefix=").ok_or_else(|| anyhow::anyhow!("mockdir add: --prefix is required"))?;
-    let prefix_lower = prefix.to_lowercase();
+    let prefix_lower = policy::path::nt_case_fold(prefix).into_owned();
     let id = find_arg(args, "--id=").map(String::from)
         .unwrap_or_else(|| crate::cli::id::generate_id("mockdir", &[&prefix_lower]));
 

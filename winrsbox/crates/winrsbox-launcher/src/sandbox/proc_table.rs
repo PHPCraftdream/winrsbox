@@ -23,6 +23,20 @@ pub(crate) fn global_proc_info() -> &'static papaya::HashMap<u32, ProcInfo> {
     PROC_INFO.get_or_init(papaya::HashMap::new)
 }
 
+/// S09: depth of a freshly spawned child = parent depth + 1, saturating at
+/// u8::MAX. A plain `+` panics (debug) or wraps to 0 (release) at 255 — and a
+/// wrap to 0 would make a maximally deep spawn chain look like the ROOT
+/// process for depth-scoped policy. Saturation is safe for policy semantics:
+/// `when.depth` filters are MINIMUM bounds (`d < min_depth` → skip), so
+/// u8::MAX passes every depth filter and can never be mistaken for a shallow
+/// root chain. `#[allow(dead_code)]` because the pipe server's SpawnedChild
+/// insert still computes `parent_depth + 1` inline; this replaces that call
+/// site.
+#[allow(dead_code)]
+pub(crate) fn child_depth(parent_depth: u8) -> u8 {
+    parent_depth.saturating_add(1)
+}
+
 /// Creation-time fingerprint of the root sandboxed target, published together
 /// with `root_target_pid` right after CreateProcessW (long before the resumed
 /// child can connect). `0` = not yet published / unknown; the gate fail-closes.
@@ -113,5 +127,16 @@ mod proc_info_tests {
         let info = map.pin().get(&50).cloned().unwrap();
         assert_eq!(info.depth, 1);
         assert_eq!(&*info.exe_lower, "new.exe");
+    }
+
+    /// S09 boundary pin: `child_depth` saturates at u8::MAX — 255 + 1 must
+    /// stay 255, never wrap to 0 (a wrap would make a maximally deep spawn
+    /// chain look like the ROOT process for depth-scoped policy).
+    #[test]
+    fn child_depth_saturates_at_u8_max() {
+        assert_eq!(child_depth(0), 1);
+        assert_eq!(child_depth(254), 255);
+        // the wrap-to-0 pin: saturation, not `+`
+        assert_eq!(child_depth(255), 255);
     }
 }

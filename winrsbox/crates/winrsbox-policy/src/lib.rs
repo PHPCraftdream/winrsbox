@@ -37,16 +37,15 @@ pub enum PolicyError {
 }
 
 pub fn ensure_lower(s: &str) -> std::borrow::Cow<'_, str> {
-    // ASCII-only fold matches what the kernel uses (RtlDowncaseUnicodeString
-    // for ASCII chars) AND every hook-side path comparison. Unicode
-    // to_lowercase() would fold U+0130 to "i\u{307}", diverging from
-    // kernel canonicalization and enabling bypass via inconsistent
-    // normalization.
-    if s.bytes().all(|b| !b.is_ascii_uppercase()) {
-        std::borrow::Cow::Borrowed(s)
-    } else {
-        std::borrow::Cow::Owned(s.to_ascii_lowercase())
-    }
+    // Canonical NTFS-identity fold: kernel upcase/downcase tables via ntdll
+    // (path::case_fold) — the one fold every policy key and hook-side path
+    // comparison shares. Rust's locale-aware to_lowercase() is NOT used: it
+    // diverges from NTFS identity (full-mapping expansions, locale rules),
+    // which would let differently-folded spellings of the same file produce
+    // different keys. The ASCII fast path is byte-for-byte the historic
+    // ASCII-only fold, so all persisted lowercase-ASCII keys stay identical
+    // (no db migration).
+    path::nt_case_fold(s)
 }
 
 #[cfg(test)]

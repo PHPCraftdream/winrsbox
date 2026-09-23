@@ -124,6 +124,59 @@ pub(crate) unsafe fn collect_present_names_lower(buf: *const u8, size: usize, cl
     out
 }
 
+/// Byte length of the live record chain in a NtQueryDirectoryFile buffer:
+/// walks the NextEntryOffset links from offset 0 and returns the offset just
+/// past the record whose NextEntryOffset == 0 — the kernel's own Information
+/// convention ("last entry + that entry's ACTUAL length", no trailing
+/// padding). Used to re-report Information after in-place hide-filtering
+/// shrank the chain, so the IOSB never advertises removed bytes.
+///
+/// Defensive on malformed input (the kernel never emits it, but the buffer
+/// base is caller-controlled): returns `max` for an unhandled class (the
+/// caller passes the original size through unchanged), 0 for a null/empty
+/// buffer, and stops at the first record whose header doesn't fit, whose
+/// name field overruns the buffer, or whose link points past `max` —
+/// returning the last verified-good boundary rather than panicking or
+/// reading out of bounds.
+///
+/// # SAFETY
+/// `buf` must be valid for `max` bytes (or `buf` null / `max == 0`, in which
+/// case it is never dereferenced) holding a record chain laid out for
+/// `class`.
+pub(crate) unsafe fn buffer_live_size(buf: *const u8, max: usize, class: u32) -> usize {
+    let Some((name_len_off, name_off)) = dir_info_name_offsets(class) else {
+        return max;
+    };
+    if buf.is_null() || max == 0 {
+        return 0;
+    }
+    let mut cur = 0usize;
+    loop {
+        let avail = max - cur;
+        if avail < name_len_off + 4 {
+            // Header doesn't fit: only [0, cur) is provably well-formed.
+            return cur;
+        }
+        // SAFETY: NextEntryOffset (offset 0) and FileNameLength (class-
+        // specific offset) are guarded by the avail check above. Both are
+        // read unaligned: `buf`'s base alignment is caller-controlled
+        // (this buffer comes from sandboxed user code).
+        let next_off = (buf.add(cur) as *const u32).read_unaligned() as usize;
+        let name_len = (buf.add(cur + name_len_off) as *const u32).read_unaligned() as usize;
+        if next_off == 0 {
+            // Chain terminator: report the record's ACTUAL extent.
+            if name_off + name_len > avail {
+                return cur; // name field overruns the buffer — don't trust it
+            }
+            return cur + name_off + name_len;
+        }
+        if next_off > avail {
+            return cur; // link past the buffer — malformed
+        }
+        cur += next_off;
+    }
+}
+
 /// Appends directory-info records for `extra` `(name, is_dir)` pairs into
 /// the unused tail of a caller-provided NtQueryDirectoryFile buffer,
 /// chaining them after whatever real entries occupy `[0, used_size)`. This
@@ -136,12 +189,14 @@ pub(crate) unsafe fn collect_present_names_lower(buf: *const u8, size: usize, cl
 ///
 /// Entries that don't fit within `capacity` are silently dropped — this
 /// mirrors NtQueryDirectoryFile's own truncation behavior (a caller that
-/// pages through a directory sees them on a later call). Known limitation:
-/// on a directory large enough to need multiple successful
-/// NtQueryDirectoryFile calls, extras are (best-effort) re-injected on every
-/// such call, since this function has no per-handle continuation state —
-/// acceptable for the common case this fixes (a handful of overlay-only
-/// files in an otherwise small directory).
+/// pages through a directory sees them on a later call). Continuation
+/// across calls is the CALLER's job: `process_dir_output` tracks a per-
+/// handle overlay cursor (`DirEnumState`) and feeds this function one
+/// pending entry at a time, so a filled buffer leaves the remaining extras
+/// pending instead of losing them. Note the returned size when nothing was
+/// written is the rounded-up append point `(used_size + 7) & !7`, which can
+/// exceed `used_size` for an unaligned tail — callers must not read that as
+/// "a record was appended".
 ///
 /// Unsupported `class` values and an empty `extra` are both a no-op.
 ///

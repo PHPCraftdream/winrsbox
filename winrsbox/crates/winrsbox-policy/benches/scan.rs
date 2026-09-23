@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use policy::scan::{find_direct_syscalls, pe_text_section};
+use winrsbox_policy::scan::{find_direct_syscalls, pe_text_section};
 
 fn make_nop_buffer(size: usize) -> Vec<u8> {
     vec![0x90u8; size]

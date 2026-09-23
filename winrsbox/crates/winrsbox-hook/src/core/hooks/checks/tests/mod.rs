@@ -38,9 +38,9 @@
 
     /// False-positive guards: pure read/probe opens must stay reads so they
     /// keep riding the (cheap) passthrough instead of forcing CoW copies.
-    /// MAXIMUM_ALLOWED is a documented deliberate exclusion: it resolves
-    /// per-DACL and is probe-heavy; classifying it as a write would
-    /// CoW-copy every probed file.
+    /// (MAXIMUM_ALLOWED used to be listed here as a deliberate exclusion;
+    /// since review XA 2026-09-20, S01, P0 it is a write — see
+    /// `write_access_maximum_allowed_is_write`.)
     #[test]
     fn write_access_read_bits_stay_read() {
         assert!(!is_write_access(0x8000_0000, FILE_OPEN));
@@ -48,7 +48,20 @@
         assert!(!is_write_access(0x0002_0000, FILE_OPEN)); // READ_CONTROL
         assert!(!is_write_access(0x0010_0000, FILE_OPEN)); // SYNCHRONIZE
         assert!(!is_write_access(0x8000_0000 | 0x0010_0000, FILE_OPEN));
-        assert!(!is_write_access(0x0200_0000, FILE_OPEN)); // MAXIMUM_ALLOWED
+    }
+
+    /// MAXIMUM_ALLOWED asks the kernel for every right the DACL grants —
+    /// which can include WRITE. Classifying it as a read let the read
+    /// passthrough forward the original mask and hand out a real
+    /// write-capable handle (review XA 2026-09-20, S01, P0). It must
+    /// classify as a write so it takes the CoW/Deny path, never the
+    /// passthrough that forwards the original desired_access.
+    #[test]
+    fn write_access_maximum_allowed_is_write() {
+        assert!(is_write_access(MAXIMUM_ALLOWED, 0));
+        assert!(is_write_access(MAXIMUM_ALLOWED, FILE_OPEN));
+        // A maximum-allowed open that also asks read rights is still a write.
+        assert!(is_write_access(MAXIMUM_ALLOWED | 0x8000_0000, FILE_OPEN));
     }
 
     /// Consequence test: a GENERIC_ALL or FILE_WRITE_ATTRIBUTES-only open
@@ -112,6 +125,59 @@
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Consequence test (review XA 2026-09-20, S01, P0): a MAXIMUM_ALLOWED
+    /// open of an EXISTING file outside project_root must take the CoW
+    /// path and must NOT get the read/passthrough decision. Uses the real
+    /// Policy engine with an empty rule set, whose documented default is
+    /// read-outside-root -> Passthrough, write-outside-root -> Cow.
+    ///
+    /// Honestly scoped: policy.decide(classification) is unit-testable,
+    /// but the actual nt_call_original forwarding of desired_access lives
+    /// behind the detour and is NOT exercised by unit tests. The unit
+    /// oracle is "MAXIMUM_ALLOWED never yields a read decision for an
+    /// outside-root path, so neither passthrough arm can be reached with
+    /// the original mask".
+    #[test]
+    fn maximum_allowed_open_outside_root_cows_not_passthrough() {
+        let base = unique_temp_path("writemask-maxallowed");
+        std::fs::create_dir_all(&base).expect("create base dir");
+        let project_root = base.join("project");
+        let sandbox_root = base.join("overlay");
+        let mock_dirs = base.join("mockdirs");
+        let outside = base.join("outside");
+        for d in [&project_root, &sandbox_root, &mock_dirs, &outside] {
+            std::fs::create_dir_all(d).expect("create policy dirs");
+        }
+        let policy = Policy::open_or_create(
+            &base.join("policy.redb"),
+            sandbox_root,
+            mock_dirs,
+            project_root.clone(),
+        )
+        .expect("open policy engine");
+
+        // Fidelity to the escape: the host file genuinely EXISTS.
+        let outside_dos =
+            outside.join("maxallowed-target.dat").to_string_lossy().into_owned();
+        std::fs::write(&outside_dos, b"real host bytes").expect("seed outside file");
+
+        // Negative control: the SAME path with read intent passes through
+        // to the real disk — proves the Cow verdict below is caused by the
+        // write classification, not by the path.
+        assert_eq!(policy.decide(&outside_dos, false).mode, Mode::Passthrough);
+
+        assert!(is_write_access(MAXIMUM_ALLOWED, FILE_OPEN));
+        let d = policy.decide(&outside_dos, is_write_access(MAXIMUM_ALLOWED, FILE_OPEN));
+        assert_eq!(
+            d.mode,
+            Mode::Cow,
+            "MAXIMUM_ALLOWED open outside root must Cow, not passthrough the real file"
+        );
+
+        drop(policy);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Build a path inside the OS temp dir that is unique per test invocation,
     /// without pulling in the `tempfile` crate (forbidden by scope rules).
     fn unique_temp_path(tag: &str) -> PathBuf {
@@ -134,21 +200,28 @@
     /// already exists. Regression test for the per-open `fs::write` storm:
     /// the second call with a different payload must NOT overwrite the
     /// file content produced by the first call.
+    ///
+    /// S05 (docs/review-xa-2026-09-20): runs against the explicit-roots seam
+    /// — the OnceLock root globals are unset in the test binary (see
+    /// `prepare_overlay_fails_closed_when_roots_unpublished`), so the
+    /// roots-resolving wrapper would now refuse every destination.
     #[test]
     fn mock_write_idempotent_when_exists() {
         let dir = unique_temp_path("mock-idem");
         let overlay = dir.join("payload.bin");
         let first: &[u8] = b"first-write";
         let second: &[u8] = b"SECOND-WRITE-MUST-NOT-LAND";
+        let root_str = dir.to_string_lossy().to_ascii_lowercase();
+        let roots = [root_str.as_str()];
 
         // First call materializes the file.
-        materialize_mock_overlay(&overlay, first);
+        materialize_mock_overlay_in_roots(&overlay, first, &roots);
         assert!(overlay.exists(), "first materialize should create the file");
         let after_first = std::fs::read(&overlay).expect("read after first");
         assert_eq!(after_first, first);
 
         // Second call must be a no-op: content unchanged.
-        materialize_mock_overlay(&overlay, second);
+        materialize_mock_overlay_in_roots(&overlay, second, &roots);
         let after_second = std::fs::read(&overlay).expect("read after second");
         assert_eq!(
             after_second, first,
@@ -732,3 +805,7 @@
         );
         assert_eq!(s_of(&abs), r"\??\C:\base\sub\file.txt");
     }
+
+
+    mod s05_alias_hardening;
+    mod c04_materialization_tests;

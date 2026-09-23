@@ -1,4 +1,5 @@
 use super::make_policy_with_project;
+use crate::{db, ensure_lower, OverlayChildMeta, Policy};
 // ── OVERLAY_CASE tests (variant B hybrid case-rewrite) ──────────────────
 
 /// 7.1 — Backward compat: existing OVERLAY_IDX entries (without any
@@ -172,9 +173,12 @@ fn overlay_case_integration_overlay_only_dir() {
 //    from ever touching git object file names."
 //
 // REGRESSION TARGET: if `record_overlay_case` is changed to store
-// all-lowercase names too (removing the `to_ascii_lowercase()` guard),
-// the second assertion fails and `overlay_children_with_case` starts
-// returning entries for git object dirs — re-introducing the `72d46d9` bug.
+// canonical-folded names too (removing the fold-identity guard — under S11
+// that guard skips a basename when `nt_case_fold(name) == name`, so ASCII
+// lowercase AND kernel-conservative non-ASCII names like İ/ß/ς are skipped
+// while case-paired ones like Секрет are stored), the second assertion
+// fails and `overlay_children_with_case` starts returning entries for git
+// object dirs — re-introducing the `72d46d9` bug.
 //
 // NOTE: A live end-to-end test requires network + 5–10 min clone time and
 // is deliberately manual-only (see docs/checkpoints/ for the 3/3 manual
@@ -367,6 +371,174 @@ fn overlay_children_directory_reports_zero_size_nonzero_time() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].size, 0);
     assert!(entries[0].last_write_time > 0);
+}
+
+// ── overlay_children (index-backed) ─────────────────────────────────────
+//
+// `overlay_children` now answers from an in-memory (parent → children)
+// index over OVERLAY_IDX instead of a full-subtree prefix range scan.
+// The two tests below pin parity with the OLD algorithm (kept verbatim
+// as a local reference fn) and pin the index's record/clear/reopen
+// maintenance.
+
+/// The OLD `overlay_children` algorithm, kept verbatim as the reference:
+/// a redb prefix range scan `idx.range(dir\ ..)` over OVERLAY_IDX that
+/// visits every descendant key and filters direct children by
+/// `rest.contains('\\')`.
+fn legacy_overlay_children_reference(p: &Policy, dir: &str) -> Vec<OverlayChildMeta> {
+    use std::os::windows::fs::MetadataExt;
+    let dir_lower = ensure_lower(dir);
+    let dir_trimmed = dir_lower.trim_end_matches('\\');
+    if dir_trimmed.is_empty() {
+        return Vec::new();
+    }
+    let prefix_with_sep = format!("{}\\", dir_trimmed);
+    let Ok(txn) = p.db().begin_read() else { return Vec::new() };
+    let Ok(idx) = txn.open_table(db::OVERLAY_IDX) else { return Vec::new() };
+    let case = txn.open_table(db::OVERLAY_CASE).ok();
+
+    let mut out = Vec::new();
+    let Ok(iter) = idx.range(prefix_with_sep.as_str()..) else { return Vec::new() };
+    for entry in iter.flatten() {
+        let key = entry.0.value();
+        let Some(rest) = key.strip_prefix(&prefix_with_sep) else { break };
+        // Direct children only — no further backslash.
+        if rest.contains('\\') {
+            continue;
+        }
+        let overlay_phys = entry.1.value();
+        let (is_dir, size, creation_time, last_access_time, last_write_time) =
+            match std::fs::metadata(overlay_phys) {
+                Ok(md) => (
+                    md.is_dir(),
+                    if md.is_dir() { 0 } else { md.file_size() },
+                    md.creation_time(),
+                    md.last_access_time(),
+                    md.last_write_time(),
+                ),
+                Err(_) => (false, 0, 0, 0, 0),
+            };
+        let name = case
+            .as_ref()
+            .and_then(|t| t.get(key).ok().flatten())
+            .map(|v| v.value().to_owned())
+            .unwrap_or_else(|| rest.to_owned());
+        out.push(OverlayChildMeta {
+            name,
+            is_dir,
+            size,
+            creation_time,
+            last_access_time,
+            last_write_time,
+        });
+    }
+    out
+}
+
+/// Parity ratchet: the index-backed `overlay_children` must return EXACTLY
+/// what the old O(S) subtree range scan returned — same entries, same
+/// bytewise order, same zeroed-stale-path metadata — while excluding
+/// grandchildren and sibling-prefix (`d:\outbar` vs `d:\out`) entries.
+#[test]
+fn overlay_children_matches_legacy_subtree_scan() {
+    let (dir, p, _project) = make_policy_with_project("proj");
+
+    // Real physical overlay files for two entries (exercised by existing
+    // tests too): sizes/times must round-trip identically through both
+    // implementations.
+    let phys_a = dir.path().join("ov_a.txt");
+    std::fs::write(&phys_a, b"hello").unwrap(); // 5 bytes
+    let phys_b = dir.path().join("ov_b.log");
+    std::fs::write(&phys_b, b"twelve bytes").unwrap(); // 12 bytes
+
+    let out_dir = r"d:\out";
+    p.record_overlay(r"d:\out\a.txt", phys_a.to_str().unwrap()).unwrap();
+    p.record_overlay(r"d:\out\b.log", phys_b.to_str().unwrap()).unwrap();
+    // Re-record with a trailing separator: the table keeps ONE key
+    // (`d:\out\b.log`) and the index must not duplicate the child.
+    p.record_overlay(r"d:\out\b.log\", phys_b.to_str().unwrap()).unwrap();
+    // Grandchildren (subtree) — must NOT be reported under d:\out.
+    p.record_overlay(r"d:\out\Sub\deep.txt", r"C:\sb\out\sub\deep.txt").unwrap();
+    p.record_overlay(r"d:\out\Sub\deeper\x.txt", r"C:\sb\out\sub\deeper\x.txt").unwrap();
+    // Stale physical path — zeroed metadata, kept either way.
+    p.record_overlay(r"d:\out\z.txt", r"C:\sb\out\z.txt").unwrap();
+    // Sibling sharing a string prefix — must NOT leak into d:\out.
+    p.record_overlay(r"d:\outbar\c.txt", r"C:\sb\outbar\c.txt").unwrap();
+    // Unrelated directories.
+    p.record_overlay(r"d:\other\f1.txt", r"C:\sb\other\f1.txt").unwrap();
+    p.record_overlay(r"c:\elsewhere\g.txt", r"C:\sb\elsewhere\g.txt").unwrap();
+
+    let got = p.overlay_children(out_dir);
+    let reference = legacy_overlay_children_reference(&p, out_dir);
+
+    // Exact parity with the old scan: same Vec<OverlayChildMeta>, including
+    // order and zeroed-stale-path semantics.
+    assert_eq!(got, reference, "index-backed result must equal the legacy subtree scan");
+
+    // And both are exactly the expected direct-children subset, in bytewise
+    // name order: grandchildren (`Sub\...`), the sibling-prefix child
+    // (`d:\outbar\c.txt`) and unrelated dirs excluded.
+    let names: Vec<&str> = got.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["a.txt", "b.log", "z.txt"], "got: {got:?}");
+
+    // Real physical files keep real metadata through the new path; the
+    // stale entry is zeroed.
+    let by_name = |n: &str| got.iter().find(|e| e.name == n).unwrap();
+    let a = by_name("a.txt");
+    assert_eq!(a.size, 5);
+    assert!(!a.is_dir);
+    assert!(a.last_write_time > 0);
+    let b = by_name("b.log");
+    assert_eq!(b.size, 12, "trailing-sep re-record must not duplicate or corrupt");
+    let z = by_name("z.txt");
+    assert_eq!(z.size, 0);
+    assert_eq!(z.creation_time, 0);
+    assert_eq!(z.last_access_time, 0);
+    assert_eq!(z.last_write_time, 0);
+    assert!(!z.is_dir);
+}
+
+/// Index maintenance: record → visible; clear → gone; re-record → visible
+/// again; a NEW child recorded after open enters the index (post-open
+/// insert path) and clearing another drops it — with parity against the
+/// legacy subtree scan holding at every step, and the index rebuilding
+/// correctly from the DB alone on reopen (legacy DBs need no migration).
+#[test]
+fn overlay_children_index_tracks_record_and_clear() {
+    let (dir, p, project) = make_policy_with_project("proj");
+    let parent = r"d:\idx";
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+
+    // record → child visible.
+    p.record_overlay(r"d:\idx\a.txt", r"C:\sb\idx\a.txt").unwrap();
+    let names = |v: &[OverlayChildMeta]| -> Vec<String> { v.iter().map(|e| e.name.clone()).collect() };
+    assert_eq!(names(&p.overlay_children(parent)), vec!["a.txt".to_string()]);
+
+    // clear → gone.
+    p.clear_overlay(r"d:\idx\a.txt").unwrap();
+    assert!(p.overlay_children(parent).is_empty(), "cleared child must vanish");
+
+    // re-record → visible again.
+    p.record_overlay(r"d:\idx\a.txt", r"C:\sb\idx\a.txt").unwrap();
+    assert_eq!(names(&p.overlay_children(parent)), vec!["a.txt".to_string()]);
+
+    // NEW child recorded after open (post-open index insert) + clear the
+    // other — parity with the reference scan still holds.
+    p.record_overlay(r"d:\idx\b.txt", r"C:\sb\idx\b.txt").unwrap();
+    p.clear_overlay(r"d:\idx\a.txt").unwrap();
+    let got = p.overlay_children(parent);
+    assert_eq!(names(&got), vec!["b.txt".to_string()], "got: {got:?}");
+    assert_eq!(got, legacy_overlay_children_reference(&p, parent));
+
+    // Reopen: the index is rebuilt from the OVERLAY_IDX rows alone — the
+    // cleared row stays cleared, the recorded row stays present.
+    drop(p);
+    let p2 = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+    let got2 = p2.overlay_children(parent);
+    assert_eq!(names(&got2), vec!["b.txt".to_string()], "got: {got2:?}");
+    assert_eq!(got2, legacy_overlay_children_reference(&p2, parent));
 }
 
 // ── Regression ratchet: Pattern #2 — multi-level whiteout cascade

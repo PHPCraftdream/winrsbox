@@ -19,6 +19,9 @@
 // WFP network policy already constrains browser traffic, and the default
 // browser runs under the same sandbox group, so opening it doesn't escape.
 //
+// F2 (R04): the Ex entry points also deny fMask-driven alternate target
+// resolution (IDList / shell class / env-subst) outright.
+//
 // Hook targets: shell32.dll!ShellExecuteW, shell32.dll!ShellExecuteExW.
 
 use std::sync::OnceLock;
@@ -28,10 +31,17 @@ use winapi::ctypes::c_void;
 use winapi::shared::minwindef::{BOOL, FALSE, HINSTANCE};
 use winapi::shared::windef::HWND;
 
-use crate::anti_rec;
 use crate::hooks::{ipc_log, is_trace};
 mod inspect;
+mod decide;
 
+use decide::{
+    shell_execute_a_deny, shell_execute_ex_a_deny, shell_execute_ex_w_deny,
+    shell_execute_w_deny,
+};
+#[cfg(test)]
+use decide::shell_execute_a_deny_reason;
+#[cfg(test)]
 use inspect::{read_lpcstr, read_lpcwstr, uninspected_deny_reason};
 
 // ---------------------------------------------------------------------------
@@ -289,6 +299,72 @@ pub(crate) fn shell_verb_deny_reason(verb: &str) -> Option<&'static str> {
     Some("verb_unknown")
 }
 
+// ---------------------------------------------------------------------------
+// F2 (R04) — fMask classification for the ShellExecuteEx* entry points.
+//
+// winapi 0.3 does not expose these constants with the features enabled in
+// our Cargo.toml; values per the SHELLEXECUTEINFOW docs
+// (learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-shellexecuteinfow).
+// ---------------------------------------------------------------------------
+
+pub(crate) const SEE_MASK_CLASSNAME: u32 = 0x0000_0001;
+pub(crate) const SEE_MASK_CLASSKEY: u32 = 0x0000_0003;
+pub(crate) const SEE_MASK_IDLIST: u32 = 0x0000_0004;
+pub(crate) const SEE_MASK_INVOKEIDLIST: u32 = 0x0000_000C;
+pub(crate) const SEE_MASK_DOENVSUBST: u32 = 0x0000_0200;
+
+/// Classifies `fMask` (the `SHELLEXECUTEINFOW.fMask` field, both the W and
+/// the A Ex entry) and returns the deny reason, or `None` when the mask
+/// keeps target resolution on the plain `lpFile` + `lpParameters` strings
+/// the string chain inspects.
+///
+/// Decisions (most-specific tag first, because `CLASSKEY` sets the
+/// `CLASSNAME` bit and `INVOKEIDLIST` sets the `IDLIST` bit):
+///
+/// * `SEE_MASK_CLASSKEY` (0x3) → `Some("mask_classkey")`. `hkeyClass`
+///   selects a registry-class handler we do not classify.
+/// * `SEE_MASK_CLASSNAME` (0x1) → `Some("mask_classname")`. `lpClass`
+///   selects a shell-class handler we do not classify.
+/// * `SEE_MASK_INVOKEIDLIST` (0xC) → `Some("mask_invokeidlist")`. The item
+///   is identified by `lpIDList` or dispatched to `lpFile`'s context-menu
+///   handler — either way execution leaves the plain string
+///   interpretation we inspect.
+/// * `SEE_MASK_IDLIST` (0x4) → `Some("mask_idlist")`. The target resolves
+///   from the `lpIDList` PIDL — a binary shell format we deliberately do
+///   not parse; the fail-closed refusal follows the
+///   `uninspected_deny_reason` precedent (an input we cannot classify must
+///   refuse the call).
+/// * `SEE_MASK_DOENVSUBST` (0x200) → `Some("mask_doenvsubst")`. The shell
+///   expands environment variables in `lpFile`/`lpDirectory` before
+///   execution, so the string we inspected is not the string executed.
+/// * anything else → `None`. The remaining documented bits (ICON 0x10,
+///   HOTKEY 0x20, NOCLOSEPROCESS 0x40, CONNECTNETDRV 0x80, NOASYNC/
+///   FLAG_DDEWAIT 0x100, FLAG_NO_UI 0x400, UNICODE 0x4000, NO_CONSOLE
+///   0x8000, ASYNCOK 0x100000, HMONITOR 0x200000, NOZONECHECKS 0x800000,
+///   WAITFORINPUTIDLE 0x2000000, FLAG_LOG_USAGE 0x4000000,
+///   FLAG_HINST_IS_SITE 0x8000000, NOQUERYCLASSSTORE 0x1000000) do not
+///   change which struct member the target is resolved from. Lone
+///   undefined values (0x2, 0x8 without their partner bits) are ignored by
+///   the shell.
+pub(crate) fn shell_fmask_deny_reason(f_mask: u32) -> Option<&'static str> {
+    if (f_mask & SEE_MASK_CLASSKEY) == SEE_MASK_CLASSKEY {
+        return Some("mask_classkey");
+    }
+    if (f_mask & SEE_MASK_CLASSNAME) != 0 {
+        return Some("mask_classname");
+    }
+    if (f_mask & SEE_MASK_INVOKEIDLIST) == SEE_MASK_INVOKEIDLIST {
+        return Some("mask_invokeidlist");
+    }
+    if (f_mask & SEE_MASK_IDLIST) != 0 {
+        return Some("mask_idlist");
+    }
+    if (f_mask & SEE_MASK_DOENVSUBST) != 0 {
+        return Some("mask_doenvsubst");
+    }
+    None
+}
+
 /// Combined check used by both ShellExecute hook entry points. Returns a
 /// short tag identifying which input matched so the violation log can
 /// distinguish `reason=verb_escalation`, `reason=verb_explorer`,
@@ -350,7 +426,11 @@ struct SHELLEXECUTEINFOW {
     // Trailing fields (lpIDList, lpClass, hkeyClass, dwHotKey, hMonitor/hIcon, hProcess)
     // intentionally omitted: we never read them and Rust permits a shorter
     // prefix-mirror over a pointed-to C struct as long as we don't read past
-    // the declared end.
+    // the declared end. After F2 this stays sound for lpIDList/lpClass/
+    // hkeyClass under every ALLOWED call: any fMask bit that would make the
+    // shell resolve the target through them is denied
+    // (`shell_fmask_deny_reason`), so under every allowed call those members
+    // are ignored-by-contract per the OS docs.
 }
 
 /// ANSI twin of the `SHELLEXECUTEINFOW` prefix-mirror — same field layout,
@@ -456,45 +536,16 @@ unsafe extern "system" fn hook_shell_execute_w(
         )
     };
 
-    let Some(_guard) = anti_rec::enter() else {
-        return call_original();
-    };
-
-    // Read all three attacker-supplied strings as `InspectedStr` — including
-    // `lp_operation` (the verb), which the old hook never read at all, so a
-    // `runas` verb bypassed every check. An argument with no NUL within
-    // `MAX_TARGET_CHARS` comes back as `Unterminated` instead of a silently
-    // truncated string.
-    let verb = read_lpcwstr(lp_operation);
-    let file = read_lpcwstr(lp_file);
-    let params = read_lpcwstr(lp_parameters);
-
-    // Fail closed FIRST: an argument the hook could not fully inspect must
-    // refuse the whole call — a truncated view would let anything past the
-    // cutoff evade every classifier below. Only when all three arguments
-    // are fully inspected are they flattened via `as_deref()` and handed
-    // to the classifier chain.
-    let deny_reason = match uninspected_deny_reason(&verb, &file, &params) {
-        Some(reason) => Some(reason),
-        None => shell_deny_reason(verb.as_deref(), file.as_deref(), params.as_deref()),
-    };
-    if let Some(reason) = deny_reason {
-        if is_trace() {
-            let (verb_str, file_str, params_str) =
-                (verb.as_deref(), file.as_deref(), params.as_deref());
-            crate::hooks::ipc_log_violation(ipc::Req::Log {
-                pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
-                level: ipc::LogLevel::Warn,
-                msg: format!(
-                    "shell_execute_blocked reason={reason} verb={verb_str} file={file_str} params={params_str}"
-                ),
-            });
-        }
+    if shell_execute_w_deny(lp_operation, lp_file, lp_parameters) {
         // ShellExecuteW returns HINSTANCE; values <= 32 indicate error.
         // 5 == SE_ERR_ACCESSDENIED.
         return SE_ERR_ACCESSDENIED as *mut c_void as HINSTANCE;
     }
 
+    // F1 (R04): the anti_rec window from the decision seam above is closed
+    // here. ShellExecuteW can dispatch shell verb handlers (guest-reachable
+    // application code); a hooked call made from inside them must run a
+    // fresh policy check, not see stale suppression.
     call_original()
 }
 
@@ -508,136 +559,15 @@ unsafe extern "system" fn hook_shell_execute_ex_w(
         HOOK_SHELL_EXECUTE_EX_W.get().unwrap().call(p_exec_info)
     };
 
-    let Some(_guard) = anti_rec::enter() else {
-        return call_original();
-    };
-
-    if !p_exec_info.is_null() {
-        // Validate the caller-declared `cbSize` BEFORE we read past the
-        // beginning of the struct or (on deny) write `hInstApp`. A caller that
-        // passes a struct smaller than our mirror (e.g. an older/truncated
-        // SHELLEXECUTEINFO) must not have `hInstApp` written into it — that
-        // field sits near the end of the struct and writing it could clobber
-        // memory past the caller's allocation.
-        //
-        // We compute the offset of `hInstApp` via `core::mem::offset_of!`
-        // (stable since Rust 1.77) so this stays correct if the mirror layout
-        // changes. A struct large enough to contain the whole `hInstApp` field
-        // can be safely written; a smaller one is still DENIED (a malformed
-        // struct must not get a free pass) but WITHOUT writing `hInstApp` — we
-        // return FALSE only, which the caller can always observe.
-        //
-        // SAFETY: `p_exec_info` is non-null (checked above). Reading `cbSize`
-        // (the first field, offset 0) is valid for any allocation a caller
-        // could legitimately pass to ShellExecuteExW, which must contain at
-        // least the `cbSize` field it is required to initialize.
-        let cb_size = (*p_exec_info).cbSize as usize;
-        const HINSTAPP_OFFSET: usize = core::mem::offset_of!(SHELLEXECUTEINFOW, hInstApp);
-        // Bytes the caller must have allocated for a write of `hInstApp` to be
-        // in-bounds: through the end of the field.
-        let hinstapp_end = HINSTAPP_OFFSET + core::mem::size_of::<HINSTANCE>();
-        // Bytes that must be present before we may read the prefix fields we
-        // inspect. `lpParameters` is the last field we read, so its end is the
-        // minimum struct size required for our reads to be in-bounds.
-        const LPPARAMETERS_OFFSET: usize = core::mem::offset_of!(SHELLEXECUTEINFOW, lpParameters);
-        let lpparameters_end = LPPARAMETERS_OFFSET + core::mem::size_of::<*const u16>();
-        let cbsize_ok_for_full_struct = cb_size >= core::mem::size_of::<SHELLEXECUTEINFOW>();
-        let cbsize_ok_for_hinstapp_write = cb_size >= hinstapp_end;
-
-        // The target controls `cbSize`. If it declares a struct too small to
-        // even contain the fields we inspect (`lpVerb`/`lpFile`/`lpParameters`),
-        // reading those fields would touch memory past the caller's allocation. We
-        // cannot inspect such a call, so fall through to the original — the
-        // documented "can't inspect → call original" path. (We never deny on a
-        // pointer we couldn't safely read; the real ShellExecuteExW will reject
-        // a malformed `cbSize` itself.)
-        if cb_size < lpparameters_end {
-            return call_original();
-        }
-
-        // SAFETY: `p_exec_info` is non-null (checked above) and `cb_size` is at
-        // least `lpparameters_end`, so the prefix fields up to and including
-        // `lpParameters` lie within the caller-declared (and per the ABI
-        // contract, initialized) allocation. We only read those prefix fields;
-        // the denylist/Unicode/params decision itself never writes the struct.
-        let info_ref = &*p_exec_info;
-        // Reading `lpVerb` is safe under the EXISTING `cb_size >=
-        // lpparameters_end` guard: `offset_of!(lpVerb)` < `offset_of!(lpParameters)`,
-        // so `lpVerb` lies within the same caller-declared allocation that
-        // guard already proves covers every field up to and including
-        // `lpParameters`. The old hook never read it, so a `runas` verb
-        // bypassed every check.
-        let verb = read_lpcwstr(info_ref.lpVerb);
-        let file = read_lpcwstr(info_ref.lpFile);
-        let params = read_lpcwstr(info_ref.lpParameters);
-
-        // Fail closed FIRST: an argument the hook could not fully inspect
-        // (no NUL within `MAX_TARGET_CHARS`) must refuse the whole call —
-        // a truncated view would let anything past the cutoff evade every
-        // classifier. Only when all three arguments are fully inspected are
-        // they flattened via `as_deref()` and handed to the classifier chain.
-        let deny_reason = match uninspected_deny_reason(&verb, &file, &params) {
-            Some(reason) => Some(reason),
-            None => shell_deny_reason(verb.as_deref(), file.as_deref(), params.as_deref()),
-        };
-        if let Some(reason) = deny_reason {
-            // Note when the struct is too small to hold a full SHELLEXECUTEINFOW
-            // so the log records why we may have skipped the hInstApp write.
-            let truncated = !cbsize_ok_for_full_struct;
-            if is_trace() {
-                let (verb_str, file_str, params_str) =
-                    (verb.as_deref(), file.as_deref(), params.as_deref());
-                crate::hooks::ipc_log_violation(ipc::Req::Log {
-                    pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
-                    level: ipc::LogLevel::Warn,
-                    msg: format!(
-                        "shell_execute_ex_blocked reason={reason} cbSize={cb_size} truncated={truncated} verb={verb_str} file={file_str} params={params_str}"
-                    ),
-                });
-            }
-            if cbsize_ok_for_hinstapp_write {
-                // Report SE_ERR_ACCESSDENIED via hInstApp per shellapi.h
-                // contract and return FALSE.
-                // SAFETY: p_exec_info is non-null and the caller declared a
-                // `cbSize` (>= hinstapp_end) large enough to contain the whole
-                // `hInstApp` field, so this write is in-bounds.
-                (*p_exec_info).hInstApp = SE_ERR_ACCESSDENIED as *mut c_void as HINSTANCE;
-            }
-            // Deny regardless: a struct too small to hold `hInstApp` is still
-            // refused (return FALSE) without the write.
-            return FALSE;
-        }
+    if shell_execute_ex_w_deny(p_exec_info) {
+        return FALSE;
     }
 
+    // F1 (R04): the anti_rec window from the decision seam above is closed
+    // here. ShellExecuteExW can dispatch shell verb handlers (guest-reachable
+    // application code); a hooked call made from inside them must run a
+    // fresh policy check, not see stale suppression.
     call_original()
-}
-
-/// Full deny decision for one ShellExecuteA / ShellExecuteExA call, from raw
-/// ANSI pointers to the classifier-chain verdict. Identical to the W path:
-/// read + inspect all three attacker strings via `read_lpcstr`, fail closed
-/// on any uninspected argument, then run the shared `shell_deny_reason`
-/// chain (verb allowlist -> file denylist -> unicode-scheme -> params scan).
-/// Returns the reason tag, or `None` when the call may proceed.
-///
-/// Pure over its inputs (reads are bounded and probe-guarded); tests
-/// fabricate ANSI buffers and drive exactly the decision the hooks apply —
-/// no shell32 involvement.
-///
-/// # SAFETY
-/// Each pointer must be null or readable memory (wild pointers are
-/// probe-guarded and yield `Absent`, never a fault we propagate).
-unsafe fn shell_execute_a_deny_reason(
-    lp_operation: *const u8,
-    lp_file: *const u8,
-    lp_parameters: *const u8,
-) -> Option<&'static str> {
-    let verb = read_lpcstr(lp_operation);
-    let file = read_lpcstr(lp_file);
-    let params = read_lpcstr(lp_parameters);
-    match uninspected_deny_reason(&verb, &file, &params) {
-        Some(reason) => Some(reason),
-        None => shell_deny_reason(verb.as_deref(), file.as_deref(), params.as_deref()),
-    }
 }
 
 // SAFETY: Called by detour2 dispatcher with shell32!ShellExecuteA ABI.
@@ -657,25 +587,16 @@ unsafe extern "system" fn hook_shell_execute_a(
         )
     };
 
-    let Some(_guard) = anti_rec::enter() else {
-        return call_original();
-    };
-
-    if let Some(reason) =
-        shell_execute_a_deny_reason(lp_operation, lp_file, lp_parameters)
-    {
-        if is_trace() {
-            crate::hooks::ipc_log_violation(ipc::Req::Log {
-                pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
-                level: ipc::LogLevel::Warn,
-                msg: format!("shell_execute_a_blocked reason={reason}"),
-            });
-        }
+    if shell_execute_a_deny(lp_operation, lp_file, lp_parameters) {
         // ShellExecuteA returns HINSTANCE; values <= 32 indicate error.
         // 5 == SE_ERR_ACCESSDENIED.
         return SE_ERR_ACCESSDENIED as *mut c_void as HINSTANCE;
     }
 
+    // F1 (R04): the anti_rec window from the decision seam above is closed
+    // here. ShellExecuteA can dispatch shell verb handlers (guest-reachable
+    // application code); a hooked call made from inside them must run a
+    // fresh policy check, not see stale suppression.
     call_original()
 }
 
@@ -689,59 +610,14 @@ unsafe extern "system" fn hook_shell_execute_ex_a(
         HOOK_SHELL_EXECUTE_EX_A.get().unwrap().call(p_exec_info)
     };
 
-    let Some(_guard) = anti_rec::enter() else {
-        return call_original();
-    };
-
-    if !p_exec_info.is_null() {
-        // cbSize validation identical to the W hook: a struct too small to
-        // contain the inspected prefix falls through to the original (the
-        // real API rejects it), and hInstApp is only written when the
-        // caller's declared size proves the field exists.
-        // SAFETY: p_exec_info is non-null (checked above); reading cbSize
-        // (offset 0) is valid for any allocation a caller could legitimately
-        // pass, since cbSize is the field it is required to initialize.
-        let cb_size = (*p_exec_info).cbSize as usize;
-        const HINSTAPP_OFFSET_A: usize = core::mem::offset_of!(SHELLEXECUTEINFOA, hInstApp);
-        let hinstapp_end = HINSTAPP_OFFSET_A + core::mem::size_of::<HINSTANCE>();
-        const LPPARAMETERS_OFFSET_A: usize = core::mem::offset_of!(SHELLEXECUTEINFOA, lpParameters);
-        let lpparameters_end = LPPARAMETERS_OFFSET_A + core::mem::size_of::<*const u8>();
-        let cbsize_ok_for_full_struct = cb_size >= core::mem::size_of::<SHELLEXECUTEINFOA>();
-        let cbsize_ok_for_hinstapp_write = cb_size >= hinstapp_end;
-
-        if cb_size < lpparameters_end {
-            return call_original();
-        }
-
-        // SAFETY: cb_size >= lpparameters_end proves the prefix fields up to
-        // and including lpParameters lie within the caller's allocation.
-        let info_ref = &*p_exec_info;
-        let deny_reason = shell_execute_a_deny_reason(
-            info_ref.lpVerb, info_ref.lpFile, info_ref.lpParameters,
-        );
-        if let Some(reason) = deny_reason {
-            let truncated = !cbsize_ok_for_full_struct;
-            if is_trace() {
-                crate::hooks::ipc_log_violation(ipc::Req::Log {
-                    pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
-                    level: ipc::LogLevel::Warn,
-                    msg: format!(
-                        "shell_execute_ex_a_blocked reason={reason} cbSize={cb_size} truncated={truncated}"
-                    ),
-                });
-            }
-            if cbsize_ok_for_hinstapp_write {
-                // Report SE_ERR_ACCESSDENIED via hInstApp and return FALSE.
-                // SAFETY: p_exec_info is non-null and the caller declared a
-                // cbSize (>= hinstapp_end) covering the whole hInstApp field.
-                (*p_exec_info).hInstApp = SE_ERR_ACCESSDENIED as *mut c_void as HINSTANCE;
-            }
-            // Denied regardless: a struct too small for hInstApp is refused
-            // (FALSE) without the write.
-            return FALSE;
-        }
+    if shell_execute_ex_a_deny(p_exec_info) {
+        return FALSE;
     }
 
+    // F1 (R04): the anti_rec window from the decision seam above is closed
+    // here. ShellExecuteExA can dispatch shell verb handlers (guest-reachable
+    // application code); a hooked call made from inside them must run a
+    // fresh policy check, not see stale suppression.
     call_original()
 }
 
@@ -772,6 +648,12 @@ unsafe fn shell32_export(name: &[u8]) -> Option<*const c_void> {
 /// # SAFETY
 /// Must be called from `install_hooks()` in DllMain context with `anti_rec`
 /// entered.
+///
+/// R04 F4 policy — MANDATORY category: all four ShellExecute* exports fail
+/// closed. shell32 has exported them since Win95 and the ShellExecute verb
+/// allow-list is documented SECURITY.md behavior, so a missing export must
+/// abort the install (Err propagates out through install_hooks) rather than
+/// degrade silently with the shell escape path left unguarded.
 pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     // ShellExecuteW
     if let Some(addr) = shell32_export(b"ShellExecuteW\0") {
@@ -788,10 +670,11 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
             .enable()
             .map_err(|e| format!("detour enable ShellExecuteW: {:?}", e))?;
     } else {
-        ipc_log(
-            ipc::LogLevel::Warn,
-            "shell_guard: shell32 export ShellExecuteW not found — skipping".into(),
-        );
+        // Fail-closed per the mandatory-category policy (R04 F4): shell32
+        // exports are universal and the ShellExecute verb allow-list is
+        // documented SECURITY.md containment behavior, so a missing export
+        // must abort the install rather than degrade silently.
+        return Err("shell_guard: shell32 export ShellExecuteW not found".into());
     }
 
     // ShellExecuteExW
@@ -809,10 +692,7 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
             .enable()
             .map_err(|e| format!("detour enable ShellExecuteExW: {:?}", e))?;
     } else {
-        ipc_log(
-            ipc::LogLevel::Warn,
-            "shell_guard: shell32 export ShellExecuteExW not found — skipping".into(),
-        );
+        return Err("shell_guard: shell32 export ShellExecuteExW not found".into());
     }
 
     // ShellExecuteA (audit High sibling closure)
@@ -830,10 +710,7 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
             .enable()
             .map_err(|e| format!("detour enable ShellExecuteA: {:?}", e))?;
     } else {
-        ipc_log(
-            ipc::LogLevel::Warn,
-            "shell_guard: shell32 export ShellExecuteA not found — skipping".into(),
-        );
+        return Err("shell_guard: shell32 export ShellExecuteA not found".into());
     }
 
     // ShellExecuteExA (audit High sibling closure)
@@ -851,10 +728,7 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
             .enable()
             .map_err(|e| format!("detour enable ShellExecuteExA: {:?}", e))?;
     } else {
-        ipc_log(
-            ipc::LogLevel::Warn,
-            "shell_guard: shell32 export ShellExecuteExA not found — skipping".into(),
-        );
+        return Err("shell_guard: shell32 export ShellExecuteExA not found".into());
     }
 
     if is_trace() {
@@ -893,3 +767,5 @@ pub(crate) const HOOKED_EXPORTS: &[&str] = &[
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod install_tests;

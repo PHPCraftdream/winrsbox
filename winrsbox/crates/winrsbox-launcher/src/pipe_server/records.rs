@@ -220,7 +220,11 @@ pub(crate) fn handle_record_overlay(
 
 // --- NetDecide: userspace network policy (audit Medium, WFP finding) ------
 
-/// Pure decision core for "Req::NetDecide" against the policy's net_rules.
+/// DB-free reference decision path for "Req::NetDecide": compiles `rules`
+/// into a `policy::net::NetSnapshot` and delegates to its compiled matcher —
+/// the same single decision implementation the production snapshot path
+/// (`handle_net_decide` → `Policy::net_rule_decide`) uses. Kept only as the
+/// DB-free reference path exercised by pipe_server tests.
 ///
 /// Semantics (the contract "winrsbox netrule add --help" documents):
 /// - a rule matches when its host pattern matches the host string the hook
@@ -236,56 +240,28 @@ pub(crate) fn handle_record_overlay(
 /// literal unless identical: the hook reports numeric addresses (DNS is not
 /// hooked), so a rule for *.github.com does NOT govern connects to GitHub's
 /// IPs -- pin IPs/CIDRs for range-level control.
+// Production traffic now goes through the versioned snapshot path
+// (`handle_net_decide` -> `Policy::net_rule_decide`); this reference core is
+// exercised by tests only, hence the cfg-gated allow.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn net_decide(rules: &[policy::net::NetRule], host: &str, port: u16) -> (bool, Option<String>) {
-    let mut deny_rule: Option<&str> = None;
-    let mut allow_rule: Option<&str> = None;
-    for r in rules {
-        if r.port.is_some() && r.port != Some(port) {
-            continue;
-        }
-        if !net_host_matches(&r.host_pattern, host) {
-            continue;
-        }
-        match r.mode {
-            policy::net::NetMode::Deny => {
-                if deny_rule.is_none() {
-                    deny_rule = Some(&r.id);
-                }
-            }
-            policy::net::NetMode::Allow => {
-                if allow_rule.is_none() {
-                    allow_rule = Some(&r.id);
-                }
-            }
-            policy::net::NetMode::Log => {}
-        }
-    }
-    match deny_rule {
-        Some(id) => (false, Some(id.to_string())),
-        None => (true, allow_rule.map(str::to_string)),
-    }
+    policy::net::NetSnapshot::from_rules(0, rules).decide(host, port)
 }
 
-/// Host-pattern match: exact/*/ *.suffix via policy::net::match_host, plus
-/// v4 CIDR containment when the pattern is a.b.c.d/len and the host is a
-/// dotted quad (the hook reports numeric addresses).
-fn net_host_matches(pattern: &str, host: &str) -> bool {
-    if policy::net::match_host(pattern, host) {
-        return true;
-    }
-    match (policy::net::parse_cidr(pattern), policy::net::parse_ipv4(host)) {
-        (Some((net, mask)), Some(ip)) => policy::net::ip_in_cidr(ip, net, mask),
-        _ => false,
-    }
-}
-
-/// NetDecide handler plumbing: read the net_rules table from the policy DB
-/// and decide. Fail-closed on DB error: the hook already denies when the IPC
+/// NetDecide handler plumbing: decide via `Policy::net_rule_decide`, the
+/// versioned net-rule snapshot path. The snapshot is built once per rule-set
+/// generation (pre-parsed CIDR/ports), and the persisted generation counter
+/// in policy.redb is the cross-process invalidation signal — `winrsbox
+/// netrule ...` writes the same policy.redb from a separate process, so each
+/// decide's O(1) generation probe observes CLI-side rule changes on the very
+/// next call (no stale window). Publication of a rebuilt snapshot is atomic
+/// (ArcSwap), so no guest ever sees a partially-applied rule set.
+/// Fail-closed on ANY error: the hook already denies when the IPC
 /// round-trip dies, and the launcher denies when it cannot read its own
 /// policy, so a broken rules store can never silently reopen the network.
 pub(crate) fn handle_net_decide(p: &Policy, host: &str, port: u16) -> (bool, Option<String>) {
-    match policy::db::net_rule_list(&p.db()) {
-        Ok(rules) => net_decide(&rules, host, port),
+    match p.net_rule_decide(host, port) {
+        Ok(decision) => decision,
         Err(e) => {
             eprintln!("[net] net_rules read failed: {e} -- denying {host}:{port} (fail-closed)");
             (false, None)
@@ -388,4 +364,125 @@ pub(crate) fn escape_violation_record(
         "caller_module": caller_module,
         "stack": stack_top.iter().map(|f| format!("0x{f:x}")).collect::<Vec<_>>(),
     })
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// NetDecide versioned-snapshot tests. Kept here rather than in
+// pipe_server/tests.rs, which sits just under the <1000-line layout guard.
+#[cfg(test)]
+mod net_snapshot_tests {
+    use super::*;
+
+    /// Local replica of pipe_server/tests.rs's `net_rule` helper — test
+    /// modules must not depend on each other.
+    fn net_rule(
+        id: &str,
+        host: &str,
+        port: Option<u16>,
+        mode: policy::net::NetMode,
+    ) -> policy::net::NetRule {
+        policy::net::NetRule { id: id.into(), host_pattern: host.into(), port, mode }
+    }
+
+    /// A real policy DB, opened exactly like pipe_server/tests.rs does.
+    fn open_policy() -> (tempfile::TempDir, policy::Policy) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = policy::Policy::open_or_create(
+            &dir.path().join("policy.redb"),
+            dir.path().join("sb"),
+            dir.path().join("md"),
+            dir.path().join("proj"),
+        )
+        .unwrap();
+        (dir, p)
+    }
+
+    #[test]
+    fn net_snapshot_invalidated_on_rule_change_no_stale_window() {
+        let (dir, p) = open_policy();
+
+        // Fresh DB: no rules -> allow. No warmup, no other decides.
+        let (allow, _) = handle_net_decide(&p, "8.8.8.8", 443);
+        assert!(allow);
+
+        // Simulates the CLI writing the same policy.redb from a separate
+        // process: the persisted generation counter is the only
+        // cross-process invalidation signal, so the very first decide after
+        // the write must observe the new rule — no stale window.
+        policy::db::net_rule_upsert(
+            &p.db(),
+            &net_rule("d1", "8.8.8.8", Some(443), policy::net::NetMode::Deny),
+        )
+        .unwrap();
+        let (allow, rule) = handle_net_decide(&p, "8.8.8.8", 443);
+        assert!(!allow, "first decide after the rule write must see it");
+        assert_eq!(rule.as_deref(), Some("d1"));
+        // Exactly one full rule-table re-read + recompile was needed.
+        assert_eq!(p.net_snapshot_rebuild_count(), 1);
+    }
+
+    #[test]
+    fn repeated_net_decide_on_unchanged_rules_do_not_reread_rule_table() {
+        let (dir, p) = open_policy();
+
+        // The O(1) generation probe runs per call, but the full rule-table
+        // read + decode never does while the generation is unchanged — that
+        // is exactly what the rebuild counter counts.
+        for _ in 0..5 {
+            let (allow, _) = handle_net_decide(&p, "8.8.8.8", 443);
+            assert!(allow);
+        }
+        assert_eq!(p.net_snapshot_rebuild_count(), 0);
+
+        // A Log rule must not change the allow outcome, but its write bumps
+        // the persisted generation, forcing exactly one rebuild.
+        policy::db::net_rule_upsert(
+            &p.db(),
+            &net_rule("l1", "8.8.8.8", Some(443), policy::net::NetMode::Log),
+        )
+        .unwrap();
+        let (allow, rule) = handle_net_decide(&p, "8.8.8.8", 443);
+        assert!(allow);
+        assert_eq!(rule, None, "log rules are observability-only");
+        assert_eq!(p.net_snapshot_rebuild_count(), 1);
+
+        // Still unchanged: probes only, no further rebuilds.
+        for _ in 0..3 {
+            let _ = handle_net_decide(&p, "8.8.8.8", 443);
+        }
+        assert_eq!(p.net_snapshot_rebuild_count(), 1);
+    }
+
+    #[test]
+    fn net_decide_reference_path_matches_snapshot_path() {
+        // Belt-and-braces that the delegation is real: the rule set
+        // exercises every matcher branch (CIDR deny, exact-host allow,
+        // wildcard log, port-scoped deny) and the pure reference path must
+        // agree with the compiled snapshot for every query.
+        let rules = [
+            net_rule("d-cidr", "10.0.0.0/8", None, policy::net::NetMode::Deny),
+            net_rule("a-exact", "api.example.com", None, policy::net::NetMode::Allow),
+            net_rule("l-wild", "*.example.com", None, policy::net::NetMode::Log),
+            net_rule("d-port", "8.8.8.8", Some(53), policy::net::NetMode::Deny),
+        ];
+        let snapshot = policy::net::NetSnapshot::from_rules(0, &rules);
+        let queries = [
+            ("10.1.2.3", 443),        // inside the CIDR -> deny d-cidr
+            ("11.0.0.1", 443),        // outside the CIDR
+            ("api.example.com", 443), // exact allow id
+            ("api.example.com", 1),   // rule has no port -> matches any
+            ("www.example.com", 80),  // only the log rule matches -> plain allow
+            ("example.com", 80),      // bare domain: no rule
+            ("8.8.8.8", 53),          // port-scoped deny
+            ("8.8.8.8", 443),         // port mismatch -> allow
+            ("other.test", 22),       // no match at all -> allow
+        ];
+        for (host, port) in queries {
+            assert_eq!(
+                net_decide(&rules, host, port),
+                snapshot.decide(host, port),
+                "reference and snapshot paths must agree for {host}:{port}"
+            );
+        }
+    }
 }

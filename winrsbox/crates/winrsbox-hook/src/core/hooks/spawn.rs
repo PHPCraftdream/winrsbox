@@ -104,26 +104,26 @@ pub(super) unsafe fn extract_child_exe(params: *mut c_void) -> String {
 // Guard configuration snapshot + spawn gate (audit 2026-09-19 High)
 // ---------------------------------------------------------------------------
 
-/// Guard configuration captured ONCE at install time (DllMain), before any
+/// Guard-relevant inputs captured ONCE at install time (DllMain), before any
 /// guest code has run.
 ///
-/// The environment block is guest-writable by construction: a sandboxed
-/// process can `SetEnvironmentVariable` a forged `FS_SANDBOX_*` value into
-/// its own block, and every child it spawns inherits the forgery. Therefore:
-///   * decision code reads ONLY this snapshot and never the environment (a
-///     per-decision env re-read was a live kill switch), and
-///   * `hook_nt_create_user_process` denies any spawn whose inherited
-///     environment carries guard settings that differ from this snapshot,
-///     so a guest can no longer downgrade its children either.
-/// This generalizes the P1-01 `SPAWN_SCAN_GUARD` snapshot (which carried only
-/// the guard level) to every guard input. The values still arrive via the
-/// environment the LAUNCHER authored at CreateProcessW time — written before
-/// any guest code existed, hence unforgeable for the root — and are
-/// re-asserted for every child by the spawn gate below.
+/// SINGLE SOURCE OF TRUTH (review XA 2026-09-20, S02): security config is
+/// delivered ONLY through the trusted session section
+/// (trusted_boot::resolve_effective_config), which the environment can never
+/// override — the old env-first / section-second order let a guest-authored
+/// FS_SANDBOX_* variable win forever (`OnceLock::set` cannot overwrite), so
+/// the env values are now never consulted at all. The snapshot therefore
+/// shrank to the two inputs that are NOT config:
+///   * decision code reads ONLY the install-time snapshots (GUARD_ENV,
+///     DISABLED_HOOK_CATS, trusted_boot::TRUSTED_GUARD) and never the
+///     environment, and
+///   * `hook_nt_create_user_process` DENIES ON PRESENCE any spawn whose
+///     inherited environment carries a security-config variable at all
+///     (guard/allow_rwx/disable_hooks/pipe/dll/cwd/root) — since the section
+///     is the only legitimate source, an inherited copy has no honest
+///     explanation; section and no_track keep their compare-to-snapshot
+///     semantics below.
 pub(crate) struct GuardEnvSnapshot {
-    pub(crate) guard: String,
-    pub(crate) disabled: String,
-    pub(crate) allow_rwx: bool,
     /// `FS_SANDBOX_SECTION` — the per-session random shared-section name.
     /// Guard-relevant because the section carries `pipe_name` and `dll_path`:
     /// a child booted with a forged name would read attacker-authored config
@@ -131,9 +131,10 @@ pub(crate) struct GuardEnvSnapshot {
     /// booted without a name (then ANY inherited value is a forgery).
     pub(crate) section: String,
     /// `FS_SANDBOX_NO_TRACK` — makes `process_tracker::mark_spawned` skip the
-    /// child (process_tracker.rs:169). Added to the snapshot and to the spawn
-    /// gate for the same reason as the others: a guard-relevant variable left
-    /// outside the gate is exactly the drift the gate exists to prevent.
+    /// child (the env read lives in the spawn hook now; the tracker itself
+    /// never consults the environment). Kept in the snapshot and the gate:
+    /// a guard-relevant variable left outside the gate is exactly the drift
+    /// the gate exists to prevent.
     ///
     /// Its worst case is milder than the others — an untracked child makes the
     /// injector's own cross-process writes look foreign to memory_guard, so
@@ -145,9 +146,9 @@ pub(crate) struct GuardEnvSnapshot {
 
 pub(super) static GUARD_ENV: OnceLock<GuardEnvSnapshot> = OnceLock::new();
 
-/// Hook categories parsed once from the snapshot's `disabled` list, consulted
-/// only through [`hook_category_disabled`] — the environment is never re-read
-/// after install.
+/// Hook categories parsed once from the trusted section's `disable_hooks`
+/// list, consulted only through [`hook_category_disabled`] — the environment
+/// is never re-read after install.
 pub(super) static DISABLED_HOOK_CATS: OnceLock<Vec<String>> = OnceLock::new();
 
 /// Install-time category gate. Reads only the install-time snapshot.
@@ -160,9 +161,12 @@ pub(crate) fn hook_category_disabled(cat: &str) -> bool {
 
 /// Children are scanned under exactly the guard levels the launcher scans the
 /// root target: `full` and `static` (launcher/src/main.rs:648). Never under
-/// `scan` or `none`.
-pub(super) fn child_scan_enabled(guard: Option<&str>) -> bool {
-    matches!(guard, Some(g) if g == "full" || g == "static")
+/// `scan` or `none`. The guard level is the typed `ipc::GuardLevel` from the
+/// trusted section — the old case-sensitive string compare silently diverged
+/// from the gate's case-insensitive one ("FULL" passed the gate, then failed
+/// here; review XA 2026-09-20, S02 #2).
+pub(super) fn child_scan_enabled(guard: ipc::GuardLevel) -> bool {
+    matches!(guard, ipc::GuardLevel::Full | ipc::GuardLevel::Static)
 }
 
 /// Upper bound on the environment walk (UTF-16 chars). A legitimate block
@@ -173,44 +177,44 @@ const MAX_GUARD_ENV_CHARS: usize = 1 << 20;
 /// environment against the trusted install-time snapshot. `Some(reason)` =
 /// mismatch = the spawn must be denied.
 ///
-/// Rules (absence is always acceptable — the child's hook then boots with
-/// fail-safe defaults: guard "full", nothing disabled, RWX not allowed):
-///   * FS_SANDBOX_GUARD — must equal the snapshot (case-insensitive);
-///   * FS_SANDBOX_ALLOW_RWX — forbidden unless the snapshot allows RWX.
-///     Presence-only semantics (the hook historically treated existence, not
-///     the value, as "allow"), so ANY value counts as an enable;
-///   * FS_SANDBOX_DISABLE_HOOKS — category set must equal the snapshot's
-///     (case-insensitive, whitespace-tolerant, order-free).
+/// DENY-ON-PRESENCE contract (review XA 2026-09-20, S02): the trusted
+/// session section is the ONLY source of security config, so an inherited
+/// security-config variable has no legitimate explanation — presence alone
+/// is the forgery, whatever the value:
+///   * fs_sandbox_guard | fs_sandbox_allow_rwx | fs_sandbox_disable_hooks |
+///     fs_sandbox_pipe | fs_sandbox_dll | fs_sandbox_cwd | fs_sandbox_root
+///     → denied on ANY presence (the old compare-to-snapshot semantics are
+///     gone together with the env config source: even the "trusted value
+///     re-stated" case is refused, and absence is still allowed);
+///   * fs_sandbox_section — must equal the snapshot's section
+///     (case-insensitive); an empty trusted section (this process booted
+///     without a name) denies any inherited value;
+///   * fs_sandbox_no_track — denied unless the snapshot carries it;
+///   * everything else (PATH, fs_sandbox_trace, fs_sandbox_init_event, …)
+///     is not guard-relevant here and is ignored.
 pub(super) fn guard_env_mismatch(observed: &[(String, String)], trusted: &GuardEnvSnapshot) -> Option<String> {
     for (name, value) in observed {
         match name.to_ascii_lowercase().as_str() {
-            "fs_sandbox_guard" => {
-                if !value.eq_ignore_ascii_case(&trusted.guard) {
-                    return Some(format!(
-                        "FS_SANDBOX_GUARD forged: child would inherit {value:?}, trusted {:?}",
-                        trusted.guard
-                    ));
-                }
-            }
-            "fs_sandbox_allow_rwx" => {
-                if !trusted.allow_rwx {
-                    return Some(format!(
-                        "FS_SANDBOX_ALLOW_RWX forged: child would inherit {value:?}, trusted off"
-                    ));
-                }
+            // Security config: presence alone is the forgery. The section is
+            // the only delivery channel, so the child must not inherit ANY
+            // of these — a value that happens to match our own config is
+            // still an inherited config channel we cannot vouch for.
+            "fs_sandbox_guard"
+            | "fs_sandbox_allow_rwx"
+            | "fs_sandbox_disable_hooks"
+            | "fs_sandbox_pipe"
+            | "fs_sandbox_dll"
+            | "fs_sandbox_cwd"
+            | "fs_sandbox_root" => {
+                return Some(format!(
+                    "{} must not be inherited: security config is delivered only through the trusted session section",
+                    name.to_ascii_uppercase()
+                ));
             }
             "fs_sandbox_no_track" => {
                 if !trusted.no_track {
                     return Some(format!(
                         "FS_SANDBOX_NO_TRACK forged: child would inherit {value:?}, trusted off"
-                    ));
-                }
-            }
-            "fs_sandbox_disable_hooks" => {
-                if !disable_categories_equal(value, &trusted.disabled) {
-                    return Some(format!(
-                        "FS_SANDBOX_DISABLE_HOOKS forged: child would inherit {value:?}, trusted {:?}",
-                        trusted.disabled
                     ));
                 }
             }
@@ -228,26 +232,9 @@ pub(super) fn guard_env_mismatch(observed: &[(String, String)], trusted: &GuardE
     None
 }
 
-/// Set-equality of comma-separated hook categories, case-insensitive and
-/// whitespace-tolerant — mirrors exactly how the snapshot is parsed at
-/// install time, so an equivalent re-spelling of the trusted list passes.
-fn disable_categories_equal(observed: &str, trusted: &str) -> bool {
-    fn parse(raw: &str) -> Vec<String> {
-        let mut cats: Vec<String> = raw
-            .split(',')
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-        cats.sort();
-        cats.dedup();
-        cats
-    }
-    parse(observed) == parse(trusted)
-}
-
 /// Full spawn-time gate: walk the environment the child would inherit and
-/// compare its guard variables against our trusted snapshot. `Some(reason)`
-/// = deny the spawn BEFORE the child exists.
+/// deny the spawn BEFORE the child exists if it carries a guard-relevant
+/// variable (see [`guard_env_mismatch`] for the per-variable contract).
 ///
 /// The snapshot is captured in install_hooks before any hook is enabled, so
 /// it is always present by the time this hook can run; without it (unit-test
@@ -330,9 +317,15 @@ unsafe fn read_guard_env_entries(
         let name = String::from_utf16_lossy(&entry[..eq]).to_ascii_lowercase();
         if matches!(
             name.as_str(),
+            // Security config — denied on presence alone (S02).
             "fs_sandbox_guard"
                 | "fs_sandbox_allow_rwx"
                 | "fs_sandbox_disable_hooks"
+                | "fs_sandbox_pipe"
+                | "fs_sandbox_dll"
+                | "fs_sandbox_cwd"
+                | "fs_sandbox_root"
+                // Compare-to-snapshot inputs.
                 | "fs_sandbox_no_track"
                 | "fs_sandbox_section"
         ) {
@@ -341,6 +334,44 @@ unsafe fn read_guard_env_entries(
         }
     }
     Some(Ok(entries))
+}
+
+/// Bound per-read chunk for remote image scans: it bounds MEMORY, not
+/// coverage — every byte of the requested range is read and decoded exactly
+/// once (plus the 15-byte instruction overlap below), regardless of section
+/// size. S06 gap 4 (XA review 2026-09-20): replaces the silent
+/// `min(64 MiB)` truncation whose tail of a large section went unscanned.
+/// Residual: a hostile image with an enormous claimed section size can cost
+/// scan TIME (the read fails closed at the first unmapped page), never
+/// unbounded scan memory.
+const REMOTE_SCAN_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Longest possible x86-64 instruction — chunk overlap so an instruction
+/// straddling a chunk boundary is still decoded by the earlier pass
+/// (same discipline as the memory guard's chunked region scan).
+const REMOTE_SCAN_CHUNK_OVERLAP: usize = 15;
+
+/// Read+decode `[base, base + size)` out of the child image in bounded
+/// chunks. Any read failure propagates — fail closed: the child must not
+/// run over an image we could not fully check.
+fn scan_remote_region(
+    proc: HANDLE,
+    base: usize,
+    size: usize,
+) -> Result<Vec<policy::scan::SyscallHit>, String> {
+    let mut hits = Vec::new();
+    let mut off = 0usize;
+    while off < size {
+        let n = (size - off).min(REMOTE_SCAN_CHUNK_BYTES);
+        let ext = (n + REMOTE_SCAN_CHUNK_OVERLAP).min(size - off);
+        let mut buf = vec![0u8; ext];
+        read_remote_bytes(proc, base + off, &mut buf)?;
+        for h in policy::scan::find_direct_syscalls_multi_entry(&buf, (base + off) as u64) {
+            hits.push(policy::scan::SyscallHit { offset: off + h.offset, kind: h.kind });
+        }
+        off += n;
+    }
+    Ok(hits)
 }
 
 /// Scan the PE image mapped in `proc` for direct `syscall`/`sysenter`/`int 2eh`
@@ -410,31 +441,33 @@ pub(super) fn scan_image_for_direct_syscalls(proc: HANDLE) -> Result<(), String>
     // DOS + NT headers + section table fit in the first page.
     let mut pe_headers = [0u8; 4096];
     read_remote_bytes(proc, image_base, &mut pe_headers)?;
-    let text = policy::scan::pe_text_section(&pe_headers)
-        .ok_or_else(|| "no .text section in child image".to_string())?;
-
-    let scan_size = (text.virtual_size as usize).min(64 * 1024 * 1024);
-    if scan_size == 0 {
-        return Ok(());
+    // S06 gap 3 (XA review 2026-09-20): scan EVERY executable section, not
+    // just ".text" — a child image can carry additional
+    // IMAGE_SCN_MEM_EXECUTE sections.
+    let exec_sections = policy::scan::pe_executable_sections(&pe_headers);
+    if exec_sections.is_empty() {
+        return Err("no executable section in child image".to_string());
     }
-    let text_addr = image_base + text.virtual_address as usize;
-    let mut text_bytes = vec![0u8; scan_size];
-    read_remote_bytes(proc, text_addr, &mut text_bytes)?;
 
-    let hits = policy::scan::find_direct_syscalls(&text_bytes, text_addr as u64);
-    if hits.is_empty() {
-        return Ok(());
+    for section in &exec_sections {
+        let sec_base = image_base + section.virtual_address as usize;
+        let hits = scan_remote_region(proc, sec_base, section.virtual_size as usize)?;
+        if hits.is_empty() {
+            continue;
+        }
+        let summary: Vec<String> = hits
+            .iter()
+            .take(5)
+            .map(|h| format!("{} @ +0x{:x}", h.kind, h.offset))
+            .collect();
+        return Err(format!(
+            "{} direct syscall instruction(s) in child executable section at RVA 0x{:x} ({}, …)",
+            hits.len(),
+            section.virtual_address,
+            summary.join(", ")
+        ));
     }
-    let summary: Vec<String> = hits
-        .iter()
-        .take(5)
-        .map(|h| format!("{} @ +0x{:x}", h.kind, h.offset))
-        .collect();
-    Err(format!(
-        "{} direct syscall instruction(s) in child .text ({}, …)",
-        hits.len(),
-        summary.join(", ")
-    ))
+    Ok(())
 }
 
 /// ReadProcessMemory with a full-length check (short reads are an error).
@@ -604,7 +637,7 @@ pub(super) unsafe extern "system" fn hook_nt_create_user_process(
     // this every process below the root keeps the SysWhispers/Hell's Gate
     // bypass open. Fail closed on BOTH detection and scan failure — terminate,
     // exactly like the launcher's pre_launch_scan refusal path.
-    if child_scan_enabled(GUARD_ENV.get().map(|g| g.guard.as_str())) {
+    if child_scan_enabled(crate::trusted_boot::trusted_guard()) {
         if let Err(reason) = scan_image_for_direct_syscalls(proc_h) {
             ipc_log(
                 ipc::LogLevel::Error,
@@ -634,33 +667,84 @@ pub(super) unsafe extern "system" fn hook_nt_create_user_process(
         // hold (M2: source-capture makes the PID-reuse defense always engage).
         // SAFETY: proc_h is the valid process handle returned by NtCreateUserProcess.
         let create_time = unsafe { crate::process_tracker::create_time_from_handle(proc_h) };
-        crate::process_tracker::mark_spawned(child_pid, parent_pid, child_exe.clone(), create_time);
+        // FS_SANDBOX_NO_TRACK moved here from process_tracker::mark_spawned
+        // (review XA 2026-09-20, S02): the tracker must not consult the
+        // guest-forgeable environment; the install-time snapshot decides.
+        if !GUARD_ENV.get().map(|s| s.no_track).unwrap_or(false) {
+            crate::process_tracker::mark_spawned(child_pid, parent_pid, child_exe.clone(), create_time);
+        }
     }
 
-    // P0-04: inject BEFORE any registration IPC. `ipc_register_child` /
-    // `ipc_spawned_child` are synchronous pipe round-trips; the child and its
-    // suspended main thread are already visible system-wide right after the
-    // syscall, and ResumeThread is not hooked, so any same-user thread could
-    // resume the child mid-registration and run it with no hooks at all.
-    // Injection is the only step that must complete before the child can
-    // safely run — keep the pre-injection window down to the APC queue alone.
+    // S02 #3 (review XA 2026-09-20): per-child bootstrap acknowledgement.
+    // APC injection success only proves LoadLibraryW was QUEUED — not that
+    // hook.dll loaded and its guard is installed in THIS child. Create a
+    // kernel Event with an unguessable per-child name here (trusted parent
+    // code, 128-bit BCryptGenRandom suffix — the launcher's root-event
+    // technique, without its predictable fallback: a guessable ack name would
+    // let a same-session process preempt-signal it and fake protection). The
+    // name rides into the child's environment through the same cross-process
+    // env-block append that carries FS_SANDBOX_SECTION (below), so nothing
+    // guest-suppliable can forge it: the spawn gate above ran on the ORIGINAL
+    // guest environment BEFORE the syscall, and this variable is appended
+    // afterwards, directly by us.
+    let mut inject_failed = false;
+    let child_ack = match crate::init_ack::create_child_init_ack(child_pid) {
+        Ok(ack) => ack,
+        Err(e) => {
+            ipc_log(
+                ipc::LogLevel::Error,
+                format!("child ack event create failed pid={child_pid}: {e}; terminating sandbox-escape candidate"),
+            );
+            // SAFETY: proc_h is the valid PROCESS handle returned moments ago
+            // by NtCreateUserProcess; TerminateProcess never blocks. Exit code 1
+            // signals "killed by sandbox" to anyone waiting on the process.
+            unsafe { winapi::um::processthreadsapi::TerminateProcess(proc_h, 1) };
+            return status;
+        }
+    };
+
+    // P0-04: inject BEFORE any blocking pipe round-trips. The child and its
+    // suspended main thread are visible system-wide right after the syscall,
+    // and ResumeThread is not hooked, so the pre-injection window must stay
+    // down to the APC queue alone; the registration calls moved BELOW the ack
+    // wait, so a child that never confirms its own protection is terminated
+    // before the launcher ever hears about it.
     //
     // If injection fails the child process ALREADY exists (suspended, no user
     // code executed yet) and would escape the sandbox once resumed. Terminate
-    // it before resume — fail closed. Registration IPC is skipped for a child
-    // we just killed: bookkeeping for a dead PID tells the launcher nothing it
-    // can act on.
-    let mut inject_failed = false;
-    if let Some(dll_path) = DLL_PATH.get() {
-        if let Err(e) = inject::inject_via_apc(
-            proc_h,
-            thr_h,
-            dll_path,
-            crate::ipc_client::session_section_name(),
-        ) {
+    // it before resume — fail closed. Registration and resume are skipped for
+    // a child we just killed: bookkeeping for a dead PID tells the launcher
+    // nothing it can act on.
+    match DLL_PATH.get() {
+        Some(dll_path) => {
+            // Env pairs delivered through the injection channel: the
+            // per-session section name (re-asserted by every spawn) plus the
+            // per-child ack event name — one remote env-block write pass.
+            let mut extra_env: Vec<(&str, &str)> = Vec::new();
+            if let Some(section) = crate::ipc_client::session_section_name() {
+                extra_env.push((inject::SECTION_ENV_VAR, section));
+            }
+            extra_env.push((crate::init_ack::CHILD_INIT_EVENT_ENV, child_ack.name()));
+            if let Err(e) = inject::inject_via_apc(proc_h, thr_h, dll_path, &extra_env) {
+                ipc_log(
+                    ipc::LogLevel::Error,
+                    format!("APC inject failed pid={child_pid}: {e}; terminating sandbox-escape candidate"),
+                );
+                // SAFETY: proc_h is the valid PROCESS handle returned moments ago
+                // by NtCreateUserProcess; TerminateProcess never blocks. Exit code 1
+                // signals "killed by sandbox" to anyone waiting on the process.
+                unsafe { winapi::um::processthreadsapi::TerminateProcess(proc_h, 1) };
+                inject_failed = true;
+            }
+        }
+        None => {
+            // Fail-closed injection (review XA 2026-09-20, S02): with no
+            // trusted DLL_PATH there is no way to protect the child — the
+            // old code silently resumed an UNHOOKED child here. Kill it
+            // exactly like an inject failure.
             ipc_log(
                 ipc::LogLevel::Error,
-                format!("APC inject failed pid={child_pid}: {e}; terminating sandbox-escape candidate"),
+                format!("no trusted DLL_PATH — cannot protect child; terminating pid={child_pid}"),
             );
             // SAFETY: proc_h is the valid PROCESS handle returned moments ago
             // by NtCreateUserProcess; TerminateProcess never blocks. Exit code 1
@@ -670,22 +754,45 @@ pub(super) unsafe extern "system" fn hook_nt_create_user_process(
         }
     }
 
-    // Launcher bookkeeping — the two blocking IPC round-trips — happens AFTER
-    // the APC is queued (P0-04: must not delay injection). Skipped for a child
-    // we just killed: bookkeeping for a dead PID tells the launcher nothing it
-    // can act on.
-    if child_pid != 0 && !inject_failed {
-        ipc_register_child(child_pid);
-        ipc_spawned_child(parent_pid, child_pid, child_exe);
-    }
-
     // Resume if the caller did not want a suspended thread — but skip if we
     // just killed the child; there is nothing to resume in a dead process and
     // ResumeThread would only return an error.
+    let mut ack_failed = false;
     if !originally_suspended && !inject_failed {
         let mut suspend_count: u32 = 0;
         // SAFETY: thr_h is a valid thread handle; NtResumeThread is always present.
         ntapi::ntpsapi::NtResumeThread(thr_h, &mut suspend_count);
+
+        // S02 #3: bounded wait for THIS child's own "guard installed" signal.
+        // The queued APC fires before the child's entry point once the initial
+        // thread runs, so a healthy child acks within milliseconds; the 5s
+        // budget mirrors the launcher's root handshake. A guest-requested
+        // CREATE_SUSPENDED child is NOT resumed here (its main thread stays
+        // suspended, so it cannot act unprotected): its ack fires from its own
+        // install_hooks whenever the guest resumes it, before any child user
+        // code runs — no wait, no timeout, nothing to fail closed.
+        if !child_ack.wait_for_ack(crate::init_ack::CHILD_INIT_ACK_TIMEOUT_MS) {
+            ipc_log(
+                ipc::LogLevel::Error,
+                format!("child bootstrap ack timeout pid={child_pid} target={spawn_target}: guard never confirmed; terminating"),
+            );
+            // SAFETY: proc_h is the valid PROCESS handle returned moments ago
+            // by NtCreateUserProcess; TerminateProcess never blocks. Exit code 1
+            // signals "killed by sandbox" to anyone waiting on the process.
+            unsafe { winapi::um::processthreadsapi::TerminateProcess(proc_h, 1) };
+            ack_failed = true;
+        }
+    }
+
+    // Launcher bookkeeping — the two blocking IPC round-trips — runs LAST,
+    // strictly after injection (P0-04) and after the ack wait: a child that
+    // failed to bootstrap was already terminated, and a dead/never-running
+    // child must not be registered — bookkeeping for it tells the launcher
+    // nothing it can act on. The pipe server tolerates a child hello arriving
+    // before these records (kernel-vouched parent walk, pipe_server/ownership.rs).
+    if child_pid != 0 && !inject_failed && !ack_failed {
+        ipc_register_child(child_pid);
+        ipc_spawned_child(parent_pid, child_pid, child_exe);
     }
 
     status

@@ -15,7 +15,7 @@ use winrsbox::cli;
 use winrsbox::observe::hot_stats::{HotStats, ThrottledFlusher};
 use winrsbox::observe::jsonl_log;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
@@ -28,6 +28,20 @@ use windows::{
     },
 };
 use sandbox::launch_prep::{build_delegation_command, is_nested_invocation};
+
+/// S11 — the one fold applied to every path this launcher publishes for
+/// identity decisions: `SessionConfig.cwd` / `sandbox_root` / `overlay_roots`
+/// and the root target's `ProcInfo.exe_lower`. Canonical NTFS-identity fold
+/// (kernel upcase/downcase tables via ntdll, `policy::path::nt_case_fold`):
+/// ASCII input stays byte-identical to the historic `to_ascii_lowercase`, so
+/// consumers see no change for ASCII paths, while non-ASCII paths now fold to
+/// the same form the policy db and the hook compute (previously published
+/// unfolded, they only matched after the hook's local re-fold). The hook
+/// re-folds what it reads and fold∘fold is the identity, so publishing the
+/// canonical form is a pure tightening.
+pub(crate) fn fold_published(s: &str) -> String {
+    policy::path::nt_case_fold(s).into_owned()
+}
 
 /// winrsbox — runs a target process inside a CoW filesystem sandbox.
 ///
@@ -143,6 +157,19 @@ struct Cli {
     #[arg(long = "strict-clipboard")]
     strict_clipboard: bool,
 
+    /// Apply ALL 8 Job Object UI restriction flags (default: only the ones
+    /// enabled by other flags, if any). This is a broader, explicit
+    /// hardening profile than `--strict-clipboard` (which sets only
+    /// READCLIPBOARD | WRITECLIPBOARD, 0x06) — `--strict-ui` also blocks
+    /// foreign window handles, global atoms, desktop switching, system
+    /// params/display settings, and ExitWindowsEx (0xFF total). WARNING:
+    /// this is an unmeasured, opt-in hardening profile — it MAY break
+    /// clipboard, browser OAuth login, and Git Credential Manager
+    /// workflows inside the sandbox. Compatibility across those workflows
+    /// has not been verified; use only if you accept that risk.
+    #[arg(long = "strict-ui")]
+    strict_ui: bool,
+
     /// Per-process memory limit in gigabytes (applied via Job Object).
     #[arg(long = "memory-limit", value_name = "GB")]
     memory_limit: Option<u64>,
@@ -230,12 +257,13 @@ async fn run() -> Result<()> {
     }
 
     // ── Nested-sandbox guard (issue C, #63) ─────────────────────────────────
-    // The outer (first) launcher exports FS_SANDBOX_PIPE into the environment
-    // of every descendant process. If WE see it, we are already inside a
-    // sandbox: spawning a second pipe + overlay here would duplicate the
-    // containment and waste resources. Instead, transparently delegate the
-    // target to the outer sandbox by launching it directly (no mitigations,
-    // no pipe, no overlay, no hook injection) and propagating its exit code.
+    // The outer (first) launcher exports FS_SANDBOX_SECTION into the
+    // environment of every descendant process. If WE see it, we are already
+    // inside a sandbox: spawning a second pipe + overlay here would duplicate
+    // the containment and waste resources. Instead, transparently delegate
+    // the target to the outer sandbox by launching it directly (no
+    // mitigations, no pipe, no overlay, no hook injection) and propagating
+    // its exit code.
     // The outer sandbox's NtCreateUserProcess hook in our parent process
     // captures this target exactly like any other child, so isolation is
     // preserved without a nested layer.
@@ -306,29 +334,22 @@ async fn run() -> Result<()> {
     // (taken from the handle's physical volume). Primary root = sandbox_root
     // (project drive). Add an explicit C: root at %LOCALAPPDATA%\.winrsbox so
     // installers writing to C:\Users\…\AppData land on C:, not the project
-    // drive. The session sub-dir matches the project's .winrsbox layout.
+    // drive. The root is keyed by the FULL project path (same identity as the
+    // per-project state dir / policy DB) — never by the basename alone
+    // (review S07: same-basename projects must not share a C: overlay).
     let mut overlay_layout = policy::path::OverlayLayout::single(sandbox_root.clone());
     {
-        let session_name = project_root
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "session".to_string());
-        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
-            let c_root = PathBuf::from(local_appdata)
-                .join(".winrsbox")
-                .join(&session_name)
-                .join("workdir");
-            // Only register a C: root if C: is NOT already the project drive
-            // (avoids a redundant/duplicate root).
-            let project_drive = project_root
-                .to_string_lossy()
-                .chars()
-                .next()
-                .map(|c| c.to_ascii_lowercase());
-            if project_drive != Some('c') {
-                std::fs::create_dir_all(&c_root).with_context(|| {
-                    format!("create C: overlay root {}", c_root.display())
-                })?;
+        // Only register a C: root if C: is NOT already the project drive
+        // (avoids a redundant/duplicate root).
+        let project_drive = project_root
+            .to_string_lossy()
+            .chars()
+            .next()
+            .map(|c| c.to_ascii_lowercase());
+        if project_drive != Some('c') {
+            if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+                let c_root =
+                    sandbox::ensure_c_overlay_root(Path::new(&local_appdata), &project_root)?;
                 overlay_layout.set_drive_root('c', c_root);
             }
         }
@@ -391,10 +412,10 @@ async fn run() -> Result<()> {
         // rules in `netrule list` and reasonably believes they are enforced.
         || policy::db::net_rule_list(&policy.db()).map(|r| !r.is_empty()).unwrap_or(false);
     // `--trace` is a blanket "show me everything" switch: it also raises the
-    // JSONL/console verbosity to trace, on top of the FS_SANDBOX_TRACE gate
-    // it sets for hook.dll below. Without this, `--trace` would enable
-    // hook-side trace events while the console (gated on jsonl_log's level)
-    // stayed silent for them.
+    // JSONL/console verbosity to trace, on top of the hook-side trace gate it
+    // publishes in the session section below. Without this, `--trace` would
+    // enable hook-side trace events while the console (gated on jsonl_log's
+    // level) stayed silent for them.
     let effective_log_level = if cli.trace {
         "trace".to_string()
     } else {
@@ -472,7 +493,7 @@ async fn run() -> Result<()> {
 
     // Sanitize sensitive env vars BEFORE child inherits them.
     // Removes API keys, tokens, secrets, credentials from the environment.
-    let removed = winrsbox::contain::env_guard::sanitize();
+    let removed = winrsbox::contain::guest::env_guard::sanitize();
     if removed > 0 && winrsbox::observe::jsonl_log::console_verbose() {
         println!("[sandbox] env: sanitized {removed} sensitive variables");
     }
@@ -480,8 +501,9 @@ async fn run() -> Result<()> {
     // Help GUI terminal emulators (WezTerm, Windows Terminal) that ignore the inherited
     // CWD and fall back to the home directory when spawning their shell.
     let cwd_str = project_root.to_string_lossy().into_owned();
-    // Hook-side trace gate value — shared by the FS_SANDBOX_TRACE env var set
-    // in set_sandbox_environment and the published session config below.
+    // Hook-side trace gate value — published ONLY in the session config
+    // below (chunk 3, review XA 2026-09-20 S02: the FS_SANDBOX_TRACE env
+    // export is retired; the trusted section is the hook's single source).
     let hook_trace = cli.trace || effective_log_level.eq_ignore_ascii_case("trace");
     let disable_hooks_effective = sandbox::launch_prep::set_sandbox_environment(
         &cli,
@@ -507,23 +529,39 @@ async fn run() -> Result<()> {
     let session_cfg = ipc::SessionConfig {
         pipe_name: pipe_name.clone(),
         dll_path: dll_path.clone(),
-        cwd: cwd_str.clone(),
-        sandbox_root: sandbox_root.to_string_lossy().into_owned(),
+        // S11: published PRE-FOLDED to the canonical NTFS-identity form (see
+        // `fold_published`). `cwd_str` itself stays raw — it also feeds the
+        // WEZTERM_EXECUTABLE_ARGS_CWD ergonomics env var above, which must
+        // preserve the operator's spelling.
+        cwd: fold_published(&cwd_str),
+        sandbox_root: fold_published(&sandbox_root.to_string_lossy()),
         // Publish ALL overlay roots (per-drive same-volume layout) so the hook
         // can mask paths against every root and derive the drive letter from
         // the matched one. Empty = single-root legacy fallback in the hook.
         overlay_roots: policy
             .overlay_layout()
             .all_roots()
-            .map(|(_drive, root)| root.to_string_lossy().into_owned())
+            .map(|(_drive, root)| fold_published(&root.to_string_lossy()))
             .collect(),
         trace: hook_trace,
         guard: match cli.guard {
-            GuardLevel::None => "none".into(),
-            GuardLevel::Scan => "scan".into(),
-            GuardLevel::Full => "full".into(),
-            GuardLevel::Static => "static".into(),
+            GuardLevel::None => ipc::GuardLevel::None,
+            GuardLevel::Scan => ipc::GuardLevel::Scan,
+            GuardLevel::Full => ipc::GuardLevel::Full,
+            GuardLevel::Static => ipc::GuardLevel::Static,
         },
+        // Launcher identity for the hook's pipe-server verification (S02):
+        // the hook compares the pipe server's PID and its kernel creation
+        // time (PID-reuse defence) against these before trusting any
+        // response. The creation time goes through
+        // query_process_create_time(self-pid) rather than
+        // process_create_time_from_handle(GetCurrentProcess()): the helper's
+        // is_invalid() check rejects the (HANDLE)-1 current-process
+        // pseudo-handle (same bit pattern as INVALID_HANDLE_VALUE) and would
+        // return 0, so open a real self-handle via the existing query.
+        launcher_pid: std::process::id(),
+        launcher_create_time: pipe_server::query_process_create_time(std::process::id())
+            .unwrap_or(0),
         allow_rwx: cli.allow_rwx,
         disable_hooks: disable_hooks_effective.clone(),
     };
@@ -533,12 +571,15 @@ async fn run() -> Result<()> {
     // name only, so every process that must read the config has to be told
     // the name through the injection channel. The root target receives it
     // here, via the inherited environment (authored before any guest code
-    // runs, hence unforgeable at root start — same trust argument as
-    // FS_SANDBOX_PIPE).
+    // runs, hence unforgeable at root start — and every hooked descendant
+    // has the same name patched in by the spawn hook).
     std::env::set_var("FS_SANDBOX_SECTION", &section_name);
 
     // Create kernel Event for hook.dll init signaling (H1 fix, random name).
     let init_event = sandbox::launch_prep::create_init_event(std::process::id())?;
+    // S10: second event for the degraded-init acknowledgment (optional
+    // component install failures buffered inside hook.dll).
+    let init_degraded_event = sandbox::launch_prep::create_degraded_event(std::process::id())?;
 
     // Guard level is taken verbatim — no trust-based downgrade. Full mode is
     // now JIT-safe (no ProhibitDynamicCode / signed-only), so unsigned dev
@@ -641,15 +682,34 @@ async fn run() -> Result<()> {
         proc_info.hProcess,
         cli.memory_limit,
         cli.strict_clipboard,
+        cli.strict_ui,
     )?;
 
-    // WFP kernel-level network filtering (best-effort — needs fwpuclnt.dll).
-    let _wfp = winrsbox::contain::wfp::install_outbound_filters(
+    // WFP kernel-level network filtering. Under `network: guarded` this is a
+    // hard requirement, not best-effort: if the kernel layer cannot be fully
+    // installed the launch is refused (fail-closed), mirroring the
+    // inject_dll refusal above — a guarded run never starts without the
+    // kernel enforcement SECURITY.md promises.
+    let _wfp = match winrsbox::contain::wfp::install_outbound_filters(
         net_guarded,
         cli.guard != GuardLevel::None,
         cli.block_localhost,
         std::path::Path::new(&target_args[0]),
-    );
+    ) {
+        winrsbox::contain::wfp::WfpInstall::Installed(engine) => Some(engine),
+        winrsbox::contain::wfp::WfpInstall::NotRequested => None,
+        winrsbox::contain::wfp::WfpInstall::Refused(reason) => {
+            // SAFETY: proc_info handles are valid PROCESS/THREAD handles from CreateProcessW.
+            unsafe {
+                windows::Win32::System::Threading::TerminateProcess(proc_info.hProcess, 0xC000_0005).ok();
+                CloseHandle(proc_info.hThread).ok();
+                CloseHandle(proc_info.hProcess).ok();
+            }
+            eprintln!("guarded network requested but kernel network enforcement could not be installed — refusing launch: {reason}");
+            // Exit immediately — don't wait for tokio runtime drop (pipe accept loop blocks).
+            std::process::exit(0xC000_0005u32 as i32);
+        }
+    };
 
     // ETW Kernel-Process listener — monitoring layer (logs events, no enforcement).
     let _etw = if cli.guard != GuardLevel::None {
@@ -681,7 +741,7 @@ async fn run() -> Result<()> {
     // Insert root target into PROC_INFO BEFORE resume — ensures ETW listener
     // sees this PID when kernel fires ImageLoad/ThreadStart during process startup.
     let arg0_lower = target_args.first()
-        .map(|s| s.to_ascii_lowercase())
+        .map(|s| fold_published(s))
         .unwrap_or_default();
     sandbox::proc_table::global_proc_info().pin().insert(
         proc_info.dwProcessId,
@@ -716,6 +776,7 @@ async fn run() -> Result<()> {
                 windows::Win32::System::Threading::TerminateProcess(proc_info.hProcess, 0xC000_0005).ok();
                 CloseHandle(proc_info.hProcess).ok();
                 CloseHandle(init_event).ok();
+                CloseHandle(init_degraded_event).ok();
             }
             anyhow::bail!("init-event wait task failed: {e}");
         }
@@ -724,6 +785,20 @@ async fn run() -> Result<()> {
     if wait_result.0 == 0 { // WAIT_OBJECT_0
         if winrsbox::observe::jsonl_log::console_verbose() {
             println!("[sandbox] hook.dll init confirmed (pid {})", proc_info.dwProcessId);
+        }
+        // S10 degraded-init probe: zero-timeout poll of the second event,
+        // signaled when hook.dll initialized DEGRADED (optional component
+        // install failures). Unconditional stderr warning — security-relevant,
+        // like the CRITICAL timeout path below, so NOT gated on verbose.
+        // SAFETY: init_degraded_event is valid and not yet closed.
+        let degraded = unsafe {
+            WaitForSingleObject(HANDLE(init_degraded_event.0 as *mut _), 0)
+        };
+        if degraded.0 == 0 { // WAIT_OBJECT_0
+            eprintln!(
+                "[sandbox] WARNING: hook.dll initialized DEGRADED (optional component install failures) — details in the sandbox log after the first hooked operation (pid {})",
+                proc_info.dwProcessId
+            );
         }
     } else {
         eprintln!(
@@ -735,9 +810,11 @@ async fn run() -> Result<()> {
             CloseHandle(proc_info.hProcess).ok();
         }
         unsafe { CloseHandle(init_event).ok() };
+        unsafe { CloseHandle(init_degraded_event).ok() };
         anyhow::bail!("hook.dll injection failed — child terminated (pid={})", proc_info.dwProcessId);
     }
     unsafe { CloseHandle(init_event).ok() };
+    unsafe { CloseHandle(init_degraded_event).ok() };
 
     if winrsbox::observe::jsonl_log::console_verbose() {
         println!("[sandbox] target started (pid {})", proc_info.dwProcessId);

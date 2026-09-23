@@ -139,7 +139,9 @@ impl HookedAttrs {
     /// double-fetch gap on `UNICODE_STRING.Buffer` AND the handle race on
     /// `OBJECT_ATTRIBUTES.RootDirectory`.
     ///
-    /// Two distinct cases:
+    /// Two distinct cases (standalone/no-pre-resolution form — in production
+    /// the hooks hand `copy_passthrough_inner` the S04 pre-resolved
+    /// snapshot, which the kernel opens for relative AND absolute opens):
     ///
     /// 1. `orig.RootDirectory.is_null()` (the common case — absolute
     ///    paths): copy `orig.ObjectName.Buffer` verbatim into hook-owned
@@ -173,6 +175,14 @@ impl HookedAttrs {
     ///     safely defuse the handle race. Fail closed.
     ///   - the joined absolute path exceeds the `UNICODE_STRING.Length` u16
     ///     ceiling (`MAX_PASSTHROUGH_LEN_BYTES`).
+    ///   - C03 carve-out: this list applies to `copy_passthrough` (no
+    ///     pre-resolution). `copy_passthrough_inner` with `pre_resolved_abs`
+    ///     = Some AND a non-null `RootDirectory` does NOT refuse on the
+    ///     three original-name conditions above — the kernel opens the
+    ///     pre-resolved path and never reads the original name. Review S04:
+    ///     with a pre-resolution the ABSOLUTE case is snapshot-only for the
+    ///     kernel too; its original name is still validated (the refusals
+    ///     fire fail-closed) but never reaches the open.
     ///
     /// SAFETY: `orig` must be a valid OBJECT_ATTRIBUTES with a readable
     /// (possibly null) ObjectName for the duration of this call. When
@@ -190,32 +200,117 @@ impl HookedAttrs {
     }
 
     /// As [`copy_passthrough`], but accepts the hook's already-resolved
-    /// absolute NT path for the RootDirectory-relative case. When
-    /// `pre_resolved_abs` is `Some`, the directory handle is NOT resolved here
-    /// — the path is taken verbatim from the single resolution the hook made
-    /// (see `hooks::resolve_for_hook`), closing the H5 double-resolve window.
-    /// When `None`, behaves exactly as the standalone `copy_passthrough`
-    /// (resolves the handle internally) — used by tests and any caller without
-    /// a pre-resolution.
+    /// absolute NT path. When `pre_resolved_abs` is `Some`, the kernel opens
+    /// THAT single resolution (see `hooks::resolve_for_hook`) and nothing
+    /// else: for a non-null `RootDirectory` the handle is not re-resolved
+    /// (closing the H5 double-resolve window) and the original ObjectName is
+    /// never read (Review C03) — a NULL or empty original name is then
+    /// LEGITIMATE (the `remove_dir_all` shape e491803's resolver emits).
+    /// Review S04: this now covers ABSOLUTE opens too (production hooks
+    /// pre-resolve them) — the kernel consumes only the snapshot, never a
+    /// re-read of the guest name buffer; the original name is still
+    /// validated and a NULL/empty/oversized one fails closed. When `None`,
+    /// behaves exactly as the standalone `copy_passthrough` (resolves the
+    /// handle internally) — used by tests and any caller without a
+    /// pre-resolution. The name refusals below apply whenever the original
+    /// name is consumed: the two `pre_resolved_abs`-absent branches
+    /// (verbatim copy, standalone handle re-resolve) plus that
+    /// pre-resolved-absolute validation gate.
     pub(crate) unsafe fn copy_passthrough_inner(
         orig: &OBJECT_ATTRIBUTES,
         pre_resolved_abs: Option<&[u16]>,
     ) -> Option<Self> {
-        if orig.ObjectName.is_null() {
-            return None;
+        // Review C03 (docs/review-xa-2026-09-20): e491803 made
+        // `resolve_for_hook` resolve an EMPTY ObjectName to the
+        // RootDirectory's own path — the shape Rust's `remove_dir_all`
+        // opens with (empty name + RootDirectory naming the directory
+        // itself). The hook hands that single resolution in here as
+        // `pre_resolved_abs`; the kernel then opens the resolved path and
+        // never reads the original ObjectName. Demanding a non-empty
+        // original name BEFORE looking at `pre_resolved_abs` re-turned
+        // every such open of a passthrough directory into
+        // STATUS_ACCESS_DENIED (the CoW-redirect branch was fixed by
+        // e491803; this consumer was not).
+        // Review S04 (docs/review-xa-2026-09-20): production hooks now
+        // pre-resolve ABSOLUTE opens too, and for EVERY pre-resolved open
+        // the kernel consumes only the snapshot (branch below) — a
+        // concurrent swap of the guest name bytes/pointer or of the
+        // caller's RootDirectory field cannot retarget the open. The
+        // original-name refusals stay gated on the name being consumed:
+        // they apply to the two `pre_resolved_abs`-absent branches
+        // (verbatim copy, standalone handle re-resolve) and to the
+        // fail-closed validation gate a pre-resolved ABSOLUTE open keeps
+        // on its (possibly swapped) original name — NULL/empty/oversized
+        // fails closed; a well-formed name is discarded in favour of the
+        // snapshot.
+        let name_needed = orig.RootDirectory.is_null() || pre_resolved_abs.is_none();
+        // SAFETY: ObjectName, when non-null, is readable for the duration
+        // of the call per this fn's SAFETY contract (NT hook parameter).
+        let src: Option<&UNICODE_STRING> = if orig.ObjectName.is_null() {
+            None
+        } else {
+            Some(&*orig.ObjectName)
+        };
+        let name_slice: &[u16] = match (src, name_needed) {
+            // Pre-resolved RELATIVE open (C03): the original name is never
+            // read — `abs` below is the entire kernel-open path. An empty
+            // or NULL original name is legitimate here. (A pre-resolved
+            // ABSOLUTE open (S04) keeps its fail-closed name validation in
+            // the arm below, but the snapshot branch still discards those
+            // bytes: the kernel sees only the snapshot.)
+            (_, false) => &[],
+            (Some(s), true) => {
+                if s.Buffer.is_null() || s.Length == 0 || s.Length > MAX_PASSTHROUGH_LEN_BYTES {
+                    return None;
+                }
+                // Length is in bytes, but Buffer is u16; char count = Length/2.
+                // SAFETY: Buffer is non-null (checked above) and points to at
+                // least Length bytes per the NT UNICODE_STRING contract.
+                std::slice::from_raw_parts(s.Buffer, (s.Length / 2) as usize)
+            }
+            // The original name is consumed but there is none: fail closed.
+            (None, true) => return None,
+        };
+
+        // Review S04 (docs/review-xa-2026-09-20): the hook resolved the
+        // absolute path ONCE (resolve_for_hook) and the policy decision was
+        // made on those bytes. Build the kernel OBJECT_ATTRIBUTES from that
+        // same owned snapshot — never from a re-read of the guest buffer.
+        // This is the same construction the relative (H5) branch already
+        // used; the absolute case now consumes it too. It must run BEFORE
+        // the RootDirectory check so a concurrent swap of the caller's
+        // RootDirectory field cannot divert a pre-resolved absolute open
+        // into the handle-join path.
+        if let Some(abs) = pre_resolved_abs {
+            let nt_buf: Vec<u16> = abs.to_vec();
+            // The joined/pre-resolved absolute path must still fit
+            // UNICODE_STRING.Length (a u16, max MAX_PASSTHROUGH_LEN_BYTES).
+            // If not, fail closed.
+            let joined_bytes = nt_buf.len().checked_mul(2)?;
+            if joined_bytes > MAX_PASSTHROUGH_LEN_BYTES as usize {
+                return None;
+            }
+            let len_bytes = joined_bytes as u16;
+            let ustr = UNICODE_STRING {
+                Length: len_bytes,
+                // Our own synthesized absolute path: a tight-but-valid
+                // MaximumLength == Length (same reasoning as the old
+                // relative branch: not a caller-supplied spare-capacity
+                // buffer).
+                MaximumLength: len_bytes,
+                Buffer: nt_buf.as_ptr() as *mut u16,
+            };
+            let attrs = OBJECT_ATTRIBUTES {
+                Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+                // The path is absolute: no handle anchor to race.
+                RootDirectory: std::ptr::null_mut(),
+                ObjectName: std::ptr::null_mut(),
+                Attributes: orig.Attributes,
+                SecurityDescriptor: orig.SecurityDescriptor,
+                SecurityQualityOfService: orig.SecurityQualityOfService,
+            };
+            return Some(HookedAttrs { nt_buf, ustr, attrs });
         }
-        let src = &*orig.ObjectName;
-        if src.Buffer.is_null() || src.Length == 0 {
-            return None;
-        }
-        if src.Length > MAX_PASSTHROUGH_LEN_BYTES {
-            return None;
-        }
-        // Length is in bytes, but Buffer is u16; char count = Length/2.
-        let char_count = (src.Length / 2) as usize;
-        // SAFETY: src.Buffer is non-null and points to at least src.Length
-        // bytes per the NT UNICODE_STRING contract (checked above).
-        let name_slice = std::slice::from_raw_parts(src.Buffer, char_count);
 
         if !orig.RootDirectory.is_null() {
             // --- H5: defuse the RootDirectory handle race -------------------
@@ -233,20 +328,14 @@ impl HookedAttrs {
             // SAFETY: orig.RootDirectory is non-null and, per the NT calling
             // convention for our hook parameter, a valid open directory
             // handle for the duration of this call.
-            // Prefer the hook's single pre-resolved absolute path (H5: avoids a
-            // SECOND resolve_handle_path here that could race the decision's
-            // resolution). Fall back to resolving once when not provided
-            // (standalone/test callers). Both produce base + '\' + name.
-            let nt_buf: Vec<u16> = match pre_resolved_abs {
-                Some(abs) => abs.to_vec(),
-                None => {
-                    let base = crate::inject::resolve_handle_path(orig.RootDirectory)?;
-                    let mut full: Vec<u16> = base;
-                    full.push(b'\\' as u16);
-                    full.extend_from_slice(name_slice);
-                    full
-                }
-            };
+            // Standalone/test form: production hooks always pre-resolve, and
+            // the snapshot branch above already consumed any
+            // `pre_resolved_abs` — so this only runs without one, resolving
+            // the handle once and joining base + '\' + name.
+            let base = crate::inject::resolve_handle_path(orig.RootDirectory)?;
+            let mut nt_buf: Vec<u16> = base;
+            nt_buf.push(b'\\' as u16);
+            nt_buf.extend_from_slice(name_slice);
 
             // The joined absolute path must still fit UNICODE_STRING.Length
             // (a u16, max MAX_PASSTHROUGH_LEN_BYTES). If not, fail closed.
@@ -280,8 +369,11 @@ impl HookedAttrs {
             return Some(HookedAttrs { nt_buf, ustr, attrs });
         }
 
-        // --- Common case: absolute path, null RootDirectory ----------------
-        // Copy the caller's buffer into hook-owned heap memory (M-S2 TOCTOU
+        // --- No pre-resolution: absolute path, null RootDirectory ----------
+        // Only reachable WITHOUT a pre-resolved snapshot (standalone
+        // `copy_passthrough` tests and any caller without one; production
+        // passthrough always carries the snapshot, consumed above). Copy the
+        // caller's buffer into hook-owned heap memory (M-S2 TOCTOU
         // defense on Buffer). Preserve MaximumLength headroom: the kernel may
         // write back into the buffer on some NtCreateFile reparse paths and
         // expects MaximumLength bytes of capacity. Allocate MaximumLength/2
@@ -291,6 +383,13 @@ impl HookedAttrs {
         // buggy caller), clamp MaximumLength up to Length so the allocation
         // always covers the copied chars and the kernel never sees
         // MaximumLength < Length.
+        let Some(src) = src else {
+            // Unreachable: RootDirectory is null on this branch, so
+            // name_needed held above and a NULL ObjectName was already
+            // refused. Fail closed rather than panic regardless.
+            return None;
+        };
+        let char_count = (src.Length / 2) as usize;
         let max_bytes = src.MaximumLength.max(src.Length);
         let cap_chars = (max_bytes / 2) as usize;
         // cap_chars >= char_count because max_bytes >= src.Length = char_count*2.
@@ -846,3 +945,9 @@ mod tests {
         assert_eq!(ustr.MaximumLength, ustr.Length);
     }
 }
+
+// C03 consumer tests live in a sibling file: this file is near the
+// workspace's 1000-line file budget.
+#[cfg(test)]
+#[path = "hooked_attrs_tests.rs"]
+mod hooked_attrs_tests;

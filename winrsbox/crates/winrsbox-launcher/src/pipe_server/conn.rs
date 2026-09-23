@@ -1,7 +1,12 @@
-use super::security::PipeSecurity;
+use super::{security::PipeSecurity, Stats};
+use ipc::Resp;
+use policy::Policy;
 use std::io::Read;
+use std::sync::atomic::Ordering;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
+use winrsbox::observe::hot_stats::HotStats;
+use winrsbox::observe::jsonl_log;
 use windows::{
     core::PCWSTR,
     Win32::{
@@ -146,12 +151,83 @@ impl<R: Read> Read for PrefixedReader<'_, R> {
     }
 }
 
+/// Read one request off the pipe with the in-flight byte budget applied
+/// (extracted from `handle_connection` so the pipe_server mod stays under
+/// the layout-guard line cap). Identical wire behaviour to the inline block
+/// it replaced: read the 4-byte length prefix, reserve the guest-declared
+/// body size against `byte_budget` BEFORE the body is read (a hostile
+/// declare-and-stall exhausts the budget and the connection is dropped),
+/// replay the prefix through [`PrefixedReader`] so parsing stays in the ipc
+/// crate, and decode the body into `recv_buf` — a connection-local scratch
+/// buffer whose capacity is reused across messages (`ipc::read_msg_with_buf`
+/// shrink-caps retained capacity at 256 KiB).
+///
+/// Returns `None` on prefix/body read or decode failure and on budget
+/// exhaustion; the caller drops the connection in that case. On success the
+/// budget reservation is handed back: the caller must keep it bound for the
+/// rest of its loop iteration so the reservation is released only after the
+/// message has been handled (as the old `let _budget = ...` binding did).
+pub(crate) fn read_request_with_budget<'a>(
+    file: &mut std::fs::File,
+    byte_budget: &'a ByteBudget,
+    recv_buf: &mut Vec<u8>,
+    client_pid: u32,
+) -> Option<(ipc::Req, Option<ByteReservation<'a>>)> {
+    let mut len_buf = [0u8; 4];
+    if file.read_exact(&mut len_buf).is_err() {
+        return None;
+    }
+    let declared = u32::from_le_bytes(len_buf) as usize;
+    // read_msg rejects oversized (and empty) bodies before allocating,
+    // so they never need budget.
+    let reservation = if declared > 0 && declared <= ipc::MAX_MSG_LEN {
+        match byte_budget.reserve_timeout(declared, BYTE_BUDGET_WAIT) {
+            Some(r) => Some(r),
+            None => {
+                eprintln!(
+                    "[pipe] pid={client_pid}: in-flight byte budget exhausted ({declared}B declared) - dropping connection"
+                );
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    let mut prefixed = PrefixedReader { prefix: len_buf, pos: 0, inner: file };
+    let req: ipc::Req = match ipc::read_msg_with_buf(&mut prefixed, recv_buf) {
+        Ok(r) => r,
+        Err(_) => return None,
+    };
+    Some((req, reservation))
+}
+
 /// Build one server-side instance of the launcher pipe. Pure FFI wrapper so
 /// the accept loop body stays focused on the connect/validate flow. The
 /// caller MUST pass `is_first = true` on exactly ONE call (the very first
 /// instance created for this pipe name) to claim the kernel namespace via
 /// `FILE_FLAG_FIRST_PIPE_INSTANCE`; subsequent calls MUST pass `false`
 /// (the flag is illegal once an instance already exists).
+///
+/// F6 note on the worker (`is_first = false`) arm: every non-first
+/// `CreateNamedPipeW` on an EXISTING name is DACL-checked for
+/// FILE_CREATE_PIPE_INSTANCE (MSDN "Named Pipe Security and Access
+/// Rights", https://learn.microsoft.com/en-us/windows/win32/ipc/named-pipe-security-and-access-rights).
+/// Two narrowing routes exist in theory and both are closed by the kernel
+/// on this OS build (both probed empirically):
+///   • `dw_open_mode` cannot express the individual rights: it accepts only
+///     the PIPE_ACCESS_* access bits plus FILE_FLAG_* values — passing
+///     FILE_CREATE_PIPE_INSTANCE (0x4) or SYNCHRONIZE (0x00100000) is
+///     rejected with E_INVALIDARG (0x00100007, 0x00000007 and 0x00100003
+///     all fail; 0x3 and 0x00080003 pass).
+///   • The DACL cannot narrow the server grant to specific rights either:
+///     for PIPE_ACCESS_DUPLEX the kernel checks the raw generic pair, so
+///     purely-specific server ACEs are ACCESS_DENIED even when they are a
+///     superset of the generic mapping (see security.rs; its ACE[1] stays
+///     `GRGW` for exactly this reason, while the CLIENT ACE is narrowed to
+///     the individual rights 0x00100003).
+/// Microsoft's stated remedy — "use the individual rights instead of using
+/// FILE_GENERIC_WRITE" — is therefore applied where the access check IS
+/// specific: the client side (DACL ACE and the hook's CreateFileW mask).
 ///
 /// Returns the handle as `isize` so it crosses tokio's `.await` / task
 /// boundaries (`HANDLE`'s raw pointer is `!Send`); reconstruct with
@@ -164,6 +240,13 @@ pub(crate) fn create_pipe_instance(
     let dw_open_mode = if is_first {
         PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
     } else {
+        // F6: stays PIPE_ACCESS_DUPLEX — `dw_open_mode` cannot express the
+        // individual rights (FILE_CREATE_PIPE_INSTANCE 0x4 and SYNCHRONIZE
+        // 0x00100000 are both rejected here with E_INVALIDARG; the kernel
+        // checks the DACL against the raw generic pair for DUPLEX, so the
+        // server ACE in security.rs must carry GRGW while the client ACE is
+        // narrowed to 0x00100003). This DACL-checked call is exactly what
+        // the SD below is consulted for.
         PIPE_ACCESS_DUPLEX
     };
     let dw_pipe_mode =
@@ -225,5 +308,146 @@ impl Drop for PipeConnGuard {
         let h = HANDLE(self.raw as *mut _);
         unsafe { DisconnectNamedPipe(h).ok() };
         unsafe { CloseHandle(h).ok() };
+    }
+}
+
+// ─── Overlay listing responses (R05: capped before encode) ───────────────────
+
+/// Hard cap on entries in a single listing response (`WhiteoutsUnder`,
+/// `OverlayChildrenWithCase`, `OverlayChildren`). Bounds a listing to roughly
+/// an order of magnitude under the 16 MiB wire cap (an entry encodes to a few
+/// dozen bytes), far above any legitimate per-directory overlay population,
+/// and replaces the previous behavior where an oversized listing was encoded
+/// in full and only then rejected by the 16 MiB check in `encode_msg`.
+/// Generous but finite, and deterministic.
+pub(crate) const MAX_OVERLAY_LISTING_ENTRIES: usize = 16_384;
+
+/// Truncate an unbounded policy listing to [`MAX_OVERLAY_LISTING_ENTRIES`].
+/// Returns `(entries, truncated)`; `truncated` is true iff the input exceeded
+/// the cap (and has been cut down to exactly the cap).
+pub(crate) fn cap_listing<T>(mut entries: Vec<T>) -> (Vec<T>, bool) {
+    if entries.len() > MAX_OVERLAY_LISTING_ENTRIES {
+        entries.truncate(MAX_OVERLAY_LISTING_ENTRIES);
+        return (entries, true);
+    }
+    (entries, false)
+}
+
+/// Same violation convention as the RegisterChild arm: both counters plus the
+/// throttled `jsonl_log::log` (NOT `log_immediate`) — a hostile loop must not
+/// flood the immediate log path via listing truncations either.
+fn log_listing_truncated(
+    stats: &Stats,
+    hot_stats: &HotStats,
+    client_pid: u32,
+    event: &str,
+    dir: &str,
+) {
+    stats.violations.fetch_add(1, Ordering::Relaxed);
+    hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    jsonl_log::log(jsonl_log::Event::violation(
+        client_pid,
+        event,
+        &format!("dir={dir} cap={MAX_OVERLAY_LISTING_ENTRIES}"),
+    ));
+}
+
+/// `Req::WhiteoutsUnder` response: policy listing, capped before encoding.
+pub(crate) fn resp_whiteouts(
+    policy: &Policy,
+    dir: &str,
+    client_pid: u32,
+    stats: &Stats,
+    hot_stats: &HotStats,
+) -> Resp {
+    let (names, truncated) = cap_listing(policy.whiteouts_under(dir));
+    if truncated {
+        log_listing_truncated(stats, hot_stats, client_pid, "WhiteoutListingTruncated", dir);
+    }
+    Resp::Whiteouts(names)
+}
+
+/// `Req::OverlayChildrenWithCase` response: policy listing, capped before encoding.
+pub(crate) fn resp_overlay_children_with_case(
+    policy: &Policy,
+    dir: &str,
+    client_pid: u32,
+    stats: &Stats,
+    hot_stats: &HotStats,
+) -> Resp {
+    let (pairs, truncated) = cap_listing(policy.overlay_children_with_case(dir));
+    if truncated {
+        log_listing_truncated(stats, hot_stats, client_pid, "OverlayListingTruncated", dir);
+    }
+    Resp::OverlayChildrenWithCase(pairs)
+}
+
+/// `Req::OverlayChildren` response: policy listing, capped before encoding.
+pub(crate) fn resp_overlay_children(
+    policy: &Policy,
+    dir: &str,
+    client_pid: u32,
+    stats: &Stats,
+    hot_stats: &HotStats,
+) -> Resp {
+    let (entries, truncated) = cap_listing(policy.overlay_children(dir));
+    if truncated {
+        log_listing_truncated(stats, hot_stats, client_pid, "OverlayListingTruncated", dir);
+    }
+    Resp::OverlayChildren(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cap_listing_truncates_one_over_the_cap() {
+        // cap + 1 trivial items: microseconds to build, deterministic.
+        let input: Vec<u32> = (0..=MAX_OVERLAY_LISTING_ENTRIES as u32).collect();
+        assert_eq!(input.len(), MAX_OVERLAY_LISTING_ENTRIES + 1);
+        let (out, truncated) = cap_listing(input);
+        assert_eq!(out.len(), MAX_OVERLAY_LISTING_ENTRIES);
+        assert!(truncated);
+        assert_eq!(out[out.len() - 1], (MAX_OVERLAY_LISTING_ENTRIES - 1) as u32);
+    }
+
+    #[test]
+    fn cap_listing_passes_through_under_cap() {
+        let input: Vec<u32> = (0..(MAX_OVERLAY_LISTING_ENTRIES - 1) as u32).collect();
+        let (out, truncated) = cap_listing(input);
+        assert_eq!(out.len(), MAX_OVERLAY_LISTING_ENTRIES - 1);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn resp_overlay_children_builder_returns_recorded_entries_uncapped() {
+        // End-to-end through the real redb DB: record two overlay children,
+        // then the response builder must return both with no truncation.
+        let dir = tempfile::tempdir().unwrap();
+        let (sb, md, proj) = (dir.path().join("sb"), dir.path().join("md"), dir.path().join("proj"));
+        std::fs::create_dir_all(&sb).unwrap();
+        std::fs::create_dir_all(&md).unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        let p = policy::Policy::open_or_create(&dir.path().join("policy.redb"), sb, md, proj).unwrap();
+        p.record_overlay(r"d:\out\a.txt", r"C:\sb\out\a.txt").unwrap();
+        p.record_overlay(r"d:\out\b.log", r"C:\sb\out\b.log").unwrap();
+
+        let stats = Stats::default();
+        let hot = HotStats::default();
+        let resp = resp_overlay_children(&p, r"d:\out", 4242, &stats, &hot);
+        match resp {
+            Resp::OverlayChildren(entries) => {
+                let mut names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
+                names.sort();
+                assert_eq!(names, vec!["a.txt".to_string(), "b.log".to_string()]);
+            }
+            other => panic!("expected Resp::OverlayChildren, got {other:?}"),
+        }
+        assert_eq!(
+            stats.violations.load(Ordering::Relaxed),
+            0,
+            "under-cap listing must not count a violation"
+        );
     }
 }

@@ -1,229 +1,8 @@
 use super::*;
 
-#[test]
-fn is_executable_page_readwrite() {
-    assert!(!is_executable(0x04)); // PAGE_READWRITE
-}
-
-#[test]
-fn is_executable_page_execute() {
-    assert!(is_executable(PAGE_EXECUTE));
-}
-
-#[test]
-fn is_executable_page_execute_read() {
-    assert!(is_executable(PAGE_EXECUTE_READ));
-}
-
-#[test]
-fn is_executable_page_execute_readwrite() {
-    assert!(is_executable(PAGE_EXECUTE_READWRITE));
-}
-
-#[test]
-fn is_executable_page_execute_writecopy() {
-    assert!(is_executable(PAGE_EXECUTE_WRITECOPY));
-}
-
-#[test]
-fn is_executable_page_noaccess() {
-    assert!(!is_executable(0x01)); // PAGE_NOACCESS
-}
-
-#[test]
-fn is_executable_page_readonly() {
-    assert!(!is_executable(0x02)); // PAGE_READONLY
-}
-
-#[test]
-fn is_executable_combined_guard() {
-    // PAGE_EXECUTE_READ | PAGE_GUARD (0x100)
-    assert!(is_executable(0x20 | 0x100));
-}
-
-#[test]
-fn is_executable_zero() {
-    assert!(!is_executable(0));
-}
-
-#[test]
-fn protect_name_covers_all_exec() {
-    assert_eq!(protect_name(PAGE_EXECUTE_READWRITE), "PAGE_EXECUTE_READWRITE");
-    assert_eq!(protect_name(PAGE_EXECUTE_WRITECOPY), "PAGE_EXECUTE_WRITECOPY");
-    assert_eq!(protect_name(PAGE_EXECUTE_READ), "PAGE_EXECUTE_READ");
-    assert_eq!(protect_name(PAGE_EXECUTE), "PAGE_EXECUTE");
-    assert_eq!(protect_name(0x04), "non-execute");
-}
-
-#[test]
-fn is_address_in_module_null() {
-    assert!(!is_address_in_module(std::ptr::null()));
-}
-
-#[test]
-fn is_address_in_module_ntdll() {
-    // GetModuleHandleW("ntdll.dll") gives us an address inside ntdll.
-    // SAFETY: ntdll.dll is always loaded.
-    let hmod = unsafe {
-        let name: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
-        winapi::um::libloaderapi::GetModuleHandleW(name.as_ptr())
-    };
-    assert!(!hmod.is_null());
-    // The module handle IS the base address — it's inside the module.
-    assert!(is_address_in_module(hmod as *const c_void));
-}
-
-#[test]
-fn is_address_in_module_heap_allocation() {
-    // Heap allocation is NOT in any module.
-    let v = vec![0u8; 64];
-    assert!(!is_address_in_module(v.as_ptr() as *const c_void));
-}
-
-#[test]
-fn module_path_for_ntdll() {
-    let hmod = unsafe {
-        let name: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
-        winapi::um::libloaderapi::GetModuleHandleW(name.as_ptr())
-    };
-    let path = module_path_for_address(hmod as *const c_void);
-    assert!(path.is_some());
-    let p = path.unwrap().to_lowercase();
-    assert!(p.contains("ntdll.dll"), "got: {p}");
-}
-
-#[test]
-fn module_path_for_heap_is_none() {
-    let v = vec![0u8; 64];
-    assert!(module_path_for_address(v.as_ptr() as *const c_void).is_none());
-}
-
-#[test]
-fn nt_current_process_check() {
-    assert!(is_current_process(-1isize as HANDLE));
-    assert!(!is_current_process(std::ptr::null_mut()));
-    assert!(!is_current_process(42usize as HANDLE));
-}
-
-#[test]
-fn critical_dll_detection() {
-    assert!(is_critical_dll("ntdll.dll"));
-    assert!(is_critical_dll("kernel32.dll"));
-    assert!(is_critical_dll("kernelbase.dll"));
-    assert!(is_critical_dll("hook.dll"));
-    assert!(!is_critical_dll("user32.dll"));
-    assert!(!is_critical_dll("evil.dll"));
-    assert!(!is_critical_dll(""));
-}
-
-#[test]
-fn extract_basename_lower_works() {
-    assert_eq!(extract_basename_lower(r"C:\Windows\System32\ntdll.dll"), "ntdll.dll");
-    assert_eq!(extract_basename_lower(r"\Device\HarddiskVolume3\Windows\System32\kernel32.dll"), "kernel32.dll");
-    assert_eq!(extract_basename_lower("hook.dll"), "hook.dll");
-    assert_eq!(extract_basename_lower(""), "");
-}
-
-#[test]
-fn is_image_mapping_for_ntdll_base() {
-    // ntdll's base should be MEM_IMAGE
-    let hmod = unsafe {
-        let name: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
-        winapi::um::libloaderapi::GetModuleHandleW(name.as_ptr())
-    };
-    assert!(!hmod.is_null());
-    assert!(is_image_mapping(hmod as *const c_void));
-}
-
-#[test]
-fn is_image_mapping_for_heap_is_false() {
-    let v = vec![0u8; 64];
-    assert!(!is_image_mapping(v.as_ptr() as *const c_void));
-}
-
-#[test]
-fn is_system_dll_path_under_matches_whole_components() {
-    // Previously-trusted layouts stay trusted under an explicit canonical
-    // root; matching is whole-component, never substring.
-    let root = r"\Device\HarddiskVolume3\Windows";
-    assert!(is_system_dll_path_under(r"\Device\HarddiskVolume3\Windows\System32\user32.dll", root));
-    assert!(is_system_dll_path_under(r"\Device\HarddiskVolume3\Windows\SysWOW64\kernel32.dll", root));
-    assert!(is_system_dll_path_under(r"\device\harddiskvolume3\windows\system32\ntdll.dll", root));
-    assert!(is_system_dll_path_under(
-        r"\Device\HarddiskVolume3\Windows\Microsoft.NET\Framework64\v4.0.30319\clr.dll",
-        root
-    ));
-    assert!(is_system_dll_path_under(
-        r"\Device\HarddiskVolume3\Windows\assembly\NativeImages_v4.0.30319_64\mscorlib\abc\mscorlib.ni.dll",
-        root
-    ));
-    // A different volume's Windows tree is not this root.
-    assert!(!is_system_dll_path_under(r"\Device\HarddiskVolume9\Windows\System32\user32.dll", root));
-    // Component boundary: System32X / System32.evildir must not match.
-    assert!(!is_system_dll_path_under(r"\Device\HarddiskVolume3\Windows\System32X\evil.dll", root));
-    assert!(!is_system_dll_path_under(r"\Device\HarddiskVolume3\Windows\System32.evildir\evil.dll", root));
-    // Nested look-alike: the trusted component must sit directly under
-    // the root, not deeper in the tree.
-    assert!(!is_system_dll_path_under(r"\Device\HarddiskVolume3\Windows\spoof\system32\evil.dll", root));
-}
-
-#[test]
-fn is_system_dll_path_rejects_spoofed_substring() {
-    // Regression (audit 2026-09-19, Medium): the old implementation
-    // trusted any path CONTAINING `\windows\system32\`. Every one of
-    // these must be untrusted.
-    assert!(!is_system_dll_path(r"\Device\HarddiskVolume9\tmp\windows\system32\evil.dll"));
-    assert!(!is_system_dll_path(r"C:\tmp\windows\system32\evil.dll"));
-    assert!(!is_system_dll_path(
-        r"\Device\HarddiskVolume3\Users\x\AppData\Local\Temp\windows\system32\evil.dll"
-    ));
-    // Pre-existing negatives keep failing closed.
-    assert!(!is_system_dll_path(r"\Device\HarddiskVolume3\Users\x\AppData\evil.dll"));
-    assert!(!is_system_dll_path(r"\Device\HarddiskVolume3\Program Files\app\plugin.dll"));
-    assert!(!is_system_dll_path(""));
-}
-
-#[test]
-fn is_system_dll_path_anchored_fallback() {
-    // Fallback (root resolution unavailable): component-anchored at a
-    // volume root — still never a substring match.
-    assert!(is_system_dll_path_anchored(r"\Device\HarddiskVolume3\Windows\System32\ntdll.dll"));
-    assert!(is_system_dll_path_anchored(r"C:\Windows\SysWOW64\kernel32.dll"));
-    assert!(!is_system_dll_path_anchored(r"C:\tmp\windows\system32\evil.dll"));
-    assert!(!is_system_dll_path_anchored(r"\Device\HarddiskVolume3\tmp\windows\system32\evil.dll"));
-    assert!(!is_system_dll_path_anchored(r"\Device\HarddiskVolume3\Windows\System32X\evil.dll"));
-    assert!(!is_system_dll_path_anchored(""));
-}
-
-#[test]
-fn is_system_dll_path_real_root_resolution() {
-    // Production path: prefixes resolved from the loader's own ntdll
-    // mapping. The real System32 must be trusted; the same tail planted
-    // one component deeper must not.
-    match trusted_windows_root_nt() {
-        Some(root) => {
-            assert!(is_system_dll_path(&format!("{}\\system32\\user32.dll", root)));
-            assert!(is_system_dll_path(&format!("{}\\syswow64\\kernel32.dll", root)));
-            assert!(!is_system_dll_path(&format!("{}\\spoof\\system32\\user32.dll", root)));
-        }
-        None => {
-            // Root unresolved in this environment: the fallback must
-            // still reject the substring spoof.
-            assert!(!is_system_dll_path(r"C:\tmp\windows\system32\evil.dll"));
-        }
-    }
-}
-
-#[test]
-fn get_mapped_file_basename_for_ntdll() {
-    let hmod = unsafe {
-        let name: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
-        winapi::um::libloaderapi::GetModuleHandleW(name.as_ptr())
-    };
-    let basename = get_mapped_file_basename(hmod as *const c_void);
-    assert!(basename.is_some());
-    assert_eq!(basename.unwrap(), "ntdll.dll");
-}
+mod basics;
+mod alloc_ex_sibling;
+mod manual_alloc_trampoline;
 
 // ---------------------------------------------------------------------------
 // decide_mapview_protection tests
@@ -489,15 +268,52 @@ fn region_scan_covers_full_chunked_region() {
 }
 
 // -------------------------------------------------------------------------
+// Scan-cache single-hash (XA review 2026-09-20, guard:939 + cache:26): a
+// miss must hash the chunk ONCE — the key computed for the lookup is
+// reused for the clean insert, and the miss path scans via the bool
+// predicate without re-hashing.
+// -------------------------------------------------------------------------
+
+/// The compute-key counter is process-global and cargo test runs tests on
+/// parallel threads, so the reset → scan → assert sequence runs under the
+/// scan_cache measurement gate (compute_key itself never takes that gate —
+/// the production path stays lock-free).
+#[test]
+fn scan_cache_miss_hashes_each_chunk_exactly_once() {
+    crate::scan_cache::with_compute_key_gate(|| {
+        crate::scan_cache::reset_compute_key_calls();
+        let bytes = [0x90u8; 256];
+        // 4 chunks: lookup_keyed hashes once per chunk; the miss path
+        // scans via the bool predicate and the clean insert reuses the key.
+        assert!(!region_has_direct_syscalls_with(&bytes, 0x41000, true, 64));
+        assert_eq!(
+            crate::scan_cache::compute_key_calls(),
+            4,
+            "first pass: exactly one hash per chunk"
+        );
+        // Second pass: all four chunks are cache hits — lookup hashes only.
+        assert!(!region_has_direct_syscalls_with(&bytes, 0x41000, true, 64));
+        assert_eq!(
+            crate::scan_cache::compute_key_calls(),
+            8,
+            "second pass: one hash per chunk for the lookup, none for the insert"
+        );
+    });
+}
+
+// -------------------------------------------------------------------------
 // Foreign NtWriteVirtualMemory decision (audit 2026-09-19, Medium)
 // -------------------------------------------------------------------------
 
 #[test]
 fn foreign_write_decision_matrix() {
     const SELF: u32 = 4242;
-    // Unresolvable handle: pass through, the original call fails on its own.
-    assert_eq!(foreign_write_decision(0, SELF, false), ForeignWriteDecision::PassThrough);
-    assert_eq!(foreign_write_decision(0, SELF, true), ForeignWriteDecision::PassThrough);
+    // Unresolvable identity (pid 0): an invalid handle, or — a documented
+    // GetProcessId failure mode (XA review R02) — a handle with mutation
+    // rights but no PROCESS_QUERY_LIMITED_INFORMATION. Unknown identity is
+    // denied exactly like a known-foreign target, never a pass-through.
+    assert_eq!(foreign_write_decision(0, SELF, false), ForeignWriteDecision::Deny);
+    assert_eq!(foreign_write_decision(0, SELF, true), ForeignWriteDecision::Deny);
     // Real handle to self (defensive — is_current_process catches it first).
     assert_eq!(foreign_write_decision(SELF, SELF, false), ForeignWriteDecision::Allow);
     // Owned child: legitimate launcher injection.
@@ -507,6 +323,58 @@ fn foreign_write_decision_matrix() {
     // did not recognise.
     assert_eq!(foreign_write_decision(999, SELF, false), ForeignWriteDecision::Deny);
     assert_eq!(foreign_write_decision(4, SELF, false), ForeignWriteDecision::Deny);
+}
+
+// -------------------------------------------------------------------------
+// pid-0 deny helpers (XA review R02): unresolvable identity is not a pass
+// -------------------------------------------------------------------------
+
+#[test]
+fn map_foreign_denied_matrix() {
+    const SELF: u32 = 4242;
+    // pid 0 = unresolvable identity (XA R02) → denied, like any foreign.
+    assert!(map_foreign_denied(0, SELF));
+    // Self via a real handle passes (the pseudo-handle is caught before
+    // this decision runs).
+    assert!(!map_foreign_denied(SELF, SELF));
+    // Any real foreign target is denied.
+    assert!(map_foreign_denied(999, SELF));
+}
+
+#[test]
+fn unmap_foreign_denied_matrix() {
+    const SELF: u32 = 4242;
+    // pid 0 = unresolvable identity (XA R02) → denied, like any foreign.
+    assert!(unmap_foreign_denied(0, SELF));
+    // Self passes.
+    assert!(!unmap_foreign_denied(SELF, SELF));
+    // Any real foreign target is denied (owned children included —
+    // unmapping their image is Process Hollowing).
+    assert!(unmap_foreign_denied(999, SELF));
+    assert!(unmap_foreign_denied(777, SELF));
+}
+
+#[test]
+fn protect_foreign_exec_kill_matrix() {
+    // pid 0 with an executable protect: unresolvable identity (XA R02)
+    // → killed like any foreign target.
+    assert!(protect_foreign_exec_kill(0, false, PAGE_EXECUTE_READWRITE));
+    // pid 0 with a non-executable protect: keeps passing, matching the
+    // existing foreign policy for data allocations.
+    assert!(!protect_foreign_exec_kill(0, false, PAGE_READWRITE));
+    // Tracked owned child: legitimate launcher injection, never a kill.
+    assert!(!protect_foreign_exec_kill(777, true, PAGE_EXECUTE_READWRITE));
+    // Real foreign target with an executable protect: the injection
+    // primitive itself.
+    assert!(protect_foreign_exec_kill(999, false, PAGE_EXECUTE));
+}
+
+/// The pid-0 deny paths above rely on the tracker contract that pid 0 is
+/// never a tracked child (mark_spawned is gated on child_pid != 0 in
+/// core/hooks/spawn.rs) — pin it, so a tracker change re-opens R02 loudly.
+#[test]
+fn pid_zero_is_never_a_tracked_child() {
+    assert!(!crate::process_tracker::is_owned_child(0));
 }
 
 // -------------------------------------------------------------------------
@@ -570,205 +438,371 @@ fn allow_rwx_snapshot_true_survives_env_removal() {
 }
 
 // -----------------------------------------------------------------
-// Sibling-entry closure (audit High): NtAllocateVirtualMemoryEx must
-// apply the SAME allocation decision as the classic hook. The decision
-// itself is shared (alloc_decision_kill_required) and asserted here.
-// The hook bodies cannot be invoked from unit tests because their deny
-// path terminates the process (report_and_terminate -> !), so Ex
-// entry-point presence is pinned by the sibling-drift check in hooks.rs
-// and by alloc_sibling_exports_resolve_in_ntdll below.
+// Sibling-entry closure (audit High) tests: see tests::alloc_ex_sibling.
+
+// -----------------------------------------------------------------
+// S03 (XA review 2026-09-20): fault-safe guarded read for the
+// protect-hook content scan. The scan must (a) return an error
+// verdict for unreadable caller-controlled memory instead of
+// faulting — an in-window fault dispatches the guest's own VEH with
+// anti_rec still set — and (b) keep finding syscall bytes through
+// the copy. The negative control reproduces the exact pre-fix
+// dereference in a THROWAWAY CHILD PROCESS, because an unguarded
+// fault cannot be caught in-process on Windows: no Rust or
+// test-harness construct catches a hardware access violation, the
+// child dies with STATUS_ACCESS_VIOLATION, and the parent asserts
+// on that exit code.
 // -----------------------------------------------------------------
 
-/// Open a real handle to a process that is neither ours nor a tracked
-/// child.
-///
-/// This used to open PID 4 (System). System does exist on every Windows
-/// host, but OPENING it requires elevation — the assert fired on any
-/// ordinary developer machine or CI runner, which made the two tests below
-/// depend on how the suite happened to be launched rather than on the code
-/// under test.
-///
-/// A process we spawned ourselves is openable unconditionally and is still
-/// "foreign" for this guard's purposes: `alloc_decision_kill_required`
-/// classifies by `process_tracker::is_owned_child`, and `mark_spawned` is
-/// never called under `cargo test`, so the child is not a tracked child.
-/// The handle stays valid after the child exits, and `GetProcessId` keeps
-/// working on it, so there is no race to lose.
-fn foreign_process_handle() -> HANDLE {
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    let child = std::process::Command::new("cmd.exe")
-        .args(["/c", "exit"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawning a helper process must succeed");
-    let pid = child.id();
-    // SAFETY: OpenProcess with query-limited access on a process we just
-    // created; returns NULL on failure, which we refuse to skip.
-    let h = unsafe {
-        winapi::um::processthreadsapi::OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION,
-            0,
-            pid,
-        )
-    };
-    assert!(
-        !h.is_null(),
-        "OpenProcess on our own helper child (pid {pid}) must succeed"
-    );
-    h
-}
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use winapi::um::winnt::{
+    EXCEPTION_POINTERS, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE,
+    STATUS_ACCESS_VIOLATION,
+};
 
-#[test]
-fn alloc_decision_foreign_exec_terminated() {
-    let h = foreign_process_handle();
-    // The VirtualAlloc2 attack shape: an executable allocation into a
-    // foreign, non-owned process — exactly what the Ex sibling must
-    // catch (pre-fix this call rode the unhooked Ex export).
-    assert!(
-        alloc_decision_kill_required(h, PAGE_EXECUTE_READWRITE, false),
-        "foreign exec allocation must be a kill decision"
-    );
-    assert!(
-        alloc_decision_kill_required(h, PAGE_EXECUTE, false),
-        "foreign PAGE_EXECUTE allocation must be a kill decision"
-    );
-    // SAFETY: handle from OpenProcess above.
-    unsafe { winapi::um::handleapi::CloseHandle(h) };
-}
+/// Serializes every test below that registers a vectored exception
+/// handler: the VEH list is process-wide, so concurrent registration /
+/// counters would make the fault-count assertions racy.
+static S03_VEH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[test]
-fn alloc_decision_foreign_non_exec_allowed() {
-    let h = foreign_process_handle();
-    assert!(
-        !alloc_decision_kill_required(h, PAGE_READWRITE, false),
-        "foreign non-executable allocation must pass"
-    );
-    // SAFETY: handle from OpenProcess above.
-    unsafe { winapi::um::handleapi::CloseHandle(h) };
-}
+static S03_VEH_HITS: AtomicUsize = AtomicUsize::new(0);
+static S03_VEH_ARMED: AtomicBool = AtomicBool::new(false);
+static S03_VEH_LO: AtomicUsize = AtomicUsize::new(0);
+static S03_VEH_HI: AtomicUsize = AtomicUsize::new(0);
 
-#[test]
-fn alloc_decision_self_rwx_static_mode() {
-    // Serialize ALLOW_RWX access with the snapshot tests.
-    let _lock = env_lock();
-    // GUARD_MODE is install-time state and install() never runs under
-    // --lib tests; pin it here (OnceLock.set is a no-op if already set).
-    GUARD_MODE.set("static".to_string()).ok();
-    test_set_allow_rwx(false);
-    // Self RWX-direct in static (hard containment): kill decision.
-    // SAFETY: GetCurrentProcess always returns the pseudo handle.
-    let cur = unsafe { winapi::um::processthreadsapi::GetCurrentProcess() };
-    assert!(
-        alloc_decision_kill_required(cur, PAGE_EXECUTE_READWRITE, false),
-        "self RWX-direct must be a kill decision in static mode"
-    );
-    // Documented escape hatch: the ALLOW_RWX snapshot permits it.
-    test_set_allow_rwx(true);
-    assert!(
-        !alloc_decision_kill_required(cur, PAGE_EXECUTE_READWRITE, false),
-        "allow_rwx must suppress the self-RWX kill"
-    );
-    test_set_allow_rwx(false);
-}
-
-/// Regression: under `--guard static`, hook.dll terminated its own
-/// process during DllMain. `install_hooks` installs memory_guard FIRST
-/// and holds `anti_rec` across every later guard's `enable()`; each of
-/// those allocates an RWX trampoline, which the already-armed allocation
-/// hook scored as a self-RWX-direct allocation. Init never signalled and
-/// the launcher killed the child, so NO target could start under
-/// `static` — `node.exe` and `cmd.exe` alike, i.e. not a JIT issue.
-///
-/// The decision itself must not change; only the gate the hooks apply.
-#[test]
-fn install_window_suppresses_static_self_rwx_kill() {
-    let _lock = env_lock();
-    GUARD_MODE.set("static".to_string()).ok();
-    test_set_allow_rwx(false);
-    // SAFETY: GetCurrentProcess always returns the pseudo handle.
-    let cur = unsafe { winapi::um::processthreadsapi::GetCurrentProcess() };
-
-    // Outside the window nothing is softened: a guest RWX-direct
-    // allocation in static mode is still a kill.
-    assert!(!in_trusted_hook_window());
-    assert!(
-        alloc_kill_gate(cur, PAGE_EXECUTE_READWRITE),
-        "guest self-RWX in static must still be killed"
-    );
-
-    // Inside the install window the same allocation is ours.
-    let window = crate::anti_rec::enter().expect("window must be free here");
-    assert!(in_trusted_hook_window());
-    assert!(
-        !alloc_kill_gate(cur, PAGE_EXECUTE_READWRITE),
-        "detour trampolines allocated during install must not be killed"
-    );
-    // The underlying decision is untouched — only the gate differs.
-    assert!(alloc_decision_kill_required(cur, PAGE_EXECUTE_READWRITE, false));
-
-    drop(window);
-    assert!(!in_trusted_hook_window());
-    assert!(alloc_kill_gate(cur, PAGE_EXECUTE_READWRITE));
-}
-
-/// The window must not blanket-suppress the foreign-process class: an
-/// executable allocation in a process we do not own is the injection
-/// primitive and is killed at every guard level.
-#[test]
-fn install_window_does_not_suppress_foreign_exec_kill() {
-    let h = foreign_process_handle();
-    let window = crate::anti_rec::enter().expect("window must be free here");
-    assert!(
-        alloc_kill_gate(h, PAGE_EXECUTE_READWRITE),
-        "foreign exec allocation must be killed even inside the window"
-    );
-    drop(window);
-    // SAFETY: handle from OpenProcess above.
-    unsafe { winapi::um::handleapi::CloseHandle(h) };
-}
-
-#[test]
-fn alloc_decision_self_benign_pass() {
-    // Current-process pseudo handle + non-exec protect: the JIT/loader
-    // path — never a kill decision in any mode.
-    // SAFETY: GetCurrentProcess always returns the pseudo handle.
-    let cur = unsafe { winapi::um::processthreadsapi::GetCurrentProcess() };
-    assert!(!alloc_decision_kill_required(cur, PAGE_READWRITE, false));
-
-    // A REAL handle to our own process resolves through GetProcessId and
-    // takes the same self branch (guards the handle-comparison path).
-    // SAFETY: OpenProcess on our own pid with query-limited access.
-    let h = unsafe {
-        winapi::um::processthreadsapi::OpenProcess(
-            0x1000,
-            0,
-            winapi::um::processthreadsapi::GetCurrentProcessId(),
-        )
-    };
-    if !h.is_null() {
-        assert!(is_current_process(h));
-        assert!(!alloc_decision_kill_required(h, PAGE_READWRITE, false));
-        // SAFETY: handle from OpenProcess above.
-        unsafe { winapi::um::handleapi::CloseHandle(h) };
-    }
-}
-
-/// Export-name tripwire for the alloc siblings: a typo'd / renamed
-/// export would fail install fatally, but resolution is pinned here so
-/// the drift check's list-vs-source test cannot silently rot either.
-#[test]
-fn alloc_sibling_exports_resolve_in_ntdll() {
-    // SAFETY: GetProcAddress wrapper over the always-loaded ntdll.
-    unsafe {
-        for name in [
-            "NtAllocateVirtualMemory\0",
-            "NtAllocateVirtualMemoryEx\0",
-        ] {
-            assert!(
-                crate::hooks::ntdll_export(name.as_bytes()).is_some(),
-                "ntdll export must resolve: {name}"
-            );
+/// VEH that only COUNTS access violations inside the armed range, then
+/// always continues search. Proves the guarded read raises NO
+/// user-mode exception: if any AV reached exception dispatch inside the
+/// watched range, this counter would move.
+unsafe extern "system" fn s03_veh_counter(info: *mut EXCEPTION_POINTERS) -> i32 {
+    if S03_VEH_ARMED.load(Ordering::Acquire) {
+        let rec = unsafe { (*info).ExceptionRecord };
+        if !rec.is_null() {
+            let code = unsafe { (*rec).ExceptionCode };
+            if code as u32 == STATUS_ACCESS_VIOLATION {
+                let fault = unsafe { (*rec).ExceptionInformation[1] };
+                let lo = S03_VEH_LO.load(Ordering::Relaxed);
+                let hi = S03_VEH_HI.load(Ordering::Relaxed);
+                if lo != 0 && fault >= lo && fault < hi {
+                    S03_VEH_HITS.fetch_add(1, Ordering::Release);
+                }
+            }
         }
     }
+    0 // EXCEPTION_CONTINUE_SEARCH — we only observe, never interfere
+}
+
+struct S03Veh {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    handle: *mut winapi::ctypes::c_void,
+}
+
+impl S03Veh {
+    /// Register the counting VEH and arm it for the half-open range.
+    /// The process-wide VEH list is serialized via the held mutex for
+    /// the lifetime of the guard.
+    fn arm(range_base: *const u8, range_len: usize) -> S03Veh {
+        let lock = S03_VEH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        S03_VEH_HITS.store(0, Ordering::SeqCst);
+        S03_VEH_LO.store(range_base as usize, Ordering::SeqCst);
+        S03_VEH_HI.store(range_base as usize + range_len, Ordering::SeqCst);
+        S03_VEH_ARMED.store(true, Ordering::Release);
+        // SAFETY: handler is a valid vectored-handler fn; NULL return
+        // means registration failed, which we refuse to skip.
+        let handle = unsafe {
+            winapi::um::errhandlingapi::AddVectoredExceptionHandler(1, Some(s03_veh_counter))
+        };
+        assert!(!handle.is_null(), "AddVectoredExceptionHandler must succeed");
+        S03Veh { _lock: lock, handle }
+    }
+
+    fn hits(&self) -> usize {
+        S03_VEH_HITS.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for S03Veh {
+    fn drop(&mut self) {
+        // SAFETY: handle came from AddVectoredExceptionHandler above.
+        unsafe { winapi::um::errhandlingapi::RemoveVectoredExceptionHandler(self.handle) };
+        S03_VEH_ARMED.store(false, Ordering::SeqCst);
+        S03_VEH_LO.store(0, Ordering::SeqCst);
+        S03_VEH_HI.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Allocate `pages` committed RW pages; returns the page-aligned base.
+/// Refuses NULL — a NULL base would fault in the tests' own setup.
+fn s03_alloc_rw_pages(pages: usize) -> *mut u8 {
+    // SAFETY: plain VirtualAlloc with commit+reserve; NULL on failure,
+    // which we assert on.
+    let p = unsafe {
+        winapi::um::memoryapi::VirtualAlloc(
+            std::ptr::null_mut(),
+            pages * 4096,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE,
+        )
+    };
+    assert!(!p.is_null(), "VirtualAlloc must succeed for S03 tests");
+    p as *mut u8
+}
+
+unsafe fn s03_protect(addr: *mut u8, size: usize, protect: u32) {
+    let mut old: u32 = 0;
+    // SAFETY: addr..addr+size is a live allocation from s03_alloc_rw_pages.
+    let ok = winapi::um::memoryapi::VirtualProtect(addr as *mut winapi::ctypes::c_void, size, protect, &mut old);
+    assert!(ok != 0, "VirtualProtect must succeed for S03 tests");
+}
+
+unsafe fn s03_free(addr: *mut u8) {
+    // SAFETY: addr is the base returned by VirtualAlloc; MEM_RELEASE
+    // with size 0 frees the whole allocation.
+    let ok = winapi::um::memoryapi::VirtualFree(addr as *mut winapi::ctypes::c_void, 0, MEM_RELEASE);
+    assert!(ok != 0, "VirtualFree must succeed for S03 tests");
+}
+
+#[test]
+fn s03_guarded_copy_fails_on_noaccess_page_without_fault() {
+    let page = s03_alloc_rw_pages(1);
+    unsafe { std::ptr::write_bytes(page, 0x90, 4096) };
+    unsafe { s03_protect(page, 4096, PAGE_NOACCESS) };
+    let veh = S03Veh::arm(page, 4096);
+    // Enter the exact S03 window condition: anti_rec held while the
+    // guarded copy (inside the scan) runs.
+    let _g = crate::anti_rec::enter().unwrap();
+    let verdict = guarded_scan_region(page, 4096, false);
+    drop(_g);
+    assert_eq!(
+        verdict,
+        GuardedScanVerdict::Unreadable,
+        "guarded copy must report failure for PAGE_NOACCESS"
+    );
+    assert_eq!(
+        veh.hits(),
+        0,
+        "guarded copy must not raise ANY user-mode exception (guest VEH would observe anti_rec)"
+    );
+    // The window must have survived the failed read and been released
+    // normally afterwards — a fault would have skipped this drop.
+    assert!(!crate::anti_rec::in_hook(), "anti_rec must be clear after the guarded copy");
+    drop(veh);
+    unsafe { s03_protect(page, 4096, PAGE_READWRITE) };
+    unsafe { s03_free(page) };
+}
+
+#[test]
+fn s03_guarded_copy_reads_readable_memory() {
+    // Positive control: the guarded copy must actually READ the memory,
+    // not just always fail — otherwise the failure tests would be
+    // vacuous. guarded_region_copy is private to detours, so the copy is
+    // observed through its only in-scope caller (guarded_scan_region):
+    // syscall bytes at the very END of a readable page can only be found
+    // if the FULL page was copied (the strict full-length contract).
+    let page = s03_alloc_rw_pages(1);
+    unsafe { std::ptr::write_bytes(page, 0xA5, 4096) };
+    unsafe { page.add(4094).write(0x0F) };
+    unsafe { page.add(4095).write(0x05) };
+    let veh = S03Veh::arm(page, 4096);
+    let verdict = guarded_scan_region(page, 4096, false);
+    assert_eq!(
+        verdict,
+        GuardedScanVerdict::SyscallsFound,
+        "guarded copy must succeed on a readable page (full length copied)"
+    );
+    assert_eq!(veh.hits(), 0, "copying readable memory must not fault");
+    drop(veh);
+    // Control arm: same-size readable page WITHOUT syscall bytes must
+    // come back Clean — the verdict is content-driven, not hardwired.
+    let clean = s03_alloc_rw_pages(1);
+    unsafe { std::ptr::write_bytes(clean, 0xA5, 4096) };
+    assert_eq!(guarded_scan_region(clean, 4096, false), GuardedScanVerdict::Clean);
+    unsafe { s03_free(page) };
+    unsafe { s03_free(clean) };
+}
+
+#[test]
+fn s03_guarded_scan_unreadable_region_is_unreadable_not_fault() {
+    let page = s03_alloc_rw_pages(1);
+    unsafe { std::ptr::write_bytes(page, 0x90, 4096) };
+    unsafe { s03_protect(page, 4096, PAGE_NOACCESS) };
+    let veh = S03Veh::arm(page, 4096);
+    let verdict = guarded_scan_region(page, 4096, false);
+    assert_eq!(verdict, GuardedScanVerdict::Unreadable);
+    assert_eq!(veh.hits(), 0, "scan of unreadable memory must not fault");
+    drop(veh);
+    unsafe { s03_protect(page, 4096, PAGE_READWRITE) };
+    unsafe { s03_free(page) };
+}
+
+#[test]
+fn s03_guarded_scan_partial_readable_region_is_unreadable() {
+    // One readable page followed by one NOACCESS page: a partial copy
+    // must fail the WHOLE region (fail-closed), not scan the readable
+    // part and allow the protect.
+    let pages = s03_alloc_rw_pages(2);
+    unsafe { std::ptr::write_bytes(pages, 0x90, 8192) };
+    unsafe { s03_protect(pages.add(4096), 4096, PAGE_NOACCESS) };
+    let veh = S03Veh::arm(pages, 8192);
+    let verdict = guarded_scan_region(pages, 8192, false);
+    assert_eq!(verdict, GuardedScanVerdict::Unreadable);
+    assert_eq!(veh.hits(), 0, "partial copy must fail cleanly, not fault");
+    drop(veh);
+    unsafe { s03_protect(pages, 8192, PAGE_READWRITE) };
+    unsafe { s03_free(pages) };
+}
+
+#[test]
+fn s03_guarded_scan_finds_syscall_bytes_in_readable_region() {
+    // Positive control for the copy+scan pipeline: syscall bytes in a
+    // readable region must still be found through the guarded copy.
+    let page = s03_alloc_rw_pages(1);
+    unsafe { std::ptr::write_bytes(page, 0x90, 4096) };
+    unsafe { page.add(1024).write(0x0F) };
+    unsafe { page.add(1025).write(0x05) };
+    let verdict = guarded_scan_region(page, 4096, false);
+    assert_eq!(verdict, GuardedScanVerdict::SyscallsFound);
+    unsafe { s03_free(page) };
+}
+
+#[test]
+fn s03_protect_scan_response_maps_verdicts_fail_closed() {
+    use GuardedScanVerdict as V;
+    assert_eq!(protect_scan_response(V::Clean), ProtectScanResponse::Proceed);
+    assert_eq!(protect_scan_response(V::SyscallsFound), ProtectScanResponse::Kill);
+    // The load-bearing mapping: unreadable MUST deny, never proceed —
+    // skipping the scan would let unreadable syscall payloads become
+    // executable unscanned.
+    assert_eq!(protect_scan_response(V::Unreadable), ProtectScanResponse::Deny);
+}
+
+const S03_RAW_PROBE_ENV: &str = "WINRSBOX_S03_RAW_READ_PROBE";
+// Full libtest path — `--exact` matches the whole `module::path::name`,
+// not just the trailing segment.
+const S03_NEGATIVE_TEST_NAME: &str =
+    "memory_guard::tests::s03_negative_unguarded_raw_read_faults_on_noaccess_page";
+
+#[test]
+fn s03_negative_unguarded_raw_read_faults_on_noaccess_page() {
+    if std::env::var(S03_RAW_PROBE_ENV).is_ok() {
+        // CHILD role (spawned by the parent below with the probe env
+        // set): reproduce the EXACT pre-fix dereference — a
+        // from_raw_parts slice over caller-controlled PAGE_NOACCESS
+        // memory, dereferenced by the scanner — and die on it. Nothing
+        // here may catch the fault: the point is that the pre-fix path
+        // has no guard.
+        let page = s03_alloc_rw_pages(1);
+        unsafe { std::ptr::write_bytes(page, 0x90, 4096) };
+        unsafe { s03_protect(page, 4096, PAGE_NOACCESS) };
+        // SAFETY: this dereference is INTENDED to raise an access
+        // violation (negative control for the guarded fix); the process
+        // must die here, which the parent asserts via the exit code.
+        let bytes = unsafe { std::slice::from_raw_parts(page, 4096) };
+        let _ = ::policy::scan::find_direct_syscalls(bytes, page as u64);
+        // Unreachable when the fault fires. Reaching this means the
+        // negative control is broken and the parent's exit-code assert
+        // fails loudly.
+        unsafe { s03_protect(page, 4096, PAGE_READWRITE) };
+        unsafe { s03_free(page) };
+        return;
+    }
+
+    // PARENT role: run this test binary again, only this test, with the
+    // probe env set, and require the unguarded read to have killed the
+    // child with STATUS_ACCESS_VIOLATION (0xC0000005).
+    let exe = std::env::current_exe().expect("current_exe must resolve the test binary");
+    let status = std::process::Command::new(exe)
+        .args([S03_NEGATIVE_TEST_NAME, "--exact"])
+        .env(S03_RAW_PROBE_ENV, "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("spawning the negative-control child must succeed");
+    assert_eq!(
+        status.code(),
+        Some(0xC0000005u32 as i32),
+        "pre-fix unguarded read must fault with STATUS_ACCESS_VIOLATION; got {status:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S06 (XA review 2026-09-20) — protect-scan page rounding, TOCTOU record,
+// sibling-cap structural guard
+// ---------------------------------------------------------------------------
+
+#[test]
+fn s06_page_rounding_covers_bytes_outside_passed_range() {
+    // Rounding must (a) keep the caller range covered and (b) extend to the
+    // full pages the kernel flips — bytes outside [addr, addr+size) on both
+    // edges.
+    let (start, len) = page_round_scan_range(0x1234, 0x10).expect("in-range values must round");
+    assert_eq!(start, 0x1000);
+    // 0x1234..0x1244 lies entirely inside page 0x1000 → exactly one page.
+    assert_eq!(len, 0x1000);
+    assert!(start < 0x1234, "must extend below the passed range");
+    assert!(start + len > 0x1244, "must extend above the passed range");
+
+    // Two-page span: a range ending inside the NEXT page rounds out to both.
+    let (start, len) = page_round_scan_range(0x1FF4, 0x10).expect("in-range values must round");
+    assert_eq!(start, 0x1000);
+    assert_eq!(len, 0x2000);
+
+    // Overflow → None → the hook fails closed (Deny), never skips the scan.
+    assert_eq!(page_round_scan_range(usize::MAX, 8), None);
+    assert_eq!(page_round_scan_range(usize::MAX - 4, 8), None);
+}
+
+#[test]
+fn s06_rounded_scan_finds_syscall_outside_caller_range_same_page() {
+    // A syscall pair on the SAME page but outside the caller-passed byte
+    // range is invisible to the unrounded scan and must be found by the
+    // rounded range the protect hook actually scans (S06 gap 1).
+    let page = s03_alloc_rw_pages(1);
+    unsafe { std::ptr::write_bytes(page, 0x90, 4096) };
+    unsafe { page.add(4000).write(0x0F) };
+    unsafe { page.add(4001).write(0x05) };
+    // The caller passes a clean 8-byte range at page+16 (same page).
+    let inner = unsafe { page.add(16) };
+    assert_eq!(
+        guarded_scan_region(inner, 8, false),
+        GuardedScanVerdict::Clean,
+        "pre-condition: unrounded scan must not see beyond the passed range"
+    );
+    let (start, len) = page_round_scan_range(page as usize + 16, 8).unwrap();
+    assert_eq!(start, page as usize);
+    assert_eq!(len, 4096);
+    assert_eq!(
+        guarded_scan_region(start as *const u8, len, false),
+        GuardedScanVerdict::SyscallsFound,
+        "page-rounded scan must cover the neighboring bytes the kernel flips"
+    );
+    unsafe { s03_free(page) };
+}
+
+const S06_TOCTOU_LIMITATION_MARKER: &str = "KNOWN LIMITATION (TOCTOU)";
+
+/// S06 gap 5: the TOCTOU residual on the scan itself must stay recorded in
+/// detours.rs. If this fails, the limitation text was deleted — restore it
+/// (see `guarded_scan_region_twice`) or close the race for real; deleting
+/// the record is not an option.
+#[test]
+fn s06_toctou_limitation_stays_documented() {
+    let src = include_str!("detours.rs");
+    assert!(
+        src.contains(S06_TOCTOU_LIMITATION_MARKER),
+        "the S06 TOCTOU known-limitation record vanished from memory_guard/detours.rs"
+    );
+}
+
+/// S06 gap 4 (hook side): the child-image scan (core/hooks/spawn.rs) must
+/// not carry the silent 64 MiB truncation cap — the tail of a large section
+/// used to go unchecked. Structural on purpose: the cap is a one-line
+/// regression magnet.
+#[test]
+fn s06_child_scan_has_no_64mib_cap() {
+    let src = include_str!("../../core/hooks/spawn.rs");
+    assert!(
+        !src.contains("64 * 1024 * 1024"),
+        "the 64 MiB scan cap must stay out of the child-image scan (S06 gap 4)"
+    );
 }

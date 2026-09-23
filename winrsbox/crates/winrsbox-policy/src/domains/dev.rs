@@ -27,7 +27,8 @@ pub enum DeviceKind {
 pub fn nt_to_device_path(raw: &[u16]) -> Option<String> {
     let s = String::from_utf16_lossy(raw);
     let s = s.trim_end_matches('\0');
-    let lower = s.to_lowercase();
+    // Canonical NTFS-identity fold (replaces locale-aware to_lowercase).
+    let lower = crate::path::nt_case_fold(s).into_owned();
 
     if let Some(rest) = lower.strip_prefix(r"\??\globalroot\") {
         return Some(rest.to_owned());
@@ -57,7 +58,8 @@ pub fn nt_to_device_path(raw: &[u16]) -> Option<String> {
 }
 
 pub fn classify_device(path: &str) -> DeviceKind {
-    let lower = path.to_lowercase();
+    // Canonical NTFS-identity fold (replaces locale-aware to_lowercase).
+    let lower = crate::path::nt_case_fold(path).into_owned();
     // === Hard blocks: actual escape vectors ===
     // Volume shadow copies — give access to historical file versions
     // bypassing current-state deny rules. \Device\HarddiskVolumeShadowCopyN\

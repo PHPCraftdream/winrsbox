@@ -91,7 +91,7 @@ fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
 
     let id = find_arg(args, "--id=").map(String::from)
         .unwrap_or_else(|| {
-            let path_lower = path.to_lowercase();
+            let path_lower = policy::path::nt_case_fold(path).into_owned();
             crate::cli::id::generate_id("mock", &[&path_lower])
         });
 
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn mock_idempotent_auto_id() {
-        let p1 = "C:\\Fake\\test.txt".to_lowercase();
+        let p1 = "C:\\Fake\\test.txt".to_ascii_lowercase();
         let id1 = crate::cli::id::generate_id("mock", &[&p1]);
         let id2 = crate::cli::id::generate_id("mock", &[&p1]);
         assert_eq!(id1, id2);

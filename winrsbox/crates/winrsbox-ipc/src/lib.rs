@@ -1,12 +1,23 @@
-use std::io::{self, Read, Write};
+use std::io;
 use policy::Decision;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod guard_level;
+pub use guard_level::GuardLevel;
+
+mod sync_client;
+mod timed_pipe;
+pub use sync_client::{CONNECT_RETRY_ATTEMPTS, CONNECT_RETRY_INTERVAL_MS, SEND_TIMEOUT, SyncClient};
+
+// Wire framing lives in `framing` with its tests; the pub surface is
+// re-exported here unchanged (`ipc::write_msg`/`read_msg`/`MAX_MSG_LEN`),
+// and the crate-internal helpers stay `pub(crate)`.
+mod framing;
+pub use framing::{read_msg, read_msg_with_buf, write_msg, write_msg_with_buf, MAX_MSG_LEN};
+pub(crate) use framing::{decode_frame, encode_msg_into, frame_len_guard};
+
 pub const PIPE_PREFIX: &str = r"\\.\pipe\fs-sandbox-";
-
-pub const MAX_MSG_LEN: usize = 16 * 1024 * 1024;
-
 // ─── Session-config shared section ────────────────────────────────────────────
 //
 // Some hosted processes lose `FS_SANDBOX_*` environment variables — most
@@ -18,7 +29,6 @@ pub const MAX_MSG_LEN: usize = 16 * 1024 * 1024;
 //
 // `Local\` namespace = session-scoped (per Windows logon session). No
 // SeCreateGlobalPrivilege required, no cross-session leakage.
-
 pub const SESSION_CONFIG_SECTION_NAME: &str = "Local\\WinRsBoxSession";
 pub const SESSION_CONFIG_SECTION_SIZE: usize = 4096;
 /// "WRSB" little-endian.
@@ -46,7 +56,15 @@ pub struct SessionConfig {
     #[serde(default)]
     pub overlay_roots: Vec<String>,
     pub trace: bool,
-    pub guard: String,
+    pub guard: GuardLevel,
+    /// Identity of the launcher process that authored this section and owns
+    /// the pipe: the hook verifies the pipe server's PID (and its kernel
+    /// creation time, defending against PID reuse) against these before
+    /// trusting any response. Defaults keep pre-identity sections decodable.
+    #[serde(default)]
+    pub launcher_pid: u32,
+    #[serde(default)]
+    pub launcher_create_time: u64,
     pub allow_rwx: bool,
     pub disable_hooks: String,
 }
@@ -74,6 +92,9 @@ impl SessionConfig {
 
     /// Decode from raw section bytes. Validates magic + body length so a
     /// torn / uninitialised section yields a `Decode` error rather than UB.
+    /// The MAX_MSG_LEN decode limit is the inner defence: the outer body
+    /// length is already guarded, and this bound stops hostile nested length
+    /// prefixes inside the body from becoming huge allocations.
     pub fn from_section_bytes(buf: &[u8]) -> Result<Self, IpcError> {
         if buf.len() < 8 {
             return Err(IpcError::Decode("session section too short".into()));
@@ -92,7 +113,7 @@ impl SessionConfig {
         }
         let (cfg, _) = bincode::serde::decode_from_slice(
             &buf[8..8 + len],
-            bincode::config::standard(),
+            bincode::config::standard().with_limit::<MAX_MSG_LEN>(),
         )
         .map_err(|e| IpcError::Decode(e.to_string()))?;
         Ok(cfg)
@@ -237,12 +258,21 @@ pub enum Resp {
     NetDecision { allow: bool },
     MemDecision { allow: bool },
     /// Filenames of whiteouted direct children of a directory (for enumerate hiding).
+    /// The server caps the per-call listing size (enforced launcher-side in
+    /// pipe_server): oversized listings come back truncated to a prefix,
+    /// never as an error.
     Whiteouts(Vec<String>),
     /// `(lowercase_name, original_case_name)` pairs for overlay entries that are
     /// direct children of the queried directory and have a recorded case.
+    /// The server caps the per-call listing size (enforced launcher-side in
+    /// pipe_server): oversized listings come back truncated to a prefix,
+    /// never as an error.
     OverlayChildrenWithCase(Vec<(String, String)>),
     /// `(basename, is_dir)` pairs for overlay-only direct children of the
     /// queried directory (see `Req::OverlayChildren`).
+    /// The server caps the per-call listing size (enforced launcher-side in
+    /// pipe_server): oversized listings come back truncated to a prefix,
+    /// never as an error.
     OverlayChildren(Vec<policy::OverlayChildMeta>),
 }
 
@@ -256,437 +286,9 @@ pub enum IpcError {
     Decode(String),
 }
 
-/// Write a length-prefixed bincode message.
-pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), IpcError> {
-    let bytes = bincode::serde::encode_to_vec(msg, bincode::config::standard())
-        .map_err(|e| IpcError::Encode(e.to_string()))?;
-    if bytes.len() > MAX_MSG_LEN {
-        return Err(IpcError::Encode(format!("message too large to send: {} bytes (max {MAX_MSG_LEN})", bytes.len())));
-    }
-    let len = bytes.len() as u32;
-    w.write_all(&len.to_le_bytes())?;
-    w.write_all(&bytes)?;
-    Ok(())
-}
-
-/// Read a length-prefixed bincode message.
-pub fn read_msg<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> Result<T, IpcError> {
-    let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf)?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_MSG_LEN {
-        return Err(IpcError::Decode(format!("message too large: {len} bytes (max {MAX_MSG_LEN})")));
-    }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
-    let (val, _) = bincode::serde::decode_from_slice(&buf, bincode::config::standard())
-        .map_err(|e| IpcError::Decode(e.to_string()))?;
-    Ok(val)
-}
-
-/// Sync IPC client (для hook.dll — без tokio).
-pub struct SyncClient {
-    pipe: std::fs::File,
-}
-
-/// Retry budget for the hook→launcher pipe connect. 60 attempts × 150 ms ≈
-/// 9 s of patience.
-///
-/// History: started at 10×50 ms (500 ms), raised to 30×100 ms (3 s), now
-/// 60×150 ms (9 s). Under MSYS2 first-run 27+ bash helpers spawn in 1 s;
-/// even with a 32-instance accept pool, late children may see transient
-/// `ERROR_PIPE_BUSY` while the pool drains the burst. 9 s gives generous
-/// headroom without meaningfully delaying a genuine "launcher dead" detect
-/// (the hook-side IPC_FAIL_THRESHOLD × per-call connect budget still trips
-/// the kill-switch within ~72 s).
-pub const CONNECT_RETRY_ATTEMPTS: u32 = 60;
-pub const CONNECT_RETRY_INTERVAL_MS: u64 = 150;
-
-impl SyncClient {
-    /// Открыть соединение к launcher pipe.
-    ///
-    /// Retry policy: `CONNECT_RETRY_ATTEMPTS` × `CONNECT_RETRY_INTERVAL_MS`.
-    /// See the doc on those constants for the budget rationale.
-    pub fn connect(pipe_name: &str) -> Result<Self, IpcError> {
-        let mut last_err = None;
-        for _ in 0..CONNECT_RETRY_ATTEMPTS {
-            match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(pipe_name)
-            {
-                Ok(f) => return Ok(Self { pipe: f }),
-                Err(e) => {
-                    last_err = Some(e);
-                    std::thread::sleep(
-                        std::time::Duration::from_millis(CONNECT_RETRY_INTERVAL_MS),
-                    );
-                }
-            }
-        }
-        let detail = last_err
-            .map(|e| format!("{} attempts, last os error: {e}", CONNECT_RETRY_ATTEMPTS))
-            .unwrap_or_else(|| "no attempts".into());
-        Err(IpcError::Io(io::Error::new(io::ErrorKind::TimedOut, detail)))
-    }
-
-    pub fn send(&mut self, req: &Req) -> Result<Resp, IpcError> {
-        write_msg(&mut self.pipe, req)?;
-        read_msg(&mut self.pipe)
-    }
-
-    /// Test-only constructor: wrap an arbitrary `std::fs::File` (typically
-    /// the write-end of an anonymous pipe whose read-end has been closed,
-    /// so `write` is guaranteed to fail) into a `SyncClient`. The `send`
-    /// method then returns `Err` on the first call, which is what we need
-    /// to drive the reconnect-on-error path in `hook::ipc_client::try_send`
-    /// from a unit test.
-    ///
-    /// Hidden from rustdoc and stable callers. Behaviour for production
-    /// callers is exactly equivalent to `connect` followed by an immediate
-    /// pipe break — nothing to gain, nothing to lose.
-    #[doc(hidden)]
-    pub fn from_file_for_test(pipe: std::fs::File) -> Self {
-        Self { pipe }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
-
-    /// Pin the connect-retry budget against accidental tightening. The total
-    /// budget (attempts × interval) must clear ~3 s — anything less re-opens
-    /// the MSYS2 first-run-burst cascade-self-terminate path documented at
-    /// the constants.
-    #[test]
-    fn connect_retry_budget_at_least_nine_seconds() {
-        let budget_ms =
-            CONNECT_RETRY_ATTEMPTS as u64 * CONNECT_RETRY_INTERVAL_MS;
-        assert!(
-            budget_ms >= 9_000,
-            "connect retry budget {budget_ms}ms < 9000ms — MSYS2 burst regression risk",
-        );
-    }
-
-    /// Defensive: very small intervals burn CPU on every spurious failure;
-    /// very large intervals push past the hook-side fail-closed threshold
-    /// (IPC_FAIL_THRESHOLD × per-call connect budget). 50–500 ms is the
-    /// sane range; pin it.
-    #[test]
-    fn connect_retry_interval_in_sane_range() {
-        assert!(
-            (100..=500).contains(&CONNECT_RETRY_INTERVAL_MS),
-            "CONNECT_RETRY_INTERVAL_MS={CONNECT_RETRY_INTERVAL_MS} out of [100,500]ms",
-        );
-    }
-
-    #[test]
-    fn req_hello_roundtrip() {
-        let msg = Req::Hello { pid: 42, exe_path: r"c:\app.exe".into() };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec {
-            Req::Hello { pid, exe_path } => {
-                assert_eq!(pid, 42);
-                assert_eq!(exe_path, r"c:\app.exe");
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn req_spawned_child_roundtrip() {
-        let msg = Req::SpawnedChild { parent_pid: 1, child_pid: 2, child_exe: "child.exe".into() };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec {
-            Req::SpawnedChild { parent_pid, child_pid, child_exe } => {
-                assert_eq!(parent_pid, 1);
-                assert_eq!(child_pid, 2);
-                assert_eq!(child_exe, "child.exe");
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn req_decide_roundtrip() {
-        let msg = Req::Decide { dos_path: r"c:\x".into(), write: true };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec {
-            Req::Decide { dos_path, write } => {
-                assert_eq!(dos_path, r"c:\x");
-                assert!(write);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn req_record_overlay_roundtrip() {
-        let msg = Req::RecordOverlay { orig: "a".into(), overlay: "b".into() };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec {
-            Req::RecordOverlay { orig, overlay } => {
-                assert_eq!(orig, "a");
-                assert_eq!(overlay, "b");
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn req_log_roundtrip() {
-        let msg = Req::Log { pid: 42, level: LogLevel::Warn, msg: "hi".into() };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec {
-            Req::Log { pid, level, msg } => {
-                assert_eq!(pid, 42);
-                assert!(matches!(level, LogLevel::Warn));
-                assert_eq!(msg, "hi");
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn req_register_child_roundtrip() {
-        let msg = Req::RegisterChild { pid: 7 };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec {
-            Req::RegisterChild { pid } => assert_eq!(pid, 7),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn resp_ok_roundtrip() {
-        let msg = Resp::Ok;
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Resp = read_msg(&mut buf).unwrap();
-        assert!(matches!(dec, Resp::Ok));
-    }
-
-    #[test]
-    fn resp_decision_roundtrip() {
-        let msg = Resp::Decision(policy::Decision {
-            mode: policy::Mode::Cow,
-            overlay: Some(std::path::PathBuf::from(r"\sb\c\x")),
-            cow_from: None,
-            mock_payload: None,
-        });
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Resp = read_msg(&mut buf).unwrap();
-        match dec {
-            Resp::Decision(d) => {
-                assert_eq!(d.mode, policy::Mode::Cow);
-                assert_eq!(d.overlay.unwrap(), std::path::PathBuf::from(r"\sb\c\x"));
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn resp_err_roundtrip() {
-        let msg = Resp::Err("boom".into());
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Resp = read_msg(&mut buf).unwrap();
-        match dec {
-            Resp::Err(e) => assert_eq!(e, "boom"),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn req_memory_violation_roundtrip() {
-        let msg = Req::MemoryViolation {
-            pid: 123,
-            exe: r"c:\app.exe".into(),
-            kind: AllocKind::Allocate,
-            requested_protect: 0x40,
-            region_size: 4096,
-            target_address: 0x7ff800000000,
-            caller_pc: 0x7ff8a1234567,
-            caller_module: Some(r"c:\windows\system32\ntdll.dll".into()),
-            stack_top: vec![0x7ff8a1234567, 0x7ff8a1234568],
-        };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec {
-            Req::MemoryViolation { pid, kind, requested_protect, stack_top, .. } => {
-                assert_eq!(pid, 123);
-                assert_eq!(kind, AllocKind::Allocate);
-                assert_eq!(requested_protect, 0x40);
-                assert_eq!(stack_top.len(), 2);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn req_escape_violation_roundtrip() {
-        let msg = Req::EscapeViolation {
-            pid: 321,
-            exe: r"c:\app\evil.exe".into(),
-            vector: "alpc-port".into(),
-            detail: r"\RPC Control\OLE58BCCC182C1065EBB0".into(),
-            caller_pc: 0x7ff8a1234567,
-            caller_module: Some(r"c:\windows\system32\combase.dll".into()),
-            stack_top: vec![0x7ff8a1234567, 0x7ff8a1234568],
-        };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec {
-            Req::EscapeViolation { pid, vector, detail, stack_top, .. } => {
-                assert_eq!(pid, 321);
-                assert_eq!(vector, "alpc-port");
-                assert_eq!(detail, r"\RPC Control\OLE58BCCC182C1065EBB0");
-                assert_eq!(stack_top.len(), 2);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn req_injection_violation_roundtrip() {
-        let msg = Req::InjectionViolation {
-            pid: 100,
-            exe: r"c:\app\evil.exe".into(),
-            kind: InjectKind::ContextHijack,
-            target_pid: 200,
-            start_address: 0xDEADBEEF,
-            caller_pc: 0x7ff8a1234567,
-            caller_module: Some(r"c:\app\evil.exe".into()),
-            stack_top: vec![0x7ff8a1234567],
-        };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec {
-            Req::InjectionViolation { pid, kind, target_pid, .. } => {
-                assert_eq!(pid, 100);
-                assert_eq!(kind, InjectKind::ContextHijack);
-                assert_eq!(target_pid, 200);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn read_msg_oversized_returns_decode() {
-        let mut buf = Cursor::new(Vec::new());
-        let len = (MAX_MSG_LEN as u32) + 1;
-        buf.write_all(&len.to_le_bytes()).unwrap();
-        buf.write_all(&vec![0u8; 64]).unwrap();
-        buf.set_position(0);
-        let res: Result<Req, IpcError> = read_msg(&mut buf);
-        let err = res.unwrap_err();
-        match err {
-            IpcError::Decode(msg) => assert!(msg.contains("too large"), "got: {msg}"),
-            other => panic!("expected Decode, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn read_msg_truncated_returns_io() {
-        let mut buf = Cursor::new(Vec::new());
-        buf.write_all(&100u32.to_le_bytes()).unwrap();
-        buf.set_position(0);
-        let res: Result<Req, IpcError> = read_msg(&mut buf);
-        assert!(res.is_err());
-        match res.unwrap_err() {
-            IpcError::Io(_) => {}
-            other => panic!("expected Io, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn req_reg_decide_roundtrip() {
-        let msg = Req::RegDecide { key_path: r"hklm\software\foo".into(), value_name: Some("bar".into()), write: false };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec {
-            Req::RegDecide { key_path, value_name, write } => {
-                assert_eq!(key_path, r"hklm\software\foo");
-                assert_eq!(value_name, Some("bar".into()));
-                assert!(!write);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn req_reg_write_roundtrip() {
-        use policy::reg::{RegData, RegType, RegValue};
-        let val = RegValue { typ: RegType::Sz, data: RegData::String("hello".into()) };
-        let msg = Req::RegWrite { key_path: "k".into(), value_name: "v".into(), value: val.clone() };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec { Req::RegWrite { value, .. } => assert_eq!(value, val), _ => panic!() }
-    }
-
-    #[test]
-    fn req_net_decide_roundtrip() {
-        let msg = Req::NetDecide { host: "api.github.com".into(), port: 443 };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec { Req::NetDecide { host, port } => { assert_eq!(host, "api.github.com"); assert_eq!(port, 443); }, _ => panic!() }
-    }
-
-    #[test]
-    fn req_mem_decide_roundtrip() {
-        let msg = Req::MemDecide { target_pid: 1234, op: "CreateRemoteThread".into() };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec { Req::MemDecide { target_pid, op } => { assert_eq!(target_pid, 1234); assert_eq!(op, "CreateRemoteThread"); }, _ => panic!() }
-    }
-
-    #[test]
-    fn resp_reg_decision_roundtrip() {
-        let msg = Resp::RegDecision { mode: policy::Mode::Cow, value_json: Some(vec![42]) };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Resp = read_msg(&mut buf).unwrap();
-        match dec { Resp::RegDecision { mode, value_json } => { assert_eq!(mode, policy::Mode::Cow); assert_eq!(value_json, Some(vec![42])); }, _ => panic!() }
-    }
 
     #[test]
     fn session_config_roundtrip_minimal() {
@@ -697,7 +299,9 @@ mod tests {
             sandbox_root: r"D:\sandbox".into(),
             overlay_roots: vec![],
             trace: true,
-            guard: "scan".into(),
+            guard: GuardLevel::Scan,
+            launcher_pid: 0,
+            launcher_create_time: 0,
             allow_rwx: false,
             disable_hooks: String::new(),
         };
@@ -708,7 +312,7 @@ mod tests {
         assert_eq!(dec.cwd, cfg.cwd);
         assert_eq!(dec.sandbox_root, r"D:\sandbox");
         assert!(dec.trace);
-        assert_eq!(dec.guard, "scan");
+        assert_eq!(dec.guard, GuardLevel::Scan);
     }
 
     #[test]
@@ -738,224 +342,32 @@ mod tests {
         let buf = [0u8; 4];
         assert!(SessionConfig::from_section_bytes(&buf).is_err());
     }
-
+    /// Typed guard + launcher identity must survive the section roundtrip.
     #[test]
-    fn resp_net_decision_roundtrip() {
-        let msg = Resp::NetDecision { allow: true };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Resp = read_msg(&mut buf).unwrap();
-        match dec { Resp::NetDecision { allow } => assert!(allow), _ => panic!() }
-    }
-
-    #[test]
-    fn req_clear_overlay_roundtrip() {
-        let msg = Req::ClearOverlay { path: r"d:\ext\file.txt".into() };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec {
-            Req::ClearOverlay { path } => assert_eq!(path, r"d:\ext\file.txt"),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn req_record_whiteout_roundtrip() {
-        let msg = Req::RecordWhiteout { path: r"d:\ext\file.txt".into() };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec {
-            Req::RecordWhiteout { path } => assert_eq!(path, r"d:\ext\file.txt"),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn req_clear_whiteout_roundtrip() {
-        let msg = Req::ClearWhiteout { path: r"d:\revive.txt".into() };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec {
-            Req::ClearWhiteout { path } => assert_eq!(path, r"d:\revive.txt"),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn req_whiteouts_under_roundtrip() {
-        let msg = Req::WhiteoutsUnder { dir: r"d:\foo".into() };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec {
-            Req::WhiteoutsUnder { dir } => assert_eq!(dir, r"d:\foo"),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn resp_whiteouts_roundtrip() {
-        let msg = Resp::Whiteouts(vec!["a.txt".into(), "b.log".into()]);
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Resp = read_msg(&mut buf).unwrap();
-        match dec {
-            Resp::Whiteouts(names) => assert_eq!(names, vec!["a.txt".to_string(), "b.log".to_string()]),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn resp_whiteouts_empty_roundtrip() {
-        let msg = Resp::Whiteouts(vec![]);
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Resp = read_msg(&mut buf).unwrap();
-        match dec {
-            Resp::Whiteouts(names) => assert!(names.is_empty()),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn req_overlay_children_with_case_roundtrip() {
-        let msg = Req::OverlayChildrenWithCase {
-            dir: r"c:\localappdata\uv\cache\builds-v0\.tmpabcd".into(),
+    fn session_config_section_roundtrip_with_guard_enum_and_identity() {
+        let cfg = SessionConfig {
+            pipe_name: r"\\.\pipe\fs-sandbox-typed".into(),
+            dll_path: r"D:\bin\hook.dll".into(),
+            guard: GuardLevel::Static,
+            launcher_pid: 4242,
+            launcher_create_time: 0x1AAA_BBBB_CCCC_DDDD,
+            ..Default::default()
         };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec {
-            Req::OverlayChildrenWithCase { dir } => {
-                assert_eq!(dir, r"c:\localappdata\uv\cache\builds-v0\.tmpabcd");
-            }
-            _ => panic!("wrong variant"),
-        }
+        let dec = SessionConfig::from_section_bytes(&cfg.to_section_bytes().unwrap()).unwrap();
+        assert_eq!(dec.guard, GuardLevel::Static);
+        assert_eq!(dec.launcher_pid, 4242);
+        assert_eq!(dec.launcher_create_time, 0x1AAA_BBBB_CCCC_DDDD);
+        assert_eq!(dec.pipe_name, cfg.pipe_name);
     }
 
+    /// Decode-side defaults: `#[serde(default)]` on the identity fields and
+    /// `#[default]` on `GuardLevel::None` must agree with what a pre-identity
+    /// section body decodes to: guard None, zeroed launcher identity.
     #[test]
-    fn resp_overlay_children_with_case_roundtrip() {
-        let msg = Resp::OverlayChildrenWithCase(vec![
-            ("mixed_case_dir".to_string(), "Mixed_Case_Dir".to_string()),
-            ("lib64".to_string(), "Lib64".to_string()),
-        ]);
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Resp = read_msg(&mut buf).unwrap();
-        match dec {
-            Resp::OverlayChildrenWithCase(pairs) => {
-                assert_eq!(pairs.len(), 2);
-                assert_eq!(pairs[0], ("mixed_case_dir".to_string(), "Mixed_Case_Dir".to_string()));
-                assert_eq!(pairs[1], ("lib64".to_string(), "Lib64".to_string()));
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn resp_overlay_children_with_case_empty_roundtrip() {
-        let msg = Resp::OverlayChildrenWithCase(vec![]);
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Resp = read_msg(&mut buf).unwrap();
-        match dec {
-            Resp::OverlayChildrenWithCase(pairs) => assert!(pairs.is_empty()),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn req_record_overlay_case_roundtrip() {
-        let msg = Req::RecordOverlayCase {
-            path: r"c:\test\mixed_case_dir".into(),
-            original_basename: "Mixed_Case_Dir".into(),
-        };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec {
-            Req::RecordOverlayCase { path, original_basename } => {
-                assert_eq!(path, r"c:\test\mixed_case_dir");
-                assert_eq!(original_basename, "Mixed_Case_Dir");
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn req_overlay_children_roundtrip() {
-        let msg = Req::OverlayChildren { dir: r"c:\users\computer\desktop\pc\vv".into() };
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Req = read_msg(&mut buf).unwrap();
-        match dec {
-            Req::OverlayChildren { dir } => assert_eq!(dir, r"c:\users\computer\desktop\pc\vv"),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn resp_overlay_children_roundtrip() {
-        let msg = Resp::OverlayChildren(vec![
-            policy::OverlayChildMeta {
-                name: "probe_cmd.txt".to_string(),
-                is_dir: false,
-                size: 12,
-                creation_time: 133_700_000_000_000_000,
-                last_access_time: 133_700_000_000_000_000,
-                last_write_time: 133_700_000_000_000_000,
-            },
-            policy::OverlayChildMeta {
-                name: "some_dir".to_string(),
-                is_dir: true,
-                size: 0,
-                creation_time: 133_700_000_000_000_000,
-                last_access_time: 133_700_000_000_000_000,
-                last_write_time: 133_700_000_000_000_000,
-            },
-        ]);
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Resp = read_msg(&mut buf).unwrap();
-        match dec {
-            Resp::OverlayChildren(entries) => {
-                assert_eq!(entries.len(), 2);
-                assert_eq!(entries[0].name, "probe_cmd.txt");
-                assert!(!entries[0].is_dir);
-                assert_eq!(entries[0].size, 12);
-                assert_eq!(entries[1].name, "some_dir");
-                assert!(entries[1].is_dir);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn resp_overlay_children_empty_roundtrip() {
-        let msg = Resp::OverlayChildren(vec![]);
-        let mut buf = Cursor::new(Vec::new());
-        write_msg(&mut buf, &msg).unwrap();
-        buf.set_position(0);
-        let dec: Resp = read_msg(&mut buf).unwrap();
-        match dec {
-            Resp::OverlayChildren(entries) => assert!(entries.is_empty()),
-            _ => panic!("wrong variant"),
-        }
+    fn session_config_decodes_without_identity_fields() {
+        let d = SessionConfig::default();
+        assert_eq!(d.guard, GuardLevel::None);
+        assert_eq!(d.launcher_pid, 0);
+        assert_eq!(d.launcher_create_time, 0);
     }
 }

@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
-use policy::Policy;
+use winrsbox_policy::Policy;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -252,7 +252,7 @@ fn make_policy_n_rules(n: usize) -> (tempfile::TempDir, Policy) {
 
 fn bench_rule_match_scale(c: &mut Criterion) {
     let mut group = c.benchmark_group("best_rule_match_scale");
-    for n in [1, 10, 50, 100] {
+    for n in [1, 10, 50, 100, 500, 2000] {
         let (_dir, policy) = make_policy_n_rules(n);
         let counter = AtomicU64::new(0);
         group.bench_function(format!("n={n}"), |b| {
@@ -260,6 +260,114 @@ fn bench_rule_match_scale(c: &mut Criterion) {
                 || {
                     let i = counter.fetch_add(1, Ordering::Relaxed);
                     format!("c:\\rule{:04}\\file{}.txt", i % (n as u64), i)
+                },
+                |path| policy.decide(black_box(&path), true),
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
+// ─── P0: rule-match complexity contract (see src/decide/rule_index.rs) ─────
+// Literal rules resolve via the segment trie in O(L + candidates): the trie
+// walk is O(L) in the query path's segments, plus work proportional to the
+// small candidate set at the terminal node — NOT O(n_rules).
+//
+// Wildcard rules are NOT indexed: every wildcard rule is re-evaluated on
+// every decision, with per-rule match cost unchanged from the old linear
+// scan — only the per-rule allocations (the repeated pattern/path re-splits)
+// were removed. Wildcard count therefore remains fully visible in these
+// numbers BY DESIGN. `rule_match_mixed` isolates exactly that: the literal
+// part of the query is constant (always hits `c:\lit0007`), so the delta
+// across the three cases is the cost of the always-evaluated wildcard set.
+
+fn make_policy_n_wild_rules(n: usize) -> (tempfile::TempDir, Policy) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&mock_dirs).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+
+    let cfg_path = dir.path().join("config.ktv");
+    let mut f = std::fs::File::create(&cfg_path).unwrap();
+    write!(f, "defaults: {{\n    read: passthrough\n    write: cow\n}}\n\nrules: [\n").unwrap();
+    for i in 0..n {
+        write!(f, "    {{\n        prefix: c:\\\\wild{:04}\\\\**\\\\end\n        write: deny\n    }}\n", i).unwrap();
+    }
+    write!(f, "]").unwrap();
+    drop(f);
+    p.load_config(&cfg_path).unwrap();
+    (dir, p)
+}
+
+fn bench_rule_match_wildcard_scale(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rule_match_wildcard_scale");
+    for n in [10, 100] {
+        let (_dir, policy) = make_policy_n_wild_rules(n);
+        let counter = AtomicU64::new(0);
+        group.bench_function(format!("n={n}"), |b| {
+            b.iter_batched(
+                || {
+                    let i = counter.fetch_add(1, Ordering::Relaxed);
+                    // Rule `c:\wild0003\**\end` matches; the `**` forces the
+                    // globstar backtracking path. Unique i → cache miss.
+                    format!("c:\\wild0003\\a\\b\\end\\x{}", i)
+                },
+                |path| policy.decide(black_box(&path), true),
+                BatchSize::SmallInput,
+            )
+        });
+    }
+    group.finish();
+}
+
+fn make_policy_mixed(lit: usize, wild: usize) -> (tempfile::TempDir, Policy) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("policy.redb");
+    let sandbox = dir.path().join("sb");
+    let mock_dirs = dir.path().join("md");
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&mock_dirs).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+
+    let p = Policy::open_or_create(&db_path, sandbox, mock_dirs, project).unwrap();
+
+    let cfg_path = dir.path().join("config.ktv");
+    let mut f = std::fs::File::create(&cfg_path).unwrap();
+    write!(f, "defaults: {{\n    read: passthrough\n    write: cow\n}}\n\nrules: [\n").unwrap();
+    for i in 0..lit {
+        write!(f, "    {{\n        prefix: c:\\\\lit{:04}\n        write: deny\n    }}\n", i).unwrap();
+    }
+    for i in 0..wild {
+        write!(f, "    {{\n        prefix: c:\\\\wild{:04}\\\\**\\\\end\n        write: deny\n    }}\n", i).unwrap();
+    }
+    write!(f, "]").unwrap();
+    drop(f);
+    p.load_config(&cfg_path).unwrap();
+    (dir, p)
+}
+
+fn bench_rule_match_mixed_shape(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rule_match_mixed");
+    for (lit, wild) in [(200, 0), (200, 50), (200, 200)] {
+        let (_dir, policy) = make_policy_mixed(lit, wild);
+        let counter = AtomicU64::new(0);
+        group.bench_function(format!("lit={lit}_wild={wild}"), |b| {
+            b.iter_batched(
+                || {
+                    let i = counter.fetch_add(1, Ordering::Relaxed);
+                    // Always a HIT on literal rule `c:\lit0007` (prefix
+                    // match, any file below it). Unique filename per iter →
+                    // cache miss → rule matching actually runs (a constant
+                    // path would be absorbed by the decide-cache).
+                    format!("c:\\lit0007\\file{}.txt", i)
                 },
                 |path| policy.decide(black_box(&path), true),
                 BatchSize::SmallInput,
@@ -350,6 +458,8 @@ criterion_group!(
     bench_cache_miss_with_both,
     bench_cache_key_composite,
     bench_rule_match_scale,
+    bench_rule_match_wildcard_scale,
+    bench_rule_match_mixed_shape,
     bench_mock_payload_lookup,
     bench_mock_dir_lookup,
 );

@@ -3,7 +3,9 @@
 // Minimal first iteration: hook ws2_32!connect (TCP/UDP connection initiator).
 // IPv4 only — IPv6 + WSAConnect + ConnectEx + sendto + DNS in next iteration.
 //
-// Localhost (127.0.0.0/8) is always allowed (no policy check).
+// Localhost (127.0.0.0/8) is allowed unless FS_SANDBOX_BLOCK_LOCALHOST was
+// present at hook-install time; that decision is latched at install, so later
+// environment changes in the guest have no effect.
 
 use std::sync::OnceLock;
 
@@ -30,6 +32,9 @@ type FnWsaSetLastError = unsafe extern "system" fn(i32);
 
 static HOOK_CONNECT: OnceLock<GenericDetour<FnConnect>> = OnceLock::new();
 static WSA_SET_LAST_ERROR: OnceLock<FnWsaSetLastError> = OnceLock::new();
+
+/// Install-time latch of FS_SANDBOX_BLOCK_LOCALHOST (see `block_localhost`).
+static BLOCK_LOCALHOST: OnceLock<bool> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
 // sockaddr parsing
@@ -86,7 +91,19 @@ pub fn is_localhost(host: &str) -> bool {
     host.starts_with("127.") || host == "::1" || host == "0:0:0:0:0:0:0:1"
 }
 
+/// The install-time value of FS_SANDBOX_BLOCK_LOCALHOST: whether the launcher
+/// asked for loopback connects to be refused. Read ONCE, at install time —
+/// a guest mutating its own environment after startup cannot lift the
+/// restriction (S08). Unset latch ⇒ true (fail closed, mirroring
+/// `trusted_guard`'s "Unset ⇒ Static"): hooks only fire once installed, and
+/// `install()` seeds the latch before the detour is enabled, so an empty
+/// latch means an ordering regression — refuse rather than silently allow.
 fn block_localhost() -> bool {
+    BLOCK_LOCALHOST.get().copied().unwrap_or(true)
+}
+
+/// Pure resolution of the env var at install time (empty string counts as set).
+fn block_localhost_from_env() -> bool {
     std::env::var("FS_SANDBOX_BLOCK_LOCALHOST").is_ok()
 }
 
@@ -148,6 +165,10 @@ unsafe extern "system" fn hook_connect(
 /// Must be called from install_hooks() in DllMain context with anti_rec entered.
 pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
     use winapi::um::libloaderapi::{LoadLibraryW, GetProcAddress};
+    // Latch the localhost policy once, BEFORE the connect detour is enabled:
+    // afterwards the guest can edit its own environment all it wants — the
+    // decision was fixed at install time (S08).
+    let _ = BLOCK_LOCALHOST.set(block_localhost_from_env());
     // Ensure ws2_32 is loaded
     let ws2_w: Vec<u16> = "ws2_32.dll\0".encode_utf16().collect();
     let hmod = LoadLibraryW(ws2_w.as_ptr());
@@ -305,5 +326,72 @@ mod tests {
         assert!(is_localhost("::1"));
         assert!(is_localhost("0:0:0:0:0:0:0:1"));
         assert!(!is_localhost("2001:db8::1"));
+    }
+
+    // ── S08: FS_SANDBOX_BLOCK_LOCALHOST must be latched at install time ──
+    //
+    // The environment is process-wide and cargo test runs tests on parallel
+    // threads, so env-mutating tests serialize on a mutex — same ENV_LOCK
+    // pattern as hooks_core_security_tests / memory_guard tests, both added
+    // after exactly that class of parallel-test flake.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// RAII guard restoring FS_SANDBOX_BLOCK_LOCALHOST on drop.
+    struct BlockLocalhostEnvGuard(Option<std::ffi::OsString>);
+
+    impl Drop for BlockLocalhostEnvGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("FS_SANDBOX_BLOCK_LOCALHOST", v),
+                None => std::env::remove_var("FS_SANDBOX_BLOCK_LOCALHOST"),
+            }
+        }
+    }
+
+    /// Seed the latch with the canonical value. OnceLocks are once-per-test-
+    /// binary; every test here must agree on this value (same discipline as
+    /// hooks_core_security_tests::seed_guard_snapshot).
+    fn seed_block_localhost_latch() {
+        let _ = BLOCK_LOCALHOST.set(true);
+        assert_eq!(
+            BLOCK_LOCALHOST.get().copied(),
+            Some(true),
+            "BLOCK_LOCALHOST seeded with a conflicting value",
+        );
+    }
+
+    /// Regression core (S08): the guest removes FS_SANDBOX_BLOCK_LOCALHOST
+    /// from its own environment after startup — enforcement must keep
+    /// following the install-time latch, not the guest-writable environment.
+    /// Old behaviour re-read the env var on every connect and let the very
+    /// next call through.
+    #[test]
+    fn block_localhost_latch_ignores_post_startup_env_removal() {
+        let _lock = env_lock();
+        seed_block_localhost_latch();
+        let _env = BlockLocalhostEnvGuard(std::env::var_os("FS_SANDBOX_BLOCK_LOCALHOST"));
+        std::env::remove_var("FS_SANDBOX_BLOCK_LOCALHOST");
+        assert!(block_localhost(), "post-startup env removal must not lift the latch");
+    }
+
+    /// Pins the install-time resolution: presence ⇒ true (including the
+    /// empty string, which counts as set), absence ⇒ false.
+    #[test]
+    fn block_localhost_from_env_matches_presence() {
+        let _lock = env_lock();
+        let _env = BlockLocalhostEnvGuard(std::env::var_os("FS_SANDBOX_BLOCK_LOCALHOST"));
+
+        std::env::set_var("FS_SANDBOX_BLOCK_LOCALHOST", "1");
+        assert!(block_localhost_from_env(), "\"1\" counts as set");
+
+        std::env::set_var("FS_SANDBOX_BLOCK_LOCALHOST", "");
+        assert!(block_localhost_from_env(), "empty string counts as set");
+
+        std::env::remove_var("FS_SANDBOX_BLOCK_LOCALHOST");
+        assert!(!block_localhost_from_env(), "absent must be false");
     }
 }

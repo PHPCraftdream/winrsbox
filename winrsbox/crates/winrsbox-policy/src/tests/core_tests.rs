@@ -2,12 +2,13 @@ use crate::*;
 use std::io::Write;
 
 #[test]
-fn ensure_lower_is_ascii_only() {
+fn ensure_lower_kernel_identity_fold() {
     assert_eq!(ensure_lower("CamelCase").as_ref(), "camelcase");
     assert_eq!(ensure_lower("already-lower").as_ref(), "already-lower");
     // U+0130 (LATIN CAPITAL LETTER I WITH DOT ABOVE) must pass through
-    // untouched — Unicode to_lowercase() would fold it to "i\u{307}",
-    // diverging from the kernel's ASCII-only RtlDowncaseUnicodeString.
+    // untouched — the kernel upcase table treats İ as identity (so
+    // Down∘Up is identity too), while Rust's locale-aware to_lowercase()
+    // would fold it to "i\u{307}", diverging from NTFS name identity.
     let input = "C:\\WIN\u{0130}DIR";
     assert_eq!(ensure_lower(input).as_ref(), "c:\\win\u{0130}dir");
 }

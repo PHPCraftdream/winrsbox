@@ -77,6 +77,7 @@ pub const SUBCOMMANDS: &[&str] = &[
     "devrule", "netrule", "memdefaults",
     "shell",
     "doctor",
+    "probe",
 ];
 
 /// Check if args represent a CLI subcommand (vs legacy sandbox run).
@@ -101,6 +102,8 @@ SUBCOMMANDS:
 
 DIAGNOSTICS:
   doctor     Pre-flight system check (WFP, mitigations, Defender)
+  probe      R04 Этап 0: dump own token/Job state (read-only, no mutation).
+             --spawn-child also inspects a throwaway suspended cmd.exe child.
 
 EXPLORER INTEGRATION:
   shell      Install/uninstall Explorer right-click context menu entries
@@ -164,6 +167,7 @@ pub fn run_cli(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         "memdefaults" => netdev::memdefaults::run(rest, state_dir),
         "shell" => shell::run(rest),
         "doctor" => diag::doctor::run(),
+        "probe" => diag::probe::run(rest),
         _ => anyhow::bail!("unknown subcommand '{}'. Run 'winrsbox --help' for usage.", cmd),
     }
 }

@@ -19,9 +19,18 @@ pub mod alpc_guard;
 pub mod fs_hooks;
 #[path = "core/hooked_attrs.rs"]
 pub(crate) mod hooked_attrs;
-#[path = "ipc/ipc_client.rs"]
+#[path = "ipc/ipc_client/mod.rs"]
 pub mod ipc_client;
-#[path = "ipc/com_guard.rs"]
+// Effective install-time security config, resolved from the trusted session
+// section ONLY (review XA 2026-09-20, S02). Declared beside ipc_client like
+// every other ipc/ module.
+#[path = "ipc/trusted_boot.rs"]
+pub(crate) mod trusted_boot;
+// Init-event handshake + SetProcessMitigationPolicy application (S10),
+// moved out of hooks/mod.rs so it is unit-testable in one place.
+#[path = "ipc/init_ack.rs"]
+pub(crate) mod init_ack;
+#[path = "ipc/com_guard/mod.rs"]
 pub mod com_guard;
 #[path = "core/cache.rs"]
 pub mod cache;

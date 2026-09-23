@@ -34,6 +34,15 @@ pub const REG_MOCKS: TableDefinition<&str, &[u8]> = TableDefinition::new("reg_mo
 pub const DEV_RULES: TableDefinition<&str, &[u8]> = TableDefinition::new("dev_rules");
 pub const NET_RULES: TableDefinition<&str, &[u8]> = TableDefinition::new("net_rules");
 
+/// Persisted net-rules generation counter (key "gen"). This is the
+/// cross-process invalidation signal for the launcher's in-memory
+/// `net::NetSnapshot` (ArcSwap): net rules are ONLY written out-of-process
+/// (CLI `winrsbox netrule add/remove/clear`), so an in-memory-only cache
+/// would go stale forever — the counter must live in the DB, next to the
+/// rules, and every rule write bumps it in the SAME write txn so a reader
+/// can never observe the new rules without the new generation.
+pub const NET_RULES_GEN: TableDefinition<&str, u64> = TableDefinition::new("net_rules_gen");
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum RuleMode { Passthrough, Deny, Cow, Redirect }
 
@@ -685,11 +694,24 @@ pub fn dev_rule_clear(db: &redb::Database) -> Result<(), crate::PolicyError> {
 
 // ─── Network CRUD ────────────────────────────────────────────────────────────
 
+/// Bump the net-rules generation counter inside the CURRENT write txn.
+/// The bump must commit atomically with the rule change itself (same txn)
+/// — that atomicity is the whole point of the counter.
+fn bump_net_rules_gen(txn: &redb::WriteTransaction) -> Result<(), crate::PolicyError> {
+    let mut gen = txn.open_table(NET_RULES_GEN)?;
+    let current = gen.get("gen")?.map(|g| g.value()).unwrap_or(0);
+    gen.insert("gen", current + 1)?;
+    Ok(())
+}
+
 pub fn net_rule_upsert(db: &redb::Database, rule: &crate::net::NetRule) -> Result<(), crate::PolicyError> {
     let enc = bincode::serde::encode_to_vec(rule, bincode::config::standard())
         .map_err(|e| crate::PolicyError::Ktav(format!("serialize: {e}")))?;
     let txn = db.begin_write()?;
-    { let mut t = txn.open_table(NET_RULES)?; t.insert(rule.id.as_str(), enc.as_slice())?; }
+    {
+        let mut t = txn.open_table(NET_RULES)?; t.insert(rule.id.as_str(), enc.as_slice())?;
+        bump_net_rules_gen(&txn)?;
+    }
     txn.commit()?;
     Ok(())
 }
@@ -697,7 +719,12 @@ pub fn net_rule_upsert(db: &redb::Database, rule: &crate::net::NetRule) -> Resul
 pub fn net_rule_remove(db: &redb::Database, id: &str) -> Result<bool, crate::PolicyError> {
     let txn = db.begin_write()?;
     let removed;
-    { let mut t = txn.open_table(NET_RULES)?; removed = t.remove(id)?.is_some(); }
+    {
+        let mut t = txn.open_table(NET_RULES)?; removed = t.remove(id)?.is_some();
+        // Bumped unconditionally: even when the id was absent, a no-op
+        // generation bump is harmless (one extra snapshot rebuild).
+        bump_net_rules_gen(&txn)?;
+    }
     txn.commit()?;
     Ok(removed)
 }
@@ -722,9 +749,26 @@ pub fn net_rule_clear(db: &redb::Database) -> Result<(), crate::PolicyError> {
         let keys: Vec<String> = t.range::<&str>(..)?.filter_map(|r| r.ok())
             .map(|(k, _)| k.value().to_owned()).collect();
         for k in keys { t.remove(k.as_str())?; }
+        bump_net_rules_gen(&txn)?;
     }
     txn.commit()?;
     Ok(())
 }
+
+/// Current net-rules generation. Reads of a DB that never had a write
+/// (table absent) are generation 0. Missing key == 0 as well.
+pub fn net_rule_generation(db: &redb::Database) -> Result<u64, crate::PolicyError> {
+    let txn = db.begin_read()?;
+    // redb auto-creates tables only in write txns; on this read path an
+    // absent table simply means "no netrule write ever" — generation 0.
+    // The table must NOT be created here: the read path stays read-only.
+    let table = match txn.open_table(NET_RULES_GEN) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(table.get("gen")?.map(|g| g.value()).unwrap_or(0))
+}
+
 #[cfg(test)]
 mod tests;
