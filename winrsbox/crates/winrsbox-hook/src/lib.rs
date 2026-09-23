@@ -54,6 +54,8 @@ pub mod net_hooks;
 pub mod proc_guard;
 #[path = "proc/process_tracker.rs"]
 pub mod process_tracker;
+#[path = "proc/child_handles.rs"]
+pub mod child_handles;
 #[path = "core/scan_cache.rs"]
 pub mod scan_cache;
 #[path = "system/reg_hooks/mod.rs"]

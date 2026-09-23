@@ -225,6 +225,7 @@ pub fn info_of(pid: u32) -> Option<SpawnedProcess> {
 /// Remove a tracked PID (e.g., on process exit).
 pub fn untrack(pid: u32) {
     with_lock(|m| { m.remove(&pid); });
+    crate::child_handles::forget(pid);
 }
 
 /// Number of currently tracked PIDs.

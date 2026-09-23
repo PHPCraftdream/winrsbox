@@ -667,3 +667,14 @@ fn extract_image_path_null_and_empty_stay_none() {
     assert!(unsafe { extract_image_path(block2.as_ptr() as *const c_void) }.is_none());
     let _ = wide;
 }
+
+/// Regression (codex MCP): a parent must be able to put its own tracked child
+/// into its job (kill-on-close lifetime); self and foreign stay denied.
+#[test]
+fn job_assign_only_for_owned_child() {
+    let owned = |pid: u32| pid == 42;
+    assert!(job_assign_allowed(42, 7, owned), "owned child must be assignable");
+    assert!(!job_assign_allowed(7, 7, |_| true), "self reassignment stays denied");
+    assert!(!job_assign_allowed(99, 7, owned), "foreign process stays denied");
+    assert!(!job_assign_allowed(0, 7, |_| true), "unresolved handle stays denied");
+}

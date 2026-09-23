@@ -672,6 +672,8 @@ pub(super) unsafe extern "system" fn hook_nt_create_user_process(
         // guest-forgeable environment; the install-time snapshot decides.
         if !GUARD_ENV.get().map(|s| s.no_track).unwrap_or(false) {
             crate::process_tracker::mark_spawned(child_pid, parent_pid, child_exe.clone(), create_time);
+            // SAFETY: proc_h is the live handle NtCreateUserProcess just returned.
+            unsafe { crate::child_handles::remember(child_pid, proc_h) };
         }
     }
 
@@ -758,6 +760,16 @@ pub(super) unsafe extern "system" fn hook_nt_create_user_process(
     // just killed the child; there is nothing to resume in a dead process and
     // ResumeThread would only return an error.
     let mut ack_failed = false;
+    if is_trace() {
+        ipc_log(
+            ipc::LogLevel::Trace,
+            format!(
+                "spawn_child pid={child_pid} caller_suspended={originally_suspended} inject_failed={inject_failed} \
+                 req_access=0x{process_desired_access:x} granted={:x?} pflags=0x{process_flags:x} tflags=0x{thread_flags:x}",
+                crate::child_handles::granted_access(proc_h)
+            ),
+        );
+    }
     if !originally_suspended && !inject_failed {
         let mut suspend_count: u32 = 0;
         // SAFETY: thr_h is a valid thread handle; NtResumeThread is always present.

@@ -290,6 +290,36 @@ pub(crate) fn nt_create_key_is_write_access(desired_access: u32) -> bool {
     (desired_access & NT_CREATE_KEY_WRITE_BITS) != 0
 }
 
+/// Access mask actually used for `NtCreateKey` under a Cow/Deny prefix.
+///
+/// `MAXIMUM_ALLOWED` means "whatever you'd grant me", not "I must write".
+/// crypt32 retries a denied `KEY_ALL_ACCESS` open of the system cert stores
+/// with it; denying that too left the root store unopenable (rustls/schannel:
+/// `invalid peer certificate: UnknownIssuer`). Under a prefix that forbids
+/// host writes the grantable set is read, so rewrite it to `KEY_READ` — the
+/// open-existing-only path then serves it.
+///
+/// Under Cow, explicit write bits are stripped the same way: crypt32 opens
+/// `HKCU\...\SystemCertificates\Root` with `KEY_ALL_ACCESS`-style masks and
+/// has no read-only retry for it. Host writes are refused anyway (value
+/// hooks deny Cow writes; the read-only handle can't write in the kernel),
+/// so a read handle loses nothing. Deny prefixes keep refusing write masks.
+pub(crate) fn nt_create_key_effective_access(desired_access: u32, mode: &policy::Mode) -> u32 {
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+    const KEY_READ: u32 = 0x0002_0019;
+    if matches!(mode, policy::Mode::Cow) && nt_create_key_is_write_access(desired_access) {
+        return (desired_access & !NT_CREATE_KEY_WRITE_BITS) | KEY_READ;
+    }
+    let restricted = matches!(mode, policy::Mode::Cow | policy::Mode::Deny);
+    if restricted && desired_access & MAXIMUM_ALLOWED != 0 {
+        let rest = desired_access & !MAXIMUM_ALLOWED;
+        if !nt_create_key_is_write_access(rest) {
+            return rest | KEY_READ;
+        }
+    }
+    desired_access
+}
+
 /// What [`hook_nt_create_key`] must do for a given access mask + policy mode.
 ///
 /// The decision is made BEFORE the original NtCreateKey runs: NtCreateKey is
@@ -427,6 +457,7 @@ unsafe extern "system" fn hook_nt_create_key(
     // prefixes (audit 2026-09-19, Medium).
     if let Some(friendly) = resolve_attrs_friendly(object_attributes as *const _) {
         let mode = check_write_mode(&friendly, None);
+        let desired_access = nt_create_key_effective_access(desired_access, &mode);
         // Mode is Clone, not Copy — clone so we can still inspect `mode`
         // below to tell the deny-policy deny apart from the Cow downgrade.
         match nt_create_key_action(desired_access, mode.clone()) {

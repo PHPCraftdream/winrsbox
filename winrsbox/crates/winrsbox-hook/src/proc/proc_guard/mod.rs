@@ -213,6 +213,16 @@ unsafe extern "system" fn hook_nt_open_process(
 // NtAssignProcessToJobObject hook — blocks Job reassignment escape
 // ---------------------------------------------------------------------------
 
+/// Job assignment is allowed only for a tracked child (never self, never an
+/// unresolved handle, never a foreign process).
+pub(crate) fn job_assign_allowed(
+    target_pid: u32,
+    self_pid: u32,
+    is_owned_child: impl Fn(u32) -> bool,
+) -> bool {
+    target_pid != 0 && target_pid != self_pid && is_owned_child(target_pid)
+}
+
 unsafe extern "system" fn hook_nt_assign_process_to_job_object(
     job: *mut c_void,
     process: *mut c_void,
@@ -224,15 +234,31 @@ unsafe extern "system" fn hook_nt_assign_process_to_job_object(
         return call_original();
     };
 
-    // Any hooked process is already inside our sandbox Job. An explicit
-    // NtAssignProcessToJobObject call from within the sandbox is an escape
-    // attempt — the attacker creates an empty Job (no limits) and reassigns
-    // themselves into it. On Win10+ nested Jobs allow this, so the process
-    // would be in both Jobs but could use the empty one to dodge restrictions.
-    // Deny unconditionally.
+    // Nested jobs (Win8+): assigning a process to a further job never removes
+    // it from ours — our limits keep applying, and breakaway needs every job
+    // in the chain to allow it (ours never does). So putting an owned CHILD
+    // into the parent's own job is harmless, and it is how codex / Node /
+    // process-wrap tie MCP-server lifetimes to their own: denying it made
+    // codex kill every stdio MCP server right after spawn. Self and foreign
+    // targets stay denied.
+    // The caller's handle may hold only SET_QUOTA|TERMINATE (all assignment
+    // needs), so GetProcessId fails on it; identify it by object identity
+    // against our own duplicates of spawned-child handles instead.
+    let owned = crate::child_handles::child_pid_of(process);
+    let target_pid =
+        owned.unwrap_or_else(|| winapi::um::processthreadsapi::GetProcessId(process));
+    if job_assign_allowed(target_pid, GetCurrentProcessId(), |_| owned.is_some()) {
+        let status = call_original();
+        if is_trace() {
+            ipc_log(ipc::LogLevel::Trace,
+                format!("job_assign_allowed target_pid={target_pid} status=0x{:08x} access={:x?}",
+                    status as u32, crate::child_handles::granted_access(process)));
+        }
+        return status;
+    }
     if is_trace() {
         ipc_log(ipc::LogLevel::Trace,
-            format!("job_assign_blocked job=0x{:x} proc=0x{:x}",
+            format!("job_assign_blocked job=0x{:x} proc=0x{:x} target_pid={target_pid}",
                 job as usize, process as usize));
     }
     STATUS_ACCESS_DENIED
@@ -336,7 +362,8 @@ unsafe extern "system" fn hook_nt_terminate_process(
     if target_pid != 0 && target_pid != self_pid {
         if is_trace() {
             ipc_log(ipc::LogLevel::Trace,
-                format!("proc_terminate_untrack pid={target_pid}"));
+                format!("proc_terminate_untrack pid={target_pid} status=0x{:08x} prior_exit={:x?}",
+                    exit_status as u32, crate::child_handles::exit_code_of(process_handle)));
         }
         process_tracker::untrack(target_pid);
     }

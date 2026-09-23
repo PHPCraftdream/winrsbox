@@ -794,3 +794,29 @@ fn install_best_effort_fails_closed_on_detour_failures() {
          found {buffered} occurrences",
     );
 }
+
+/// Regression (codex UnknownIssuer): crypt32 retries a denied system-store
+/// open with MAXIMUM_ALLOWED; under Cow/Deny it must become a read-only
+/// open-existing, not a deny. Explicit write bits still deny.
+#[test]
+fn maximum_allowed_under_cow_becomes_read_open() {
+    const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+    const KEY_READ: u32 = 0x0002_0019;
+    for mode in [policy::Mode::Cow, policy::Mode::Deny] {
+        let eff = nt_create_key_effective_access(MAXIMUM_ALLOWED, &mode);
+        assert_eq!(eff, KEY_READ);
+        assert!(matches!(nt_create_key_action(eff, mode.clone()), CreateKeyAction::OpenExistingOnly));
+    }
+    // crypt32's HKCU Root open (0x3001f): Cow → read-only open-existing.
+    let eff = nt_create_key_effective_access(0x0003_001f, &policy::Mode::Cow);
+    assert!(!nt_create_key_is_write_access(eff));
+    assert!(matches!(nt_create_key_action(eff, policy::Mode::Cow), CreateKeyAction::OpenExistingOnly));
+    // Deny prefixes keep refusing explicit write masks.
+    let eff = nt_create_key_effective_access(0x0003_001f, &policy::Mode::Deny);
+    assert!(matches!(nt_create_key_action(eff, policy::Mode::Deny), CreateKeyAction::Deny));
+    // Unrestricted prefixes keep the caller's mask verbatim.
+    assert_eq!(
+        nt_create_key_effective_access(MAXIMUM_ALLOWED, &policy::Mode::Passthrough),
+        MAXIMUM_ALLOWED
+    );
+}

@@ -227,7 +227,7 @@ const PEB_PROCESS_PARAMETERS_OFFSET: usize = 0x20; // PEB -> ProcessParameters
 const PARAMS_ENVIRONMENT_OFFSET: usize = 0x80; // RTL_USER_PROCESS_PARAMETERS -> Environment
 const PARAMS_ENVIRONMENT_SIZE_OFFSET: usize = 0x3F0; // -> EnvironmentSize (Win8+)
 const PARAMS_ENVIRONMENT_VALUES_SIZE_OFFSET: usize = 0x3F8; // -> EnvironmentValuesSize (Win8+)
-/// `RTL_USER_PROCESS_PARAMETERS.Length` for a genuine 64-bit process.
+/// Minimum x64 `RTL_USER_PROCESS_PARAMETERS` size covering every field we write.
 const PARAMS_X64_LENGTH: usize = 0x400;
 /// Upper bound for scanning the child's env block for its double-NUL
 /// terminator (UTF-16 chars). A legitimate block stays far below this;
@@ -344,9 +344,8 @@ fn read_remote_bytes(process: HANDLE, addr: usize, buf: &mut [u8]) -> Result<(),
 /// live under a heap we cannot safely VirtualFreeEx; a few KiB per child is
 /// acceptable (same trade as the intentionally leaked DLL-path buffer).
 ///
-/// Returns Ok(()) without doing anything when the child does not look like a
-/// 64-bit process (struct Length mismatch): such a child cannot load this
-/// x64 hook DLL anyway, so there is no config to deliver.
+/// Returns Ok(()) without doing anything for a WOW64 child: it cannot load
+/// this x64 hook DLL anyway, so there is no config to deliver.
 fn patch_child_env_pairs(process: HANDLE, entries: &[(&str, &str)]) -> Result<(), String> {
     #[allow(dead_code)] // reserved fields mirror the kernel struct layout
     #[repr(C)]
@@ -417,14 +416,30 @@ fn patch_child_env_pairs(process: HANDLE, entries: &[(&str, &str)]) -> Result<()
         return Err("child ProcessParameters is null".into());
     }
 
-    // Struct Length sanity (offset 0x00): a genuine 64-bit process reports
-    // 0x400. A mismatch means a layout we do not claim to understand (e.g.
-    // WOW64) — skip instead of writing through guessed offsets.
+    // WOW64 children use a 32-bit layout we do not write through (and cannot
+    // load this x64 DLL anyway) — skip them explicitly.
+    let mut wow64: usize = 0;
+    // SAFETY: wow64 is a valid usize out-param; class 26 = ProcessWow64Information.
+    let status = unsafe {
+        qip_fn(process, 26, &mut wow64 as *mut usize as *mut c_void,
+               std::mem::size_of::<usize>() as u32, std::ptr::null_mut())
+    };
+    if status < 0 {
+        return Err(format!("ProcessWow64Information failed: 0x{status:08x}"));
+    }
+    if wow64 != 0 {
+        return Ok(());
+    }
+
+    // Length (offset 0x00) spans the header PLUS the packed strings (0x726
+    // observed), never exactly the 0x400 header — the old `== 0x400` test
+    // skipped EVERY child, so no injected variable ever arrived. Require only
+    // that the header covers every field written below.
     let mut len_bytes = [0u8; 4];
     read_remote_bytes(process, params, &mut len_bytes)?;
     let params_length = u32::from_le_bytes(len_bytes) as usize;
-    if params_length != PARAMS_X64_LENGTH {
-        return Ok(());
+    if params_length < PARAMS_X64_LENGTH {
+        return Err(format!("child ProcessParameters too short: 0x{params_length:x}"));
     }
 
     // Existing entries, if any. Read in 4 KiB chunks (the block may end well
@@ -971,3 +986,7 @@ mod env_delivery_tests {
     }
 }
 
+
+#[cfg(test)]
+#[path = "inject_env_tests.rs"]
+mod inject_env_tests;
