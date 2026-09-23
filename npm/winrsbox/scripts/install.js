@@ -148,7 +148,7 @@ function main() {
   const built = run('cargo', [
     'build', '--release', '--locked',
     '--manifest-path', workspaceManifest,
-    '-p', 'winrsbox', '-p', 'hook',
+    '-p', 'winrsbox', '-p', 'winrsbox-hook',
   ]);
   if (!built) {
     fail('cargo build failed — see output above.');
