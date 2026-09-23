@@ -639,10 +639,10 @@
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Pre-S07 data (basename-keyed C: root) moves into the new root; an
-    /// existing destination is never overwritten.
+    /// A partial copy fails closed, preserves the source and resumes after
+    /// the destination conflict is resolved.
     #[test]
-    fn s07_legacy_c_overlay_merges_without_overwrite() {
+    fn s07_legacy_c_overlay_partial_copy_is_retryable_and_scoped_to_index() {
         let base = s07_fixture_dir("legacy-merge");
         let proj = base.join("proj");
         let localapp = base.join("localapp");
@@ -657,16 +657,129 @@
         std::fs::create_dir_all(c_root.join(r"users\me")).expect("create new tree");
         std::fs::write(c_root.join(r"users\me\b.txt"), "new-b").expect("write new b");
 
-        let moved = super::migrate_legacy_c_overlay(&localapp, &legacy, &c_root).expect("migrate");
-        assert_eq!(moved, 1);
+        let policy = policy::Policy::open_or_create(
+            &base.join("policy.redb"),
+            legacy.clone(),
+            base.join("mock-dirs"),
+            proj.clone(),
+        )
+        .expect("open policy");
+        let overlay_a = legacy.join(r"users\me\a.txt").to_string_lossy().into_owned();
+        let overlay_b = legacy.join(r"users\me\b.txt").to_string_lossy().into_owned();
+        policy.record_overlay(r"c:\users\me\a.txt", &overlay_a).expect("index a");
+        policy.record_overlay(r"c:\users\me\b.txt", &overlay_b).expect("index b");
+
+        assert_eq!(policy.overlay_values_under_root(&legacy).expect("read index").len(), 2);
+        let indexed = vec![
+            PathBuf::from(format!("{}\\USERS\\ME\\A.TXT", legacy.display())),
+            PathBuf::from(format!("{}\\USERS\\ME\\B.TXT", legacy.display())),
+        ];
+        let err = super::migrate_legacy_c_overlay(&localapp, &legacy, &c_root, &indexed)
+            .expect_err("a conflicting indexed entry must abort migration");
+        assert!(err.to_string().contains("refusing to overwrite"));
         assert_eq!(std::fs::read_to_string(c_root.join(r"users\me\a.txt")).unwrap(), "legacy-a");
         assert_eq!(std::fs::read_to_string(c_root.join(r"users\me\b.txt")).unwrap(), "new-b");
-        assert!(legacy.join(r"users\me\b.txt").exists(), "unmoved entry stays in legacy");
+        assert!(legacy.join(r"users\me\a.txt").exists(), "source remains after partial copy");
+        assert!(legacy.join(r"users\me\b.txt").exists(), "conflicting source remains in legacy");
         assert_eq!(
-            super::migrate_legacy_c_overlay(&localapp, &legacy, &c_root).expect("re-run"),
-            0,
-            "idempotent"
+            policy.overlay_values_under_root(&legacy).expect("read index after failure").len(),
+            2,
+            "failed migration does not rebase the index"
         );
+        assert!(!policy.legacy_c_overlay_migration_complete(&c_root).expect("read marker"));
+
+        std::fs::remove_file(c_root.join(r"users\me\b.txt")).expect("resolve destination conflict");
+        assert_eq!(
+            super::migrate_legacy_c_overlay(&localapp, &legacy, &c_root, &indexed).expect("retry"),
+            (1, false),
+            "the already copied entry is verified and the unresolved entry is copied"
+        );
+        assert_eq!(
+            policy
+                .rebase_legacy_c_overlay_and_mark_complete(&legacy, &c_root)
+                .expect("rebase after complete copy"),
+            2
+        );
+        assert!(policy.legacy_c_overlay_migration_complete(&c_root).expect("read marker"));
+        assert!(policy.overlay_values_under_root(&legacy).expect("read legacy index").is_empty());
+        assert_eq!(policy.overlay_values_under_root(&c_root).expect("read new index").len(), 2);
+        assert_eq!(std::fs::read_to_string(c_root.join(r"users\me\a.txt")).unwrap(), "legacy-a");
+        assert_eq!(std::fs::read_to_string(c_root.join(r"users\me\b.txt")).unwrap(), "legacy-b");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn s07_legacy_overlay_hole_below_indexed_directory_blocks_rebase() {
+        let base = s07_fixture_dir("legacy-index-hole");
+        let proj = base.join("proj");
+        let localapp = base.join("localapp");
+        std::fs::create_dir_all(&proj).expect("create project");
+        let legacy = super::legacy_c_overlay_root(&localapp, &proj);
+        std::fs::create_dir_all(legacy.join(r"users\me")).expect("create legacy tree");
+        let hole = legacy.join(r"users\me\relative-open.txt");
+        std::fs::write(&hole, "unindexed CoW data").expect("write relative-open CoW data");
+        let c_root = super::ensure_c_overlay_root(&localapp, &proj).expect("create C: root");
+
+        let policy = policy::Policy::open_or_create(
+            &base.join("policy.redb"),
+            legacy.clone(),
+            base.join("mock-dirs"),
+            proj.clone(),
+        )
+        .expect("open policy");
+        let directory_overlay = legacy.join(r"users\me").to_string_lossy().into_owned();
+        policy
+            .record_overlay(r"c:\users\me", &directory_overlay)
+            .expect("index directory only");
+        let indexed = policy.overlay_values_under_root(&legacy).expect("read index");
+        assert_eq!(indexed.len(), 1);
+
+        let err = super::migrate_legacy_c_overlay(&localapp, &legacy, &c_root, &indexed)
+            .expect_err("an unindexed file below an indexed directory must block migration");
+        assert!(err.to_string().contains(hole.to_string_lossy().as_ref()));
+        assert!(hole.exists(), "unindexed source data remains recoverable");
+        assert!(
+            !c_root.join(r"users\me\relative-open.txt").exists(),
+            "preflight detects the hole before copying or rebasing"
+        );
+        assert_eq!(policy.overlay_values_under_root(&legacy).expect("read index after failure").len(), 1);
+        assert!(!policy.legacy_c_overlay_migration_complete(&c_root).expect("read marker"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn s07_empty_policy_leaves_shared_legacy_data_unattributed() {
+        let base = s07_fixture_dir("legacy-unattributed");
+        let proj = base.join("proj");
+        let localapp = base.join("localapp");
+        std::fs::create_dir_all(&proj).expect("create project");
+        let legacy = super::legacy_c_overlay_root(&localapp, &proj);
+        std::fs::create_dir_all(&legacy).expect("create legacy root");
+        let shared_file = legacy.join("another-project.txt");
+        std::fs::write(&shared_file, "unattributed").expect("write shared legacy entry");
+        let c_root = super::ensure_c_overlay_root(&localapp, &proj).expect("create C: root");
+        let policy = policy::Policy::open_or_create(
+            &base.join("policy.redb"),
+            legacy.clone(),
+            base.join("mock-dirs"),
+            proj.clone(),
+        )
+        .expect("open empty policy");
+
+        assert_eq!(
+            super::migrate_legacy_c_overlay(&localapp, &legacy, &c_root, &[])
+                .expect("leave shared legacy data untouched"),
+            (0, true)
+        );
+        assert!(shared_file.exists());
+        assert!(!c_root.join("another-project.txt").exists());
+        assert_eq!(
+            policy
+                .rebase_legacy_c_overlay_and_mark_complete(&legacy, &c_root)
+                .expect("mark empty policy migration complete"),
+            0
+        );
+        assert!(policy.legacy_c_overlay_migration_complete(&c_root).expect("read marker"));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -681,11 +794,11 @@
         std::fs::create_dir_all(&localapp).expect("create localapp dir");
         let c_root = super::ensure_c_overlay_root(&localapp, &proj).expect("create C: root");
         let legacy = super::legacy_c_overlay_root(&localapp, &proj);
-        assert_eq!(super::migrate_legacy_c_overlay(&localapp, &legacy, &c_root).expect("absent"), 0);
+        assert_eq!(super::migrate_legacy_c_overlay(&localapp, &legacy, &c_root, &[]).expect("absent"), (0, false));
 
         create_junction(&localapp.join(".winrsbox").join("proj"), &elsewhere).expect("junction");
         std::fs::write(elsewhere.join(r"workdir\x.txt"), "x").expect("write x");
-        super::migrate_legacy_c_overlay(&localapp, &legacy, &c_root)
+        super::migrate_legacy_c_overlay(&localapp, &legacy, &c_root, &[])
             .expect_err("legacy chain through a junction must be refused");
         assert!(elsewhere.join(r"workdir\x.txt").exists(), "junction target untouched");
         let _ = std::fs::remove_dir(localapp.join(".winrsbox").join("proj"));

@@ -933,3 +933,53 @@ fn rebase_overlay_root_rewrites_only_rows_under_old_root() {
     assert_eq!(get(r"c:\x\b.txt").as_deref(), Some(r"C:\LA\.winrsbox\app2\workdir\x\b.txt"), "sibling-prefix root untouched");
     assert_eq!(get(r"d:\y\c.txt").as_deref(), Some(r"D:\sb\y\c.txt"));
 }
+
+#[test]
+fn overlay_values_under_root_returns_only_indexed_values_from_that_root() {
+    let (_dir, p) = make_policy();
+    let root = std::path::Path::new(r"C:\LA\.winrsbox\app\workdir");
+    p.record_overlay(
+        r"c:\users\me\a.txt",
+        r"C:\la\.WINRSBOX\app\workdir\users\me\a.txt",
+    )
+    .unwrap();
+    p.record_overlay(r"c:\x\b.txt", r"C:\LA\.winrsbox\app2\workdir\x\b.txt")
+        .unwrap();
+    p.record_overlay(r"d:\other.txt", r"D:\sb\other.txt")
+        .unwrap();
+
+    let mut values = p.overlay_values_under_root(root).expect("read overlay index");
+    values.sort();
+    assert_eq!(
+        values,
+        vec![std::path::PathBuf::from(
+            r"C:\la\.WINRSBOX\app\workdir\users\me\a.txt"
+        )]
+    );
+}
+
+#[test]
+fn legacy_c_overlay_completion_marker_commits_with_rebase() {
+    let (_dir, p) = make_policy();
+    let old = std::path::Path::new(r"C:\LA\.winrsbox\app\workdir");
+    let new = std::path::Path::new(r"C:\LA\.winrsbox\app-00ff\workdir");
+    p.record_overlay(
+        r"c:\users\me\a.txt",
+        r"C:\LA\.winrsbox\app\workdir\users\me\a.txt",
+    )
+    .expect("record old overlay");
+
+    assert!(!p.legacy_c_overlay_migration_complete(new).expect("read marker"));
+    assert_eq!(
+        p.rebase_legacy_c_overlay_and_mark_complete(old, new)
+            .expect("rebase and mark"),
+        1
+    );
+    assert!(p.legacy_c_overlay_migration_complete(new).expect("read marker"));
+    assert!(p.overlay_values_under_root(old).expect("read old index").is_empty());
+    assert_eq!(
+        p.rebase_legacy_c_overlay_and_mark_complete(old, new)
+            .expect("idempotent rebase"),
+        0
+    );
+}

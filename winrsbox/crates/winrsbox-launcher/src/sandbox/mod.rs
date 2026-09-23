@@ -866,7 +866,7 @@ pub(crate) mod inject;
 // returning) moved into inject.rs (layout-guard: this file was over the
 // 1000-line limit) — thematically "locate and verify hook.dll before
 // injecting it" belongs with the rest of inject.rs's DLL-injection concerns.
-pub(crate) use inject::{find_hook_dll, prepare_c_overlay_root};
+pub(crate) use inject::{complete_c_overlay_migration, find_hook_dll, prepare_c_overlay_root};
 #[cfg(test)]
 pub(crate) use inject::{legacy_c_overlay_root, migrate_legacy_c_overlay};
 

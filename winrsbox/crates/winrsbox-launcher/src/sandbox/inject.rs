@@ -3,8 +3,11 @@
 use anyhow::{Context, Result};
 use std::{
     ffi::OsStr,
+    fs::{self, File, OpenOptions},
+    io::Read,
     os::windows::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 use windows::{
     core::PCWSTR,
@@ -486,33 +489,67 @@ fn is_plain_dir(md: &std::fs::Metadata) -> bool {
     md.is_dir() && md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
 }
 
-/// Create/reuse the current C: overlay root and best-effort migrate any
-/// pre-S07 legacy tree into it. Returns `(c_root, legacy_root)` — the legacy
-/// path is returned unconditionally (migration failure is logged, never
-/// fatal) so the caller can rebase the policy DB's `OVERLAY_IDX` against it
-/// once the DB is open.
+/// Create/reuse the current C: overlay root and return it with the pre-S07
+/// path. Migration waits until the policy database identifies owned entries.
 pub(crate) fn prepare_c_overlay_root(
     local_appdata: &Path,
     project_root: &Path,
 ) -> Result<(PathBuf, PathBuf)> {
     let c_root = super::ensure_c_overlay_root(local_appdata, project_root)?;
     let legacy = legacy_c_overlay_root(local_appdata, project_root);
-    if let Err(e) = migrate_legacy_c_overlay(local_appdata, &legacy, &c_root) {
-        eprintln!("[sandbox] legacy C: overlay not migrated: {e:#}");
-    }
     Ok((c_root, legacy))
 }
 
-/// Move the legacy C: overlay tree into `new_root` so data CoW'd by pre-S07
-/// builds stays visible. Never overwrites an existing destination and never
-/// descends through a reparse point (the legacy chain itself must be plain
-/// directories). Per-entry failures (busy files) are skipped. Returns the
-/// number of moved entries; 0 when there is no legacy tree.
+pub(crate) fn complete_c_overlay_migration(
+    policy: &policy::Policy,
+    local_appdata: &Path,
+    legacy: &Path,
+    c_root: &Path,
+) -> Result<()> {
+    if policy.legacy_c_overlay_migration_complete(c_root)? {
+        let leftovers = policy.overlay_values_under_root(legacy)?;
+        anyhow::ensure!(
+            leftovers.is_empty(),
+            "legacy C: overlay migration is marked complete, but OVERLAY_IDX still references {}; refusing to launch",
+            leftovers[0].display()
+        );
+        return Ok(());
+    }
+
+    let indexed_paths = policy.overlay_values_under_root(legacy)?;
+    let (copied, unattributed_legacy) =
+        migrate_legacy_c_overlay(local_appdata, legacy, c_root, &indexed_paths)?;
+    if unattributed_legacy {
+        eprintln!(
+            "[sandbox] legacy C: overlay {} contains entries but this policy DB has no indexed C: overlays; leaving shared data untouched",
+            legacy.display()
+        );
+    }
+    if copied > 0 {
+        eprintln!(
+            "[sandbox] copied {copied} indexed legacy C: overlay entries into {}",
+            c_root.display()
+        );
+    }
+    let rebased = policy.rebase_legacy_c_overlay_and_mark_complete(legacy, c_root)?;
+    if rebased > 0 {
+        eprintln!(
+            "[sandbox] rebased {rebased} legacy C: overlay index entries to {}",
+            c_root.display()
+        );
+    }
+    Ok(())
+}
+
+/// Copy indexed entries from the pre-S07 C: root. Source files remain intact;
+/// any failure aborts before rebase. The bool reports unattributed legacy
+/// entries when this policy has no indexed paths.
 pub(crate) fn migrate_legacy_c_overlay(
     local_appdata: &Path,
     legacy: &Path,
     new_root: &Path,
-) -> Result<usize> {
+    indexed_paths: &[PathBuf],
+) -> Result<(usize, bool)> {
     let rel = legacy
         .strip_prefix(local_appdata)
         .context("legacy C: overlay root is outside LOCALAPPDATA")?;
@@ -525,40 +562,323 @@ pub(crate) fn migrate_legacy_c_overlay(
                 "legacy C: overlay component {} is not a plain directory",
                 cur.display()
             ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, false)),
             Err(e) => return Err(e).with_context(|| format!("stat {}", cur.display())),
         }
     }
-    Ok(merge_tree_no_overwrite(legacy, new_root))
-}
+    if indexed_paths.is_empty() {
+        let mut entries = fs::read_dir(legacy)
+            .with_context(|| format!("read legacy overlay {}", legacy.display()))?;
+        let has_unattributed_entries = match entries.next() {
+            Some(Ok(_)) => true,
+            Some(Err(e)) => return Err(e).with_context(|| format!("read legacy overlay {}", legacy.display())),
+            None => false,
+        };
+        return Ok((0, has_unattributed_entries));
+    }
+    let indexed_relatives = indexed_paths
+        .iter()
+        .map(|indexed_path| {
+            let relative = strip_path_prefix_ascii_case_insensitive(indexed_path, legacy)
+                .with_context(|| {
+                    format!(
+                        "indexed overlay {} is outside legacy root",
+                        indexed_path.display()
+                    )
+                })?;
+            validate_relative_overlay_path(indexed_path, &relative)?;
+            Ok(normalized_relative_key(&relative))
+        })
+        .collect::<Result<std::collections::HashSet<_>>>()?;
+    validate_legacy_indexed_files(legacy, &indexed_relatives)?;
 
-fn merge_tree_no_overwrite(src: &Path, dst: &Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(src) else { return 0 };
-    let mut moved = 0;
-    for entry in entries.flatten() {
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        let Ok(src_md) = std::fs::symlink_metadata(&from) else { continue };
-        match std::fs::symlink_metadata(&to) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if std::fs::rename(&from, &to).is_ok() {
-                    moved += 1;
+    let mut copied = 0;
+    for indexed_path in indexed_paths {
+        let relative = strip_path_prefix_ascii_case_insensitive(indexed_path, legacy)
+            .with_context(|| {
+                format!(
+                    "indexed overlay {} is outside legacy root",
+                    indexed_path.display()
+                )
+            })?;
+        validate_relative_overlay_path(indexed_path, &relative)?;
+        let source = legacy.join(&relative);
+        let destination = new_root.join(&relative);
+        ensure_plain_source_ancestors(legacy, relative.parent().unwrap_or_else(|| Path::new("")))?;
+        match fs::symlink_metadata(&source) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("stat legacy overlay {}", source.display())),
+            Ok(source_md) if !is_plain_entry(&source_md) => {
+                anyhow::bail!(
+                    "legacy overlay entry {} is a reparse point or unsupported file type",
+                    source.display()
+                );
+            }
+            Ok(source_md) if source_md.is_dir() => {
+                ensure_plain_directory(new_root, &relative)?;
+            }
+            Ok(_) => {
+                ensure_plain_directory(new_root, relative.parent().unwrap_or_else(|| Path::new("")))?;
+                if copy_file_without_overwrite(&source, &destination)? {
+                    copied += 1;
                 }
             }
-            Ok(dst_md) if is_plain_dir(&src_md) && is_plain_dir(&dst_md) => {
-                moved += merge_tree_no_overwrite(&from, &to);
-            }
-            _ => {}
         }
     }
-    // Succeeds only once everything was moved out.
-    let _ = std::fs::remove_dir(src);
-    moved
+    Ok((copied, false))
+}
+
+fn validate_relative_overlay_path(indexed_path: &Path, relative: &Path) -> Result<()> {
+    anyhow::ensure!(
+        relative
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "indexed overlay {} has an unsafe relative path",
+        indexed_path.display()
+    );
+    Ok(())
+}
+
+fn normalized_relative_key(relative: &Path) -> String {
+    let normalized = relative.to_string_lossy().replace('/', "\\");
+    policy::path::nt_case_fold(&normalized).into_owned()
+}
+
+fn validate_legacy_indexed_files(
+    root: &Path,
+    indexed_relatives: &std::collections::HashSet<String>,
+) -> Result<()> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).with_context(|| format!("read legacy overlay {}", dir.display()))? {
+            let entry = entry.with_context(|| format!("read entry in legacy overlay {}", dir.display()))?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("stat legacy overlay entry {}", path.display()))?;
+            anyhow::ensure!(
+                is_plain_entry(&metadata),
+                "legacy overlay entry {} is a reparse point or unsupported file type",
+                path.display()
+            );
+            if metadata.is_dir() {
+                pending.push(path);
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .context("legacy overlay entry escaped its root")?;
+                anyhow::ensure!(
+                    indexed_relatives.contains(&normalized_relative_key(relative)),
+                    "unindexed legacy C: overlay file {} has no OVERLAY_IDX entry; refusing to rebase",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn strip_path_prefix_ascii_case_insensitive(path: &Path, root: &Path) -> Option<PathBuf> {
+    let mut path_components = path.components();
+    for root_component in root.components() {
+        let path_component = path_components.next()?;
+        if !path_component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&root_component.as_os_str().to_string_lossy())
+        {
+            return None;
+        }
+    }
+    Some(path_components.fold(PathBuf::new(), |mut relative, component| {
+        relative.push(component.as_os_str());
+        relative
+    }))
+}
+
+fn is_plain_entry(md: &std::fs::Metadata) -> bool {
+    md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 && (md.is_dir() || md.is_file())
+}
+
+fn ensure_plain_directory(root: &Path, relative: &Path) -> Result<()> {
+    let root_md = fs::symlink_metadata(root)
+        .with_context(|| format!("stat overlay root {}", root.display()))?;
+    anyhow::ensure!(
+        is_plain_dir(&root_md),
+        "overlay root {} is not a plain directory",
+        root.display()
+    );
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            anyhow::bail!("unsafe overlay directory component in {}", relative.display());
+        };
+        current.push(name);
+        match fs::symlink_metadata(&current) {
+            Ok(md) if is_plain_dir(&md) => {}
+            Ok(_) => anyhow::bail!(
+                "overlay destination component {} is not a plain directory",
+                current.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current).with_context(|| format!("create overlay directory {}", current.display()))?;
+                let md = fs::symlink_metadata(&current)
+                    .with_context(|| format!("verify overlay directory {}", current.display()))?;
+                anyhow::ensure!(
+                    is_plain_dir(&md),
+                    "overlay destination component {} is not a plain directory",
+                    current.display()
+                );
+            }
+            Err(e) => return Err(e).with_context(|| format!("stat overlay directory {}", current.display())),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_plain_source_ancestors(root: &Path, relative: &Path) -> Result<()> {
+    let root_md = fs::symlink_metadata(root)
+        .with_context(|| format!("stat legacy overlay root {}", root.display()))?;
+    anyhow::ensure!(
+        is_plain_dir(&root_md),
+        "legacy overlay root {} is not a plain directory",
+        root.display()
+    );
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            anyhow::bail!("unsafe legacy overlay directory component in {}", relative.display());
+        };
+        current.push(name);
+        match fs::symlink_metadata(&current) {
+            Ok(md) if is_plain_dir(&md) => {}
+            Ok(_) => anyhow::bail!(
+                "legacy overlay component {} is not a plain directory",
+                current.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("stat legacy overlay directory {}", current.display())),
+        }
+    }
+    Ok(())
+}
+
+fn copy_file_without_overwrite(source: &Path, destination: &Path) -> Result<bool> {
+    if let Some(equal) = existing_destination_matches(source, destination)? {
+        anyhow::ensure!(
+            equal,
+            "legacy overlay conflict at {}; refusing to overwrite",
+            destination.display()
+        );
+        return Ok(false);
+    }
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+    let parent = destination.parent().context("overlay destination has no parent")?;
+    loop {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".winrsbox-migrate-{}-{id}.tmp", std::process::id()));
+        match OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(mut output) => {
+                let result = (|| -> Result<bool> {
+                    let mut input = File::open(source)
+                        .with_context(|| format!("open legacy overlay {}", source.display()))?;
+                    std::io::copy(&mut input, &mut output)
+                        .with_context(|| format!("copy legacy overlay {}", source.display()))?;
+                    output.sync_all().context("flush migrated overlay file")?;
+                    drop(output);
+                    link_staged_file_no_replace(&candidate, destination, source)
+                })();
+                let _ = fs::remove_file(&candidate);
+                return result;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("create migration temp file in {}", parent.display()))
+            }
+        }
+    }
+}
+
+fn link_staged_file_no_replace(staged: &Path, destination: &Path, source: &Path) -> Result<bool> {
+    match fs::hard_link(staged, destination) {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            if let Some(equal) = existing_destination_matches(source, destination)? {
+                anyhow::ensure!(
+                    equal,
+                    "legacy overlay conflict at {}; refusing to overwrite",
+                    destination.display()
+                );
+                return Ok(false);
+            }
+            Err(e).with_context(|| {
+                format!(
+                    "atomically install migrated overlay at {}; hard links are required",
+                    destination.display()
+                )
+            })
+        }
+    }
+}
+
+fn existing_destination_matches(source: &Path, destination: &Path) -> Result<Option<bool>> {
+    match fs::symlink_metadata(destination) {
+        Ok(md) => {
+            anyhow::ensure!(
+                md.is_file() && md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+                "overlay destination {} is not a regular file",
+                destination.display()
+            );
+            Ok(Some(files_equal(source, destination)?))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("stat overlay destination {}", destination.display())),
+    }
+}
+
+fn files_equal(left: &Path, right: &Path) -> Result<bool> {
+    let left_md = fs::metadata(left).with_context(|| format!("stat {}", left.display()))?;
+    let right_md = fs::metadata(right).with_context(|| format!("stat {}", right.display()))?;
+    if left_md.len() != right_md.len() {
+        return Ok(false);
+    }
+    let mut left_file = File::open(left).with_context(|| format!("open {}", left.display()))?;
+    let mut right_file = File::open(right).with_context(|| format!("open {}", right.display()))?;
+    let mut left_buf = [0u8; 16 * 1024];
+    let mut right_buf = [0u8; 16 * 1024];
+    loop {
+        let left_read = left_file.read(&mut left_buf)?;
+        let right_read = right_file.read(&mut right_buf)?;
+        if left_read != right_read || left_buf[..left_read] != right_buf[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_hardlink_failure_does_not_publish_destination() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let source = dir.path().join("legacy.bin");
+        let staged = dir.path().join("staged.tmp");
+        let destination = dir.path().join("missing-parent").join("overlay.bin");
+        fs::write(&source, b"legacy contents").expect("write legacy source");
+        fs::write(&staged, b"legacy contents").expect("write staged file");
+
+        let err = link_staged_file_no_replace(&staged, &destination, &source)
+            .expect_err("link to a missing parent must fail");
+        assert!(err.to_string().contains("hard links are required"));
+        assert!(!destination.exists(), "failure must not publish a partial destination");
+        assert_eq!(fs::read(&staged).expect("read staged file"), b"legacy contents");
+        assert_eq!(fs::read(&source).expect("read legacy source"), b"legacy contents");
+    }
 
     /// The pre-launch record lands in the same violations.log audit trail
     /// as the pipe-side violation records; a hostile target path must not

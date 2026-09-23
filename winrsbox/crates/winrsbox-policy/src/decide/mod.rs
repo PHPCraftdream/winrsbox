@@ -542,6 +542,82 @@ pub(crate) fn path_aliases_outside_root(dos_path: &str, root_lower: &str) -> boo
 use crate::Policy;
 
 impl Policy {
+    /// Whether the legacy C: overlay migration completed for `new_root`.
+    pub fn legacy_c_overlay_migration_complete(
+        &self,
+        new_root: &std::path::Path,
+    ) -> Result<bool, PolicyError> {
+        const MARKER: &str = "legacy-c-overlay-s07-v1";
+        let new_owned = new_root.to_string_lossy();
+        let target = crate::path::nt_case_fold(&new_owned);
+        let txn = self.inner.db.begin_read()?;
+        let t = txn.open_table(db::OVERLAY_MIGRATIONS)?;
+        let Some(value) = t.get(MARKER)? else { return Ok(false) };
+        Ok(crate::path::nt_case_fold(value.value()).as_ref() == target.as_ref())
+    }
+
+    /// Rebase legacy C: entries and persist completion in the same database
+    /// transaction so a successful retry can distinguish retained shared data.
+    pub fn rebase_legacy_c_overlay_and_mark_complete(
+        &self,
+        old_root: &std::path::Path,
+        new_root: &std::path::Path,
+    ) -> Result<usize, PolicyError> {
+        const MARKER: &str = "legacy-c-overlay-s07-v1";
+        let old_owned = old_root.to_string_lossy();
+        let old_lower = old_owned.trim_end_matches('\\').to_ascii_lowercase();
+        let new_owned = new_root.to_string_lossy();
+        let new = new_owned.trim_end_matches('\\');
+        let txn = self.inner.db.begin_write()?;
+        let rewritten;
+        {
+            let mut index = txn.open_table(db::OVERLAY_IDX)?;
+            let mut updates = Vec::new();
+            for row in index.iter()? {
+                let (key, value) = row?;
+                if let Some(rest) = strip_root_prefix(value.value(), &old_lower) {
+                    updates.push((key.value().to_string(), format!("{new}{rest}")));
+                }
+            }
+            for (key, value) in &updates {
+                index.insert(key.as_str(), value.as_str())?;
+            }
+            rewritten = updates.len();
+        }
+        {
+            let mut migrations = txn.open_table(db::OVERLAY_MIGRATIONS)?;
+            migrations.insert(MARKER, new)?;
+        }
+        txn.commit()?;
+        if rewritten > 0 {
+            self.inner.cache.clear();
+        }
+        Ok(rewritten)
+    }
+
+    /// Return indexed overlay paths beneath `root` without changing the index.
+    /// Callers use this to migrate only data owned by this policy database.
+    pub fn overlay_values_under_root(
+        &self,
+        root: &std::path::Path,
+    ) -> Result<Vec<PathBuf>, PolicyError> {
+        let root_owned = root.to_string_lossy();
+        let root_lower = root_owned.trim_end_matches('\\').to_ascii_lowercase();
+        if root_lower.is_empty() {
+            return Ok(Vec::new());
+        }
+        let txn = self.inner.db.begin_read()?;
+        let t = txn.open_table(db::OVERLAY_IDX)?;
+        let mut paths = Vec::new();
+        for row in t.iter()? {
+            let (_, value) = row?;
+            if strip_root_prefix(value.value(), &root_lower).is_some() {
+                paths.push(PathBuf::from(value.value()));
+            }
+        }
+        Ok(paths)
+    }
+
     /// Rewrite every `OVERLAY_IDX` value under `old_root` to the same relative
     /// path under `new_root` (segment-aware, ASCII case-insensitive prefix).
     /// Needed when an overlay root moves: review S07 re-keyed the C: root, and

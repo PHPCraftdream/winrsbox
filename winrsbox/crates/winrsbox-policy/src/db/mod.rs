@@ -6,6 +6,8 @@ pub const RULES: TableDefinition<&str, &[u8]> = TableDefinition::new("rules");
 pub const MOCKS: TableDefinition<&str, &[u8]> = TableDefinition::new("mocks");
 pub const MOCK_DIRS: TableDefinition<&str, ()> = TableDefinition::new("mock_dirs");
 pub const OVERLAY_IDX: TableDefinition<&str, &str> = TableDefinition::new("overlay_idx");
+pub const OVERLAY_MIGRATIONS: TableDefinition<&str, &str> =
+    TableDefinition::new("overlay_migrations");
 
 /// Optional case-preservation index for overlay entries.
 ///

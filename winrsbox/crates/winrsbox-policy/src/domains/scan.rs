@@ -6,7 +6,7 @@
 // Crate version assumed:
 //   iced-x86 = "1"  (no_std + decoder, no encoder)
 
-use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic};
+use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -120,38 +120,84 @@ fn syscall_kind(instr: &Instruction) -> Option<SyscallKind> {
 }
 
 /// A syscall pattern decoded within this many instructions after an INVALID
-/// decode is data, not code: the sweep is walking a jump/lookup table that
-/// MSVC/LLVM place inside `.text`. Observed: codex.exe (230 MB `.text`) has
-/// `…0f 0f 04 0f 0f 05…` in a byte table, reached through a run of INVALID
-/// decodes. Buffers of at most MAX_INSTRUCTION_LEN bytes are exempt.
+/// decode is data, not code, unless it has the canonical Windows x64 stub
+/// setup (`mov r10, rcx; mov eax, imm32; syscall`). The suppression avoids
+/// flagging jump/lookup tables that MSVC/LLVM place inside `.text`. Observed:
+/// codex.exe (230 MB `.text`) has `…0f 0f 04 0f 0f 05…` in a byte table,
+/// reached through a run of INVALID decodes. Buffers of at most
+/// MAX_INSTRUCTION_LEN bytes are exempt.
 ///
-/// Residual (same class as the deep-immediate one documented on
-/// [`find_direct_syscalls_multi_entry`]): a stub deliberately preceded by
-/// undecodable bytes is not flagged.
+/// An exact byte-pattern check also catches this stub when the decoder's
+/// INVALID instruction consumes its first byte. Other stub forms can still
+/// be suppressed when they occur within the lookback window;
+/// this remains a mitigation, not a proof that every executable entry is
+/// found (see [`find_direct_syscalls_multi_entry`]).
 pub const DATA_CONTEXT_LOOKBACK: usize = 4;
+
+/// Offset of the syscall in `mov r10, rcx; mov eax, imm32; syscall`.
+fn canonical_stub_syscalls(bytes: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    bytes.windows(10).enumerate().filter_map(|(offset, window)| {
+        (window.starts_with(&[0x4c, 0x8b, 0xd1, 0xb8])
+            && window[8..] == [0x0f, 0x05])
+            .then_some(offset + 8)
+    })
+}
 
 /// Tracks decoded instructions since the last INVALID one.
 struct DataContext {
     exempt: bool,
     since_invalid: usize,
+    after_mov_r10_rcx: bool,
+    after_stub_setup: bool,
 }
 
 impl DataContext {
     fn new(len: usize) -> Self {
-        Self { exempt: len <= MAX_INSTRUCTION_LEN, since_invalid: DATA_CONTEXT_LOOKBACK }
+        Self {
+            exempt: len <= MAX_INSTRUCTION_LEN,
+            since_invalid: DATA_CONTEXT_LOOKBACK,
+            after_mov_r10_rcx: false,
+            after_stub_setup: false,
+        }
     }
 
     /// Classify `instr` and advance the context.
     fn hit(&mut self, instr: &Instruction) -> Option<SyscallKind> {
         if instr.is_invalid() {
             self.since_invalid = 0;
+            self.after_mov_r10_rcx = false;
+            self.after_stub_setup = false;
             return None;
         }
-        let kind = syscall_kind(instr)
-            .filter(|_| self.exempt || self.since_invalid >= DATA_CONTEXT_LOOKBACK);
+
+        let is_syscall = syscall_kind(instr);
+        let canonical_stub = self.after_stub_setup && is_syscall == Some(SyscallKind::Syscall);
+        let kind = is_syscall.filter(|_| {
+            self.exempt || self.since_invalid >= DATA_CONTEXT_LOOKBACK || canonical_stub
+        });
+
+        self.after_stub_setup = self.after_mov_r10_rcx && is_mov_eax_imm32(instr);
+        self.after_mov_r10_rcx = is_mov_r10_rcx(instr);
         self.since_invalid = self.since_invalid.saturating_add(1);
         kind
     }
+}
+
+fn is_mov_r10_rcx(instr: &Instruction) -> bool {
+    instr.mnemonic() == Mnemonic::Mov
+        && instr.op_count() == 2
+        && instr.op_kind(0) == OpKind::Register
+        && instr.op_register(0) == Register::R10
+        && instr.op_kind(1) == OpKind::Register
+        && instr.op_register(1) == Register::RCX
+}
+
+fn is_mov_eax_imm32(instr: &Instruction) -> bool {
+    instr.mnemonic() == Mnemonic::Mov
+        && instr.op_count() == 2
+        && instr.op_kind(0) == OpKind::Register
+        && instr.op_register(0) == Register::EAX
+        && instr.op_kind(1) == OpKind::Immediate32
 }
 
 /// Disassemble `bytes` as x86-64 instructions starting at `base_addr` and
@@ -159,8 +205,8 @@ impl DataContext {
 ///
 /// This is *linear sweep* disassembly — it decodes from byte 0 sequentially.
 /// iced-x86 returns a 1-byte INVALID instruction for undecodable bytes and
-/// continues; patterns right after INVALID decodes are skipped as data (see
-/// [`DATA_CONTEXT_LOOKBACK`]).
+/// continues; patterns right after INVALID decodes are skipped as data except
+/// for the canonical Windows syscall stub (see [`DATA_CONTEXT_LOOKBACK`]).
 pub fn find_direct_syscalls(bytes: &[u8], base_addr: u64) -> Vec<SyscallHit> {
     let mut hits = Vec::new();
     let mut ctx = DataContext::new(bytes.len());
@@ -172,6 +218,12 @@ pub fn find_direct_syscalls(bytes: &[u8], base_addr: u64) -> Vec<SyscallHit> {
             hits.push(SyscallHit { offset: pos, kind: k });
         }
     }
+    hits.extend(canonical_stub_syscalls(bytes).map(|offset| SyscallHit {
+        offset,
+        kind: SyscallKind::Syscall,
+    }));
+    hits.sort_by_key(|hit| hit.offset);
+    hits.dedup_by_key(|hit| hit.offset);
     hits
 }
 
@@ -202,6 +254,9 @@ fn sweep_has_direct_syscall(bytes: &[u8], base_addr: u64) -> bool {
 /// remaining passes after a hit are not decoded and no Vec is built.
 pub fn has_direct_syscall(bytes: &[u8], base_addr: u64) -> bool {
     if sweep_has_direct_syscall(bytes, base_addr) {
+        return true;
+    }
+    if canonical_stub_syscalls(bytes).next().is_some() {
         return true;
     }
     let entries = bytes.len().min(MAX_INSTRUCTION_LEN + 1);
@@ -646,11 +701,26 @@ mod tests {
     }
 
     #[test]
-    fn syscall_stub_right_after_invalid_is_documented_residual() {
+    fn canonical_syscall_stub_right_after_invalid_is_detected() {
         // 06 = INVALID in 64-bit; mov r10,rcx; mov eax,0x18; syscall; ret.
         let mut bytes = vec![0x90u8; 32];
-        bytes.extend_from_slice(&[0x06, 0x4C, 0x8B, 0xD1, 0xB8, 0x18, 0, 0, 0, 0x0F, 0x05, 0xC3]);
+        bytes.extend_from_slice(&[
+            0x06, 0x4C, 0x8B, 0xD1, 0xB8, 0x18, 0, 0, 0, 0x0F, 0x05, 0xC3,
+        ]);
+        let hits = find_direct_syscalls(&bytes, 0);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].offset, 32 + 1 + 3 + 5);
+        assert!(has_direct_syscall(&bytes, 0));
+    }
+
+    #[test]
+    fn non_stub_syscall_near_invalid_remains_suppressed() {
+        // An immediate load followed by syscall lacks the Windows x64
+        // argument-register setup and should not override table suppression.
+        let mut bytes = vec![0x90u8; 32];
+        bytes.extend_from_slice(&[0x06, 0xB8, 0x18, 0, 0, 0, 0x0F, 0x05, 0xC3]);
         assert!(find_direct_syscalls(&bytes, 0).is_empty());
+        assert!(!has_direct_syscall(&bytes, 0));
     }
 
     /// 32 NOPs, `06 90` (one 2-byte INVALID decode), `nops` NOPs, syscall, ret.

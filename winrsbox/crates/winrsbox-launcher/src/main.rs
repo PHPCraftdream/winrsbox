@@ -338,9 +338,9 @@ async fn run() -> Result<()> {
     // per-project state dir / policy DB) — never by the basename alone
     // (review S07: same-basename projects must not share a C: overlay).
     let mut overlay_layout = policy::path::OverlayLayout::single(sandbox_root.clone());
-    // (legacy pre-S07 C: root, current C: root) — rows recorded against the
-    // legacy root are rebased once the policy DB is open.
-    let mut c_root_migration: Option<(PathBuf, PathBuf)> = None;
+    // (local appdata, legacy pre-S07 C: root, current C: root). Indexed data
+    // is copied and rebased after the policy DB is open.
+    let mut c_root_migration: Option<(PathBuf, PathBuf, PathBuf)> = None;
     {
         // Only register a C: root if C: is NOT already the project drive
         // (avoids a redundant/duplicate root).
@@ -353,7 +353,7 @@ async fn run() -> Result<()> {
             if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
                 let (c_root, legacy) =
                     sandbox::prepare_c_overlay_root(Path::new(&local_appdata), &project_root)?;
-                c_root_migration = Some((legacy, c_root.clone()));
+                c_root_migration = Some((PathBuf::from(local_appdata), legacy, c_root.clone()));
                 overlay_layout.set_drive_root('c', c_root);
             }
         }
@@ -367,10 +367,8 @@ async fn run() -> Result<()> {
         )?,
     );
     policy.load_config(&cfg_path)?;
-    if let Some((legacy, c_root)) = &c_root_migration {
-        if let Err(e) = policy.rebase_overlay_root(legacy, c_root) {
-            eprintln!("[sandbox] overlay index not rebased to {}: {e}", c_root.display());
-        }
+    if let Some((local_appdata, legacy, c_root)) = &c_root_migration {
+        sandbox::complete_c_overlay_migration(&policy, local_appdata, legacy, c_root)?;
     }
 
     // Registry policy — shares the FS policy DB; overlay store lives under
