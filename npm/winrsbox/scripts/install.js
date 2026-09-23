@@ -86,7 +86,10 @@ function main() {
   let workspaceManifest;
 
   if (fs.existsSync(localWorkspace)) {
-    console.log('[winrsbox postinstall] found local workspace, building in place');
+    console.log(
+      `[winrsbox postinstall] local workspace fast path: building the working tree in place; ` +
+      `the package source pin ${PINNED_COMMIT} applies only to external source builds.`
+    );
     workspaceManifest = localWorkspace;
   } else {
     if (!haveCommand('git')) {
