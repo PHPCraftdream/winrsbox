@@ -180,6 +180,22 @@
 
     /// Build a path inside the OS temp dir that is unique per test invocation,
     /// without pulling in the `tempfile` crate (forbidden by scope rules).
+    ///
+    /// The base is canonicalized before appending the unique suffix: on some
+    /// hosts (observed on GitHub Actions' windows-latest runners — the
+    /// account's `%TEMP%` resolves through an 8.3 short-name component)
+    /// `std::env::temp_dir()`'s literal string differs from its canonical
+    /// form. Tests build `roots` directly from this path's own string (the
+    /// "explicit-roots" seam — see `overlay::prepare_overlay_in_roots`'s doc
+    /// comment), while `verified_create_dir_all` resolves the deepest
+    /// EXISTING ancestor via `std::fs::canonicalize` before checking
+    /// containment (`overlay.rs`, S05 anti-junction hardening). A
+    /// non-canonical literal root then never prefix-matches the canonicalized
+    /// anchor, so every write is rejected as "outside overlay roots" —
+    /// `prepare_overlay_in_roots` returns `None` for every racer and the
+    /// destination is never created. Canonicalizing here makes the test's
+    /// root construction match what `verified_create_dir_all` will actually
+    /// compare against, on every host.
     fn unique_temp_path(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -189,7 +205,21 @@
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut p = std::env::temp_dir();
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .map(|c| {
+                // Strip the `\\?\` extended-length prefix canonicalize()
+                // adds, so this matches the plain-DOS form
+                // `normalize_resolved_dos` produces in overlay.rs — tests
+                // build `roots` as plain lowercased strings, never
+                // device-prefixed ones.
+                let s = c.to_string_lossy().into_owned();
+                let s = s.strip_prefix(r"\\?\UNC\").map(|rest| format!(r"\\{rest}"))
+                    .or_else(|| s.strip_prefix(r"\\?\").map(str::to_string))
+                    .unwrap_or(s);
+                PathBuf::from(s)
+            })
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let mut p = base;
         p.push(format!(
             "winrsbox-hook-test-{tag}-{pid}-{nanos}-{seq}",
         ));
