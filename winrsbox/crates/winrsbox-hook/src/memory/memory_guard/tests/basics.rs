@@ -157,6 +157,13 @@ fn is_system_dll_path_under_matches_whole_components() {
         r"\Device\HarddiskVolume3\Windows\assembly\NativeImages_v4.0.30319_64\mscorlib\abc\mscorlib.ni.dll",
         root
     ));
+    // WinSxS: side-by-side redirected system components (e.g. gdiplus.dll,
+    // loaded by System.Drawing's clipboard image APIs) are TrustedInstaller-
+    // owned and manifest-hash-pinned by the component store.
+    assert!(is_system_dll_path_under(
+        r"\Device\HarddiskVolume3\Windows\WinSxS\amd64_microsoft.windows.gdiplus_6595b64144ccf1df_1.1.19041.7725_none_91a0b114cc8b5498\gdiplus.dll",
+        root
+    ));
     // A different volume's Windows tree is not this root.
     assert!(!is_system_dll_path_under(r"\Device\HarddiskVolume9\Windows\System32\user32.dll", root));
     // Component boundary: System32X / System32.evildir must not match.

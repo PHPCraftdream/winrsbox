@@ -3,7 +3,7 @@ use ipc::Resp;
 use policy::Policy;
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use winrsbox::observe::hot_stats::HotStats;
+use winrsbox::observe::hot_stats::{HotStats, ThrottledFlusher};
 use winrsbox::observe::jsonl_log;
 
 /// Registry-key substrings that always deny on write — every entry here
@@ -263,11 +263,121 @@ pub(crate) fn handle_net_decide(p: &Policy, host: &str, port: u16) -> (bool, Opt
     match p.net_rule_decide(host, port) {
         Ok(decision) => decision,
         Err(e) => {
-            eprintln!("[net] net_rules read failed: {e} -- denying {host}:{port} (fail-closed)");
+            let msg = format!("net_rules read failed: {e} -- denying {host}:{port} (fail-closed)");
+            if jsonl_log::console_verbose() {
+                eprintln!("[net] {msg}");
+            }
+            jsonl_log::log_immediate(jsonl_log::Event::launcher_diag("ERROR", msg));
             (false, None)
         }
     }
 }
+/// `Req::RegDecide` handler: hardcoded persistence/injection deny layer,
+/// then the DB-backed rules/mocks layer. Moved out of `handle_connection`'s
+/// match (layout-guard: that file was over the 1000-line limit).
+pub(crate) fn resp_reg_decide(
+    reg_policy: &policy::RegistryPolicy,
+    hot_stats: &HotStats,
+    flusher: &ThrottledFlusher,
+    key_path: &str,
+    value_name: Option<&str>,
+    write: bool,
+) -> Resp {
+    let key_lower = key_path.to_ascii_lowercase();
+    let is_persistence = is_persistence_denied(&key_lower);
+    let env_allowed =
+        is_persistence && key_lower.ends_with(r"\environment") && is_env_value_allowed(value_name);
+
+    let (mode, value_json) = if write && is_persistence && !env_allowed {
+        // Console only on request — the JSONL `reg_decide` event a few lines
+        // below is the permanent record. A deny-listed key touched in a loop
+        // (dnsapi re-reads Tcpip\Parameters) produced hundreds of identical
+        // lines over the guest's own output.
+        if jsonl_log::console_verbose() {
+            eprintln!("[reg] DENY {key_path} value={value_name:?}");
+        }
+        (policy::Mode::Deny, None)
+    } else {
+        // Layer 2 (DB-backed + overlay merge): RegistryPolicy consults
+        // REG_RULES / REG_MOCKS and returns the recorded overlay value (if
+        // any) for the read-side merge.
+        let d = reg_policy.decide(key_path, value_name, write);
+        let vj = d
+            .overlay_value
+            .or(d.mock_value)
+            .map(|v| serde_json::to_vec(&v.to_json_value()).unwrap_or_default());
+        (d.mode, vj)
+    };
+
+    let denied = matches!(mode, policy::Mode::Deny);
+    hot_stats.totals.reg_decides.fetch_add(1, Ordering::Relaxed);
+    if denied {
+        hot_stats.totals.reg_denies.fetch_add(1, Ordering::Relaxed);
+    }
+    hot_stats.record_reg(key_path, write, denied);
+    if denied {
+        jsonl_log::log(jsonl_log::Event::reg_decide(key_path, write, &format!("{mode:?}")));
+    }
+    flusher.maybe_flush();
+    Resp::RegDecision { mode, value_json }
+}
+
+/// `Req::RegWrite` handler: records the value into the CoW overlay
+/// (read-back merge happens via `RegDecision.overlay_value`).
+pub(crate) fn resp_reg_write(
+    reg_policy: &policy::RegistryPolicy,
+    key_path: &str,
+    value_name: &str,
+    value: policy::reg::RegValue,
+) -> Resp {
+    match reg_policy.write_to_overlay(key_path, value_name, value) {
+        Ok(()) => {
+            if is_persistence_denied(&key_path.to_ascii_lowercase()) {
+                let msg = format!("overlay write (persistence-allowed): {key_path}\\{value_name}");
+                if jsonl_log::console_verbose() {
+                    eprintln!("[reg] {msg}");
+                }
+                jsonl_log::log(jsonl_log::Event::launcher_diag("INFO", msg));
+            }
+            Resp::Ok
+        }
+        Err(e) => {
+            let msg = format!("overlay write FAILED {key_path}\\{value_name}: {e}");
+            if jsonl_log::console_verbose() {
+                eprintln!("[reg] {msg}");
+            }
+            jsonl_log::log_immediate(jsonl_log::Event::launcher_diag("ERROR", msg));
+            Resp::Err(e)
+        }
+    }
+}
+
+/// `Req::NetDecide` handler: userspace network policy (see
+/// [`handle_net_decide`] for the fail-closed match semantics).
+pub(crate) fn resp_net_decide(
+    p: &Policy,
+    hot_stats: &HotStats,
+    flusher: &ThrottledFlusher,
+    host: &str,
+    port: u16,
+) -> Resp {
+    let (allow, rule_id) = handle_net_decide(p, host, port);
+    hot_stats.totals.net_decides.fetch_add(1, Ordering::Relaxed);
+    let host_port = format!("{host}:{port}");
+    hot_stats.record_net(&host_port, !allow);
+    if let Some(id) = &rule_id {
+        if jsonl_log::console_verbose() {
+            println!(
+                "[net] {host_port} -> {} (rule {id})",
+                if allow { "allow" } else { "DENY" }
+            );
+        }
+    }
+    jsonl_log::log(jsonl_log::Event::net_decide(&host_port, allow));
+    flusher.maybe_flush();
+    Resp::NetDecision { allow }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // violations.log serialization
 //

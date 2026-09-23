@@ -133,9 +133,12 @@ pub(crate) fn get_mapped_file_path(addr: *const c_void) -> Option<String> {
 /// Trusted subsystem directories below the real Windows root. A mapped image
 /// whose backing file resolves under one of these is exempt from the .text
 /// direct-syscall scan: core Win32 DLLs (System32/SysWOW64), the CLR runtime
-/// (Microsoft.NET) and NGen'd native images (assembly) legitimately contain
-/// `syscall` instructions.
-const TRUSTED_SYSTEM_SUBDIRS: &[&str] = &["system32", "syswow64", "microsoft.net", "assembly"];
+/// (Microsoft.NET), NGen'd native images (assembly) and side-by-side
+/// redirected system components (WinSxS — TrustedInstaller-owned, manifest-
+/// hash-pinned by the component store, e.g. gdiplus.dll loaded via clipboard
+/// image APIs) legitimately contain `syscall` instructions.
+const TRUSTED_SYSTEM_SUBDIRS: &[&str] =
+    &["system32", "syswow64", "microsoft.net", "assembly", "winsxs"];
 
 /// Component-anchored prefix test: `path_lower` equals `prefix_lower` or
 /// continues with a path separator immediately after it. Never a bare

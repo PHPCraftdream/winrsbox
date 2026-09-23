@@ -910,3 +910,26 @@ fn s05_in_root_write_to_root_itself_still_passthrough() {
     let d = p.decide(&root, true);
     assert_eq!(d.mode, Mode::Passthrough);
 }
+
+#[test]
+fn rebase_overlay_root_rewrites_only_rows_under_old_root() {
+    let (_dir, p) = make_policy();
+    let old = std::path::Path::new(r"C:\LA\.winrsbox\app\workdir");
+    let new = std::path::Path::new(r"C:\LA\.winrsbox\app-00ff\workdir");
+    p.record_overlay(r"c:\users\me\a.txt", r"C:\la\.WINRSBOX\app\workdir\users\me\a.txt").unwrap();
+    p.record_overlay(r"c:\users", r"C:\LA\.winrsbox\app\workdir").unwrap();
+    p.record_overlay(r"c:\x\b.txt", r"C:\LA\.winrsbox\app2\workdir\x\b.txt").unwrap();
+    p.record_overlay(r"d:\y\c.txt", r"D:\sb\y\c.txt").unwrap();
+
+    assert_eq!(p.rebase_overlay_root(old, new).unwrap(), 2);
+    assert_eq!(p.rebase_overlay_root(old, new).unwrap(), 0, "idempotent");
+
+    let db = p.db();
+    let txn = db.begin_read().unwrap();
+    let t = txn.open_table(db::OVERLAY_IDX).unwrap();
+    let get = |k: &str| t.get(k).unwrap().map(|v| v.value().to_string());
+    assert_eq!(get(r"c:\users\me\a.txt").as_deref(), Some(r"C:\LA\.winrsbox\app-00ff\workdir\users\me\a.txt"));
+    assert_eq!(get(r"c:\users").as_deref(), Some(r"C:\LA\.winrsbox\app-00ff\workdir"));
+    assert_eq!(get(r"c:\x\b.txt").as_deref(), Some(r"C:\LA\.winrsbox\app2\workdir\x\b.txt"), "sibling-prefix root untouched");
+    assert_eq!(get(r"d:\y\c.txt").as_deref(), Some(r"D:\sb\y\c.txt"));
+}

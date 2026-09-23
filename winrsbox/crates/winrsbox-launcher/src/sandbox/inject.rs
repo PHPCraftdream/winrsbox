@@ -1,7 +1,11 @@
 // ─── DLL injection and pre-launch scan ───────────────────────────────────────
 
 use anyhow::{Context, Result};
-use std::{ffi::OsStr, os::windows::ffi::OsStrExt, path::Path};
+use std::{
+    ffi::OsStr,
+    os::windows::{ffi::OsStrExt, fs::MetadataExt},
+    path::{Path, PathBuf},
+};
 use windows::{
     core::PCWSTR,
     Win32::{
@@ -462,6 +466,94 @@ fn verify_not_inside_guest_project_node_modules(dll_path: &str) -> Result<()> {
         dll_path
     );
     Ok(())
+}
+
+/// Pre-S07 C: overlay root, keyed by basename only:
+/// `<local_appdata>/.winrsbox/<basename>/workdir`.
+pub(crate) fn legacy_c_overlay_root(local_appdata: &Path, project_root: &Path) -> PathBuf {
+    let name = project_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "session".to_string());
+    local_appdata.join(".winrsbox").join(name).join("workdir")
+}
+
+/// `FILE_ATTRIBUTE_REPARSE_POINT` (winnt.h). Set on any reparse point —
+/// symlink, junction, mount point, and others.
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+fn is_plain_dir(md: &std::fs::Metadata) -> bool {
+    md.is_dir() && md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+}
+
+/// Create/reuse the current C: overlay root and best-effort migrate any
+/// pre-S07 legacy tree into it. Returns `(c_root, legacy_root)` — the legacy
+/// path is returned unconditionally (migration failure is logged, never
+/// fatal) so the caller can rebase the policy DB's `OVERLAY_IDX` against it
+/// once the DB is open.
+pub(crate) fn prepare_c_overlay_root(
+    local_appdata: &Path,
+    project_root: &Path,
+) -> Result<(PathBuf, PathBuf)> {
+    let c_root = super::ensure_c_overlay_root(local_appdata, project_root)?;
+    let legacy = legacy_c_overlay_root(local_appdata, project_root);
+    if let Err(e) = migrate_legacy_c_overlay(local_appdata, &legacy, &c_root) {
+        eprintln!("[sandbox] legacy C: overlay not migrated: {e:#}");
+    }
+    Ok((c_root, legacy))
+}
+
+/// Move the legacy C: overlay tree into `new_root` so data CoW'd by pre-S07
+/// builds stays visible. Never overwrites an existing destination and never
+/// descends through a reparse point (the legacy chain itself must be plain
+/// directories). Per-entry failures (busy files) are skipped. Returns the
+/// number of moved entries; 0 when there is no legacy tree.
+pub(crate) fn migrate_legacy_c_overlay(
+    local_appdata: &Path,
+    legacy: &Path,
+    new_root: &Path,
+) -> Result<usize> {
+    let rel = legacy
+        .strip_prefix(local_appdata)
+        .context("legacy C: overlay root is outside LOCALAPPDATA")?;
+    let mut cur = local_appdata.to_path_buf();
+    for comp in rel.components() {
+        cur.push(comp);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(md) if is_plain_dir(&md) => {}
+            Ok(_) => anyhow::bail!(
+                "legacy C: overlay component {} is not a plain directory",
+                cur.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e).with_context(|| format!("stat {}", cur.display())),
+        }
+    }
+    Ok(merge_tree_no_overwrite(legacy, new_root))
+}
+
+fn merge_tree_no_overwrite(src: &Path, dst: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(src) else { return 0 };
+    let mut moved = 0;
+    for entry in entries.flatten() {
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let Ok(src_md) = std::fs::symlink_metadata(&from) else { continue };
+        match std::fs::symlink_metadata(&to) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::rename(&from, &to).is_ok() {
+                    moved += 1;
+                }
+            }
+            Ok(dst_md) if is_plain_dir(&src_md) && is_plain_dir(&dst_md) => {
+                moved += merge_tree_no_overwrite(&from, &to);
+            }
+            _ => {}
+        }
+    }
+    // Succeeds only once everything was moved out.
+    let _ = std::fs::remove_dir(src);
+    moved
 }
 
 #[cfg(test)]

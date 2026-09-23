@@ -541,6 +541,59 @@ pub(crate) fn path_aliases_outside_root(dos_path: &str, root_lower: &str) -> boo
 
 use crate::Policy;
 
+impl Policy {
+    /// Rewrite every `OVERLAY_IDX` value under `old_root` to the same relative
+    /// path under `new_root` (segment-aware, ASCII case-insensitive prefix).
+    /// Needed when an overlay root moves: review S07 re-keyed the C: root, and
+    /// rows recorded against the old root point outside the published roots,
+    /// so the hook refuses every write to them. Returns the rewritten count.
+    pub fn rebase_overlay_root(
+        &self,
+        old_root: &std::path::Path,
+        new_root: &std::path::Path,
+    ) -> Result<usize, PolicyError> {
+        let old_owned = old_root.to_string_lossy();
+        let old_lower = old_owned.trim_end_matches('\\').to_ascii_lowercase();
+        let new_owned = new_root.to_string_lossy();
+        let new = new_owned.trim_end_matches('\\');
+        if old_lower.is_empty() || old_lower == new.to_ascii_lowercase() {
+            return Ok(0);
+        }
+        let txn = self.inner.db.begin_write()?;
+        let rewritten;
+        {
+            let mut t = txn.open_table(db::OVERLAY_IDX)?;
+            let mut updates = Vec::new();
+            for row in t.iter()? {
+                let (k, v) = row?;
+                if let Some(rest) = strip_root_prefix(v.value(), &old_lower) {
+                    updates.push((k.value().to_string(), format!("{new}{rest}")));
+                }
+            }
+            for (k, v) in &updates {
+                t.insert(k.as_str(), v.as_str())?;
+            }
+            rewritten = updates.len();
+        }
+        txn.commit()?;
+        if rewritten > 0 {
+            self.inner.cache.clear();
+        }
+        Ok(rewritten)
+    }
+}
+
+/// `value` with the `root_lower` prefix removed when `value` equals the root
+/// or lies beneath it (next byte is `\`); None otherwise.
+fn strip_root_prefix<'a>(value: &'a str, root_lower: &str) -> Option<&'a str> {
+    let head = value.get(..root_lower.len())?;
+    if !head.eq_ignore_ascii_case(root_lower) {
+        return None;
+    }
+    let rest = &value[root_lower.len()..];
+    (rest.is_empty() || rest.starts_with('\\')).then_some(rest)
+}
+
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum Mode {

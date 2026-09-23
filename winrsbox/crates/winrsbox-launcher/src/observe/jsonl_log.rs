@@ -1,7 +1,9 @@
 // JSONL structured logging — appends events to <state_dir>/sandbox.log.jsonl.
 //
-// Console output (println/eprintln) remains unchanged for human readability.
-// This module provides machine-parseable persistent logs for post-mortem.
+// This module also gates console diagnostics via `console_verbose()`: the
+// launcher shares its console with the sandboxed target, so routine
+// println!/eprintln! from callers must be gated by it (see that function's
+// doc) and always paired with a JSONL event, never the console alone.
 //
 // Throttled: events are buffered in memory and flushed to disk at most once
 // per FLUSH_INTERVAL. Critical events (violations) flush immediately.
@@ -202,6 +204,16 @@ pub enum Event {
     /// trace messages) in the JSONL instead of only on stdout.
     #[serde(rename = "hook_log")]
     HookLog { ts: u64, pid: u32, level: String, msg: String },
+    /// Launcher-internal diagnostics (pipe-server housekeeping, IPC framing
+    /// errors) that have no dedicated event shape of their own. Console
+    /// printing of these is gated by `console_verbose()` — the launcher
+    /// shares its console with the sandboxed target, so unconditional
+    /// eprintln!/println! from a background thread corrupts whatever the
+    /// target is rendering (observed: raw `[pipe] WARN: ...` text landing in
+    /// a TUI's input box). This event is the JSONL side of that gate, so
+    /// gating a message never means losing it.
+    #[serde(rename = "launcher_diag")]
+    LauncherDiag { ts: u64, level: String, msg: String },
 }
 
 impl Event {
@@ -212,7 +224,7 @@ impl Event {
             Event::Hello { .. } | Event::Child { .. } | Event::Wfp { .. } | Event::Exit { .. }
             | Event::RegDecide { .. } | Event::NetDecide { .. } => LogLevel::Info,
             Event::Decide { .. } | Event::EtwEvent { .. } => LogLevel::Trace,
-            Event::HookLog { level, .. } => match level.as_str() {
+            Event::HookLog { level, .. } | Event::LauncherDiag { level, .. } => match level.as_str() {
                 "ERROR" => LogLevel::Error,
                 "WARN" => LogLevel::Warn,
                 "TRACE" => LogLevel::Trace,
@@ -254,5 +266,8 @@ impl Event {
     }
     pub fn etw_event(pid: u32, kind: &str) -> Self {
         Self::EtwEvent { ts: ts(), pid, kind: kind.to_string() }
+    }
+    pub fn launcher_diag(level: &str, msg: impl Into<String>) -> Self {
+        Self::LauncherDiag { ts: ts(), level: level.to_string(), msg: msg.into() }
     }
 }

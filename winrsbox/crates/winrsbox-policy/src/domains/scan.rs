@@ -119,23 +119,56 @@ fn syscall_kind(instr: &Instruction) -> Option<SyscallKind> {
     }
 }
 
+/// A syscall pattern decoded within this many instructions after an INVALID
+/// decode is data, not code: the sweep is walking a jump/lookup table that
+/// MSVC/LLVM place inside `.text`. Observed: codex.exe (230 MB `.text`) has
+/// `…0f 0f 04 0f 0f 05…` in a byte table, reached through a run of INVALID
+/// decodes. Buffers of at most MAX_INSTRUCTION_LEN bytes are exempt.
+///
+/// Residual (same class as the deep-immediate one documented on
+/// [`find_direct_syscalls_multi_entry`]): a stub deliberately preceded by
+/// undecodable bytes is not flagged.
+pub const DATA_CONTEXT_LOOKBACK: usize = 4;
+
+/// Tracks decoded instructions since the last INVALID one.
+struct DataContext {
+    exempt: bool,
+    since_invalid: usize,
+}
+
+impl DataContext {
+    fn new(len: usize) -> Self {
+        Self { exempt: len <= MAX_INSTRUCTION_LEN, since_invalid: DATA_CONTEXT_LOOKBACK }
+    }
+
+    /// Classify `instr` and advance the context.
+    fn hit(&mut self, instr: &Instruction) -> Option<SyscallKind> {
+        if instr.is_invalid() {
+            self.since_invalid = 0;
+            return None;
+        }
+        let kind = syscall_kind(instr)
+            .filter(|_| self.exempt || self.since_invalid >= DATA_CONTEXT_LOOKBACK);
+        self.since_invalid = self.since_invalid.saturating_add(1);
+        kind
+    }
+}
+
 /// Disassemble `bytes` as x86-64 instructions starting at `base_addr` and
 /// return all direct syscall instructions found.
 ///
 /// This is *linear sweep* disassembly — it decodes from byte 0 sequentially.
-/// Real .text sections may have padding/data between functions, but iced-x86
-/// handles invalid instructions by returning a 1-byte INVALID instruction
-/// and continuing. False positives are rare because immediate operand bytes
-/// matching 0F 05 / 0F 34 / CD 2E only become "instructions" if linear sweep
-/// happens to land on them as instruction boundaries — which is statistically
-/// rare in compiler-generated code.
+/// iced-x86 returns a 1-byte INVALID instruction for undecodable bytes and
+/// continues; patterns right after INVALID decodes are skipped as data (see
+/// [`DATA_CONTEXT_LOOKBACK`]).
 pub fn find_direct_syscalls(bytes: &[u8], base_addr: u64) -> Vec<SyscallHit> {
     let mut hits = Vec::new();
+    let mut ctx = DataContext::new(bytes.len());
     let mut decoder = Decoder::with_ip(64, bytes, base_addr, DecoderOptions::NONE);
     while decoder.can_decode() {
         let pos = decoder.position();
         let instr = decoder.decode();
-        if let Some(k) = syscall_kind(&instr) {
+        if let Some(k) = ctx.hit(&instr) {
             hits.push(SyscallHit { offset: pos, kind: k });
         }
     }
@@ -143,11 +176,12 @@ pub fn find_direct_syscalls(bytes: &[u8], base_addr: u64) -> Vec<SyscallHit> {
 }
 
 /// Early-exiting variant of the [`find_direct_syscalls`] sweep, used only
-/// by [`has_direct_syscall`]; classification is shared via [`syscall_kind`].
+/// by [`has_direct_syscall`]; classification is shared via [`DataContext`].
 fn sweep_has_direct_syscall(bytes: &[u8], base_addr: u64) -> bool {
+    let mut ctx = DataContext::new(bytes.len());
     let mut decoder = Decoder::with_ip(64, bytes, base_addr, DecoderOptions::NONE);
     while decoder.can_decode() {
-        if syscall_kind(&decoder.decode()).is_some() {
+        if ctx.hit(&decoder.decode()).is_some() {
             return true;
         }
     }
@@ -590,6 +624,71 @@ mod tests {
             "alternate-entry pass must still run on buffers longer than one window"
         );
         assert_eq!(find_direct_syscalls_multi_entry(&bytes, 0)[0].offset, 3);
+    }
+
+    // ---- data-context suppression (in-.text lookup tables) ----
+
+    /// Verbatim bytes from codex.exe `.text` (RVA 0x1000 + 0xd983460..): a
+    /// byte lookup table whose linear sweep lands on `0f 05` right after a
+    /// run of INVALID decodes. Must not be flagged by any scan entry point.
+    const CODEX_TABLE: [u8; 48] = [
+        0xb5, 0x3f, 0x98, 0x0d, 0x00, 0x0f, 0x0f, 0x0f, 0x01, 0x0f, 0x0f, 0x0f,
+        0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x00, 0x0f, 0x0f,
+        0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x0f, 0x02, 0x03, 0x0f, 0x0f, 0x0f, 0x0f,
+        0x04, 0x0f, 0x0f, 0x05, 0x0f, 0x0f, 0x0f, 0x06, 0x0f, 0x0f, 0x07, 0x0f,
+    ];
+
+    #[test]
+    fn syscall_bytes_inside_lookup_table_not_flagged() {
+        assert!(find_direct_syscalls(&CODEX_TABLE, 0).is_empty());
+        assert!(find_direct_syscalls_multi_entry(&CODEX_TABLE, 0).is_empty());
+        assert!(!has_direct_syscall(&CODEX_TABLE, 0));
+    }
+
+    #[test]
+    fn syscall_stub_right_after_invalid_is_documented_residual() {
+        // 06 = INVALID in 64-bit; mov r10,rcx; mov eax,0x18; syscall; ret.
+        let mut bytes = vec![0x90u8; 32];
+        bytes.extend_from_slice(&[0x06, 0x4C, 0x8B, 0xD1, 0xB8, 0x18, 0, 0, 0, 0x0F, 0x05, 0xC3]);
+        assert!(find_direct_syscalls(&bytes, 0).is_empty());
+    }
+
+    /// 32 NOPs, `06 90` (one 2-byte INVALID decode), `nops` NOPs, syscall, ret.
+    fn invalid_then_syscall(nops: usize) -> Vec<u8> {
+        let mut bytes = vec![0x90u8; 32];
+        bytes.extend_from_slice(&[0x06, 0x90]);
+        bytes.extend(std::iter::repeat(0x90).take(nops));
+        bytes.extend_from_slice(&[0x0F, 0x05, 0xC3]);
+        bytes
+    }
+
+    #[test]
+    fn lookback_boundary_after_invalid() {
+        let inside = invalid_then_syscall(DATA_CONTEXT_LOOKBACK - 1);
+        assert!(find_direct_syscalls(&inside, 0).is_empty());
+        assert!(!has_direct_syscall(&inside, 0));
+
+        let beyond = invalid_then_syscall(DATA_CONTEXT_LOOKBACK);
+        let hits = find_direct_syscalls(&beyond, 0);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].offset, 34 + DATA_CONTEXT_LOOKBACK);
+        assert!(has_direct_syscall(&beyond, 0));
+    }
+
+    #[test]
+    fn typical_syscall_stub_still_flagged() {
+        let mut bytes = vec![0xCCu8; 32];
+        bytes.extend_from_slice(&[0x4C, 0x8B, 0xD1, 0xB8, 0x18, 0, 0, 0, 0x0F, 0x05, 0xC3]);
+        assert_eq!(find_direct_syscalls(&bytes, 0).len(), 1);
+        assert!(has_direct_syscall(&bytes, 0));
+    }
+
+    #[test]
+    fn short_buffer_flags_syscall_even_after_invalid() {
+        // `06 90` decodes as one INVALID; the syscall follows it directly.
+        let bytes = [0x06u8, 0x90, 0x0F, 0x05];
+        assert_eq!(find_direct_syscalls(&bytes, 0).len(), 1);
+        assert!(has_direct_syscall(&bytes, 0));
     }
 
     // ---- S06 gap 3: every executable section, not just ".text" ----

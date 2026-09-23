@@ -55,16 +55,22 @@ pub(crate) use ownership::{
     query_process_create_time, query_process_image_path, spawned_child_kinship,
 };
 pub(crate) use records::{
-    append_violation_record, escape_violation_record, handle_net_decide, handle_record_overlay,
-    injection_violation_record, is_env_value_allowed, is_persistence_denied,
-    memory_violation_record,
+    append_violation_record, escape_violation_record, handle_record_overlay,
+    injection_violation_record, memory_violation_record,
 };
 pub(crate) use security::{build_pipe_security, PipeSecurity};
 
 #[cfg(test)]
 pub(crate) use ownership::is_owned_client_pid_impl;
+// handle_net_decide/is_env_value_allowed/is_persistence_denied now have
+// non-test callers only inside records.rs itself (resp_reg_decide/
+// resp_reg_write/resp_net_decide) — this re-export exists solely so
+// tests.rs's `use super::*` still sees them.
 #[cfg(test)]
-pub(crate) use records::{net_decide, segment_contains, PERSISTENCE_DENY_SUFFIXES};
+pub(crate) use records::{
+    handle_net_decide, is_env_value_allowed, is_persistence_denied, net_decide,
+    segment_contains, PERSISTENCE_DENY_SUFFIXES,
+};
 #[cfg(test)]
 use std::time::Duration;
 
@@ -231,7 +237,11 @@ async fn accept_worker(
             match create_pipe_instance(&pipe_name_wide, &pipe_sec, false) {
                 Ok(ph) => ph,
                 Err(err) => {
-                    eprintln!("[pipe] CreateNamedPipeW (instance) failed: {err} — retrying");
+                    let msg = format!("CreateNamedPipeW (instance) failed: {err} — retrying");
+                    if jsonl_log::console_verbose() {
+                        eprintln!("[pipe] {msg}");
+                    }
+                    jsonl_log::log(jsonl_log::Event::launcher_diag("WARN", msg));
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
@@ -281,9 +291,15 @@ async fn accept_worker(
             GetNamedPipeClientProcessId(HANDLE(ph as *mut _), &mut client_pid).is_ok()
         };
         if !pid_ok {
-            eprintln!(
-                "[pipe] GetNamedPipeClientProcessId failed on new connection — disconnecting",
-            );
+            if jsonl_log::console_verbose() {
+                eprintln!(
+                    "[pipe] GetNamedPipeClientProcessId failed on new connection — disconnecting",
+                );
+            }
+            jsonl_log::log_immediate(jsonl_log::Event::launcher_diag(
+                "WARN",
+                "GetNamedPipeClientProcessId failed on new connection — disconnecting",
+            ));
             // SAFETY: ph is the isize repr of our pipe handle.
             unsafe { DisconnectNamedPipe(HANDLE(ph as *mut _)).ok() };
             unsafe { CloseHandle(HANDLE(ph as *mut _)).ok() };
@@ -291,10 +307,12 @@ async fn accept_worker(
         }
         let root_pid_snapshot = root_target_pid.load(Ordering::Acquire);
         if !is_owned_client_pid(client_pid, root_pid_snapshot) {
-            eprintln!(
-                "[pipe] WARN: rejecting connection from non-owned pid={client_pid} \
-                 (root_target_pid={root_pid_snapshot})",
-            );
+            if jsonl_log::console_verbose() {
+                eprintln!(
+                    "[pipe] WARN: rejecting connection from non-owned pid={client_pid} \
+                     (root_target_pid={root_pid_snapshot})",
+                );
+            }
             stats.violations.fetch_add(1, Ordering::Relaxed);
             hot_stats
                 .totals
@@ -430,10 +448,12 @@ fn handle_connection(
                 // Bind this connection to the kernel-vouched client_pid from
                 // GetNamedPipeClientProcessId; the claimed pid is only logged.
                 if pid != client_pid {
-                    eprintln!(
-                        "[pipe] WARN: Hello pid={pid} != kernel client_pid={client_pid} — \
-                         using client_pid (possible spoof)",
-                    );
+                    if jsonl_log::console_verbose() {
+                        eprintln!(
+                            "[pipe] WARN: Hello pid={pid} != kernel client_pid={client_pid} — \
+                             using client_pid (possible spoof)",
+                        );
+                    }
                     stats.violations.fetch_add(1, Ordering::Relaxed);
                     hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     jsonl_log::log_immediate(jsonl_log::Event::violation(
@@ -452,10 +472,12 @@ fn handle_connection(
                 match hello_exe_context(client_pid, &exe_path) {
                     Ok((exe_lower, claimed_mismatch)) => {
                         if claimed_mismatch {
-                            eprintln!(
-                                "[pipe] WARN: Hello exe_path={exe_path} != kernel image path — \
-                                 using kernel path (possible spoof)",
-                            );
+                            if jsonl_log::console_verbose() {
+                                eprintln!(
+                                    "[pipe] WARN: Hello exe_path={exe_path} != kernel image path — \
+                                     using kernel path (possible spoof)",
+                                );
+                            }
                             stats.violations.fetch_add(1, Ordering::Relaxed);
                             hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             jsonl_log::log_immediate(jsonl_log::Event::violation(
@@ -469,8 +491,14 @@ fn handle_connection(
                         // fail-closes later connections (see tracked_entry_still_owned).
                         let live_ct = query_process_create_time(client_pid).unwrap_or(0);
                         if live_ct == 0 {
-                            eprintln!("[pipe] hello pid={client_pid}: creation-time probe failed — \
-                                       entry stored with unknown fingerprint");
+                            let msg = format!(
+                                "hello pid={client_pid}: creation-time probe failed — \
+                                 entry stored with unknown fingerprint"
+                            );
+                            if jsonl_log::console_verbose() {
+                                eprintln!("[pipe] {msg}");
+                            }
+                            jsonl_log::log(jsonl_log::Event::launcher_diag("WARN", msg));
                         }
                         let map = crate::sandbox::proc_table::global_proc_info().pin();
                         if let Some(existing) = map.get(&client_pid) {
@@ -498,10 +526,12 @@ fn handle_connection(
                         // the connection un-Hello'd. The hook treats any non-matching
                         // response as an IPC failure and fails closed (Deny) on later
                         // decides, so an unresolved path can't purchase policy context.
-                        eprintln!(
-                            "[pipe] WARN: hello pid={client_pid}: kernel image path query \
-                             failed — refusing Hello (fail closed)",
-                        );
+                        if jsonl_log::console_verbose() {
+                            eprintln!(
+                                "[pipe] WARN: hello pid={client_pid}: kernel image path query \
+                                 failed — refusing Hello (fail closed)",
+                            );
+                        }
                         stats.violations.fetch_add(1, Ordering::Relaxed);
                         hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         jsonl_log::log_immediate(jsonl_log::Event::violation(
@@ -523,10 +553,12 @@ fn handle_connection(
                 // only logged. (child_pid is still parent-reported; it is
                 // reconciled when the child itself connects with its own Hello.)
                 if parent_pid != client_pid {
-                    eprintln!(
-                        "[pipe] WARN: SpawnedChild parent_pid={parent_pid} != client_pid={client_pid} \
-                         — inheriting depth from client_pid (possible spoof)",
-                    );
+                    if jsonl_log::console_verbose() {
+                        eprintln!(
+                            "[pipe] WARN: SpawnedChild parent_pid={parent_pid} != client_pid={client_pid} \
+                             — inheriting depth from client_pid (possible spoof)",
+                        );
+                    }
                     stats.violations.fetch_add(1, Ordering::Relaxed);
                     hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     jsonl_log::log_immediate(jsonl_log::Event::violation(
@@ -539,10 +571,12 @@ fn handle_connection(
                 // a fresh connection (ipc_client.rs sends Hello before anything
                 // else), so SpawnedChild without Hello is hostile — refuse fail closed.
                 if conn_pid.is_none() {
-                    eprintln!(
-                        "[pipe] WARN: SpawnedChild before Hello from pid={client_pid} — \
-                         refused (fail closed)",
-                    );
+                    if jsonl_log::console_verbose() {
+                        eprintln!(
+                            "[pipe] WARN: SpawnedChild before Hello from pid={client_pid} — \
+                             refused (fail closed)",
+                        );
+                    }
                     stats.violations.fetch_add(1, Ordering::Relaxed);
                     hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     jsonl_log::log_immediate(jsonl_log::Event::violation(
@@ -557,10 +591,12 @@ fn handle_connection(
                     // immutable and survives parent death, so a hostile parent naming
                     // an unrelated PID fails (the kernel records the real creator);
                     // child_pid reuse is handled by the create-time fingerprint below.
-                    eprintln!(
-                        "[pipe] WARN: SpawnedChild child={child_pid} is not a kernel child of \
-                         client={client_pid} — rejected (possible spoof)",
-                    );
+                    if jsonl_log::console_verbose() {
+                        eprintln!(
+                            "[pipe] WARN: SpawnedChild child={child_pid} is not a kernel child of \
+                             client={client_pid} — rejected (possible spoof)",
+                        );
+                    }
                     stats.violations.fetch_add(1, Ordering::Relaxed);
                     hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     jsonl_log::log_immediate(jsonl_log::Event::violation(
@@ -593,8 +629,14 @@ fn handle_connection(
                     // child's own Hello would refresh it if it ever connects.
                     let child_ct = query_process_create_time(child_pid).unwrap_or(0);
                     if child_ct == 0 {
-                        eprintln!("[pipe] SpawnedChild pid={child_pid}: creation-time probe failed — \
-                                   entry stored with unknown fingerprint");
+                        let msg = format!(
+                            "SpawnedChild pid={child_pid}: creation-time probe failed — \
+                             entry stored with unknown fingerprint"
+                        );
+                        if jsonl_log::console_verbose() {
+                            eprintln!("[pipe] {msg}");
+                        }
+                        jsonl_log::log(jsonl_log::Event::launcher_diag("WARN", msg));
                     }
                     let map = crate::sandbox::proc_table::global_proc_info().pin();
                     let parent_depth = map.get(&client_pid).map(|p| p.depth).unwrap_or(0);
@@ -672,10 +714,12 @@ fn handle_connection(
                         Resp::Decision(d)
                     }
                     Err(()) => {
-                        eprintln!(
-                            "[pipe] WARN: decide before hello (or identity lost) from \
-                             pid={client_pid} — refused (fail closed)",
-                        );
+                        if jsonl_log::console_verbose() {
+                            eprintln!(
+                                "[pipe] WARN: decide before hello (or identity lost) from \
+                                 pid={client_pid} — refused (fail closed)",
+                            );
+                        }
                         stats.violations.fetch_add(1, Ordering::Relaxed);
                         hot_stats.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         jsonl_log::log_immediate(jsonl_log::Event::violation(
@@ -864,65 +908,12 @@ fn handle_connection(
                 Resp::Ok
             }
             Req::RegDecide { key_path, value_name, write } => {
-                // Layer 1 (security, hardcoded): persistence/DLL-injection
-                // deny-suffixes always deny on write, EXCEPT a benign value-name
-                // in ENV_VALUE_NAME_ALLOWLIST for HKCU\Environment. This layer
-                // is intentionally NOT in the DB-backed RegistryPolicy — it is a
-                // non-bypassable safety floor that survives any user rule config.
-                let key_lower = key_path.to_ascii_lowercase();
-                let is_persistence = is_persistence_denied(&key_lower);
-                let env_allowed = is_persistence
-                    && key_lower.ends_with(r"\environment")
-                    && is_env_value_allowed(value_name.as_deref());
-
-                let (mode, value_json) = if write && is_persistence && !env_allowed {
-                    // Console only on request — the JSONL `reg_decide` event a
-                    // few lines below is the permanent record. A deny-listed
-                    // key touched in a loop (dnsapi re-reads Tcpip\Parameters)
-                    // produced hundreds of identical lines over the guest's
-                    // own output.
-                    if jsonl_log::console_verbose() {
-                        eprintln!("[reg] DENY {key_path} value={value_name:?}");
-                    }
-                    (policy::Mode::Deny, None)
-                } else {
-                    // Layer 2 (DB-backed + overlay merge): RegistryPolicy consults
-                    // REG_RULES / REG_MOCKS and returns the recorded overlay value
-                    // (if any) for the read-side merge.
-                    let d = reg_policy.decide(&key_path, value_name.as_deref(), write);
-                    let vj = d.overlay_value.or(d.mock_value).map(|v| {
-                        serde_json::to_vec(&v.to_json_value()).unwrap_or_default()
-                    });
-                    (d.mode, vj)
-                };
-
-                let denied = matches!(mode, policy::Mode::Deny);
-                hot_stats.totals.reg_decides.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if denied { hot_stats.totals.reg_denies.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-                hot_stats.record_reg(&key_path, write, denied);
-                if denied {
-                    jsonl_log::log(jsonl_log::Event::reg_decide(&key_path, write, &format!("{mode:?}")));
-                }
-                flusher.maybe_flush();
-                Resp::RegDecision { mode, value_json }
+                records::resp_reg_decide(
+                    reg_policy, hot_stats, flusher, &key_path, value_name.as_deref(), write,
+                )
             }
             Req::RegWrite { key_path, value_name, value } => {
-                // Record the value into the CoW overlay (read-back merge happens
-                // via RegDecision's overlay_value). The hook builds the RegValue
-                // from the raw NtSetValueKey bytes; bincode carries it here.
-                let resp = match reg_policy.write_to_overlay(&key_path, &value_name, value) {
-                    Ok(()) => {
-                        if is_persistence_denied(&key_path.to_ascii_lowercase()) {
-                            eprintln!("[reg] overlay write (persistence-allowed): {key_path}\\{value_name}");
-                        }
-                        Resp::Ok
-                    }
-                    Err(e) => {
-                        eprintln!("[reg] overlay write FAILED {key_path}\\{value_name}: {e}");
-                        Resp::Err(e)
-                    }
-                };
-                resp
+                records::resp_reg_write(reg_policy, &key_path, &value_name, value)
             }
             Req::RegDeleteValue { key_path, value_name } => {
                 let resp = match reg_policy.delete_value_in_overlay(&key_path, &value_name) {
@@ -950,24 +941,12 @@ fn handle_connection(
                 // only exist when the launcher's WFP session can install
                 // filters -- without them this userspace decision is the
                 // only network enforcement the sandbox has.
-                let (allow, rule_id) = handle_net_decide(policy, &host, port);
-                hot_stats.totals.net_decides.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let host_port = format!("{host}:{port}");
-                hot_stats.record_net(&host_port, !allow);
-                if let Some(id) = &rule_id {
-                    if jsonl_log::console_verbose() {
-                        println!(
-                            "[net] {host_port} -> {} (rule {id})",
-                            if allow { "allow" } else { "DENY" }
-                        );
-                    }
-                }
-                jsonl_log::log(jsonl_log::Event::net_decide(&host_port, allow));
-                flusher.maybe_flush();
-                Resp::NetDecision { allow }
+                records::resp_net_decide(policy, hot_stats, flusher, &host, port)
             }
             Req::MemDecide { target_pid, op } => {
-                println!("[mem] decide: pid={target_pid} op={op}");
+                if jsonl_log::console_verbose() {
+                    println!("[mem] decide: pid={target_pid} op={op}");
+                }
                 Resp::MemDecision { allow: false }
             }
         };

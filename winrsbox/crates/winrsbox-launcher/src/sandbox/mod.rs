@@ -771,6 +771,7 @@ pub(crate) fn ensure_c_overlay_root(
     Ok(c_root)
 }
 
+
 /// Assign `process` to a new Job Object with given limits; returns the Job handle.
 /// The caller must keep the returned HANDLE alive for the duration of the child.
 pub(crate) fn setup_job_object(
@@ -865,7 +866,9 @@ pub(crate) mod inject;
 // returning) moved into inject.rs (layout-guard: this file was over the
 // 1000-line limit) — thematically "locate and verify hook.dll before
 // injecting it" belongs with the rest of inject.rs's DLL-injection concerns.
-pub(crate) use inject::find_hook_dll;
+pub(crate) use inject::{find_hook_dll, prepare_c_overlay_root};
+#[cfg(test)]
+pub(crate) use inject::{legacy_c_overlay_root, migrate_legacy_c_overlay};
 
 #[cfg(test)]
 mod tests;

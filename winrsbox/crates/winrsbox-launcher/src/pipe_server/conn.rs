@@ -184,9 +184,13 @@ pub(crate) fn read_request_with_budget<'a>(
         match byte_budget.reserve_timeout(declared, BYTE_BUDGET_WAIT) {
             Some(r) => Some(r),
             None => {
-                eprintln!(
-                    "[pipe] pid={client_pid}: in-flight byte budget exhausted ({declared}B declared) - dropping connection"
+                let msg = format!(
+                    "pid={client_pid}: in-flight byte budget exhausted ({declared}B declared) - dropping connection"
                 );
+                if jsonl_log::console_verbose() {
+                    eprintln!("[pipe] {msg}");
+                }
+                jsonl_log::log_immediate(jsonl_log::Event::launcher_diag("WARN", msg));
                 return None;
             }
         }

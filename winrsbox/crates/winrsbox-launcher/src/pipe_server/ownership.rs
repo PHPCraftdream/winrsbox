@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
+use winrsbox::observe::jsonl_log;
 use windows::{
     core::{HRESULT, PCWSTR, PWSTR},
     Win32::{
@@ -284,14 +285,28 @@ fn tracked_entry_still_owned(pid: u32, live_create_time: LiveCreateFn<'_>) -> bo
     match live_create_time(pid) {
         Some(t) if t == stored => true,
         Some(_) => {
-            eprintln!(
-                "[pipe] stale entry pid={pid}: creation-time mismatch (PID reused) — pruning"
+            // Notable: a PID was reused fast enough to reach the same lookup
+            // window — fail-closed correctness working as designed, not
+            // routine housekeeping, so this stays at WARN.
+            let msg = format!(
+                "stale entry pid={pid}: creation-time mismatch (PID reused) — pruning"
             );
+            if jsonl_log::console_verbose() {
+                eprintln!("[pipe] {msg}");
+            }
+            jsonl_log::log(jsonl_log::Event::launcher_diag("WARN", msg));
             prune_stale_entry(pid);
             false
         }
         None => {
-            eprintln!("[pipe] stale entry pid={pid}: process gone — pruning");
+            // Routine: fires on every tracked process's normal exit. Console
+            // printing this unconditionally corrupted the sandboxed target's
+            // own terminal rendering (REG-4) — buffered INFO only.
+            let msg = format!("stale entry pid={pid}: process gone — pruning");
+            if jsonl_log::console_verbose() {
+                eprintln!("[pipe] {msg}");
+            }
+            jsonl_log::log(jsonl_log::Event::launcher_diag("INFO", msg));
             prune_stale_entry(pid);
             false
         }

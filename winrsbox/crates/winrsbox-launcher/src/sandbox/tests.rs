@@ -639,6 +639,59 @@
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Pre-S07 data (basename-keyed C: root) moves into the new root; an
+    /// existing destination is never overwritten.
+    #[test]
+    fn s07_legacy_c_overlay_merges_without_overwrite() {
+        let base = s07_fixture_dir("legacy-merge");
+        let proj = base.join("proj");
+        let localapp = base.join("localapp");
+        std::fs::create_dir_all(&proj).expect("create proj dir");
+        let legacy = super::legacy_c_overlay_root(&localapp, &proj);
+        assert_eq!(legacy, localapp.join(".winrsbox").join("proj").join("workdir"));
+        std::fs::create_dir_all(legacy.join(r"users\me")).expect("create legacy tree");
+        std::fs::write(legacy.join(r"users\me\a.txt"), "legacy-a").expect("write a");
+        std::fs::write(legacy.join(r"users\me\b.txt"), "legacy-b").expect("write b");
+
+        let c_root = super::ensure_c_overlay_root(&localapp, &proj).expect("create C: root");
+        std::fs::create_dir_all(c_root.join(r"users\me")).expect("create new tree");
+        std::fs::write(c_root.join(r"users\me\b.txt"), "new-b").expect("write new b");
+
+        let moved = super::migrate_legacy_c_overlay(&localapp, &legacy, &c_root).expect("migrate");
+        assert_eq!(moved, 1);
+        assert_eq!(std::fs::read_to_string(c_root.join(r"users\me\a.txt")).unwrap(), "legacy-a");
+        assert_eq!(std::fs::read_to_string(c_root.join(r"users\me\b.txt")).unwrap(), "new-b");
+        assert!(legacy.join(r"users\me\b.txt").exists(), "unmoved entry stays in legacy");
+        assert_eq!(
+            super::migrate_legacy_c_overlay(&localapp, &legacy, &c_root).expect("re-run"),
+            0,
+            "idempotent"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn s07_legacy_c_overlay_absent_is_noop_and_junction_refused() {
+        let base = s07_fixture_dir("legacy-junction");
+        let proj = base.join("proj");
+        let localapp = base.join("localapp");
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&proj).expect("create proj dir");
+        std::fs::create_dir_all(elsewhere.join("workdir")).expect("create junction target");
+        std::fs::create_dir_all(&localapp).expect("create localapp dir");
+        let c_root = super::ensure_c_overlay_root(&localapp, &proj).expect("create C: root");
+        let legacy = super::legacy_c_overlay_root(&localapp, &proj);
+        assert_eq!(super::migrate_legacy_c_overlay(&localapp, &legacy, &c_root).expect("absent"), 0);
+
+        create_junction(&localapp.join(".winrsbox").join("proj"), &elsewhere).expect("junction");
+        std::fs::write(elsewhere.join(r"workdir\x.txt"), "x").expect("write x");
+        super::migrate_legacy_c_overlay(&localapp, &legacy, &c_root)
+            .expect_err("legacy chain through a junction must be refused");
+        assert!(elsewhere.join(r"workdir\x.txt").exists(), "junction target untouched");
+        let _ = std::fs::remove_dir(localapp.join(".winrsbox").join("proj"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// S07 hardening: the same refusal applies when the junction sits one
     /// level up, at the shared `.winrsbox` component — the whole chain is
     /// validated, not just the leaf.
