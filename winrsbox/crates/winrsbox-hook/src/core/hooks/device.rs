@@ -269,7 +269,10 @@ pub(crate) fn short_name_alias_or_unknown(path: &str) -> bool {
         if count == 0 {
             // SAFETY: reads this thread's immediately preceding Win32 error.
             let error = unsafe { winapi::um::errhandlingapi::GetLastError() };
-            if error != winapi::shared::winerror::ERROR_FILE_NOT_FOUND
+            // GetLongPathNameW can leave ERROR_SUCCESS for a missing leaf
+            // inside a hooked process; existing parents are still checked.
+            if error != winapi::shared::winerror::ERROR_SUCCESS
+                && error != winapi::shared::winerror::ERROR_FILE_NOT_FOUND
                 && error != winapi::shared::winerror::ERROR_PATH_NOT_FOUND
             {
                 return true;
@@ -392,6 +395,9 @@ mod short_name_tests {
         let alias = r"C:\PROGRA~1";
         if std::path::Path::new(alias).exists() {
             assert!(short_name_alias_or_unknown(alias));
+            let missing_child = format!(r"C:\PROGRA~1\winrsbox-missing-{}~0.js", std::process::id());
+            assert!(!std::path::Path::new(&missing_child).exists());
+            assert!(short_name_alias_or_unknown(&missing_child));
         }
     }
 }
