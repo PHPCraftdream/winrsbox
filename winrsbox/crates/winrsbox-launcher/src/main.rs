@@ -647,11 +647,11 @@ async fn run() -> Result<()> {
         && !cli.no_pre_scan
     {
         if let Err(e) = sandbox::inject::pre_launch_scan(
-            proc_info.hProcess,
+            proc_info.hProcess.0 as usize,
             &target_args[0],
             proc_info.dwProcessId,
             &violations_log,
-        ) {
+        ).await {
             // SAFETY: proc_info.hProcess is valid PROCESS handle from CreateProcessW.
             unsafe {
                 windows::Win32::System::Threading::TerminateProcess(

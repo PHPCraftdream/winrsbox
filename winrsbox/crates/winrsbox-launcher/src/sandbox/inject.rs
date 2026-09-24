@@ -116,42 +116,90 @@ const REMOTE_SCAN_CHUNK_OVERLAP: usize = 15;
 /// Read+decode `[base, base + size)` out of the target image in bounded
 /// chunks. Any read failure propagates — fail closed: the target must not
 /// run over an image we could not fully check.
-fn scan_remote_region(
-    process: HANDLE,
+async fn scan_remote_region(
+    process_raw: usize,
     base: usize,
     size: usize,
 ) -> Result<Vec<policy::scan::SyscallHit>> {
     let mut hits = Vec::new();
-    let mut off = 0usize;
-    while off < size {
-        let n = (size - off).min(REMOTE_SCAN_CHUNK_BYTES);
-        let ext = (n + REMOTE_SCAN_CHUNK_OVERLAP).min(size - off);
-        let mut buf = vec![0u8; ext];
-        read_remote_memory(process, base + off, &mut buf)?;
-        for h in policy::scan::find_direct_syscalls_multi_entry(&buf, (base + off) as u64) {
-            hits.push(policy::scan::SyscallHit { offset: off + h.offset, kind: h.kind });
+    let mut offset = 0usize;
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get().min(4))
+        .unwrap_or(1);
+    while offset < size {
+        let mut tasks = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            if offset >= size {
+                break;
+            }
+            let start = offset;
+            let body = (size - offset).min(REMOTE_SCAN_CHUNK_BYTES);
+            let len = body.saturating_add(REMOTE_SCAN_CHUNK_OVERLAP).min(size - offset);
+            offset += body;
+            tasks.push(tokio::task::spawn_blocking(move || -> Result<_> {
+                let address = base.checked_add(start).context("scan address overflow")?;
+                let mut bytes = vec![0u8; len];
+                read_remote_memory(HANDLE(process_raw as *mut _), address, &mut bytes)?;
+                Ok(policy::scan::find_direct_syscalls_multi_entry(&bytes, address as u64)
+                    .into_iter()
+                    .map(|hit| policy::scan::SyscallHit {
+                        offset: start + hit.offset,
+                        kind: hit.kind,
+                    })
+                    .collect::<Vec<_>>())
+            }));
         }
-        off += n;
+        let mut first_error = None;
+        for task in tasks {
+            match task.await {
+                Ok(Ok(mut chunk_hits)) => hits.append(&mut chunk_hits),
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(anyhow::Error::new(error));
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
     }
+    hits.sort_by_key(|hit| hit.offset);
+    hits.dedup_by_key(|hit| hit.offset);
     Ok(hits)
 }
 
 /// Scan the main exe's executable sections for direct syscall instructions
 /// before resuming the child process. Returns Err if syscall instructions are found.
-pub(crate) fn pre_launch_scan(
-    process: HANDLE,
+pub(crate) async fn pre_launch_scan(
+    process_raw: usize,
     target_exe: &str,
     target_pid: u32,
     violations_log: &Path,
 ) -> Result<()> {
-    let image_base = get_image_base(process).context("get image base")?;
+    let cache_dir = std::env::current_exe().ok()
+        .and_then(|exe| exe.parent().map(policy::pe_cache::cache_dir));
+    let image_path = crate::pipe_server::query_process_image_path(target_pid);
+    let cache_key = if let Some(path) = image_path {
+        tokio::task::spawn_blocking(move || policy::pe_cache::file_key(Path::new(&path)))
+            .await.ok().and_then(Result::ok)
+    } else {
+        None
+    };
+    if let (Some(dir), Some(key)) = (&cache_dir, &cache_key) {
+        if policy::pe_cache::contains_clean(dir, key) {
+            return Ok(());
+        }
+    }
+    let image_base = get_image_base(HANDLE(process_raw as *mut _)).context("get image base")?;
     if image_base == 0 {
         anyhow::bail!("image base is null");
     }
 
     // Read PE headers (4 KiB is enough for DOS + NT + section table)
     let mut pe_headers = vec![0u8; 4096];
-    read_remote_memory(process, image_base, &mut pe_headers)
+    read_remote_memory(HANDLE(process_raw as *mut _), image_base, &mut pe_headers)
         .context("read PE headers")?;
     // S06 gap 3 (XA review 2026-09-20): scan EVERY executable section, not
     // just ".text" — a target can carry additional IMAGE_SCN_MEM_EXECUTE
@@ -165,7 +213,7 @@ pub(crate) fn pre_launch_scan(
 
     for section in &exec_sections {
         let sec_base = image_base + section.virtual_address as usize;
-        let hits = scan_remote_region(process, sec_base, section.virtual_size as usize)?;
+        let hits = scan_remote_region(process_raw, sec_base, section.virtual_size as usize).await?;
         if hits.is_empty() {
             continue;
         }
@@ -182,6 +230,9 @@ pub(crate) fn pre_launch_scan(
             eprintln!("  - {} at offset 0x{:x}", h.kind, h.offset);
         }
         anyhow::bail!("direct syscall instructions found in target executable section");
+    }
+    if let (Some(dir), Some(key)) = (cache_dir, cache_key) {
+        let _ = tokio::task::spawn_blocking(move || policy::pe_cache::record_clean(&dir, &key)).await;
     }
     Ok(())
 }

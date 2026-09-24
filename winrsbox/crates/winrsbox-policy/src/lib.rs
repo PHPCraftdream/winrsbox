@@ -12,7 +12,7 @@ use thiserror::Error;
 pub use decide::{Decision, Mode, Verdict, ConsideredRule, TracedDecision, OverlayChildMeta};
 pub use policy_impl::Policy;
 pub use registry::{RegDecision, RegistryPolicy};
-pub use domains::{dev, mem, net, scan};
+pub use domains::{dev, mem, net, pe_cache, scan};
 pub(crate) use domains::policy_impl;
 pub(crate) use path::trim_trailing_sep;
 

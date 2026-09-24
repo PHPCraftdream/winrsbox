@@ -494,6 +494,23 @@ fn read_remote_bytes(proc: HANDLE, addr: usize, buf: &mut [u8]) -> Result<(), St
     Ok(())
 }
 
+fn child_image_cache_key(proc: HANDLE) -> Option<(std::path::PathBuf, String)> {
+    let dir = DLL_PATH.get()
+        .and_then(|dll| std::path::Path::new(dll).parent())
+        .map(policy::pe_cache::cache_dir)?;
+    let mut path = vec![0u16; 1024];
+    let mut len = path.len() as u32;
+    // SAFETY: proc is the live child handle; path and len are writable buffers.
+    if unsafe { winapi::um::winbase::QueryFullProcessImageNameW(
+        proc, 0, path.as_mut_ptr(), &mut len,
+    ) } == 0 {
+        return None;
+    }
+    let image = std::path::PathBuf::from(String::from_utf16(&path[..len as usize]).ok()?);
+    let key = policy::pe_cache::file_key(&image).ok()?;
+    Some((dir, key))
+}
+
 const THREAD_CREATE_FLAGS_CREATE_SUSPENDED: u32 = 0x0000_0001;
 
 pub(super) unsafe extern "system" fn hook_nt_create_user_process(
@@ -637,17 +654,24 @@ pub(super) unsafe extern "system" fn hook_nt_create_user_process(
     // this every process below the root keeps the SysWhispers/Hell's Gate
     // bypass open. Fail closed on BOTH detection and scan failure — terminate,
     // exactly like the launcher's pre_launch_scan refusal path.
+    let mut clean_image_key = None;
     if child_scan_enabled(crate::trusted_boot::trusted_guard()) {
-        if let Err(reason) = scan_image_for_direct_syscalls(proc_h) {
-            ipc_log(
-                ipc::LogLevel::Error,
-                format!("child pre-launch scan refused pid={child_pid} target={spawn_target}: {reason}; terminating"),
-            );
-            // SAFETY: proc_h is the valid PROCESS handle returned moments ago
-            // by NtCreateUserProcess; TerminateProcess never blocks. Exit code 1
-            // signals "killed by sandbox" to anyone waiting on the process.
-            unsafe { winapi::um::processthreadsapi::TerminateProcess(proc_h, 1) };
-            return status;
+        let cache = child_image_cache_key(proc_h);
+        let cached_clean = cache.as_ref().is_some_and(|(dir, key)|
+            policy::pe_cache::contains_clean(dir, key));
+        if !cached_clean {
+            if let Err(reason) = scan_image_for_direct_syscalls(proc_h) {
+                ipc_log(
+                    ipc::LogLevel::Error,
+                    format!("child pre-launch scan refused pid={child_pid} target={spawn_target}: {reason}; terminating"),
+                );
+                // SAFETY: proc_h is the valid PROCESS handle returned moments ago
+                // by NtCreateUserProcess; TerminateProcess never blocks. Exit code 1
+                // signals "killed by sandbox" to anyone waiting on the process.
+                unsafe { winapi::um::processthreadsapi::TerminateProcess(proc_h, 1) };
+                return status;
+            }
+            clean_image_key = cache.map(|(_, key)| key);
         }
     }
 
@@ -805,7 +829,10 @@ pub(super) unsafe extern "system" fn hook_nt_create_user_process(
     if child_pid != 0 && !inject_failed && !ack_failed {
         ipc_register_child(child_pid);
         ipc_spawned_child(parent_pid, child_pid, child_exe);
+        if let Some(key) = clean_image_key {
+            let _ = ipc_send_and_recv(ipc::Req::RecordCleanImage { key });
+        }
     }
 
     status
-}
+}

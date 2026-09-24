@@ -197,6 +197,7 @@ pub enum Req {
     OverlayChildren { dir: String },
     Log { pid: u32, level: LogLevel, msg: String },
     RegisterChild { pid: u32 },
+    RecordCleanImage { key: String },
     InjectionViolation {
         pid: u32,
         exe: String,

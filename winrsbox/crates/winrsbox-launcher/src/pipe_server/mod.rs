@@ -813,6 +813,18 @@ fn handle_connection(
                 }
                 Resp::Ok
             }
+            Req::RecordCleanImage { key } => {
+                let result = std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| exe.parent().map(policy::pe_cache::cache_dir))
+                    .ok_or_else(|| "scan cache location unavailable".to_string())
+                    .and_then(|dir| policy::pe_cache::record_clean(&dir, &key)
+                        .map_err(|error| error.to_string()));
+                match result {
+                    Ok(()) => Resp::Ok,
+                    Err(error) => Resp::Err(error),
+                }
+            }
             Req::PreLaunchViolation { launcher_pid: _, target_exe: _, hits: _ } => {
                 // Launcher emits this directly to violations.log; this variant
                 // exists only for IPC schema completeness. If a hook DLL ever
