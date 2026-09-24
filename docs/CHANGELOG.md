@@ -4,7 +4,7 @@ All notable changes to winrsbox are documented in this file.
 
 ## [Unreleased]
 
-## [0.2.0] — 2026-09-24
+## [0.1.1] — 2026-09-24
 
 ### Features
 
