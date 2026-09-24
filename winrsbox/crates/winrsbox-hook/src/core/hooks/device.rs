@@ -335,14 +335,21 @@ mod short_name_tests {
     #[test]
     fn literal_tilde_digit_name_survives_the_denylist() {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("9710~0.js");
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        let canonical = canonical.to_string_lossy();
+        let parent = canonical.strip_prefix(r"\\?\UNC\")
+            .map(|rest| format!(r"\\{rest}"))
+            .or_else(|| canonical.strip_prefix(r"\\?\").map(str::to_string))
+            .unwrap_or_else(|| canonical.into_owned());
+        let parent = std::path::Path::new(&parent);
+        let file = parent.join("9710~0.js");
         std::fs::write(&file, b"fixture").unwrap();
         let literal = file.to_string_lossy();
         assert!(needs_short_name_resolve(&literal));
         assert!(!short_name_alias_or_unknown(&literal));
         assert!(canonical_denylist_status(&canonicalize_for_denylist(&literal)).is_none());
         assert!(!short_name_alias_or_unknown(
-            &dir.path().join("new~0.js").to_string_lossy()
+            &parent.join("new~0.js").to_string_lossy()
         ));
     }
 
