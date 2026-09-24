@@ -1,6 +1,6 @@
 {
   "name": "winrsbox",
-  "version": "0.2.0",
+  "version": "0.1.1",
   "description": "Windows filesystem sandbox for AI agents (CoW overlay, ntdll-level hooks) — builds and installs the native winrsbox.exe + hook.dll from source.",
   "license": "MIT OR Apache-2.0",
   "repository": {
@@ -8,7 +8,7 @@
     "url": "https://github.com/PHPCraftdream/winrsbox.git"
   },
   "winrsboxSource": {
-    "commit": "9196ece2518cb68878511faabfc18a4234d701cb"
+    "commit": "0a5d7d3cfb977e0385b01aefdb9d86ca10cd8458"
   },
   "homepage": "https://github.com/PHPCraftdream/winrsbox",
   "keywords": ["sandbox", "windows", "security", "filesystem", "hooks"],
