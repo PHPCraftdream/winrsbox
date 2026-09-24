@@ -304,6 +304,25 @@
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn prepare_overlay_accepts_existing_workdir_root() {
+        let dir = unique_temp_path("prep-root");
+        let root = dir.join("state").join("workdir");
+        std::fs::create_dir_all(&root).unwrap();
+        let root_str = root.to_string_lossy().to_ascii_lowercase();
+        let decision = Decision {
+            mode: Mode::Cow,
+            overlay: Some(root.clone()),
+            cow_from: None,
+            mock_payload: None,
+        };
+        assert_eq!(
+            prepare_overlay_in_roots(&decision, &[root_str.as_str()]),
+            Some(root.to_string_lossy().into_owned()),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Audit Critical #2 defence in depth: an overlay destination OUTSIDE the
     /// published roots (the audit PoC shape: a real Startup folder next to the
     /// sandbox state) must be refused — no returned path, no directory

@@ -136,7 +136,15 @@ pub(super) fn prepare_overlay_in_roots(decision: &Decision, roots: &[&str]) -> O
         //
         // IN_HOOK is true on this thread; filesystem calls here will see IN_HOOK=true
         // in the hook and call the original immediately — no recursion.
-        if !verified_create_dir_all(parent, roots) {
+        let parent_lower = parent.to_string_lossy().to_ascii_lowercase();
+        let parent_ok = if overlay_dest_in_roots(&parent_lower, roots) {
+            verified_create_dir_all(parent, roots)
+        } else {
+            // The destination itself may be the published workdir root.
+            std::fs::symlink_metadata(overlay_path).is_ok()
+                && resolved_parent_in_roots(overlay_path, roots)
+        };
+        if !parent_ok {
             ipc_log_violation(ipc::Req::Log {
                 // SAFETY: GetCurrentProcessId is a non-failing Win32 query with no
                 // preconditions (constant pseudo-handle semantics, no pointers).
@@ -593,4 +601,4 @@ pub(crate) fn materialize_mock_overlay_in_roots(
         // Swallowed exactly like the old `std::fs::write`.
         Err(_) => {}
     }
-}
+}

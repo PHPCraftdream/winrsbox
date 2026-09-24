@@ -176,6 +176,26 @@ use super::*;
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[test]
+    fn s05_prepare_overlay_refuses_junctioned_workdir_root() {
+        let base = s05_fixture_dir("hook-root-junction");
+        let state = base.join("state");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let root = state.join("workdir");
+        s05_create_junction(&outside, &root).expect("create junction");
+        let root_str = root.to_string_lossy().to_ascii_lowercase();
+        let decision = Decision {
+            mode: Mode::Cow,
+            overlay: Some(root),
+            cow_from: None,
+            mock_payload: None,
+        };
+        assert!(prepare_overlay_in_roots(&decision, &[&root_str]).is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// S05 (docs/review-xa-2026-09-20) NEGATIVE CONTROL / no over-block: a
     /// junction whose target resolves back INSIDE the root stays allowed —
     /// the same tolerance as the merged policy-side gap-1 fix (containment

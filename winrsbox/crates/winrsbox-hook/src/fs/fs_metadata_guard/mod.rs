@@ -92,6 +92,25 @@ static HOOK_NT_SET_INFO_FILE: OnceLock<GenericDetour<FnNtSetInformationFile>> = 
 static HOOK_NT_FS_CONTROL_FILE: OnceLock<GenericDetour<FnNtFsControlFile>> = OnceLock::new();
 static HOOK_NT_SET_EA_FILE: OnceLock<GenericDetour<FnNtSetEaFile>> = OnceLock::new();
 pub(crate) static HOOK_NT_DELETE_FILE: OnceLock<GenericDetour<FnNtDeleteFile>> = OnceLock::new();
+type FnCreateSymbolicLinkW = unsafe extern "system" fn(*const u16, *const u16, u32) -> u8;
+type FnCreateSymbolicLinkA = unsafe extern "system" fn(*const i8, *const i8, u32) -> u8;
+static HOOK_CREATE_SYMBOLIC_LINK_W: OnceLock<GenericDetour<FnCreateSymbolicLinkW>> =
+    OnceLock::new();
+static HOOK_CREATE_SYMBOLIC_LINK_A: OnceLock<GenericDetour<FnCreateSymbolicLinkA>> = OnceLock::new();
+static HOOK_KERNELBASE_CREATE_SYMBOLIC_LINK_W: OnceLock<GenericDetour<FnCreateSymbolicLinkW>> =
+    OnceLock::new();
+
+unsafe extern "system" fn deny_create_symbolic_link_w(_: *const u16, _: *const u16, _: u32) -> u8 {
+    // SAFETY: SetLastError only updates this thread's error slot.
+    unsafe { winapi::um::errhandlingapi::SetLastError(winapi::shared::winerror::ERROR_ACCESS_DENIED) };
+    0
+}
+
+unsafe extern "system" fn deny_create_symbolic_link_a(_: *const i8, _: *const i8, _: u32) -> u8 {
+    // SAFETY: SetLastError only updates this thread's error slot.
+    unsafe { winapi::um::errhandlingapi::SetLastError(winapi::shared::winerror::ERROR_ACCESS_DENIED) };
+    0
+}
 
 // ---------------------------------------------------------------------------
 // FileInformationClass constants
@@ -279,10 +298,63 @@ pub unsafe fn install() -> Result<(), Box<dyn std::error::Error>> {
             "NtSetEaFile export not found in ntdll".into()),
     }
 
+    macro_rules! install_symlink_guard {
+        ($module:expr, $name:literal, $ty:ty, $hook:expr, $slot:expr) => {
+            match winapi::um::libloaderapi::GetProcAddress($module, $name.as_ptr() as *const i8) {
+                addr if !addr.is_null() => {
+                    // SAFETY: the resolved export has the Win32 ABI declared by $ty.
+                    let target: $ty = std::mem::transmute(addr as usize);
+                    let hook: $ty = $hook;
+                    match GenericDetour::<$ty>::new(target, hook) {
+                        Ok(detour) => {
+                            let _ = $slot.set(detour);
+                            if let Some(detour) = $slot.get() {
+                                if let Err(error) = detour.enable() {
+                                    hooks::buffer_install_error(format!(
+                                        "{} detour enable: {error:?}",
+                                        stringify!($name)
+                                    ));
+                                }
+                            }
+                        }
+                        Err(error) => hooks::buffer_install_error(format!(
+                            "{} detour init: {error:?}",
+                            stringify!($name)
+                        )),
+                    }
+                }
+                _ => hooks::buffer_install_error(format!(
+                    "{} export unavailable",
+                    stringify!($name)
+                )),
+            }
+        };
+    }
+    let kernel32_w: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
+    let kernel32 = winapi::um::libloaderapi::GetModuleHandleW(kernel32_w.as_ptr());
+    if kernel32.is_null() {
+        hooks::buffer_install_error("kernel32 unavailable for symlink guard".into());
+    } else {
+        install_symlink_guard!(kernel32, b"CreateSymbolicLinkA\0", FnCreateSymbolicLinkA,
+            deny_create_symbolic_link_a, HOOK_CREATE_SYMBOLIC_LINK_A);
+    }
+    let kernelbase_w: Vec<u16> = "kernelbase.dll\0".encode_utf16().collect();
+    let kernelbase = winapi::um::libloaderapi::GetModuleHandleW(kernelbase_w.as_ptr());
+    if !kernelbase.is_null() {
+        install_symlink_guard!(kernelbase, b"CreateSymbolicLinkW\0", FnCreateSymbolicLinkW,
+            deny_create_symbolic_link_w, HOOK_KERNELBASE_CREATE_SYMBOLIC_LINK_W);
+    } else if !kernel32.is_null() {
+        install_symlink_guard!(kernel32, b"CreateSymbolicLinkW\0", FnCreateSymbolicLinkW,
+            deny_create_symbolic_link_w, HOOK_CREATE_SYMBOLIC_LINK_W);
+    }
+
     Ok(())
 }
 
 pub unsafe fn uninstall() {
+    if let Some(h) = HOOK_KERNELBASE_CREATE_SYMBOLIC_LINK_W.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_CREATE_SYMBOLIC_LINK_A.get() { let _ = h.disable(); }
+    if let Some(h) = HOOK_CREATE_SYMBOLIC_LINK_W.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_NT_DELETE_FILE.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_NT_SET_EA_FILE.get() { let _ = h.disable(); }
     if let Some(h) = HOOK_NT_FS_CONTROL_FILE.get() { let _ = h.disable(); }
