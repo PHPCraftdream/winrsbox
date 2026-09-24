@@ -248,10 +248,15 @@ pub(crate) fn needs_short_name_resolve(path: &str) -> bool {
 }
 
 /// Only a spelling that expands to a different name is an 8.3 alias.
-/// Unverifiable paths remain denied.
+/// Relative paths are deferred until their base is resolved; unknown absolute paths are denied.
 pub(crate) fn short_name_alias_or_unknown(path: &str) -> bool {
     use std::os::windows::ffi::OsStrExt;
     let mut current = std::path::Path::new(path);
+    // Relative names are checked again after resolve_for_hook has pinned their
+    // actual base directory; resolving them here could use a different base.
+    if !current.is_absolute() {
+        return false;
+    }
     loop {
         let wide: Vec<u16> = current.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut stack = [0u16; 512];
@@ -351,6 +356,35 @@ mod short_name_tests {
         assert!(!short_name_alias_or_unknown(
             &parent.join("new~0.js").to_string_lossy()
         ));
+        let relative = format!("winrsbox-missing-{}~0.js", std::process::id());
+        assert!(!std::path::Path::new(&relative).exists());
+        assert!(!short_name_alias_or_unknown(&relative));
+        assert!(canonical_denylist_status(&canonicalize_for_denylist(&relative)).is_none());
+    }
+
+    #[test]
+    fn resolved_bare_relative_literal_tilde_digit_is_not_treated_as_alias() {
+        let name = format!("winrsbox-missing-{}~0.js", std::process::id());
+        assert!(!std::path::Path::new(&name).exists());
+        let buf: Vec<u16> = name.encode_utf16().collect();
+        let len_bytes = (buf.len() * 2) as u16;
+        let us = UNICODE_STRING {
+            Length: len_bytes,
+            MaximumLength: len_bytes,
+            Buffer: buf.as_ptr() as *mut u16,
+        };
+        let oa = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: std::ptr::null_mut(),
+            ObjectName: &us as *const UNICODE_STRING as *mut UNICODE_STRING,
+            Attributes: 0,
+            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityQualityOfService: std::ptr::null_mut(),
+        };
+        // SAFETY: us, oa, and buf remain valid for the duration of resolution.
+        let (dos, kernel_path) = unsafe { resolve_for_hook(&oa) }.expect("relative path resolves");
+        assert!(kernel_path.is_some(), "resolved path is reused for the kernel open");
+        assert!(canonical_denylist_status(&canonicalize_for_denylist(&dos)).is_none());
     }
 
     #[test]
