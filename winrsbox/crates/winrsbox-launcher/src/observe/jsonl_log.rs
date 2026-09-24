@@ -92,6 +92,7 @@ struct JsonlLogger {
     path: PathBuf,
     buffer: Mutex<Vec<String>>,
     last_flush: Mutex<Instant>,
+    flush_lock: Mutex<()>,
 }
 
 impl JsonlLogger {
@@ -100,6 +101,7 @@ impl JsonlLogger {
             path,
             buffer: Mutex::new(Vec::with_capacity(MAX_BUFFER)),
             last_flush: Mutex::new(Instant::now() - FLUSH_INTERVAL),
+            flush_lock: Mutex::new(()),
         }
     }
 
@@ -152,6 +154,7 @@ impl JsonlLogger {
     }
 
     fn do_flush(&self) {
+        let _flush = self.flush_lock.lock().unwrap_or_else(|p| p.into_inner());
         let lines: Vec<String> = {
             let mut buf = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
             std::mem::take(&mut *buf)

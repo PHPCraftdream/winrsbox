@@ -43,6 +43,7 @@ fn is_whitelisted(upper: &str) -> bool {
         "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR",
         "WEZTERM_EXECUTABLE", "WEZTERM_EXECUTABLE_ARGS_CWD",
         "COLORTERM", "TERM_PROGRAM",
+        "NO_COLOR", "FORCE_COLOR", "CLICOLOR", "CLICOLOR_FORCE", "CI",
         "AI_AGENT",
     ];
     // FS_SANDBOX_* vars always kept
@@ -76,6 +77,11 @@ mod tests {
         assert!(!is_sensitive("FS_SANDBOX_PIPE"));
         assert!(!is_sensitive("RUST_BACKTRACE"));
         assert!(!is_sensitive("CARGO_HOME"));
+        assert!(!is_sensitive("NO_COLOR"));
+        assert!(!is_sensitive("FORCE_COLOR"));
+        assert!(!is_sensitive("CLICOLOR"));
+        assert!(!is_sensitive("CLICOLOR_FORCE"));
+        assert!(!is_sensitive("CI"));
     }
 
     #[test]
