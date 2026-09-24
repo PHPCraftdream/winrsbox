@@ -96,7 +96,7 @@
             MaximumLength: 0,
             Buffer: std::ptr::null_mut(),
         };
-        let attrs = OBJECT_ATTRIBUTES {
+        let mut attrs = OBJECT_ATTRIBUTES {
             Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
             RootDirectory: handle as *mut _,
             ObjectName: &ustr as *const UNICODE_STRING as *mut UNICODE_STRING,
@@ -105,6 +105,10 @@
             SecurityQualityOfService: std::ptr::null_mut(),
         };
         let got = unsafe { resolve_for_hook(&attrs) };
+        attrs.Attributes = 0x1000; // OBJ_DONT_REPARSE
+        let no_follow = unsafe { resolve_for_hook(&attrs) }.unwrap();
+        let kernel_path = String::from_utf16_lossy(&no_follow.1.unwrap());
+        assert!(kernel_path.to_ascii_lowercase().starts_with(r"\device\"));
         // SAFETY: handle came from CreateFileW above and is not used after.
         unsafe { winapi::um::handleapi::CloseHandle(handle) };
         let _ = std::fs::remove_dir_all(&dir);

@@ -67,7 +67,7 @@ pub(crate) use path_resolve::{extract_nt_basename, extract_raw_nt_path, make_ove
 #[cfg(test)] use path_resolve::{ascii_to_lower_u16, device_drive_map};
 pub(crate) use denylist::{canonical_denylist_status, canonicalize_for_denylist, check_path_traversal, strip_trailing_dot_space};
 #[cfg(test)] use denylist::{is_control_file, is_self_overlay_workdir_access};
-pub(crate) use device::{classify_device_open, is_fs_device_path, needs_short_name_resolve, DeviceVerdict};
+pub(crate) use device::{classify_device_open, is_fs_device_path, needs_short_name_resolve, short_name_alias_or_unknown, DeviceVerdict};
 pub(crate) use overlay::{materialize_mock_overlay, prepare_overlay};
 #[cfg(test)] pub(crate) use overlay::overlay_dest_in_roots;
 #[cfg(test)] use overlay::{materialize_mock_overlay_in_roots, overlay_roots_lower, prepare_overlay_in_roots};

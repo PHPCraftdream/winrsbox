@@ -172,6 +172,7 @@ pub(crate) unsafe fn resolve_for_hook(
         // opens the file with RootDirectory = handle to CWD and ObjectName =
         // bare basename) silently falls through to call_original and writes
         // land on the real filesystem instead of the overlay.
+        let base_device = base.clone();
         let base = device_path_to_dos_nt(&base).unwrap_or(base);
         let mut full: Vec<u16> = base;
         // Empty name → the target IS the handle's own directory; appending a
@@ -189,14 +190,26 @@ pub(crate) unsafe fn resolve_for_hook(
         // on the unfolded string (which prefix-matched project_root) while
         // the kernel resolved the `..` segments outside the sandbox.
         let full = policy::path::fold_nt_dots(&full);
-        let dos = policy::path::nt_to_dos_lower(&full)?;
+        let physical_dos = policy::path::nt_to_dos_lower(&full)?;
         // Relative-open whose directory handle was itself a CoW'd overlay file:
         // see `unmirror_overlay_handle_relative` for the rationale. Returns the
         // original `dos` unchanged when the handle does not resolve into the
         // overlay storage (the common non-sandbox case, zero overhead).
         let sb_root = SANDBOX_ROOT.get().map(|s| s.as_str());
-        let dos = unmirror_overlay_handle_relative(&dos, sb_root).unwrap_or(dos);
-        return Some((dos, Some(full.into_owned())));
+        let virtual_dos = unmirror_overlay_handle_relative(&physical_dos, sb_root);
+        let kernel_nt = virtual_dos
+            .as_deref()
+            .and_then(|virtual_path| read_through_missing_overlay(&physical_dos, virtual_path))
+            .unwrap_or_else(|| full.into_owned());
+        let dos = virtual_dos.unwrap_or(physical_dos);
+        // OBJ_DONT_REPARSE would reject the DOS drive-name symlink (`\??\D:`).
+        let kernel_path = if obj.Attributes & 0x1000 != 0 {
+            super::device::device_nt_for_folded_dos(&base_device, &kernel_nt)
+                .unwrap_or(kernel_nt)
+        } else {
+            kernel_nt
+        };
+        return Some((dos, Some(kernel_path)));
     }
 
     // Fast path: ObjectName already in absolute NT form (`\??\C:\…`).
@@ -273,6 +286,37 @@ pub(crate) unsafe fn resolve_for_hook(
     Some((dos, Some(abs.into_owned())))
 }
 
+fn read_through_missing_overlay(physical: &str, virtual_path: &str) -> Option<Vec<u16>> {
+    let missing = std::fs::symlink_metadata(physical)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    if !missing {
+        return None;
+    }
+    let mut nt = policy::path::dos_to_nt(virtual_path);
+    nt.pop(); // UNICODE_STRING.Length excludes the terminator.
+    Some(nt)
+}
+
+#[cfg(test)]
+mod read_through_tests {
+    use super::*;
+
+    #[test]
+    fn missing_overlay_leaf_reads_host_but_existing_leaf_stays_overlayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let physical = dir.path().join("overlay").join("config.json");
+        let host = dir.path().join("host").join("config.json");
+        std::fs::create_dir_all(physical.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(host.parent().unwrap()).unwrap();
+        std::fs::write(&host, b"host").unwrap();
+        let snapshot = read_through_missing_overlay(&physical.to_string_lossy(), &host.to_string_lossy())
+            .expect("missing overlay leaf must read through");
+        assert_eq!(String::from_utf16_lossy(&snapshot), format!(r"\??\{}", host.display()));
+        std::fs::write(&physical, b"overlay").unwrap();
+        assert!(read_through_missing_overlay(&physical.to_string_lossy(), &host.to_string_lossy()).is_none());
+    }
+}
+
 /// Lowercase-DOS form of a folded absolute NT path for the bare-relative
 /// CWD branch, WITH the overlay-storage unmirror its two sibling branches
 /// (RootDirectory-relative and absolute-path) already apply.
@@ -338,8 +382,8 @@ pub(crate) fn join_bare_relative_to_nt(cwd: &[u16], name: &[u16]) -> Vec<u16> {
 /// Such a handle-relative open is a legitimate self-access, NOT an attempt by
 /// the agent to poke sandbox internals by virtual path. This fn translates the
 /// overlay path back to the virtual DOS path; subsequent `decide` re-mirrors it
-/// into the overlay (Cow) and the kernel passthrough still uses the original
-/// overlay `full` path, so the actual file touched is unchanged. The denylist
+/// into the overlay (Cow). A missing overlay leaf reads through to the virtual
+/// host path; an existing overlay leaf keeps the physical snapshot. The denylist
 /// then sees the VIRTUAL path, so a genuine `D:\…\.winrsbox` attack by virtual
 /// path stays blocked.
 ///
@@ -494,4 +538,4 @@ pub(crate) unsafe fn extract_nt_basename(attrs: *const OBJECT_ATTRIBUTES) -> Opt
     } else {
         None
     }
-}
+}

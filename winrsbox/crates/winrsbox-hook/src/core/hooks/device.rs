@@ -245,4 +245,112 @@ pub(crate) fn needs_short_name_resolve(path: &str) -> bool {
         }
     }
     false
-}
+}
+
+/// Only a spelling that expands to a different name is an 8.3 alias.
+/// Unverifiable paths remain denied.
+pub(crate) fn short_name_alias_or_unknown(path: &str) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    let mut current = std::path::Path::new(path);
+    loop {
+        let wide: Vec<u16> = current.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut stack = [0u16; 512];
+        // SAFETY: wide is NUL-terminated; stack is writable for its full length.
+        let count = unsafe {
+            winapi::um::fileapi::GetLongPathNameW(
+                wide.as_ptr(), stack.as_mut_ptr(), stack.len() as u32,
+            )
+        };
+        if count == 0 {
+            // SAFETY: reads this thread's immediately preceding Win32 error.
+            let error = unsafe { winapi::um::errhandlingapi::GetLastError() };
+            if error != winapi::shared::winerror::ERROR_FILE_NOT_FOUND
+                && error != winapi::shared::winerror::ERROR_PATH_NOT_FOUND
+            {
+                return true;
+            }
+            current = match current.parent() {
+                Some(parent) if parent != current => parent,
+                _ => return true,
+            };
+            continue;
+        }
+        let expanded = if (count as usize) < stack.len() {
+            String::from_utf16_lossy(&stack[..count as usize])
+        } else {
+            if count > 32 * 1024 {
+                return true;
+            }
+            let mut big = vec![0u16; count as usize];
+            // SAFETY: wide is NUL-terminated; big has the size requested by Win32.
+            let copied = unsafe {
+                winapi::um::fileapi::GetLongPathNameW(
+                    wide.as_ptr(), big.as_mut_ptr(), big.len() as u32,
+                )
+            };
+            if copied == 0 || copied as usize >= big.len() {
+                return true;
+            }
+            String::from_utf16_lossy(&big[..copied as usize])
+        };
+        return policy::path::nt_case_fold(&expanded)
+            != policy::path::nt_case_fold(&current.to_string_lossy());
+    }
+}
+
+/// Keep a no-reparse relative open off the DOS drive-name symlink.
+pub(super) fn device_nt_for_folded_dos(base: &[u16], folded_dos: &[u16]) -> Option<Vec<u16>> {
+    use super::path_resolve::{ascii_to_lower_u16, device_drive_map};
+    let nt_prefix = folded_dos.starts_with(&[b'\\' as u16, b'?' as u16, b'?' as u16, b'\\' as u16])
+        || folded_dos.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]);
+    if folded_dos.len() < 7
+        || !nt_prefix
+        || !matches!(folded_dos[4], 0x41..=0x5A | 0x61..=0x7A)
+        || folded_dos[5] != b':' as u16
+        || folded_dos[6] != b'\\' as u16
+    {
+        return None;
+    }
+    let drive = ascii_to_lower_u16(folded_dos[4]);
+    let lower_base: Vec<u16> = base.iter().copied().map(ascii_to_lower_u16).collect();
+    for (device, letter) in device_drive_map() {
+        if *letter != drive || !lower_base.starts_with(device) {
+            continue;
+        }
+        if lower_base.get(device.len()).is_some_and(|unit| *unit != b'\\' as u16) {
+            continue;
+        }
+        let mut path = Vec::with_capacity(device.len() + folded_dos.len() - 6);
+        path.extend_from_slice(&base[..device.len()]);
+        path.extend_from_slice(&folded_dos[6..]);
+        return Some(path);
+    }
+    None
+}
+
+#[cfg(test)]
+mod short_name_tests {
+    use super::*;
+
+    #[test]
+    fn literal_tilde_digit_name_survives_the_denylist() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("9710~0.js");
+        std::fs::write(&file, b"fixture").unwrap();
+        let literal = file.to_string_lossy();
+        assert!(needs_short_name_resolve(&literal));
+        assert!(!short_name_alias_or_unknown(&literal));
+        assert!(canonical_denylist_status(&canonicalize_for_denylist(&literal)).is_none());
+        assert!(!short_name_alias_or_unknown(
+            &dir.path().join("new~0.js").to_string_lossy()
+        ));
+    }
+
+    #[test]
+    fn existing_short_alias_is_denied_when_windows_provides_one() {
+        let alias = r"C:\PROGRA~1";
+        if std::path::Path::new(alias).exists() {
+            assert!(short_name_alias_or_unknown(alias));
+        }
+    }
+}

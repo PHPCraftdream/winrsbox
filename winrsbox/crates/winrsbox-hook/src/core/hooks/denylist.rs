@@ -64,9 +64,8 @@ pub(crate) fn canonical_denylist_status(canon: &str) -> Option<(NTSTATUS, &'stat
             }
         }
     }
-    // 8.3 short-name (e.g. PROGRA~1) — kernel resolves to a full path, bypassing
-    // the classifier and the CoW overlay.
-    if needs_short_name_resolve(canon) {
+    // A literal `~0` filename is valid; only a spelling that expands is an alias.
+    if needs_short_name_resolve(canon) && short_name_alias_or_unknown(after) {
         return Some((STATUS_ACCESS_DENIED, "short_name"));
     }
     // Sandbox state directory — masked as non-existent (NAME_NOT_FOUND) so the
@@ -322,4 +321,4 @@ fn strip_nt_dos_prefix(lower: &str) -> Option<&str> {
         return Some(rest);
     }
     None
-}
+}
