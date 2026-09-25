@@ -583,10 +583,10 @@ async fn run() -> Result<()> {
     std::env::set_var("FS_SANDBOX_SECTION", &section_name);
 
     // Create kernel Event for hook.dll init signaling (H1 fix, random name).
-    let init_event = sandbox::launch_prep::create_init_event(std::process::id())?;
+    let init_event = sandbox::launch_prep::create_init_event()?;
     // S10: second event for the degraded-init acknowledgment (optional
     // component install failures buffered inside hook.dll).
-    let init_degraded_event = sandbox::launch_prep::create_degraded_event(std::process::id())?;
+    let init_degraded_event = sandbox::launch_prep::create_degraded_event()?;
 
     // Guard level is taken verbatim — no trust-based downgrade. Full mode is
     // now JIT-safe (no ProhibitDynamicCode / signed-only), so unsigned dev
@@ -628,7 +628,12 @@ async fn run() -> Result<()> {
     // interrupt into "session destroyed".
     sandbox::install_console_ctrl_handler();
 
-    let proc_info = sandbox::launch_suspended(&project_root, &target_args, effective_guard)?;
+    let proc_info = sandbox::launch_suspended(
+        &project_root,
+        &target_args,
+        effective_guard,
+        [init_event, init_degraded_event],
+    )?;
 
     // C3 Part 3: publish the root PID to the pipe accept loop so it can
     // validate `GetNamedPipeClientProcessId` against our own target on every

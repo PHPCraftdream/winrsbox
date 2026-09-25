@@ -16,6 +16,7 @@ use windows::{
                 InitializeProcThreadAttributeList, TerminateProcess,
                 UpdateProcThreadAttribute, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
                 EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
                 PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROCESS_INFORMATION,
                 STARTUPINFOEXW, STARTUPINFOW,
             },
@@ -326,13 +327,19 @@ pub(crate) fn install_console_ctrl_handler() {
 
 /// Launch `target_args[0]` suspended under `cwd`, returning the PROCESS_INFORMATION.
 ///
+/// Only the two root init-event handles are inherited by the child.
 /// Applies create-time kernel mitigations via PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY.
 /// The runtime-only `BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON` flag is dropped here
 /// (hook.dll is unsigned — kernel would reject its load if the bit were set at
 /// create time). That flag is re-applied AFTER hook.dll loads, from inside
 /// hook::apply_mitigations via SetProcessMitigationPolicy. All other v1/v2 bits
 /// only take effect at process create, so they MUST be passed via this path.
-pub(crate) fn launch_suspended(cwd: &Path, target_args: &[String], guard: crate::GuardLevel) -> Result<PROCESS_INFORMATION> {
+pub(crate) fn launch_suspended(
+    cwd: &Path,
+    target_args: &[String],
+    guard: crate::GuardLevel,
+    inherited_event_handles: [HANDLE; 2],
+) -> Result<PROCESS_INFORMATION> {
     let cmdline = build_cmdline(target_args);
     let mut cmdline_wide: Vec<u16> = cmdline.encode_utf16().chain(Some(0)).collect();
     let cwd_wide: Vec<u16> = cwd.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -412,46 +419,54 @@ pub(crate) fn launch_suspended(cwd: &Path, target_args: &[String], guard: crate:
 
     let mut pi = PROCESS_INFORMATION::default();
 
-    // ─── Build the attribute list (only if we have any mitigation bits) ────
-    //
-    // SAFETY for the whole block: the buffers used by UpdateProcThreadAttribute
-    // (here: `bytes` for PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY) MUST outlive
-    // the CreateProcessW call AND the DeleteProcThreadAttributeList call. We
-    // keep `bytes` (stack) and `attr_buf` (heap Vec) on this stack frame past
-    // both. `attr_list` is a raw pointer into `attr_buf`'s backing storage.
-    let mut attr_buf: Vec<u8> = Vec::new();
-    let mut attr_list = LPPROC_THREAD_ATTRIBUTE_LIST::default();
-    // CREATE_UNICODE_ENVIRONMENT is always set: this function always passes
-    // an explicit Unicode environment block (see copy_caller_environment_block)
-    // to CreateProcessAsUserW rather than NULL — required whenever an
-    // explicit lpEnvironment is supplied to CreateProcessAsUserW/CreateProcessW.
-    let mut creation_flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT;
+    // ─── Build the attribute list for exact handle inheritance ─────────────
+    // Only the two root handshake events cross into the less-trusted guest.
+    // The handle-list attribute prevents unrelated inheritable launcher
+    // handles from leaking into it.
+    let attribute_count = if has_mitigations { 2 } else { 1 };
+    let mut attr_list_size: usize = 0;
+    // SAFETY: passing None is the documented size-query call.
+    let _ = unsafe {
+        InitializeProcThreadAttributeList(None, attribute_count, None, &mut attr_list_size)
+    };
+    anyhow::ensure!(attr_list_size > 0, "InitializeProcThreadAttributeList returned size=0");
+    let mut attr_buf = vec![0u8; attr_list_size];
+    let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_buf.as_mut_ptr() as *mut _);
+    // SAFETY: attr_buf is sized to the queried length and remains alive through
+    // DeleteProcThreadAttributeList below.
+    unsafe {
+        InitializeProcThreadAttributeList(
+            Some(attr_list),
+            attribute_count,
+            None,
+            &mut attr_list_size,
+        )
+    }
+    .context("InitializeProcThreadAttributeList failed")?;
+
+    // SAFETY: inherited_event_handles is a live array of the only inheritable
+    // handles intended for the root child; the OS reads it during process creation.
+    let handle_list_result = unsafe {
+        UpdateProcThreadAttribute(
+            attr_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            Some(inherited_event_handles.as_ptr() as *const std::ffi::c_void),
+            std::mem::size_of_val(&inherited_event_handles),
+            None,
+            None,
+        )
+    };
+    if let Err(error) = handle_list_result {
+        // SAFETY: attr_list was successfully initialized above.
+        unsafe { DeleteProcThreadAttributeList(attr_list) };
+        return Err(anyhow::Error::from(error))
+            .context("UpdateProcThreadAttribute(HANDLE_LIST) failed");
+    }
 
     if has_mitigations {
-        // First call: query required buffer size. Expected to fail with
-        // ERROR_INSUFFICIENT_BUFFER and write attr_list_size. Ignore the Result.
-        let mut attr_list_size: usize = 0;
-        // SAFETY: passing None for lpattributelist is the documented way to query size.
-        let _ = unsafe {
-            InitializeProcThreadAttributeList(None, 1, None, &mut attr_list_size)
-        };
-        anyhow::ensure!(
-            attr_list_size > 0,
-            "InitializeProcThreadAttributeList returned size=0 (driver inconsistency)",
-        );
-        attr_buf = vec![0u8; attr_list_size];
-        attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_buf.as_mut_ptr() as *mut _);
-
-        // SAFETY: attr_buf is at least attr_list_size bytes; pointer is valid.
-        unsafe {
-            InitializeProcThreadAttributeList(Some(attr_list), 1, None, &mut attr_list_size)
-        }
-        .context("InitializeProcThreadAttributeList failed")?;
-
-        // SAFETY: bytes is a stack 16-byte array; pointer valid for the
-        // duration of the CreateProcessW call (and the subsequent
-        // DeleteProcThreadAttributeList — the kernel keeps the buffer pointer
-        // in the attribute list, not a copy).
+        // SAFETY: bytes lives through CreateProcessAsUserW and attribute-list
+        // deletion; the API consumes this fixed mitigation bitmask.
         let update_result = unsafe {
             UpdateProcThreadAttribute(
                 attr_list,
@@ -463,29 +478,23 @@ pub(crate) fn launch_suspended(cwd: &Path, target_args: &[String], guard: crate:
                 None,
             )
         };
-        if let Err(e) = update_result {
-            // SAFETY: attr_list was successfully Initialize'd above.
-            unsafe { DeleteProcThreadAttributeList(attr_list); }
-            return Err(anyhow::Error::from(e))
+        if let Err(error) = update_result {
+            // SAFETY: attr_list was successfully initialized above.
+            unsafe { DeleteProcThreadAttributeList(attr_list) };
+            return Err(anyhow::Error::from(error))
                 .context("UpdateProcThreadAttribute(MITIGATION_POLICY) failed");
         }
-        creation_flags |= EXTENDED_STARTUPINFO_PRESENT;
     }
+    let creation_flags =
+        CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
 
     // STARTUPINFOEXW is repr(C) with STARTUPINFOW as the first field, so
     // CreateProcessW (which expects *const STARTUPINFOW) can read the W part
     // from a pointer to the EXW; `cb` must equal sizeof(STARTUPINFOEXW) so
-    // the kernel knows to look past the W tail at lpAttributeList. When we
-    // have no mitigations, we still use STARTUPINFOEXW for code simplicity
-    // but set `cb = sizeof(STARTUPINFOW)` and omit EXTENDED_STARTUPINFO_PRESENT
-    // so the kernel ignores the unused tail.
+    // the kernel knows to read lpAttributeList for the exact inherited handles.
     let si_ex = STARTUPINFOEXW {
         StartupInfo: STARTUPINFOW {
-            cb: if has_mitigations {
-                std::mem::size_of::<STARTUPINFOEXW>() as u32
-            } else {
-                std::mem::size_of::<STARTUPINFOW>() as u32
-            },
+            cb: std::mem::size_of::<STARTUPINFOEXW>() as u32,
             ..Default::default()
         },
         lpAttributeList: attr_list,
@@ -505,7 +514,7 @@ pub(crate) fn launch_suspended(cwd: &Path, target_args: &[String], guard: crate:
             Some(guest.handle()),
             PCWSTR::null(),
             Some(windows::core::PWSTR(cmdline_wide.as_mut_ptr())),
-            None, None, false,
+            None, None, true,
             creation_flags,
             Some(env_block.as_ptr() as *const std::ffi::c_void),
             PCWSTR(cwd_wide.as_ptr()),
@@ -518,16 +527,15 @@ pub(crate) fn launch_suspended(cwd: &Path, target_args: &[String], guard: crate:
     // the time CreateProcessAsUserW returns (success OR failure). Per MSDN,
     // DeleteProcThreadAttributeList does NOT free the buffer pointers we
     // attached (bytes); we manage their lifetime ourselves via Rust's stack.
-    if has_mitigations {
-        // SAFETY: attr_list was Initialize'd; safe to Delete exactly once.
-        unsafe { DeleteProcThreadAttributeList(attr_list); }
-    }
+    // SAFETY: attr_list was initialized above and is deleted exactly once.
+    unsafe { DeleteProcThreadAttributeList(attr_list); }
     // Touch si_ex AFTER CreateProcessAsUserW to ensure the compiler doesn't
     // move the drop earlier. (Defensive — repr(C) on-stack lifetime already
     // covers the syscall, but the read is free and documents intent.)
     let _ = si_ex.StartupInfo.cb;
     // Touch attr_buf/env_block to assert both stayed alive past the syscall.
     let _ = attr_buf.len();
+    let _ = inherited_event_handles.len();
     let _ = env_block.len();
 
     // Fail closed: any CreateProcessAsUserW error (including the documented

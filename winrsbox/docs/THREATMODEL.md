@@ -166,12 +166,15 @@ Blocks system-level privileged operations:
 
 #### Hook injection verification (P1-1)
 
-After injecting `hook.dll` into the sandboxed child, the launcher waits on a
-named kernel Event (`winrsbox-hook-ready-<pid>`) using `WaitForSingleObject`
-with a 5-second timeout (executed via `spawn_blocking` so the async runtime
-is not stalled).
+Before creating the suspended root child, the launcher creates anonymous
+kernel Events and passes only their inheritable handles through
+`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. The hook signals those handles directly;
+it does not reopen a named object under the guest token. The launcher waits on
+the init event using `WaitForSingleObject` with a 5-second timeout (executed
+via `spawn_blocking` so the async runtime is not stalled).
 
-- If `hook.dll` successfully initializes, it signals the Event from `DllMain`.
+- If `hook.dll` successfully initializes, it signals the inherited event from
+  `DllMain` and closes its copy of the handle.
 - If the Event is not signaled within the timeout (DLL injection failed, DLL was
   blocked by AV, or `DllMain` panicked), the launcher terminates the child and
   reports an injection failure.
@@ -179,7 +182,8 @@ is not stalled).
 This is fail-closed: a child that never signals readiness is killed, not
 allowed to run unhooked.
 
-**Code**: `launcher/src/main.rs` (Event wait), `hook/src/lib.rs` (Event signal).
+**Code**: `launcher/src/main.rs` (Event wait), `launcher/src/sandbox/mod.rs`
+(restricted handle inheritance), `hook/src/ipc/init_ack.rs` (Event signal).
 
 #### IPC fail-closed
 

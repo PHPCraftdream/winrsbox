@@ -4,11 +4,10 @@ use std::path::Path;
 use windows::{
     core::PCWSTR,
     Win32::{
-        Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree},
-        Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG},
+        Foundation::{CloseHandle, HANDLE},
         Security::{
-            PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_ADJUST_DEFAULT,
-            TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
+            SECURITY_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID,
+            TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
         },
         System::{
             Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW},
@@ -19,119 +18,9 @@ use windows::{
 
 use winrsbox::contain::guest as guest_token;
 
-/// SYNCHRONIZE | EVENT_MODIFY_STATE — exactly the two rights this event's
-/// two openers use: the launcher's `WaitForSingleObject` (main.rs) needs
-/// SYNCHRONIZE, and the guest hook's `signal_one`
-/// (winrsbox-hook/src/ipc/init_ack.rs) opens with `EVENT_MODIFY_STATE`
-/// (0x0002) before `SetEvent`.
-const INIT_EVENT_RIGHTS_MASK: &str = "0x100002";
-
-/// Build the explicit per-object SDDL for an init-handshake event (R04-1b).
-///
-/// With `lpEventAttributes=None` (the previous behaviour) the DACL is
-/// copied from the LAUNCHER's own `TokenDefaultDacl` at creation time.
-/// R04-0's probe (docs/R04-implementation-plan-t1-light-t2.md) measured
-/// that DACL to carry a `BUILTIN\Administrators` ACE alongside SYSTEM and
-/// the user SID — an ACE that stops granting access once R04-1c derives the
-/// guest token with Administrators deny-only. The guest (and its
-/// descendants, per this file's `INIT_DEGRADED_EVENT_ENV`/`FS_SANDBOX_INIT_EVENT`
-/// contract) must open these events BY NAME from `winrsbox-hook`'s
-/// `signal_one`, so the grant has to name the specific user SID — not a
-/// group the guest's token now denies. Same technique as
-/// `pipe_server::security::current_user_string_sid` +
-/// `ConvertStringSecurityDescriptorToSecurityDescriptorW` already proved
-/// for the IPC pipe (F6) — reused here via `pub(crate)`, not duplicated.
-fn build_init_event_sddl() -> anyhow::Result<String> {
-    let sid = crate::pipe_server::security::current_user_string_sid()?;
-    Ok(format!("D:(A;;{INIT_EVENT_RIGHTS_MASK};;;{sid})"))
-}
-
-/// Convert `sddl` into a `SECURITY_ATTRIBUTES` ready for `CreateEventW`, and
-/// the owning `PSECURITY_DESCRIPTOR` that must be `LocalFree`'d once the
-/// kernel call has copied what it needs (the call site frees it
-/// immediately after `CreateEventW` returns, on every path).
-fn security_attributes_from_sddl(sddl: &str) -> anyhow::Result<(SECURITY_ATTRIBUTES, PSECURITY_DESCRIPTOR)> {
-    let sddl_w: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
-    let mut psd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: sddl_w is NUL-terminated; psd is a valid stack out-param; the
-    // SDDL converter LocalAlloc's the descriptor and stores its pointer in
-    // `psd` on success.
-    let ok = unsafe {
-        crate::pipe_server::security::ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR(sddl_w.as_ptr()),
-            1, // SDDL_REVISION_1
-            &mut psd,
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == 0 || psd.is_invalid() {
-        anyhow::bail!("ConvertStringSecurityDescriptorToSecurityDescriptorW failed (sddl={sddl})");
-    }
-    let sa = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: psd.0,
-        bInheritHandle: windows::core::BOOL(0),
-    };
-    Ok((sa, psd))
-}
-
-/// Env var carrying the DEGRADED-init acknowledgment event name to the child
-/// (S10). The hook-side counterpart literal lives in
-/// winrsbox-hook/src/ipc/init_ack.rs; the two literals MUST stay identical,
-/// and each side pins it in a test.
+/// Environment variables carrying inherited root-event handle values.
+pub(crate) const INIT_EVENT_HANDLE_ENV: &str = "FS_SANDBOX_INIT_EVENT";
 pub(crate) const INIT_DEGRADED_EVENT_ENV: &str = "FS_SANDBOX_INIT_DEGRADED_EVENT";
-
-/// Build the kernel-Event name used by hook.dll to signal "initialised" to
-/// the launcher (H1 fix). Format:
-///     Local\fs-sandbox-init-<pid>-<32 lowercase hex chars>
-///
-/// The 32-char suffix is 16 bytes of cryptographically-strong entropy from
-/// `BCryptGenRandom` — 128 bits, the same budget you'd spend on a UUID.
-/// The launcher process keeps the only kernel handle returned by
-/// `CreateEventW`; the hook.dll opens the same object by name via the
-/// `FS_SANDBOX_INIT_EVENT` env var (set on this process and inherited by
-/// the suspended child via CreateProcessW's environment block).
-///
-/// If `BCryptGenRandom` ever fails (it really shouldn't — the system RNG is
-/// always available), we fall back to the predictable PID-only name so the
-/// handshake still works. A panic here would brick every launch.
-pub(crate) fn build_random_event_name(pid: u32) -> String {
-    build_session_event_name(pid, "init")
-}
-
-/// Shared builder for the hello-handshake kernel-event names (S10): draws 16
-/// cryptographically-strong random bytes and formats
-///     Local\fs-sandbox-<label>-<pid>-<32 lowercase hex chars>
-///
-/// If `BCryptGenRandom` ever fails, we fall back to the predictable
-/// PID-only name so the handshake still works (see `build_random_event_name`).
-fn build_session_event_name(pid: u32, label: &str) -> String {
-    let mut rand_bytes = [0u8; 16];
-    // SAFETY: FFI call to bcrypt!BCryptGenRandom; pbbuffer is a valid
-    // mutable 16-byte slice and BCRYPT_USE_SYSTEM_PREFERRED_RNG means
-    // halgorithm is unused.
-    let status = unsafe {
-        BCryptGenRandom(None, &mut rand_bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
-    };
-    if status.0 < 0 {
-        // RNG unavailable — degrade to legacy predictable name rather than
-        // brick the launch. The TOCTOU window is bounded by the 5-second
-        // hello-handshake timeout in the launcher.
-        return format!("Local\\fs-sandbox-{label}-{}", pid);
-    }
-    let mut suffix = String::with_capacity(32);
-    for b in rand_bytes.iter() {
-        use std::fmt::Write;
-        let _ = write!(&mut suffix, "{:02x}", b);
-    }
-    format!("Local\\fs-sandbox-{label}-{}-{}", pid, suffix)
-}
-
-/// Build the kernel-Event name for the S10 degraded-init acknowledgment:
-///     Local\fs-sandbox-init-degraded-<pid>-<32 lowercase hex chars>
-pub(crate) fn build_random_degraded_event_name(pid: u32) -> String {
-    build_session_event_name(pid, "init-degraded")
-}
 
 /// Detect whether THIS launcher was spawned inside an existing sandbox.
 ///
@@ -206,28 +95,12 @@ pub(crate) fn build_delegation_command(target: &[String]) -> std::process::Comma
 
 /// Create kernel Event for hook.dll init signaling.
 ///
-/// H1 fix: the event name embeds a 128-bit random suffix so a same-session
-/// attacker cannot guess the name and SetEvent() it ahead of the real
-/// hook.dll. The `Local\` namespace already scopes the object to this
-/// logon session; the random suffix raises the bar from "any same-user
-/// process can OpenEvent" to "attacker must enumerate the object-manager
-/// directory or read our env vars" (the env var is propagated through
-/// CreateProcessW's environment block to the target only).
-pub(crate) fn create_init_event(pid: u32) -> anyhow::Result<HANDLE> {
-    let init_event_name = build_random_event_name(pid);
-    let event_name_wide: Vec<u16> = init_event_name.encode_utf16().chain(Some(0)).collect();
-    let sddl = build_init_event_sddl()?;
-    let (sa, psd) = security_attributes_from_sddl(&sddl)?;
-    let result = unsafe {
-        CreateEventW(Some(&sa), false, false, PCWSTR(event_name_wide.as_ptr()))
-    };
-    // SAFETY: psd was allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW
-    // above; the kernel copied it during CreateEventW, so it is freed here on
-    // every path.
-    unsafe { LocalFree(Some(HLOCAL(psd.0))) };
-    let init_event = result?;
-    std::env::set_var("FS_SANDBOX_INIT_EVENT", &init_event_name);
-    Ok(init_event)
+/// The root hook signals this anonymous event through a handle inherited via
+/// the launcher's explicit handle list.
+pub(crate) fn create_init_event() -> anyhow::Result<HANDLE> {
+    let event = create_session_event()?;
+    std::env::set_var(INIT_EVENT_HANDLE_ENV, (event.0 as usize).to_string());
+    Ok(event)
 }
 
 /// Create the second kernel Event for the S10 degraded-init acknowledgment:
@@ -235,22 +108,25 @@ pub(crate) fn create_init_event(pid: u32) -> anyhow::Result<HANDLE> {
 /// install (buffered errors), it signals this event so the launcher can warn
 /// the operator instead of silently running a degraded sandbox. Same
 /// auto-reset, initially-unset shape as `create_init_event`; the name is
-/// exported to the child via `INIT_DEGRADED_EVENT_ENV`.
-pub(crate) fn create_degraded_event(pid: u32) -> anyhow::Result<HANDLE> {
-    let degraded_event_name = build_random_degraded_event_name(pid);
-    let event_name_wide: Vec<u16> = degraded_event_name.encode_utf16().chain(Some(0)).collect();
-    let sddl = build_init_event_sddl()?;
-    let (sa, psd) = security_attributes_from_sddl(&sddl)?;
-    let result = unsafe {
-        CreateEventW(Some(&sa), false, false, PCWSTR(event_name_wide.as_ptr()))
+/// handle value is exported to the child via `INIT_DEGRADED_EVENT_ENV`.
+pub(crate) fn create_degraded_event() -> anyhow::Result<HANDLE> {
+    let event = create_session_event()?;
+    std::env::set_var(INIT_DEGRADED_EVENT_ENV, (event.0 as usize).to_string());
+    Ok(event)
+}
+
+fn create_session_event() -> anyhow::Result<HANDLE> {
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: windows::core::BOOL(1),
     };
-    // SAFETY: psd was allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW
-    // above; the kernel copied it during CreateEventW, so it is freed here on
-    // every path.
-    unsafe { LocalFree(Some(HLOCAL(psd.0))) };
-    let degraded_event = result?;
-    std::env::set_var(INIT_DEGRADED_EVENT_ENV, &degraded_event_name);
-    Ok(degraded_event)
+    // SAFETY: attributes is valid; the unnamed event can only be reached by
+    // the exact handle inherited through the launcher's handle list.
+    unsafe {
+        CreateEventW(Some(&attributes), false, false, PCWSTR::null())
+    }
+        .context("CreateEventW for sandbox init handshake failed")
 }
 
 /// Set (non-security) env vars for child before CreateProcessW — child
@@ -391,126 +267,32 @@ pub(crate) fn verify_child_token(
 
 #[cfg(test)]
 mod init_event_security_tests {
-    //! R04-1b: the init-handshake events must carry an explicit DACL naming
-    //! the current user SID with SYNCHRONIZE | EVENT_MODIFY_STATE — not a
-    //! bare Administrators-group grant and not a default (NULL) SD. Same
-    //! ACE-walk technique as `pipe_server::security::tests`.
-
-    use super::create_init_event;
-    use std::ffi::c_void;
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
-    use windows::Win32::Security::{
-        GetAce, GetAclInformation, ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION,
-        AclSizeInformation, DACL_SECURITY_INFORMATION,
+    use super::{
+        create_degraded_event, create_init_event, INIT_DEGRADED_EVENT_ENV, INIT_EVENT_HANDLE_ENV,
     };
+    use windows::Win32::Foundation::{CloseHandle, GetHandleInformation};
 
-    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x00;
+    fn assert_inheritable(handle: windows::Win32::Foundation::HANDLE, env: &str) {
+        let value = std::env::var(env).expect("event handle env must be set");
+        assert_eq!(value.parse::<usize>().unwrap(), handle.0 as usize);
+        let mut flags = 0u32;
+        // SAFETY: handle is live and owned by this test.
+        let result = unsafe { GetHandleInformation(handle, &mut flags) };
+        std::env::remove_var(env);
+        // SAFETY: handle is closed exactly once after the query.
+        unsafe { CloseHandle(handle).ok() };
+        result.expect("GetHandleInformation failed");
+        assert_ne!(flags & 1, 0, "root handshake handle must be inheritable");
+    }
 
     #[test]
-    fn init_event_dacl_grants_exactly_the_current_user_sync_and_modify_state() {
-        // Unique pid-like tag so parallel test runs never collide on the
-        // event name.
-        let pid = std::process::id().wrapping_add(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock before epoch")
-                .subsec_nanos(),
-        );
-        let handle = create_init_event(pid).expect("create_init_event failed");
-        std::env::remove_var("FS_SANDBOX_INIT_EVENT");
-
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        // SAFETY: handle is the valid event handle just created; GetSecurityInfo
-        // with DACL only reads the object's security descriptor.
-        let err = unsafe {
-            GetSecurityInfo(
-                handle,
-                SE_KERNEL_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                None,
-                None,
-                Some(&mut dacl),
-                None,
-                None,
-            )
-        };
-        assert_eq!(err.0, 0, "GetSecurityInfo failed: WIN32_ERROR({})", err.0);
-        assert!(!dacl.is_null(), "explicit SDDL must produce a present DACL");
-
-        let mut info = ACL_SIZE_INFORMATION::default();
-        // SAFETY: dacl is valid per the successful GetSecurityInfo call above;
-        // ACL_SIZE_INFORMATION is the struct documented for AclSizeInformation.
-        unsafe {
-            GetAclInformation(
-                dacl,
-                &mut info as *mut _ as *mut c_void,
-                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-                AclSizeInformation,
-            )
-        }
-        .expect("GetAclInformation failed");
-        assert_eq!(
-            info.AceCount, 1,
-            "the SDDL grants exactly one ACE — the current user, nothing else \
-             (no bare Administrators-group ACE, no default-DACL leftovers)"
-        );
-
-        let mut ace: *mut c_void = std::ptr::null_mut();
-        // SAFETY: index 0 < AceCount (asserted above); dacl is valid.
-        unsafe { GetAce(dacl, 0, &mut ace) }.expect("GetAce failed");
-        // SAFETY: ace points into the live DACL buffer owned by the event's
-        // security descriptor, valid for this scope.
-        let (ace_type, mask) = unsafe {
-            let a = &*(ace as *mut ACCESS_ALLOWED_ACE);
-            (a.Header.AceType, a.Mask)
-        };
-        assert_eq!(ace_type, ACCESS_ALLOWED_ACE_TYPE, "ACE must be access-allowed");
-        assert_eq!(
-            mask, 0x0010_0002,
-            "ACE must grant exactly SYNCHRONIZE | EVENT_MODIFY_STATE — the \
-             two rights create_init_event's own WaitForSingleObject caller \
-             and winrsbox-hook's signal_one (SetEvent) actually use"
-        );
-
-        // SAFETY: ace points into the live DACL; SidStart aliases the trustee SID.
-        let ace_sid = unsafe {
-            let a = &*(ace as *mut ACCESS_ALLOWED_ACE);
-            windows::Win32::Security::PSID(&a.SidStart as *const u32 as *mut c_void)
-        };
-        let current_sid = crate::pipe_server::security::current_user_string_sid()
-            .expect("current_user_string_sid failed");
-        let mut sid_pwstr: *mut u16 = std::ptr::null_mut();
-        // SAFETY: ace_sid points into the live DACL buffer; ConvertSidToStringSidW's
-        // raw binding used here is the same one build_init_event_sddl relies on.
-        let ok = unsafe {
-            crate::pipe_server::security::ConvertSidToStringSidW(ace_sid, &mut sid_pwstr)
-        };
-        assert_ne!(ok, 0, "ConvertSidToStringSidW failed on ACE trustee");
-        let ace_sid_str = unsafe {
-            let mut len = 0usize;
-            while *sid_pwstr.add(len) != 0 {
-                len += 1;
-            }
-            String::from_utf16_lossy(std::slice::from_raw_parts(sid_pwstr, len))
-        };
-        // SAFETY: sid_pwstr is LocalAlloc'd by ConvertSidToStringSidW.
-        unsafe {
-            let _ = windows::Win32::Foundation::LocalFree(Some(
-                windows::Win32::Foundation::HLOCAL(sid_pwstr as *mut c_void),
-            ));
-        }
-        assert_eq!(
-            ace_sid_str, current_sid,
-            "ACE trustee must be the current user SID, not a group"
-        );
-
-        // SAFETY: handle came from CreateEventW above and is not yet closed.
-        unsafe { CloseHandle(handle).ok() };
+    fn root_handshake_events_export_inheritable_handle_values() {
+        let init = create_init_event().expect("create init event");
+        assert_inheritable(init, INIT_EVENT_HANDLE_ENV);
+        let degraded = create_degraded_event().expect("create degraded event");
+        assert_inheritable(degraded, INIT_DEGRADED_EVENT_ENV);
     }
-}
-
-#[cfg(test)]
+}#[cfg(test)]
 mod network_opt_in_tests {
     use super::disable_hooks_categories;
 
@@ -542,89 +324,6 @@ mod network_opt_in_tests {
         assert_eq!(disable_hooks_categories(Some(" NET , reg "), false), "net,reg");
         // Empty entries from sloppy input are dropped rather than passed on.
         assert_eq!(disable_hooks_categories(Some("reg,,"), true), "reg");
-    }
-}
-
-#[cfg(test)]
-mod hello_event_name_tests {
-    //! H1 regression tests for the randomized hello-event name.
-
-    use super::{build_random_degraded_event_name, build_random_event_name};
-
-    /// Asserts the new format exactly:
-    ///     Local\fs-sandbox-init-<pid>-<32 lowercase hex chars>
-    #[test]
-    fn format_includes_pid_and_32_hex_suffix() {
-        let name = build_random_event_name(4242);
-        let prefix = "Local\\fs-sandbox-init-4242-";
-        assert!(
-            name.starts_with(prefix),
-            "missing pid-anchored prefix: {name}",
-        );
-        let suffix = &name[prefix.len()..];
-        assert_eq!(suffix.len(), 32, "suffix is not 32 chars: {name}");
-        assert!(
-            suffix.chars().all(|c| {
-                c.is_ascii_hexdigit() && (!c.is_ascii_alphabetic() || c.is_ascii_lowercase())
-            }),
-            "suffix has non-lowercase-hex chars: {suffix}",
-        );
-    }
-
-    /// Two consecutive runs must produce different names. Collision is
-    /// 2^-128 per pair — effectively never on any real test bot. If this
-    /// flakes, the RNG is broken and we have bigger problems.
-    #[test]
-    fn two_consecutive_calls_differ() {
-        let a = build_random_event_name(1);
-        let b = build_random_event_name(1);
-        assert_ne!(a, b, "two random names collided: {a} vs {b}");
-    }
-
-    /// Sanity: a batch of 16 names are all distinct. Catches a wedged RNG
-    /// that returns zeros more reliably than the two-sample test.
-    #[test]
-    fn batch_of_sixteen_all_distinct() {
-        use std::collections::HashSet;
-        let mut seen: HashSet<String> = HashSet::new();
-        for _ in 0..16 {
-            let name = build_random_event_name(7);
-            assert!(seen.insert(name.clone()), "duplicate random name: {name}");
-        }
-    }
-
-    /// S10: the degraded-ack event name follows the same pid-anchored random
-    /// format under its own "init-degraded" label.
-    #[test]
-    fn degraded_format_includes_pid_and_32_hex_suffix() {
-        let name = build_random_degraded_event_name(4242);
-        let prefix = "Local\\fs-sandbox-init-degraded-4242-";
-        assert!(
-            name.starts_with(prefix),
-            "missing pid-anchored prefix: {name}",
-        );
-        let suffix = &name[prefix.len()..];
-        assert_eq!(suffix.len(), 32, "suffix is not 32 chars: {name}");
-        assert!(
-            suffix.chars().all(|c| {
-                c.is_ascii_hexdigit() && (!c.is_ascii_alphabetic() || c.is_ascii_lowercase())
-            }),
-            "suffix has non-lowercase-hex chars: {suffix}",
-        );
-    }
-
-    /// S10: degraded and main hello names must never collide — the launcher
-    /// waits on both, and a shared name would make the degraded probe fire on
-    /// every successful init (or vice versa).
-    #[test]
-    fn degraded_name_differs_from_main_name_for_same_pid() {
-        for pid in [1u32, 4242, 0xDEAD_BEEF] {
-            assert_ne!(
-                build_random_degraded_event_name(pid),
-                build_random_event_name(pid),
-                "degraded and main names collided for pid {pid}",
-            );
-        }
     }
 }
 

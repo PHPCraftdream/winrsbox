@@ -20,12 +20,9 @@
 //     init-signal time), so the launcher can report it instead of trusting a
 //     clean "initialized" handshake.
 
-/// Env var naming the SECOND kernel event the hook sets when init completes
-/// with buffered install errors (degraded init). The launcher-side
-/// counterpart lives in `winrsbox-launcher/src/sandbox/launch_prep.rs`
-/// (chunk 3): the launcher creates the event and exports the name; the hook
-/// opens it by name here. The two literals MUST stay identical — each side
-/// pins the exact string in a test.
+/// Environment variables carrying the two root init-event handles inherited
+/// through the launcher's explicit handle list.
+pub(crate) const INIT_EVENT_HANDLE_ENV: &str = "FS_SANDBOX_INIT_EVENT";
 pub(crate) const INIT_DEGRADED_EVENT_ENV: &str = "FS_SANDBOX_INIT_DEGRADED_EVENT";
 
 /// PROCESS_MITIGATION_POLICY ids (winapi types them as the
@@ -290,6 +287,47 @@ fn signal_one(event_name: Option<&str>) {
             winapi::um::synchapi::SetEvent(h);
             winapi::um::handleapi::CloseHandle(h);
         }
+    }
+}
+
+/// Signal and close a root handshake handle inherited explicitly at process
+/// creation. Remove its variable before descendants inherit the environment.
+fn consume_inherited_event(handle_env: &str, signal: bool) {
+    let Ok(raw_handle) = std::env::var(handle_env) else {
+        return;
+    };
+    std::env::remove_var(handle_env);
+    let handle_value = match raw_handle.parse::<usize>() {
+        Ok(value) if value != 0 => value,
+        _ => {
+            crate::ipc_client::buffer_install_error(format!(
+                "invalid inherited event handle in {handle_env}"
+            ));
+            return;
+        }
+    };
+    let handle = handle_value as winapi::shared::ntdef::HANDLE;
+    // SAFETY: the launcher placed this valid event handle in the explicit
+    // inherited-handle list for this process; this function consumes it once.
+    let (signaled, error) = unsafe {
+        let signaled = if signal {
+            winapi::um::synchapi::SetEvent(handle)
+        } else {
+            1
+        };
+        let error = if signaled == 0 {
+            winapi::um::errhandlingapi::GetLastError()
+        } else {
+            0
+        };
+        (signaled, error)
+    };
+    // SAFETY: this process owns the inherited handle and no later code uses it.
+    unsafe { winapi::um::handleapi::CloseHandle(handle) };
+    if signaled == 0 {
+        crate::ipc_client::buffer_install_error(format!(
+            "SetEvent({handle_env}) failed: GetLastError={error}"
+        ));
     }
 }
 
@@ -574,21 +612,20 @@ pub(crate) fn create_child_init_ack(pid: u32) -> Result<ChildInitAck, String> {
 
 /// Signal launcher that hook.dll initialized via kernel Events.
 ///
-/// FS_SANDBOX_INIT_EVENT is ALWAYS signaled when present (absent env =
-/// silently skip — e.g. unit tests running hook code directly).
-/// ADDITIONALLY, INIT_DEGRADED_EVENT_ENV is signaled when buffered install
+/// The inherited root-init handle is consumed and closed when present; absent
+/// env means this context does not need the root handshake (e.g. unit tests).
+/// The degraded-init handle is signaled when buffered install
 /// errors exist at init-signal time, so the launcher can distinguish a clean
 /// init from a degraded one (S10) instead of treating any SetEvent as
 /// "healthy". Finally, the PER-CHILD bootstrap ack event
 /// (CHILD_INIT_EVENT_ENV) is signaled when present, telling OUR spawn hook
 /// (core/hooks/spawn.rs) that THIS process finished install_hooks.
 pub(crate) fn signal_init_events() {
-    let init = std::env::var("FS_SANDBOX_INIT_EVENT").ok();
-    signal_one(init.as_deref());
-    if crate::ipc_client::install_errors_pending() {
-        let degraded = std::env::var(INIT_DEGRADED_EVENT_ENV).ok();
-        signal_one(degraded.as_deref());
-    }
+    consume_inherited_event(INIT_EVENT_HANDLE_ENV, true);
+    consume_inherited_event(
+        INIT_DEGRADED_EVENT_ENV,
+        crate::ipc_client::install_errors_pending(),
+    );
     // S02 #3: the per-child bootstrap ack. Firing here means exactly "THIS
     // process finished install_hooks": the event was created by OUR spawn
     // hook with a per-child unguessable name, so only this child can satisfy
@@ -741,6 +778,11 @@ mod tests {
     #[test]
     fn init_degraded_event_env_literal_is_pinned() {
         assert_eq!(INIT_DEGRADED_EVENT_ENV, "FS_SANDBOX_INIT_DEGRADED_EVENT");
+    }
+
+    #[test]
+    fn root_init_event_handle_env_literal_is_pinned() {
+        assert_eq!(INIT_EVENT_HANDLE_ENV, "FS_SANDBOX_INIT_EVENT");
     }
 
     /// The env-var literal is an in-crate contract between the spawn hook's
