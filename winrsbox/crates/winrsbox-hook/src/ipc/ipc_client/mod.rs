@@ -283,9 +283,14 @@ pub(crate) fn try_load_session_config_from_section() -> Option<()> {
 /// it directly — the trusted section is the ONLY source of security config
 /// (review XA 2026-09-20, S02).
 pub(crate) fn try_load_session_config_named(name: &str) -> Option<ipc::SessionConfig> {
+    load_session_config_named(name).ok()
+}
+
+pub(crate) fn load_session_config_named(name: &str) -> Result<ipc::SessionConfig, String> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use winapi::shared::minwindef::FALSE;
+    use winapi::um::errhandlingapi::GetLastError;
     use winapi::um::handleapi::CloseHandle;
     use winapi::um::memoryapi::{
         MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ,
@@ -296,22 +301,21 @@ pub(crate) fn try_load_session_config_named(name: &str) -> Option<ipc::SessionCo
         .chain(Some(0))
         .collect();
     // SAFETY: name_wide is null-terminated UTF-16; we pass FALSE for inherit.
-    let h = unsafe { OpenFileMappingW(FILE_MAP_READ, FALSE, name_wide.as_ptr()) };
+    let (h, open_error) = unsafe {
+        let handle = OpenFileMappingW(FILE_MAP_READ, FALSE, name_wide.as_ptr());
+        (handle, GetLastError())
+    };
     if h.is_null() {
-        // Silent: stderr output from the hook DLL corrupts PowerShell's
-        // $ErrorActionPreference="Stop" handling (NativeCommandError wraps
-        // stderr lines as exceptions). The launcher's own log captures all
-        // hook diagnostics via ipc_log; eprintln is reserved for truly
-        // fatal DllMain-time errors where IPC is not yet available.
-        return None;
+        return Err(format!("OpenFileMappingW(session config) failed: {open_error}"));
     }
     // SAFETY: h is a valid mapping handle from OpenFileMappingW.
-    let view = unsafe {
-        MapViewOfFile(h, FILE_MAP_READ, 0, 0, ipc::SESSION_CONFIG_SECTION_SIZE)
+    let (view, map_error) = unsafe {
+        let view = MapViewOfFile(h, FILE_MAP_READ, 0, 0, ipc::SESSION_CONFIG_SECTION_SIZE);
+        (view, GetLastError())
     };
     if view.is_null() {
         unsafe { CloseHandle(h) };
-        return None;
+        return Err(format!("MapViewOfFile(session config) failed: {map_error}"));
     }
     // SAFETY: view points to a readable mapping of at least
     //         SESSION_CONFIG_SECTION_SIZE bytes.
@@ -327,15 +331,7 @@ pub(crate) fn try_load_session_config_named(name: &str) -> Option<ipc::SessionCo
         UnmapViewOfFile(view);
         CloseHandle(h);
     }
-    match parsed {
-        Ok(c) => Some(c),
-        Err(e) => {
-            // Silent (see comment above): stderr from hook DLL breaks
-            // PowerShell NativeCommandError handling.
-            let _ = e;
-            None
-        }
-    }
+    parsed.map_err(|error| format!("decode session config failed: {error}"))
 }
 
 /// Ensure `PIPE_NAME` is populated, attempting a one-shot fallback to the
@@ -868,4 +864,3 @@ mod ipc_threshold_tests {
 
 #[cfg(test)]
 mod session_section_tests;
-

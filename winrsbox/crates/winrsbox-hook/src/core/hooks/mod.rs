@@ -620,8 +620,13 @@ pub unsafe fn install_hooks() -> Result<(), Box<dyn std::error::Error>> {
     // which has no env equivalent at all. An absent section fails closed in
     // trusted_boot: everything empty/off, guard Static (strongest tier),
     // nothing permitted — and no pipe name means every IPC decision denies.
-    let section = crate::ipc_client::session_section_name()
-        .and_then(crate::ipc_client::try_load_session_config_named);
+    let section = match crate::ipc_client::session_section_name() {
+        Some(name) => Some(
+            crate::ipc_client::load_session_config_named(name)
+                .map_err(|error| format!("load trusted session config failed: {error}"))?,
+        ),
+        None => None,
+    };
     let effective = crate::trusted_boot::resolve_effective_config(section.as_ref());
     crate::trusted_boot::apply_effective_config(&effective);
 

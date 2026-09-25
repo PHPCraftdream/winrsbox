@@ -80,6 +80,8 @@
     #[test]
     fn missing_section_yields_none_and_touches_no_globals() {
         let name = unique_section_name("missing");
+        let error = load_session_config_named(&name).unwrap_err();
+        assert!(error.contains("OpenFileMappingW"), "unexpected error: {error}");
         assert!(try_load_session_config_named(&name).is_none());
         assert!(PIPE_NAME.get().is_none(), "a failed lookup must not set PIPE_NAME");
         assert!(

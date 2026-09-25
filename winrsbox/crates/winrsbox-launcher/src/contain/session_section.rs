@@ -21,7 +21,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use windows::core::{w, PCWSTR};
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, HLOCAL, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 };
@@ -29,13 +29,68 @@ use windows::Win32::Security::Cryptography::{
     BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    SDDL_REVISION_1,
 };
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows::Win32::Security::{
+    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_ADJUST_DEFAULT,
+    TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER,
+    TokenUser,
+};
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_READ,
     FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
 };
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+fn current_user_sid_string() -> Result<String> {
+    let mut token = HANDLE::default();
+    // SAFETY: GetCurrentProcess is a pseudo-handle; TOKEN_QUERY is read-only.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+        .context("OpenProcessToken for session-section owner failed")?;
+
+    let result = (|| {
+        let mut needed = 0u32;
+        // SAFETY: the null buffer is the documented size-query call.
+        let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut needed) };
+        anyhow::ensure!(needed >= std::mem::size_of::<TOKEN_USER>() as u32);
+        let words = (needed as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut buffer = vec![0usize; words];
+        // SAFETY: buffer is aligned and has at least `needed` writable bytes.
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(buffer.as_mut_ptr().cast()),
+                needed,
+                &mut needed,
+            )
+        }
+        .context("GetTokenInformation(TokenUser) failed")?;
+        // SAFETY: successful TokenUser query filled a TOKEN_USER at buffer start.
+        let user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
+        let mut sid = PWSTR::null();
+        // SAFETY: user.User.Sid is the valid SID returned in the token buffer.
+        unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid) }
+            .context("ConvertSidToStringSidW(TokenUser) failed")?;
+        anyhow::ensure!(!sid.0.is_null(), "ConvertSidToStringSidW returned null");
+        let mut length = 0usize;
+        // SAFETY: ConvertSidToStringSidW returns a null-terminated string.
+        unsafe {
+            while *sid.0.add(length) != 0 {
+                length += 1;
+            }
+        }
+        let value = unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(sid.0, length)) };
+        // SAFETY: sid is allocated by ConvertSidToStringSidW.
+        unsafe { LocalFree(Some(HLOCAL(sid.0.cast()))) };
+        Ok(value)
+    })();
+
+    // SAFETY: token was opened above and is closed exactly once.
+    unsafe { CloseHandle(token).ok() };
+    result
+}
 
 /// RAII guard owning the kernel object behind the session's randomly named
 /// section. The section is reclaimed by the kernel when the last handle
@@ -129,47 +184,21 @@ pub fn publish_named(section_name: &str, cfg: &ipc::SessionConfig) -> Result<Ses
         .chain(Some(0))
         .collect();
 
-    // Explicit DACL — DEFENCE IN DEPTH, not the fix. It grants the object
-    // owner (the creating user) SECTION_QUERY | SECTION_MAP_READ only, and
-    // explicitly denies SECTION_MAP_WRITE to everyone:
-    //   D:(D;;0x0002;;;WD)(A;;0x0005;;;OW)
-    // An OWNER_RIGHTS ACE also suppresses the owner's implicit WRITE_DAC /
-    // READ_CONTROL, so a same-user process cannot simply rewrite the DACL to
-    // grant itself write. It does NOT stop a determined same-user guest with
-    // admin privileges (SeTakeOwnership / SeDebugPrivilege), and the guest
-    // can still READ the config (it is the same user) — the random name is
-    // what keeps uninvited processes out; this DACL is what removes the
-    // rewrite primitive even when a guest learns the name.
-    // The launcher itself needs no post-create write access: it writes the
-    // config through the full-access handle CreateFileMappingW returns.
-    //
-    // R04-1b re-examination: is `OW` (OWNER_RIGHTS) still correct once the
-    // guest may run under R04-1c's restricted token (Administrators
-    // deny-only)? `OW` in an SDDL string resolves to the object's OWNER SID
-    // at the moment the SD is applied — it is NOT the same mechanism as
-    // `TokenDefaultDacl` (which copies GROUP ACEs, including Administrators,
-    // when `lpSecurityAttributes=NULL`). This SDDL is explicit (`D:` with no
-    // `O:`), so `CreateFileMappingW` assigns owner = the CALLER's
-    // `TokenOwner`. R04-0's probe (docs/R04-implementation-plan-t1-light-t2.md,
-    // "Гипотеза «Administrators как owner по умолчанию»") measured, and the
-    // documented `TokenOwner` algorithm confirms, that `TokenOwner` defaults
-    // to `TokenUser` — the specific user SID — unless an enabled token group
-    // carries `SE_GROUP_OWNER` (ordinary tokens, restricted or not, do not).
-    // So `OW` here resolves to the specific user SID today AND after R04-1c,
-    // regardless of whether Administrators is enabled or deny-only in the
-    // creating token — it was never gated on the Administrators group in the
-    // first place. Conclusion: left unchanged; `OW` already IS the
-    // specific-SID grant this task asks for, just spelled via the owner
-    // indirection instead of a literal SID. See `dacl_denies_write_and_allows_read_to_the_owner`
-    // below, which already asserts the resulting behaviour empirically.
-    let sddl = w!("D:(D;;0x0002;;;WD)(A;;0x0005;;;OW)");
+    // The random name gates disclosure; this DACL denies map-write and grants
+    // read/query to TokenUser. Explicit owner SID keeps restricted guests
+    // independent of the elevated launcher token default owner.
+    let user_sid = current_user_sid_string()?;
+    let sddl = format!("O:{user_sid}D:(D;;0x0002;;;WD)(A;;0x0005;;;OW)");
+    let sddl_wide: Vec<u16> = OsStr::new(&sddl)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
     let mut psd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
-    // SAFETY: psd is a valid out-pointer; SDDL_REVISION_1 is the only
-    //         documented revision; sddl is a NUL-terminated literal valid
-    //         for the duration of the call.
+    // SAFETY: psd is a valid out-pointer; sddl_wide is NUL-terminated and
+    //         remains alive for the conversion call.
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl,
+            PCWSTR(sddl_wide.as_ptr()),
             SDDL_REVISION_1,
             &mut psd,
             None,
@@ -541,5 +570,58 @@ mod tests {
         assert_eq!(dec.pipe_name, cfg.pipe_name);
         unsafe { UnmapViewOfFile(view).ok() };
         unsafe { CloseHandle(reader).ok() };
+    }
+
+    #[test]
+    fn restricted_guest_can_read_session_section() {
+        let section = unique_section_name("restricted-reader");
+        let cfg = test_cfg("restricted-reader", false);
+        let _owner = publish_named(&section, &cfg).expect("publish ok");
+
+        let mut source = HANDLE::default();
+        let access = TOKEN_QUERY
+            | TOKEN_DUPLICATE
+            | TOKEN_ASSIGN_PRIMARY
+            | TOKEN_ADJUST_DEFAULT
+            | TOKEN_ADJUST_SESSIONID;
+        // SAFETY: GetCurrentProcess is a pseudo-handle; access is the minimal
+        // token set used by the launcher to derive the guest token.
+        unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut source) }
+            .expect("OpenProcessToken failed");
+        let guest = crate::contain::guest::build_guest_token(source)
+            .expect("build restricted guest token");
+        unsafe { CloseHandle(source).ok() };
+
+        // SAFETY: guest is a valid restricted token for the current user.
+        unsafe { windows::Win32::Security::ImpersonateLoggedOnUser(guest.handle()) }
+        .expect("ImpersonateLoggedOnUser failed");
+        let read_result = open_read(&section);
+        let name_wide: Vec<u16> = OsStr::new(&section)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let write_result = unsafe {
+            OpenFileMappingW(FILE_MAP_WRITE.0, false, PCWSTR(name_wide.as_ptr()))
+        };
+        // SAFETY: this test impersonated guest above and must restore the
+        // original thread token before assertions or returning.
+        unsafe { windows::Win32::Security::RevertToSelf() }
+            .expect("RevertToSelf failed");
+
+        let reader = read_result.expect("restricted guest must open read-only config");
+        unsafe { CloseHandle(reader).ok() };
+        match write_result {
+            Ok(handle) => {
+                unsafe { CloseHandle(handle).ok() };
+                panic!("restricted guest must not open the section for write");
+            }
+            Err(error) => assert_eq!(
+                error.code(),
+                windows::core::HRESULT::from_win32(
+                    windows::Win32::Foundation::ERROR_ACCESS_DENIED.0
+                ),
+                "restricted write must fail with ACCESS_DENIED"
+            ),
+        }
     }
 }

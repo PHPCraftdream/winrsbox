@@ -33,6 +33,13 @@ const POLICY_DYNAMIC_CODE: u32 = 2;
 const POLICY_EXTENSION_POINT_DISABLE: u32 = 6;
 const POLICY_SIGNATURE: u32 = 8;
 const POLICY_IMAGE_LOAD: u32 = 10;
+const SIGNATURE_MICROSOFT_SIGNED_ONLY: u32 = 1 << 0;
+const SIGNATURE_AUDIT_MICROSOFT_SIGNED_ONLY: u32 = 1 << 3;
+
+fn signature_policy_is_enforced(flags: u32) -> bool {
+    flags & SIGNATURE_MICROSOFT_SIGNED_ONLY != 0
+        && flags & SIGNATURE_AUDIT_MICROSOFT_SIGNED_ONLY == 0
+}
 
 /// Whether a SetProcessMitigationPolicy failure for `policy` must abort the
 /// whole hook install (Err → DllMain FALSE → launcher kills the child).
@@ -190,11 +197,9 @@ pub(crate) fn apply_mitigations(guard: ipc::GuardLevel) -> Result<(), String> {
         }
 
         // SignaturePolicy (8): only Microsoft-signed DLLs (subsequent loads).
-        // winnt bit layout (PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY):
-        //   bit 0 = MicrosoftSignedOnly
-        //   bit 1 = StoreSignedOnly
-        //   bit 2 = AuditMicrosoftSignedOnly
-        let sig_flags: u32 = 1; // MicrosoftSignedOnly = bit 0
+        // PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY bits: MicrosoftSignedOnly
+        // is bit 0, MitigationOptIn is bit 2, and AuditMicrosoftSignedOnly is bit 3.
+        let sig_flags = SIGNATURE_MICROSOFT_SIGNED_ONLY;
         // SAFETY: sig_flags is valid for
         // PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY (4 bytes).
         let ok = unsafe {
@@ -208,10 +213,7 @@ pub(crate) fn apply_mitigations(guard: ipc::GuardLevel) -> Result<(), String> {
             let err = unsafe { GetLastError() };
             buffer_mitigation_failure(guard, POLICY_SIGNATURE, "Signature", err)?;
         } else {
-            // Verify-after-set: bit 0 MicrosoftSignedOnly must be SET and
-            // bit 2 AuditMicrosoftSignedOnly must be CLEAR (audit mode
-            // merely LOGS the violation — the load goes through — so an
-            // "enforced" bit-0 with a set bit-2 is not containment).
+            // Verify the enforcement bit and reject audit-only behavior.
             let mut cur: u32 = 0;
             // SAFETY: pseudo-handle + valid 4-byte out-buffer, as above.
             let got = unsafe {
@@ -229,7 +231,7 @@ pub(crate) fn apply_mitigations(guard: ipc::GuardLevel) -> Result<(), String> {
                 crate::ipc_client::buffer_install_error(msg.clone());
                 return Err(msg);
             }
-            if cur & 1 == 0 || cur & (1 << 2) != 0 {
+            if !signature_policy_is_enforced(cur) {
                 buffer_mitigation_not_enforced(guard, POLICY_SIGNATURE, "Signature", cur)?;
             }
         }
@@ -836,6 +838,15 @@ mod tests {
                 "guard={guard} policy={policy}"
             );
         }
+    }
+
+    #[test]
+    fn signature_policy_readback_accepts_enforcement_and_rejects_audit() {
+        assert!(signature_policy_is_enforced(0x1));
+        assert!(signature_policy_is_enforced(0x5));
+        assert!(!signature_policy_is_enforced(0x0));
+        assert!(!signature_policy_is_enforced(0x8));
+        assert!(!signature_policy_is_enforced(0x9));
     }
 
     /// The env-var literal is a cross-crate contract with the launcher
