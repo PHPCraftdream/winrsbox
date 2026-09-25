@@ -14,7 +14,7 @@ use crate::anti_rec;
 use crate::hooked_attrs::HookedAttrs;
 use crate::hooks::{
     check_path_traversal, classify_device_open, DeviceVerdict, decide, resolve_for_hook,
-    is_write_access, materialize_mock_overlay,
+    is_delete_only_access, is_write_access, materialize_mock_overlay,
     prepare_overlay, set_io_status, ipc_record_overlay, ipc_record_overlay_case,
     extract_nt_basename, nt_call_original,
     FILE_CREATE, FILE_DELETE_ON_CLOSE, FILE_OPEN, FILE_OPEN_IF, FILE_OVERWRITE_IF,

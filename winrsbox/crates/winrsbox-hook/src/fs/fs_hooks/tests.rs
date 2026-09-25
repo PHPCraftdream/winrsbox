@@ -469,6 +469,26 @@ fn s05_probe_clean_plain_file() {
 }
 
 #[test]
+fn s05_delete_probe_allows_unlinking_one_hardlink_name() {
+    let base = s05_probe_fixture_dir("probe-delete-hardlink");
+    std::fs::create_dir_all(&base).unwrap();
+    let original = base.join("original.o");
+    let alias = base.join("alias.o");
+    std::fs::write(&original, b"object").unwrap();
+    std::fs::hard_link(&original, &alias).expect("create NTFS hardlink");
+
+    assert_eq!(
+        probe_passthrough(&alias.to_string_lossy()),
+        PassthroughProbe::MultiLink
+    );
+    assert_eq!(
+        probe_passthrough_delete(&alias.to_string_lossy()),
+        PassthroughProbe::Clean
+    );
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
 fn s05_probe_flags_junction_component() {
     let base = s05_probe_fixture_dir("probe-junc");
     let root = base.join("root");
@@ -694,6 +714,14 @@ fn s05_passthrough_probe_wired_into_both_hook_bodies() {
         assert!(
             arm.contains("passthrough_alias_decision(&dos, write)"),
             "{tag}: the probe call must live INSIDE the Mode::Passthrough arm (before copy_passthrough_inner)"
+        );
+        assert!(
+            arm.contains("is_delete_only_access(desired_access"),
+            "{tag}: delete-only opens must use the no-hardlink-count probe"
+        );
+        assert!(
+            arm.contains("passthrough_delete_alias_decision(&dos)"),
+            "{tag}: delete-only opens must still check reparse traversal"
         );
         assert!(
             arm.contains("STATUS_ACCESS_DENIED"),

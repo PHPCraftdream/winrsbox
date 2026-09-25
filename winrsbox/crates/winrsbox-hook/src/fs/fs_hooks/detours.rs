@@ -15,7 +15,7 @@ use super::ipc_log;
 use super::is_create_disposition;
 use super::is_ea_present;
 use super::is_trace;
-use super::is_write_access;
+use super::{is_delete_only_access, is_write_access};
 use super::materialize_mock_overlay;
 use super::nt_call_original;
 use super::overlay_publish_forget;
@@ -39,7 +39,7 @@ use super::HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE;
 use policy::Decision;
 
 mod passthrough_probe;
-pub(crate) use passthrough_probe::{PassthroughProbe, probe_passthrough, aliased_resolution_permits, passthrough_alias_decision};
+pub(crate) use passthrough_probe::{PassthroughProbe, probe_passthrough, aliased_resolution_permits, passthrough_alias_decision, probe_passthrough_delete, passthrough_delete_alias_decision};
 mod query_attributes;
 pub(crate) use query_attributes::{hook_nt_query_attributes_file, hook_nt_query_full_attributes_file};
 
@@ -297,11 +297,17 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
             // traverse a pre-existing reparse point or mutate a multi-link file
             // object under another name. Probed BEFORE the kernel open — a
             // post-open check is too late for OVERWRITE/truncate dispositions.
-            if let Some(_deny) = passthrough_alias_decision(&dos, write) {
+            let delete_only = is_delete_only_access(desired_access, create_disposition);
+            let alias_deny = if delete_only {
+                passthrough_delete_alias_decision(&dos)
+            } else {
+                passthrough_alias_decision(&dos, write)
+            };
+            if let Some(deny) = alias_deny {
                 crate::ipc_client::ipc_log_violation(ipc::Req::Log {
                     pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
                     level: ipc::LogLevel::Warn,
-                    msg: format!("passthrough_alias_denied: {dos}"),
+                    msg: format!("passthrough_alias_denied: {dos} delete_only={delete_only} {deny:?}"),
                 });
                 if !file_handle.is_null() {
                     *file_handle = std::ptr::null_mut();
@@ -660,11 +666,17 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
             // traverse a pre-existing reparse point or mutate a multi-link file
             // object under another name. Probed BEFORE the kernel open — a
             // post-open check is too late for OVERWRITE/truncate dispositions.
-            if let Some(_deny) = passthrough_alias_decision(&dos, write) {
+            let delete_only = is_delete_only_access(desired_access, FILE_OPEN);
+            let alias_deny = if delete_only {
+                passthrough_delete_alias_decision(&dos)
+            } else {
+                passthrough_alias_decision(&dos, write)
+            };
+            if let Some(deny) = alias_deny {
                 crate::ipc_client::ipc_log_violation(ipc::Req::Log {
                     pid: winapi::um::processthreadsapi::GetCurrentProcessId(),
                     level: ipc::LogLevel::Warn,
-                    msg: format!("passthrough_alias_denied: {dos}"),
+                    msg: format!("passthrough_alias_denied: {dos} delete_only={delete_only} {deny:?}"),
                 });
                 if !file_handle.is_null() {
                     *file_handle = std::ptr::null_mut();

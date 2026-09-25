@@ -14,6 +14,8 @@ jobs:
   test:
     name: build + test + clippy (windows)
     runs-on: windows-latest
+    env:
+      CARGO_BUILD_JOBS: 1
     defaults:
       run:
         working-directory: winrsbox
@@ -30,18 +32,57 @@ jobs:
         with:
           workspaces: winrsbox
 
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.x'
+          cache: false
+
+      - name: Install Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Install PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          tools: none
+
+      - name: Configure MSVC compiler environment
+        uses: ilammy/msvc-dev-cmd@v1
+
       # Compile the whole workspace including benches + the escape-test bins.
       - name: Build
         run: cargo build --workspace --all-targets
+
+      # Compile and execute small no-dependency programs through the real full
+      # sandbox. Toolchain caches, temp files and outputs stay in each CoW tree.
+      - name: Compiler builds inside sandbox
+        env:
+          WINRSBOX_REQUIRE_TOOLCHAINS: '1'
+        run: cargo test -p winrsbox-integration-tests --test compiler_builds -- --nocapture --test-threads=1
 
       # `--lib --bins`, not `--lib`. The launcher's own logic — target
       # resolution, console ownership, the Ctrl+C decision table, the child
       # drain — lives in the BIN target (`launcher/src/main.rs` and its
       # modules), so `--lib` alone silently skipped 123 tests of it.
       #
-      # Still excluded: `winrsbox/integration-tests/tests/*.rs`. Those ARE
-      # cargo tests (~123, including 90 that drive a real sandbox and assert
-      # containment), and they are the ones that would have caught the
+      # Still excluded: the broader integration suite (`tests/*.rs`). Those
+      # tests include roughly 90 cases that drive a real sandbox and assert
+      # containment, and they are the ones that would have caught the
       # copy-on-write, pipe/console, `--guard static` and exit-code
       # regressions this CI stayed green through. They need a built launcher
       # + hook.dll and roughly three minutes of live process launching, so

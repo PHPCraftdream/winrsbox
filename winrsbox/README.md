@@ -158,10 +158,19 @@ Run `winrsbox --help` for full options.
 ## Tests
 
 ```bash
+cargo build -p winrsbox -p winrsbox-hook             # build launcher + hook artifacts first
 cargo test --lib                                    # 136 unit tests
-cargo test -p integration-tests --test memory_guard # 28 e2e tests (serialized)
+cargo test -p winrsbox-integration-tests --test memory_guard # 28 e2e tests (serialized)
+WINRSBOX_REQUIRE_TOOLCHAINS=1 cargo test -p winrsbox-integration-tests --test compiler_builds -- --nocapture --test-threads=1
 bash scripts/compat-check.sh                        # 7 program compat checks
 ```
+
+`compiler_builds` checks Node.js, Python, and PHP runtime startup, then builds
+minimal Go, Rust/Cargo, Java, .NET Framework C#, and C++ programs inside the
+full sandbox. Compiler caches and temporary files stay in each test project;
+outputs are checked in the workspace. CI installs the toolchains and sets
+`WINRSBOX_REQUIRE_TOOLCHAINS=1`; locally, missing tools are reported as skips
+unless that variable is set.
 
 ## License
 

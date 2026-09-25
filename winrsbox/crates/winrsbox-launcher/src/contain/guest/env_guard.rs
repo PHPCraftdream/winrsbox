@@ -1,8 +1,7 @@
 // Environment variable sanitization — removes sensitive variables
 // before spawning the sandboxed child process.
 //
-// Sensitive patterns: API keys, tokens, secrets, credentials, passwords.
-// Whitelist: PATH, TEMP, HOME, USERPROFILE, SystemRoot, and FS_SANDBOX_* vars.
+// Sensitive patterns: secrets and retired sandbox configuration.
 
 /// Remove sensitive environment variables from the current process.
 /// Must be called BEFORE CreateProcessW (child inherits parent env).
@@ -46,8 +45,8 @@ fn is_whitelisted(upper: &str) -> bool {
         "NO_COLOR", "FORCE_COLOR", "CLICOLOR", "CLICOLOR_FORCE", "CI",
         "AI_AGENT",
     ];
-    // FS_SANDBOX_* vars always kept
-    if upper.starts_with("FS_SANDBOX_") { return true; }
+    // These switches only make the child more restrictive.
+    if matches!(upper, "FS_SANDBOX_BLOCK_LOCALHOST" | "FS_SANDBOX_STRICT_CLIPBOARD") { return true; }
     // WINRSBOX_* vars always kept
     if upper.starts_with("WINRSBOX_") { return true; }
     WHITELIST.contains(&upper)
@@ -74,7 +73,8 @@ mod tests {
         assert!(!is_sensitive("TEMP"));
         assert!(!is_sensitive("USERPROFILE"));
         assert!(!is_sensitive("SYSTEMROOT"));
-        assert!(!is_sensitive("FS_SANDBOX_PIPE"));
+        assert!(!is_sensitive("FS_SANDBOX_BLOCK_LOCALHOST"));
+        assert!(!is_sensitive("FS_SANDBOX_STRICT_CLIPBOARD"));
         assert!(!is_sensitive("RUST_BACKTRACE"));
         assert!(!is_sensitive("CARGO_HOME"));
         assert!(!is_sensitive("NO_COLOR"));
@@ -99,9 +99,16 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_prefixes_always_kept() {
-        assert!(!is_sensitive("FS_SANDBOX_PIPE"));
-        assert!(!is_sensitive("FS_SANDBOX_CWD"));
+    fn retired_sandbox_configuration_is_scrubbed() {
+        assert!(is_sensitive("FS_SANDBOX_PIPE"));
+        assert!(is_sensitive("FS_SANDBOX_DLL"));
+        assert!(is_sensitive("FS_SANDBOX_CWD"));
+        assert!(is_sensitive("FS_SANDBOX_ROOT"));
+        assert!(is_sensitive("FS_SANDBOX_GUARD"));
+        assert!(is_sensitive("FS_SANDBOX_ALLOW_RWX"));
+        assert!(is_sensitive("FS_SANDBOX_DISABLE_HOOKS"));
+        assert!(is_sensitive("FS_SANDBOX_SECTION"));
+        assert!(is_sensitive("FS_SANDBOX_NO_TRACK"));
         assert!(!is_sensitive("WINRSBOX_CUSTOM"));
     }
 }

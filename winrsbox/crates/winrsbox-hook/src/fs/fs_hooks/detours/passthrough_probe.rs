@@ -16,9 +16,8 @@ use super::*;
 /// about the REAL filesystem behind a passthrough write-open path.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PassthroughProbe {
-    /// Every existing component is reparse-free and the final component is
-    /// either missing, a directory, or a single-link file — the kernel open
-    /// will land exactly on the decided path.
+    /// Every existing component is reparse-free; write probes also verified
+    /// the final file has one link.
     Clean,
     /// A reparse point sits on some component (final or intermediate): the
     /// kernel would silently traverse it. `resolved` is that component's
@@ -135,6 +134,16 @@ fn canonical_dos_lower(p: &std::path::Path) -> Option<String> {
 /// expose; the decide→open window is narrowed to the walk itself, which is
 /// the same accepted TOCTOU class as the policy-side gap-1 fix.
 pub(crate) fn probe_passthrough(dos: &str) -> PassthroughProbe {
+    probe_passthrough_with_link_check(dos, true)
+}
+
+/// Probe a delete-only open. Reparse traversal is still checked, but removing
+/// one hardlink name does not mutate the file object reached by other names.
+pub(crate) fn probe_passthrough_delete(dos: &str) -> PassthroughProbe {
+    probe_passthrough_with_link_check(dos, false)
+}
+
+fn probe_passthrough_with_link_check(dos: &str, check_link_count: bool) -> PassthroughProbe {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
@@ -175,7 +184,7 @@ pub(crate) fn probe_passthrough(dos: &str) -> PassthroughProbe {
     // must be single-link, else one underlying object answers to names we
     // cannot see; an undeterminable link count fails closed.
     let md = final_md.expect("ancestors() is never empty, so the loop assigned at least once");
-    if md.is_dir() {
+    if md.is_dir() || !check_link_count {
         return PassthroughProbe::Clean;
     }
     match file_link_count(p) {
@@ -239,7 +248,15 @@ pub(crate) fn passthrough_alias_decision(dos: &str, write: bool) -> Option<Decis
     if !write {
         return None;
     }
-    match probe_passthrough(dos) {
+    passthrough_alias_decision_from_probe(probe_passthrough(dos))
+}
+
+pub(crate) fn passthrough_delete_alias_decision(dos: &str) -> Option<Decision> {
+    passthrough_alias_decision_from_probe(probe_passthrough_delete(dos))
+}
+
+fn passthrough_alias_decision_from_probe(probe: PassthroughProbe) -> Option<Decision> {
+    match probe {
         PassthroughProbe::Clean => None,
         PassthroughProbe::Aliased { resolved } => {
             if aliased_resolution_permits(decide(&resolved, true).mode) {

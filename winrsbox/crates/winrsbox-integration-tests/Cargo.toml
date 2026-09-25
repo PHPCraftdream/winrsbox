@@ -397,6 +397,10 @@ path = "tests/cli/dev_e2e.rs"
 name = "reg_cli_workflow"
 path = "tests/cli/reg_cli_workflow.rs"
 
+[[test]]
+name = "compiler_builds"
+path = "tests/cli/compiler_builds.rs"
+
 [dependencies]
 policy = { package = "winrsbox-policy", path = "../winrsbox-policy" }
 serde_json = "1"

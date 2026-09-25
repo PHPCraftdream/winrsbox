@@ -475,6 +475,35 @@ impl Drop for ImagePathOverlayGuard {
     }
 }
 
+/// Whether a FILE_OPEN only requests removal of this directory entry.
+/// Unlinking one hardlink name does not modify the object reached by others.
+pub fn is_delete_only_access(desired: ACCESS_MASK, disposition: u32) -> bool {
+    const OTHER_WRITE_BITS: ACCESS_MASK = GENERIC_ALL
+        | GENERIC_WRITE
+        | FILE_WRITE_DATA
+        | FILE_APPEND_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | WRITE_DAC
+        | WRITE_OWNER
+        | MAXIMUM_ALLOWED;
+
+    disposition == FILE_OPEN && desired & DELETE != 0 && desired & OTHER_WRITE_BITS == 0
+}
+
+#[cfg(test)]
+mod delete_only_access_tests {
+    use super::*;
+
+    #[test]
+    fn only_open_delete_requests_are_delete_only() {
+        assert!(is_delete_only_access(DELETE, FILE_OPEN));
+        assert!(!is_delete_only_access(DELETE | FILE_WRITE_DATA, FILE_OPEN));
+        assert!(!is_delete_only_access(DELETE, FILE_OVERWRITE));
+        assert!(!is_delete_only_access(FILE_DELETE_ON_CLOSE, FILE_OPEN));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Resolve an export from ntdll.dll by name.
 // ---------------------------------------------------------------------------

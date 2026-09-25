@@ -498,8 +498,8 @@ async fn run() -> Result<()> {
     // ── Launch target process ─────────────────────────────────────────────
     let dll_path = sandbox::find_hook_dll()?;
 
-    // Sanitize sensitive env vars BEFORE child inherits them.
-    // Removes API keys, tokens, secrets, credentials from the environment.
+    // Sanitize sensitive variables and retired sandbox config before the
+    // target inherits them; the trusted session section carries that config.
     let removed = winrsbox::contain::guest::env_guard::sanitize();
     if removed > 0 && winrsbox::observe::jsonl_log::console_verbose() {
         println!("[sandbox] env: sanitized {removed} sensitive variables");
