@@ -918,8 +918,24 @@
     fn launch_suspended_produces_a_privilege_reduced_child_token() {
         let cwd = std::env::temp_dir();
         let target_args = vec!["cmd.exe".to_string(), "/c".to_string(), "exit".to_string()];
+        struct RootEvents([HANDLE; 2]);
+        impl Drop for RootEvents {
+            fn drop(&mut self) {
+                std::env::remove_var("FS_SANDBOX_INIT_EVENT");
+                std::env::remove_var("FS_SANDBOX_INIT_DEGRADED_EVENT");
+                // SAFETY: these are the two event handles created by this test.
+                unsafe {
+                    CloseHandle(self.0[0]).ok();
+                    CloseHandle(self.0[1]).ok();
+                }
+            }
+        }
+        let events = RootEvents([
+            super::launch_prep::create_init_event().expect("create init event"),
+            super::launch_prep::create_degraded_event().expect("create degraded event"),
+        ]);
 
-        let pi = launch_suspended(&cwd, &target_args, crate::GuardLevel::None)
+        let pi = launch_suspended(&cwd, &target_args, crate::GuardLevel::None, events.0)
             .expect("launch_suspended must succeed for a harmless cmd.exe target");
 
         // Independent re-verification (launch_suspended already ran this
