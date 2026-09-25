@@ -125,8 +125,8 @@ pub unsafe extern "system" fn DllMain(
             DisableThreadLibraryCalls(hinst);
             match hooks::install_hooks() {
                 Ok(()) => TRUE,
-                Err(_) => {
-                    crate::init_ack::signal_init_failure();
+                Err(error) => {
+                    crate::init_ack::signal_init_failure(&error.to_string());
                     FALSE
                 }
             }

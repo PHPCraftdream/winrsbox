@@ -589,6 +589,7 @@ async fn run() -> Result<()> {
     let init_event = sandbox::launch_prep::create_init_event()?;
     // The status event marks optional degradation or fatal DllMain failure.
     let init_degraded_event = sandbox::launch_prep::create_degraded_event()?;
+    let init_error_buffer = sandbox::launch_prep::create_init_error_buffer()?;
 
     // Guard level is taken verbatim — no trust-based downgrade. Full mode is
     // now JIT-safe (no ProhibitDynamicCode / signed-only), so unsigned dev
@@ -634,7 +635,11 @@ async fn run() -> Result<()> {
         &project_root,
         &target_args,
         effective_guard,
-        [init_event, init_degraded_event],
+        [
+            init_event,
+            init_degraded_event,
+            init_error_buffer.handle(),
+        ],
     )?;
 
     // C3 Part 3: publish the root PID to the pipe accept loop so it can
@@ -817,14 +822,18 @@ async fn run() -> Result<()> {
         }
     } else {
         let reason = match wait_result.0 {
-            1 => "hook.dll failed during initialization",
-            258 => "hook.dll did not signal init within 5s",
-            _ => "hook init wait failed",
+            1 => format!(
+                "hook.dll failed during initialization: {}",
+                init_error_buffer
+                    .read_message()
+                    .unwrap_or_else(|| "error detail unavailable".to_string())
+            ),
+            258 => "hook.dll did not signal init within 5s".to_string(),
+            code => format!("hook init wait failed (wait=0x{code:08x})"),
         };
         eprintln!(
-            "[sandbox] CRITICAL: {reason}, killing child pid={} (wait=0x{:08x})",
-            proc_info.dwProcessId,
-            wait_result.0,
+            "[sandbox] CRITICAL: {reason}, killing child pid={}",
+            proc_info.dwProcessId
         );
         unsafe {
             windows::Win32::System::Threading::TerminateProcess(proc_info.hProcess, 0xC000_0005).ok();

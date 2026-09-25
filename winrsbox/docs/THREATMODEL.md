@@ -167,16 +167,17 @@ Blocks system-level privileged operations:
 #### Hook injection verification (P1-1)
 
 Before creating the suspended root child, the launcher creates anonymous
-kernel Events and passes only their inheritable handles through
-`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. The hook signals those handles directly;
-it does not reopen a named object under the guest token. The launcher waits on
-the success and status events using `WaitForMultipleObjects` with a 5-second
-timeout (executed via `spawn_blocking` so the async runtime is not stalled).
+kernel Events and a bounded shared-memory error buffer, then passes only those
+handles through `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. The hook signals the
+events directly and writes fatal init detail to the buffer; it does not reopen
+a named object under the guest token. The launcher waits on both events using
+`WaitForMultipleObjects` with a 5-second timeout (executed via `spawn_blocking`
+so the async runtime is not stalled).
 
 - If `hook.dll` successfully initializes, it signals the inherited event from
   `DllMain` and closes its copy of the handle.
 - If hook installation fails in `DllMain`, only the status event is signaled;
-  the launcher terminates the child and reports an initialization failure.
+  the launcher reads the bounded error detail and terminates the child.
 - If optional hooks fail, both events are signaled: the launcher accepts the
   initialized child and warns that the sandbox is degraded.
 - If neither event is signaled before the timeout, the launcher terminates the

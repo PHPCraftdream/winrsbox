@@ -24,6 +24,8 @@
 /// through the launcher's explicit handle list.
 pub(crate) const INIT_EVENT_HANDLE_ENV: &str = "FS_SANDBOX_INIT_EVENT";
 pub(crate) const INIT_DEGRADED_EVENT_ENV: &str = "FS_SANDBOX_INIT_DEGRADED_EVENT";
+const INIT_ERROR_BUFFER_HANDLE_ENV: &str = "FS_SANDBOX_INIT_ERROR_BUFFER";
+const INIT_ERROR_BUFFER_SIZE: usize = 4096;
 
 /// PROCESS_MITIGATION_POLICY ids (winapi types them as the
 /// `PROCESS_MITIGATION_POLICY` enum; we pass these `u32`s cast with `as`).
@@ -619,6 +621,7 @@ pub(crate) fn create_child_init_ack(pid: u32) -> Result<ChildInitAck, String> {
 /// (CHILD_INIT_EVENT_ENV) is signaled when present, telling OUR spawn hook
 /// (core/hooks/spawn.rs) that THIS process finished install_hooks.
 pub(crate) fn signal_init_events() {
+    discard_init_error_buffer();
     consume_inherited_event(INIT_EVENT_HANDLE_ENV, true);
     consume_inherited_event(
         INIT_DEGRADED_EVENT_ENV,
@@ -633,13 +636,74 @@ pub(crate) fn signal_init_events() {
     signal_one(child_ack.as_deref());
 }
 
-pub(crate) fn signal_init_failure() {
+pub(crate) fn signal_init_failure(message: &str) {
+    let handle = std::env::var(INIT_ERROR_BUFFER_HANDLE_ENV)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value != 0)
+        .map(|value| value as winapi::shared::ntdef::HANDLE);
+    std::env::remove_var(INIT_ERROR_BUFFER_HANDLE_ENV);
+    if let Some(handle) = handle {
+        // SAFETY: the launcher passed this live mapping handle in the explicit
+        // inherited-handle list and the mapping is writable by the child.
+        let view = unsafe {
+            winapi::um::memoryapi::MapViewOfFile(
+                handle,
+                winapi::um::memoryapi::FILE_MAP_WRITE,
+                0,
+                0,
+                0,
+            )
+        };
+        if !view.is_null() {
+            let bytes = message.as_bytes();
+            let length = bytes.len().min(INIT_ERROR_BUFFER_SIZE - 4);
+            // SAFETY: the mapping has INIT_ERROR_BUFFER_SIZE bytes and the
+            // serialized length keeps the copy within that view.
+            unsafe {
+                std::ptr::write(view as *mut u32, length as u32);
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    (view as *mut u8).add(4),
+                    length,
+                );
+                winapi::um::memoryapi::UnmapViewOfFile(view);
+            }
+        }
+        // SAFETY: this process owns the inherited mapping handle.
+        unsafe { winapi::um::handleapi::CloseHandle(handle) };
+    }
     consume_inherited_event(INIT_DEGRADED_EVENT_ENV, true);
+}
+
+fn discard_init_error_buffer() {
+    let Ok(raw) = std::env::var(INIT_ERROR_BUFFER_HANDLE_ENV) else {
+        return;
+    };
+    std::env::remove_var(INIT_ERROR_BUFFER_HANDLE_ENV);
+    if let Ok(value) = raw.parse::<usize>() {
+        if value != 0 {
+            // SAFETY: this process owns the inherited mapping handle.
+            unsafe {
+                winapi::um::handleapi::CloseHandle(
+                    value as winapi::shared::ntdef::HANDLE,
+                )
+            };
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_error_buffer_env_contract_is_pinned() {
+        assert_eq!(
+            INIT_ERROR_BUFFER_HANDLE_ENV,
+            "FS_SANDBOX_INIT_ERROR_BUFFER"
+        );
+    }
 
     /// R04-1b: the child ack event's DACL must grant exactly the current
     /// user SID SYNCHRONIZE | EVENT_MODIFY_STATE — not a bare

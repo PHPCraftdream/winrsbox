@@ -4,13 +4,17 @@ use std::path::Path;
 use windows::{
     core::PCWSTR,
     Win32::{
-        Foundation::{CloseHandle, HANDLE},
+        Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
         Security::{
             SECURITY_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID,
             TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
         },
         System::{
             Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW},
+            Memory::{
+                CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ,
+                FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
+            },
             Threading::{CreateEventW, GetCurrentProcess, OpenProcessToken},
         },
     },
@@ -21,6 +25,85 @@ use winrsbox::contain::guest as guest_token;
 /// Environment variables carrying inherited root-event handle values.
 pub(crate) const INIT_EVENT_HANDLE_ENV: &str = "FS_SANDBOX_INIT_EVENT";
 pub(crate) const INIT_DEGRADED_EVENT_ENV: &str = "FS_SANDBOX_INIT_DEGRADED_EVENT";
+pub(crate) const INIT_ERROR_BUFFER_HANDLE_ENV: &str = "FS_SANDBOX_INIT_ERROR_BUFFER";
+const INIT_ERROR_BUFFER_SIZE: usize = 4096;
+
+pub(crate) struct InitErrorBuffer {
+    handle: HANDLE,
+    view: MEMORY_MAPPED_VIEW_ADDRESS,
+}
+
+impl InitErrorBuffer {
+    pub(crate) fn handle(&self) -> HANDLE {
+        self.handle
+    }
+
+    pub(crate) fn read_message(&self) -> Option<String> {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self.view.Value.cast::<u8>(), INIT_ERROR_BUFFER_SIZE)
+        };
+        let length = u32::from_ne_bytes(bytes[..4].try_into().ok()?) as usize;
+        if length == 0 || length > INIT_ERROR_BUFFER_SIZE - 4 {
+            return None;
+        }
+        let message = String::from_utf8_lossy(&bytes[4..4 + length]);
+        Some(
+            message
+                .chars()
+                .map(|character| if character.is_control() { ' ' } else { character })
+                .collect(),
+        )
+    }
+}
+
+impl Drop for InitErrorBuffer {
+    fn drop(&mut self) {
+        // SAFETY: the view and handle are owned by this guard and released once.
+        unsafe {
+            UnmapViewOfFile(self.view).ok();
+            CloseHandle(self.handle).ok();
+        }
+    }
+}
+
+pub(crate) fn create_init_error_buffer() -> anyhow::Result<InitErrorBuffer> {
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: windows::core::BOOL(1),
+    };
+    // SAFETY: attributes is valid; the anonymous section is inherited only
+    // through the launcher's explicit handle list.
+    let handle = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            Some(&attributes),
+            PAGE_READWRITE,
+            0,
+            INIT_ERROR_BUFFER_SIZE as u32,
+            PCWSTR::null(),
+        )
+    }
+    .context("CreateFileMappingW(init error buffer) failed")?;
+    // SAFETY: handle names a live pagefile-backed mapping of the declared size.
+    let view = unsafe {
+        MapViewOfFile(
+            handle,
+            FILE_MAP_READ | FILE_MAP_WRITE,
+            0,
+            0,
+            INIT_ERROR_BUFFER_SIZE,
+        )
+    };
+    if view.Value.is_null() {
+        // SAFETY: handle was created above and no view was mapped.
+        unsafe { CloseHandle(handle).ok() };
+        return Err(windows::core::Error::from_win32())
+            .context("MapViewOfFile(init error buffer) failed");
+    }
+    std::env::set_var(INIT_ERROR_BUFFER_HANDLE_ENV, (handle.0 as usize).to_string());
+    Ok(InitErrorBuffer { handle, view })
+}
 
 /// Detect whether THIS launcher was spawned inside an existing sandbox.
 ///
@@ -266,7 +349,8 @@ pub(crate) fn verify_child_token(
 #[cfg(test)]
 mod init_event_security_tests {
     use super::{
-        create_degraded_event, create_init_event, INIT_DEGRADED_EVENT_ENV, INIT_EVENT_HANDLE_ENV,
+        create_degraded_event, create_init_error_buffer, create_init_event,
+        INIT_DEGRADED_EVENT_ENV, INIT_ERROR_BUFFER_HANDLE_ENV, INIT_EVENT_HANDLE_ENV,
     };
     use windows::Win32::Foundation::{CloseHandle, GetHandleInformation};
 
@@ -289,6 +373,36 @@ mod init_event_security_tests {
         assert_inheritable(init, INIT_EVENT_HANDLE_ENV);
         let degraded = create_degraded_event().expect("create degraded event");
         assert_inheritable(degraded, INIT_DEGRADED_EVENT_ENV);
+    }
+
+    #[test]
+    fn init_error_buffer_is_inheritable_and_readable() {
+        let buffer = create_init_error_buffer().expect("create init error buffer");
+        let mut flags = 0u32;
+        // SAFETY: buffer.handle is live and owned by this test.
+        unsafe { GetHandleInformation(buffer.handle, &mut flags) }
+            .expect("GetHandleInformation failed");
+        assert_ne!(flags & 1, 0, "error buffer handle must be inheritable");
+        assert_eq!(
+            std::env::var(INIT_ERROR_BUFFER_HANDLE_ENV)
+                .unwrap()
+                .parse::<usize>()
+                .unwrap(),
+            buffer.handle.0 as usize
+        );
+
+        let message = b"hook init test";
+        // SAFETY: the mapping is writable for INIT_ERROR_BUFFER_SIZE bytes.
+        unsafe {
+            std::ptr::write(buffer.view.Value.cast::<u32>(), message.len() as u32);
+            std::ptr::copy_nonoverlapping(
+                message.as_ptr(),
+                buffer.view.Value.cast::<u8>().add(4),
+                message.len(),
+            );
+        }
+        assert_eq!(buffer.read_message().as_deref(), Some("hook init test"));
+        std::env::remove_var(INIT_ERROR_BUFFER_HANDLE_ENV);
     }
 }#[cfg(test)]
 mod network_opt_in_tests {

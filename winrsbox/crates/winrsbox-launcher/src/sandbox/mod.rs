@@ -334,11 +334,8 @@ pub(crate) fn install_console_ctrl_handler() {
 /// create time). That flag is re-applied AFTER hook.dll loads, from inside
 /// hook::apply_mitigations via SetProcessMitigationPolicy. All other v1/v2 bits
 /// only take effect at process create, so they MUST be passed via this path.
-fn verify_inherited_event_handles(
-    child_process: HANDLE,
-    expected: [HANDLE; 2],
-) -> Result<()> {
-    for (name, source_handle) in ["init", "degraded"].into_iter().zip(expected) {
+fn verify_inherited_handles(child_process: HANDLE, expected: [HANDLE; 3]) -> Result<()> {
+    for (name, source_handle) in ["init", "status", "error buffer"].into_iter().zip(expected) {
         let mut duplicate = HANDLE::default();
         // SAFETY: child_process is the live suspended child returned by
         // CreateProcessAsUserW; DuplicateHandle reads its handle table and
@@ -354,20 +351,19 @@ fn verify_inherited_event_handles(
                 DUPLICATE_SAME_ACCESS,
             )
         }
-        .with_context(|| format!("root child is missing inherited {name} event handle"))?;
+        .with_context(|| format!("root child is missing inherited {name} handle"))?;
         // SAFETY: duplicate was returned by DuplicateHandle above and is owned here.
         unsafe { CloseHandle(duplicate) }.context("CloseHandle(inherited event probe) failed")?;
     }
     Ok(())
 }
 
-/// Launch `target_args[0]` suspended under `cwd` and pass only the root init
-/// event handles alongside any create-time mitigation attributes.
+/// Launch the target suspended and inherit only root handshake handles.
 pub(crate) fn launch_suspended(
     cwd: &Path,
     target_args: &[String],
     guard: crate::GuardLevel,
-    inherited_event_handles: [HANDLE; 2],
+    inherited_bootstrap_handles: [HANDLE; 3],
 ) -> Result<PROCESS_INFORMATION> {
     let cmdline = build_cmdline(target_args);
     let mut cmdline_wide: Vec<u16> = cmdline.encode_utf16().chain(Some(0)).collect();
@@ -449,7 +445,7 @@ pub(crate) fn launch_suspended(
     let mut pi = PROCESS_INFORMATION::default();
 
     // ─── Build the attribute list for exact handle inheritance ─────────────
-    // Only the two root handshake events cross into the less-trusted guest.
+    // Only root handshake handles cross into the less-trusted guest.
     // The handle-list attribute prevents unrelated inheritable launcher
     // handles from leaking into it.
     let attribute_count = if has_mitigations { 2 } else { 1 };
@@ -473,15 +469,15 @@ pub(crate) fn launch_suspended(
     }
     .context("InitializeProcThreadAttributeList failed")?;
 
-    // SAFETY: inherited_event_handles is a live array of the only inheritable
-    // handles intended for the root child; the OS reads it during process creation.
+    // SAFETY: inherited_bootstrap_handles contains the only handles intended
+    // for the root child; the OS reads it during process creation.
     let handle_list_result = unsafe {
         UpdateProcThreadAttribute(
             attr_list,
             0,
             PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-            Some(inherited_event_handles.as_ptr() as *const std::ffi::c_void),
-            std::mem::size_of_val(&inherited_event_handles),
+            Some(inherited_bootstrap_handles.as_ptr() as *const std::ffi::c_void),
+            std::mem::size_of_val(&inherited_bootstrap_handles),
             None,
             None,
         )
@@ -564,7 +560,7 @@ pub(crate) fn launch_suspended(
     let _ = si_ex.StartupInfo.cb;
     // Touch attr_buf/env_block to assert both stayed alive past the syscall.
     let _ = attr_buf.len();
-    let _ = inherited_event_handles.len();
+    let _ = inherited_bootstrap_handles.len();
     let _ = env_block.len();
 
     // Fail closed: any CreateProcessAsUserW error (including the documented
@@ -580,7 +576,7 @@ pub(crate) fn launch_suspended(
          unrestricted token",
     )?;
 
-    if let Err(error) = verify_inherited_event_handles(pi.hProcess, inherited_event_handles) {
+    if let Err(error) = verify_inherited_handles(pi.hProcess, inherited_bootstrap_handles) {
         // SAFETY: the process and thread handles are valid; the child is still
         // suspended, so no guest code has run and termination is safe.
         unsafe {
