@@ -123,7 +123,13 @@ pub unsafe extern "system" fn DllMain(
     match reason {
         DLL_PROCESS_ATTACH => {
             DisableThreadLibraryCalls(hinst);
-            if hooks::install_hooks().is_ok() { TRUE } else { FALSE }
+            match hooks::install_hooks() {
+                Ok(()) => TRUE,
+                Err(_) => {
+                    crate::init_ack::signal_init_failure();
+                    FALSE
+                }
+            }
         }
         DLL_PROCESS_DETACH => {
             hooks::uninstall_hooks();

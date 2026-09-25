@@ -103,12 +103,10 @@ pub(crate) fn create_init_event() -> anyhow::Result<HANDLE> {
     Ok(event)
 }
 
-/// Create the second kernel Event for the S10 degraded-init acknowledgment:
-/// when hook.dll finished initializing but some optional components failed to
-/// install (buffered errors), it signals this event so the launcher can warn
-/// the operator instead of silently running a degraded sandbox. Same
-/// auto-reset, initially-unset shape as `create_init_event`; the name is
-/// handle value is exported to the child via `INIT_DEGRADED_EVENT_ENV`.
+/// Create the status event for degraded success or fatal hook initialization.
+/// Optional install errors signal it alongside the success event; a fatal
+/// install error signals it alone. Its inheritable handle value is exported
+/// through `INIT_DEGRADED_EVENT_ENV`.
 pub(crate) fn create_degraded_event() -> anyhow::Result<HANDLE> {
     let event = create_session_event()?;
     std::env::set_var(INIT_DEGRADED_EVENT_ENV, (event.0 as usize).to_string());

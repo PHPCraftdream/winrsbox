@@ -614,10 +614,8 @@ pub(crate) fn create_child_init_ack(pid: u32) -> Result<ChildInitAck, String> {
 ///
 /// The inherited root-init handle is consumed and closed when present; absent
 /// env means this context does not need the root handshake (e.g. unit tests).
-/// The degraded-init handle is signaled when buffered install
-/// errors exist at init-signal time, so the launcher can distinguish a clean
-/// init from a degraded one (S10) instead of treating any SetEvent as
-/// "healthy". Finally, the PER-CHILD bootstrap ack event
+/// The status handle is signaled for buffered optional errors on success and
+/// alone for fatal install failures. Finally, the PER-CHILD bootstrap ack event
 /// (CHILD_INIT_EVENT_ENV) is signaled when present, telling OUR spawn hook
 /// (core/hooks/spawn.rs) that THIS process finished install_hooks.
 pub(crate) fn signal_init_events() {
@@ -633,6 +631,10 @@ pub(crate) fn signal_init_events() {
     // which child initialized).
     let child_ack = std::env::var(CHILD_INIT_EVENT_ENV).ok();
     signal_one(child_ack.as_deref());
+}
+
+pub(crate) fn signal_init_failure() {
+    consume_inherited_event(INIT_DEGRADED_EVENT_ENV, true);
 }
 
 #[cfg(test)]

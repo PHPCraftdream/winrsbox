@@ -24,7 +24,10 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{CloseHandle, HANDLE},
-        System::Threading::{GetExitCodeProcess, ResumeThread, WaitForSingleObject, INFINITE},
+        System::Threading::{
+            GetExitCodeProcess, ResumeThread, WaitForMultipleObjects, WaitForSingleObject,
+            INFINITE,
+        },
     },
 };
 use sandbox::launch_prep::{build_delegation_command, is_nested_invocation};
@@ -584,8 +587,7 @@ async fn run() -> Result<()> {
 
     // Create kernel Event for hook.dll init signaling (H1 fix, random name).
     let init_event = sandbox::launch_prep::create_init_event()?;
-    // S10: second event for the degraded-init acknowledgment (optional
-    // component install failures buffered inside hook.dll).
+    // The status event marks optional degradation or fatal DllMain failure.
     let init_degraded_event = sandbox::launch_prep::create_degraded_event()?;
 
     // Guard level is taken verbatim — no trust-based downgrade. Full mode is
@@ -771,12 +773,13 @@ async fn run() -> Result<()> {
     // SAFETY: same — close the thread handle after use; the thread continues running.
     unsafe { CloseHandle(proc_info.hThread).ok() };
 
-    // Wait for hook.dll to signal successful initialization via kernel Event.
+    // Wait for hook success or fatal DllMain failure via kernel Events.
     // spawn_blocking moves the blocking wait to tokio's thread pool — the async
     // runtime stays free to run pipe_accept_loop and other tasks.
-    let event_handle_raw = init_event.0 as usize; // HANDLE → usize for Send
+    let event_handles_raw = [init_event.0 as usize, init_degraded_event.0 as usize];
     let wait_result = match tokio::task::spawn_blocking(move || unsafe {
-        WaitForSingleObject(HANDLE(event_handle_raw as *mut _), 5000)
+        let handles = event_handles_raw.map(|raw| HANDLE(raw as *mut _));
+        WaitForMultipleObjects(&handles, false, 5000)
     }).await {
         Ok(wr) => wr,
         Err(e) => {
@@ -813,9 +816,15 @@ async fn run() -> Result<()> {
             );
         }
     } else {
+        let reason = match wait_result.0 {
+            1 => "hook.dll failed during initialization",
+            258 => "hook.dll did not signal init within 5s",
+            _ => "hook init wait failed",
+        };
         eprintln!(
-            "[sandbox] CRITICAL: hook.dll did not signal init within 5s, killing child pid={}",
-            proc_info.dwProcessId
+            "[sandbox] CRITICAL: {reason}, killing child pid={} (wait=0x{:08x})",
+            proc_info.dwProcessId,
+            wait_result.0,
         );
         unsafe {
             windows::Win32::System::Threading::TerminateProcess(proc_info.hProcess, 0xC000_0005).ok();

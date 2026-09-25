@@ -170,14 +170,17 @@ Before creating the suspended root child, the launcher creates anonymous
 kernel Events and passes only their inheritable handles through
 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. The hook signals those handles directly;
 it does not reopen a named object under the guest token. The launcher waits on
-the init event using `WaitForSingleObject` with a 5-second timeout (executed
-via `spawn_blocking` so the async runtime is not stalled).
+the success and status events using `WaitForMultipleObjects` with a 5-second
+timeout (executed via `spawn_blocking` so the async runtime is not stalled).
 
 - If `hook.dll` successfully initializes, it signals the inherited event from
   `DllMain` and closes its copy of the handle.
-- If the Event is not signaled within the timeout (DLL injection failed, DLL was
-  blocked by AV, or `DllMain` panicked), the launcher terminates the child and
-  reports an injection failure.
+- If hook installation fails in `DllMain`, only the status event is signaled;
+  the launcher terminates the child and reports an initialization failure.
+- If optional hooks fail, both events are signaled: the launcher accepts the
+  initialized child and warns that the sandbox is degraded.
+- If neither event is signaled before the timeout, the launcher terminates the
+  child and reports that the hook did not initialize.
 
 This is fail-closed: a child that never signals readiness is killed, not
 allowed to run unhooked.
