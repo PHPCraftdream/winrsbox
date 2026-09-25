@@ -142,10 +142,9 @@ fn is_section_image_backed(section_handle: HANDLE) -> bool {
     let Some(nt_query) = NT_QUERY_SECTION.get() else {
         return false;
     };
-    // SECTION_IMAGE_INFORMATION layout (first 64 bytes are always present).
-    // We only care whether the call succeeds — a non-image section returns
-    // STATUS_SECTION_NOT_IMAGE (0xC0000049) and we return false.
-    let mut info = [0u8; 64];
+    // SECTION_IMAGE_INFORMATION may grow between Windows releases. We only
+    // use query success, so provide spare output space and ignore its fields.
+    let mut info = [0u8; 1024];
     let mut ret_len: usize = 0;
     // SAFETY: info is a valid mutable buffer; section_handle was passed to
     // NtMapViewOfSection by the caller and is valid for the duration of the hook.
@@ -763,4 +762,3 @@ pub(crate) unsafe extern "system" fn hook_nt_protect_virtual_memory(
 // NtMapViewOfSection, NtWriteVirtualMemory: see detours::map_and_write.
 // Manual NtAllocateVirtualMemory(Ex) hook install/uninstall: see
 // detours::manual_alloc. Both re-exported above.
-

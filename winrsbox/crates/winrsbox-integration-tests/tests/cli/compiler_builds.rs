@@ -19,7 +19,12 @@ struct SandboxProject {
 
 impl SandboxProject {
     fn new() -> Self {
-        let root = tempfile::tempdir().expect("create isolated compiler test root");
+        let launcher = find_launcher();
+        let artifact_dir = launcher.parent().expect("launcher has an artifact directory");
+        let root = tempfile::Builder::new()
+            .prefix("winrsbox-compiler-")
+            .tempdir_in(artifact_dir)
+            .expect("create isolated compiler test root");
         let project = root.path().join("project");
         let state = root.path().join(".winrsbox").join("project");
         let temp = project.join(".tmp");
@@ -35,7 +40,7 @@ impl SandboxProject {
             _root: root,
             project,
             temp,
-            launcher: find_launcher(),
+            launcher,
             hook: find_hook_dll(),
         }
     }
@@ -236,6 +241,7 @@ fn go_build_in_full_box() {
         ("GOTOOLCHAIN", "local".into()),
         ("GOWORK", "off".into()),
         ("GOENV", "off".into()),
+        ("GOTELEMETRY", "off".into()),
         ("GOPROXY", "off".into()),
         ("GOSUMDB", "off".into()),
         ("GOCACHE", project.path(".cache/go-build").into_os_string()),
@@ -262,7 +268,7 @@ fn rust_cargo_build_in_full_box() {
     fs::create_dir_all(project.path("src")).expect("create Rust source directory");
     fs::write(
         project.path("Cargo.toml"),
-        "[package]\nname = \"sandbox_compile_rust\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        "[package]\nname = \"sandbox_compile_rust\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
     )
     .expect("write Rust manifest");
     fs::write(
