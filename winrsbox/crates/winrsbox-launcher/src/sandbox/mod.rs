@@ -8,11 +8,11 @@ use std::{
 use windows::{
     core::PCWSTR,
     Win32::{
-        Foundation::{CloseHandle, HANDLE},
+        Foundation::{CloseHandle, DuplicateHandle, HANDLE, DUPLICATE_SAME_ACCESS},
         System::{
             Console::GetConsoleWindow,
             Threading::{
-                CreateProcessAsUserW, DeleteProcThreadAttributeList,
+                CreateProcessAsUserW, DeleteProcThreadAttributeList, GetCurrentProcess,
                 InitializeProcThreadAttributeList, TerminateProcess,
                 UpdateProcThreadAttribute, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
                 EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
@@ -334,6 +334,35 @@ pub(crate) fn install_console_ctrl_handler() {
 /// create time). That flag is re-applied AFTER hook.dll loads, from inside
 /// hook::apply_mitigations via SetProcessMitigationPolicy. All other v1/v2 bits
 /// only take effect at process create, so they MUST be passed via this path.
+fn verify_inherited_event_handles(
+    child_process: HANDLE,
+    expected: [HANDLE; 2],
+) -> Result<()> {
+    for (name, source_handle) in ["init", "degraded"].into_iter().zip(expected) {
+        let mut duplicate = HANDLE::default();
+        // SAFETY: child_process is the live suspended child returned by
+        // CreateProcessAsUserW; DuplicateHandle reads its handle table and
+        // duplicates the entry into this process for verification.
+        unsafe {
+            DuplicateHandle(
+                child_process,
+                source_handle,
+                GetCurrentProcess(),
+                &mut duplicate,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+        }
+        .with_context(|| format!("root child is missing inherited {name} event handle"))?;
+        // SAFETY: duplicate was returned by DuplicateHandle above and is owned here.
+        unsafe { CloseHandle(duplicate) }.context("CloseHandle(inherited event probe) failed")?;
+    }
+    Ok(())
+}
+
+/// Launch `target_args[0]` suspended under `cwd` and pass only the root init
+/// event handles alongside any create-time mitigation attributes.
 pub(crate) fn launch_suspended(
     cwd: &Path,
     target_args: &[String],
@@ -550,6 +579,17 @@ pub(crate) fn launch_suspended(
          guest token; aborting launch rather than falling back to CreateProcessW/an \
          unrestricted token",
     )?;
+
+    if let Err(error) = verify_inherited_event_handles(pi.hProcess, inherited_event_handles) {
+        // SAFETY: the process and thread handles are valid; the child is still
+        // suspended, so no guest code has run and termination is safe.
+        unsafe {
+            TerminateProcess(pi.hProcess, STATUS_DLL_INIT_FAILED).ok();
+            CloseHandle(pi.hThread).ok();
+            CloseHandle(pi.hProcess).ok();
+        }
+        return Err(error).context("root child did not inherit its init event handles");
+    }
 
     // ─── R04-1c point 6: verify the REAL child token, not the request ──────
     //
