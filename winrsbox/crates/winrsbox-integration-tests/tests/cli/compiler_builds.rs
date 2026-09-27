@@ -7,7 +7,7 @@ use tempfile::TempDir;
 
 #[path = "../common/mod.rs"]
 mod common;
-use common::{find_hook_dll, find_launcher};
+use common::{find_binary, find_hook_dll, find_launcher};
 
 struct SandboxProject {
     _root: TempDir,
@@ -186,6 +186,29 @@ fn assert_stdout_contains(project: &SandboxProject, label: &str, output: &Output
         "{label} did not print {marker:?}:\nstdout:\n{stdout}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn relative_root_file_io_in_full_box() {
+    let project = SandboxProject::new();
+    let output = project.run(
+        find_binary("relative_create_probe").as_os_str(),
+        &[],
+        &project.environment(&[]),
+    );
+    eprintln!(
+        "relative probe:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_stdout_contains(
+        &project,
+        "relative file opens",
+        &output,
+        "sandbox-relative-io-ok",
+    );
+    for file in ["probe_absolute.exe", "probe_root.exe", "hello.exe"] {
+        project.assert_host_output_present(file);
+    }
 }
 
 #[test]

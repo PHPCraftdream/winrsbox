@@ -428,6 +428,10 @@ name = "escape_rename_device_path"
 path = "src/bin/fs/rename/escape_rename_device_path.rs"
 
 [[bin]]
+name = "relative_create_probe"
+path = "src/bin/fs/naming/relative_create_probe.rs"
+
+[[bin]]
 name = "escape_rename_sibling"
 path = "src/bin/fs/rename/escape_rename_sibling.rs"
 

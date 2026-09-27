@@ -107,20 +107,6 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
     // copy_passthrough_inner so the kernel opens the SAME path policy approved,
     // closing the double-resolve window.
     let Some((dos, pre_resolved)) = resolve_for_hook(object_attributes as *const _) else {
-        // Forensic: a WRITE we couldn't resolve is exactly the class of bug
-        // that the cmd.exe `>filename` escape lived in (device-namespace
-        // RootDirectory + bare ObjectName). Keep this one on TRACE — it
-        // produces no event under default log_level, but with `log_level:
-        // trace` in sandbox.ktav an escape investigator sees every unresolved
-        // write and the raw path that caused it.
-        if is_trace() && is_write_access(desired_access, create_disposition) {
-            let raw = crate::hooks::extract_raw_nt_path(object_attributes as *const _)
-                .unwrap_or_else(|| "<unresolved>".to_string());
-            ipc_log(
-                ipc::LogLevel::Trace,
-                format!("fs_resolve_failed: NtCreateFile raw={raw} write=true"),
-            );
-        }
         // Fail closed (P0-03): a write that does not resolve to a DOS path
         // must not reach the original NtCreateFile — it would bypass decide()
         // and the CoW overlay entirely (UNC shares, raw device namespaces).
@@ -128,6 +114,8 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
             dead_end_write_intent(desired_access, Some(create_disposition), create_options);
         let device = classify_device_open(object_attributes as *const _, write_intent);
         if let DeviceVerdict::Deny(status) = device {
+            let raw = crate::hooks::extract_raw_nt_path(object_attributes as *const _).unwrap_or_default();
+            log_open_failure("device_create", &raw, desired_access, create_options, status);
             set_io_status(io_status_block, status);
             return status;
         }
@@ -135,6 +123,9 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
         // it, so the dead-end write deny below must not apply: denying it is
         // what broke `CreatePipe`, `child_process.spawn` and every TTY open.
         if write_intent && device != DeviceVerdict::PassThrough {
+            let raw = crate::hooks::extract_raw_nt_path(object_attributes as *const _)
+                .unwrap_or_else(|| "<unresolved>".to_string());
+            log_open_failure("unresolved_create", &raw, desired_access, create_options, STATUS_ACCESS_DENIED);
             if is_trace() {
                 // Keep the sharper forensic label for raw volume-device targets.
                 let kind = if crate::hooks::is_fs_device_path(object_attributes as *const _) {
@@ -563,6 +554,8 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
 
     // Early-deny: path-traversal vectors (GLOBALROOT, FILE_OPEN_BY_FILE_ID, ADS)
     if let Some(status) = check_path_traversal(object_attributes as *const _, open_options) {
+        let raw = crate::hooks::extract_raw_nt_path(object_attributes as *const _).unwrap_or_default();
+        log_open_failure("traversal_open", &raw, desired_access, open_options, status);
         set_io_status(io_status_block, status);
         return status;
     }
@@ -577,11 +570,16 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
         let write_intent = dead_end_write_intent(desired_access, None, open_options);
         let device = classify_device_open(object_attributes as *const _, write_intent);
         if let DeviceVerdict::Deny(status) = device {
+            let raw = crate::hooks::extract_raw_nt_path(object_attributes as *const _).unwrap_or_default();
+            log_open_failure("device_open", &raw, desired_access, open_options, status);
             set_io_status(io_status_block, status);
             return status;
         }
         // Non-filesystem devices pass through — see the NtCreateFile twin.
         if write_intent && device != DeviceVerdict::PassThrough {
+            let raw = crate::hooks::extract_raw_nt_path(object_attributes as *const _)
+                .unwrap_or_else(|| "<unresolved>".to_string());
+            log_open_failure("unresolved_open", &raw, desired_access, open_options, STATUS_ACCESS_DENIED);
             if is_trace() {
                 let kind = if crate::hooks::is_fs_device_path(object_attributes as *const _) {
                     "device_volume"
