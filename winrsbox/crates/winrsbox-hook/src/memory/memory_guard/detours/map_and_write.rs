@@ -2,6 +2,16 @@
 
 use super::*;
 
+fn log_mapview_rejection(reason: &str, base: *const c_void, protect: u32) {
+    let path = get_mapped_file_path(base).unwrap_or_else(|| "<anonymous>".to_owned());
+    crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+        // SAFETY: GetCurrentProcessId has no caller preconditions.
+        pid: unsafe { GetCurrentProcessId() },
+        level: ipc::LogLevel::Warn,
+        msg: format!("mem_map_rejected reason={reason} path={path} protect={protect:#x}"),
+    });
+}
+
 pub(crate) unsafe extern "system" fn hook_nt_map_view_of_section(
     section_handle: HANDLE,
     process_handle: HANDLE,
@@ -85,6 +95,7 @@ pub(crate) unsafe extern "system" fn hook_nt_map_view_of_section(
     if is_image_mapping(mapped_base) || section_is_image {
         if let Some(basename) = get_mapped_file_basename(mapped_base) {
             if is_critical_dll(&basename) {
+                log_mapview_rejection("critical_image", mapped_base, win32_protect);
                 if let Some(unmap_fn) = unmap_section_original_pub() {
                     // SAFETY: mapped_base was just mapped successfully; we unmap
                     // it before terminating to clean up.
@@ -128,6 +139,7 @@ pub(crate) unsafe extern "system" fn hook_nt_map_view_of_section(
                             let sec_addr = (mapped_base as usize + va) as *const u8;
                             let sec_slice = std::slice::from_raw_parts(sec_addr, scan_size);
                             if region_has_direct_syscalls(sec_slice, sec_addr as usize, false) {
+                                log_mapview_rejection("image_syscall", mapped_base, win32_protect);
                                 let unmap = unmap_section_original_pub();
                                 if let Some(unmap_fn) = unmap {
                                     unmap_fn(-1isize as HANDLE, mapped_base);
@@ -170,6 +182,7 @@ pub(crate) unsafe extern "system" fn hook_nt_map_view_of_section(
             let is_file_backed = get_mapped_file_path(mapped_base).is_some();
 
             if !is_file_backed {
+                log_mapview_rejection("anonymous_executable", mapped_base, effective);
                 // Anonymous or pagefile-backed executable mapping: deny.
                 let unmap = unmap_section_original_pub();
                 if let Some(unmap_fn) = unmap {
@@ -187,6 +200,7 @@ pub(crate) unsafe extern "system" fn hook_nt_map_view_of_section(
                 if view_bytes > 0 {
                     let bytes = std::slice::from_raw_parts(mapped_base as *const u8, view_bytes);
                     if region_has_direct_syscalls(bytes, mapped_base as usize, false) {
+                        log_mapview_rejection("file_mapping_syscall", mapped_base, effective);
                         let unmap = unmap_section_original_pub();
                         if let Some(unmap_fn) = unmap {
                             unmap_fn(-1isize as HANDLE, mapped_base);

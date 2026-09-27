@@ -20,7 +20,9 @@ struct SandboxProject {
 impl SandboxProject {
     fn new() -> Self {
         let launcher = find_launcher();
-        let artifact_dir = launcher.parent().expect("launcher has an artifact directory");
+        let artifact_dir = launcher
+            .parent()
+            .expect("launcher has an artifact directory");
         let root = tempfile::Builder::new()
             .prefix("winrsbox-compiler-")
             .tempdir_in(artifact_dir)
@@ -99,6 +101,21 @@ impl SandboxProject {
         let mut out = String::new();
         for name in ["sandbox.log.jsonl", "violations.log"] {
             if let Ok(text) = fs::read_to_string(state.join(name)) {
+                let warnings = text
+                    .lines()
+                    .filter(|line| {
+                        serde_json::from_str::<serde_json::Value>(line).is_ok_and(|event| {
+                            matches!(event["level"].as_str(), Some("WARN" | "ERROR"))
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if !warnings.is_empty() {
+                    out.push_str(&format!("\n{name} warnings:\n"));
+                    for line in warnings {
+                        out.push_str(line);
+                        out.push('\n');
+                    }
+                }
                 let tail = text.lines().rev().take(40).collect::<Vec<_>>();
                 if !tail.is_empty() {
                     out.push_str(&format!("\n{name}:\n"));
