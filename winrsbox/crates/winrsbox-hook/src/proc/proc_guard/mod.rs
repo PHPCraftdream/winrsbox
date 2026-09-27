@@ -14,8 +14,7 @@
 // Hook 3: NtAssignProcessToJobObject — unconditionally denies Job reassignment
 //         from within the sandbox, preventing nested-Job escape on Win10+.
 // Hook 4: NtSetInformationProcess — blocks dangerous ProcessInformationClass
-//         mutations on foreign (non-owned) processes. Self-process is always
-//         allowed for legitimate JIT/runtime usage.
+//         mutations on foreign processes; device-map changes are denied for all.
 // Hook 5: NtTerminateProcess — untracks child PIDs from process_tracker on
 //         exit, preventing unbounded growth and PID-reuse poisoning (P1-2).
 
@@ -268,8 +267,7 @@ unsafe extern "system" fn hook_nt_assign_process_to_job_object(
 // NtSetInformationProcess hook — block dangerous foreign-process mutations
 // ---------------------------------------------------------------------------
 //
-// Classes treated as dangerous on FOREIGN PIDs (self-process is always allowed
-// for legitimate JIT/runtime usage):
+// These classes are dangerous on foreign PIDs. DeviceMap is denied for all PIDs.
 //   1  ProcessQuotaLimits        — change quotas of another process
 //   3  ProcessBasePriority       — set base priority foreign
 //   8  ProcessIoPortHandlers     — set IO completion port handlers
@@ -287,6 +285,7 @@ const PROCESS_PRIORITY_BOOST: ULONG = 20;
 const PROCESS_AFFINITY_MASK: ULONG = 21;
 const PROCESS_FOREGROUND_INFORMATION: ULONG = 25;
 const PROCESS_HANDLE_TRACING: ULONG = 32;
+const PROCESS_DEVICE_MAP: ULONG = ntapi::ntpsapi::ProcessDeviceMap as ULONG;
 
 const DANGEROUS_PROC_CLASSES: &[ULONG] = &[
     PROCESS_QUOTA_LIMITS,
@@ -313,6 +312,11 @@ unsafe extern "system" fn hook_nt_set_information_process(
     let Some(_guard) = anti_rec::enter() else {
         return call_original();
     };
+
+    // A private DOS device map would retarget broker-authorized drive paths.
+    if class == PROCESS_DEVICE_MAP {
+        return STATUS_ACCESS_DENIED;
+    }
 
     if !DANGEROUS_PROC_CLASSES.contains(&class) {
         return call_original();

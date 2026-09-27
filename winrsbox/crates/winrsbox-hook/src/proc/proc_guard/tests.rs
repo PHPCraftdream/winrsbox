@@ -1,5 +1,15 @@
 use super::*;
 
+#[test]
+fn device_map_mutation_is_denied_for_self_and_unknown_handles() {
+    for handle in [-1isize, 0isize] {
+        // SAFETY: the policy rejects this class before reading the empty input record.
+        let status = unsafe { hook_nt_set_information_process(
+            handle as HANDLE, PROCESS_DEVICE_MAP, std::ptr::null_mut(), 0) };
+        assert_eq!(status, STATUS_ACCESS_DENIED);
+    }
+}
+
 /// Both legacy hooks must return STATUS_ACCESS_DENIED for any input —
 /// including null pointers and zero scalar args — without dereferencing
 /// anything. This is the contract that makes "unconditional deny" safe:

@@ -54,8 +54,14 @@ pub(super) fn device_drive_map() -> &'static Vec<(Vec<u16>, u16)> {
 /// freshly-built `\??\<letter>:<rest>` vector. Returns `None` when no mapping
 /// applies (non-volume devices, paths already in DOS form, etc.).
 pub(crate) fn device_path_to_dos_nt(path: &[u16]) -> Option<Vec<u16>> {
+    device_path_with_map(path, device_drive_map()).or_else(|| {
+        let mappings = broker_device_drive_map()?;
+        device_path_with_map(path, mappings)
+    })
+}
+
+fn device_path_with_map(path: &[u16], map: &[(Vec<u16>, u16)]) -> Option<Vec<u16>> {
     let path_lower: Vec<u16> = path.iter().copied().map(ascii_to_lower_u16).collect();
-    let map = device_drive_map();
     for (device, letter) in map.iter() {
         if !path_lower.starts_with(device) {
             continue;
@@ -77,6 +83,64 @@ pub(crate) fn device_path_to_dos_nt(path: &[u16]) -> Option<Vec<u16>> {
         return Some(out);
     }
     None
+}
+
+fn broker_device_drive_map() -> Option<&'static Vec<(Vec<u16>, u16)>> {
+    static MAP: OnceLock<Vec<(Vec<u16>, u16)>> = OnceLock::new();
+    if let Some(map) = MAP.get() { return Some(map); }
+    // No broker exists outside a launcher-authored session (including unit tests).
+    crate::ipc_client::SESSION_SECTION_NAME.get()?;
+    let ipc::Resp::DeviceDriveMap(entries) = ipc_send_and_recv(ipc::Req::DeviceDriveMap)? else {
+        return None;
+    };
+    let mappings = validate_broker_drive_map(entries)?;
+    if mappings.is_empty() { return None; }
+    if MAP.set(mappings).is_ok() {
+        ipc_log(ipc::LogLevel::Info, "device_map_broker_loaded".to_owned());
+    }
+    MAP.get()
+}
+
+fn validate_broker_drive_map(entries: Vec<(u8, String)>) -> Option<Vec<(Vec<u16>, u16)>> {
+    if entries.len() > 26 { return None; }
+    let mut seen = 0u32;
+    let mut mappings = Vec::with_capacity(entries.len());
+    for (letter, device) in entries {
+        if !letter.is_ascii_alphabetic() || device.len() > 4096 { return None; }
+        let letter = letter.to_ascii_lowercase();
+        let bit = 1u32 << (letter - b'a');
+        if seen & bit != 0 { return None; }
+        seen |= bit;
+        let device: Vec<u16> = device.encode_utf16().map(ascii_to_lower_u16).collect();
+        let prefix: Vec<u16> = r"\device\".encode_utf16().collect();
+        if device.len() > 1024 || !device.starts_with(&prefix) { return None; }
+        mappings.push((device, letter as u16));
+    }
+    Some(mappings)
+}
+
+#[cfg(test)]
+mod broker_map_tests {
+    use super::*;
+
+    #[test]
+    fn missing_guest_volume_uses_validated_broker_mapping() {
+        let path: Vec<u16> = r"\Device\HarddiskVolume77\project\output.exe".encode_utf16().collect();
+        assert!(device_path_with_map(&path, &[]).is_none());
+        let map = validate_broker_drive_map(vec![(b'D', r"\Device\HarddiskVolume77".to_owned())]).unwrap();
+        assert_eq!(String::from_utf16(&device_path_with_map(&path, &map).unwrap()).unwrap(),
+            r"\??\d:\project\output.exe");
+        let other: Vec<u16> = r"\Device\HarddiskVolume770\outside".encode_utf16().collect();
+        assert!(device_path_with_map(&other, &map).is_none());
+    }
+
+    #[test]
+    fn malformed_and_duplicate_drive_mappings_are_rejected() {
+        assert!(validate_broker_drive_map(vec![(b'1', r"\Device\HarddiskVolume77".into())]).is_none());
+        assert!(validate_broker_drive_map(vec![(b'D', r"\??\C:\outside".into())]).is_none());
+        assert!(validate_broker_drive_map(vec![(b'D', r"\Device\HarddiskVolume77".into()),
+            (b'd', r"\Device\HarddiskVolume78".into())]).is_none());
+    }
 }
 
 // ---------------------------------------------------------------------------

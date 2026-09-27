@@ -326,6 +326,31 @@ impl Drop for PipeConnGuard {
 /// Generous but finite, and deterministic.
 pub(crate) const MAX_OVERLAY_LISTING_ENTRIES: usize = 16_384;
 
+/// Read drive mappings outside the guest's restricted token.
+pub(crate) fn device_drive_map_response() -> Resp {
+    static MAP: std::sync::OnceLock<Vec<(u8, String)>> = std::sync::OnceLock::new();
+    let mappings = MAP.get_or_init(|| {
+        let mut entries = Vec::new();
+        let mut target = vec![0u16; 32768];
+        for letter in b'A'..=b'Z' {
+            let drive = [letter as u16, b':' as u16, 0];
+            // SAFETY: terminated drive name and writable output buffer.
+            let len = unsafe { windows::Win32::Storage::FileSystem::QueryDosDeviceW(
+                PCWSTR(drive.as_ptr()), Some(&mut target)) } as usize;
+            if len == 0 || len >= target.len() { continue; }
+            let end = target[..len].iter().position(|&c| c == 0).unwrap_or(len);
+            if end == 0 || end > 1024 { continue; }
+            if let Ok(device) = String::from_utf16(&target[..end]) {
+                if device.to_ascii_lowercase().starts_with(r"\device\") {
+                    entries.push((letter, device));
+                }
+            }
+        }
+        entries
+    });
+    Resp::DeviceDriveMap(mappings.clone())
+}
+
 /// Truncate an unbounded policy listing to [`MAX_OVERLAY_LISTING_ENTRIES`].
 /// Returns `(entries, truncated)`; `truncated` is true iff the input exceeded
 /// the cap (and has been cut down to exactly the cap).

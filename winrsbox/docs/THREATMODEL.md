@@ -261,7 +261,17 @@ CLSID denylist (14 entries):
 
 **Code**: `hook/src/ui_guard.rs`.
 
+### Relative filesystem path resolution
+
+Relative filesystem opens resolve the directory handle to its kernel path.
+If the restricted guest cannot map that volume to a drive letter, it uses a
+bounded device-drive map from the authenticated launcher. This supplies
+names only; the usual path policy and fail-closed write checks still apply.
+`NtSetInformationProcess(ProcessDeviceMap)` is denied even for self, so a
+guest cannot retarget drive letters after the broker authorizes a DOS path.
+
 ### Direct syscall execution
+
 Content scanning detects `syscall`/`sysenter`/`int 2eh` instructions in
 executable memory before they can run.
 
