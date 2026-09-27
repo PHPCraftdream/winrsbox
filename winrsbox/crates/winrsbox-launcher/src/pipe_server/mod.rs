@@ -825,6 +825,9 @@ fn handle_connection(
                     Err(error) => Resp::Err(error),
                 }
             }
+            Req::VerifyMicrosoftImage { base_address } => Resp::ImagePublisher {
+                trusted: winrsbox::contain::trust::verify_microsoft_mapping(client_pid, base_address),
+            },
             Req::PreLaunchViolation { launcher_pid: _, target_exe: _, hits: _ } => {
                 // Launcher emits this directly to violations.log; this variant
                 // exists only for IPC schema completeness. If a hook DLL ever

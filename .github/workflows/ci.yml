@@ -77,7 +77,7 @@ jobs:
 
       # `--lib --bins`, not `--lib`. The launcher's own logic — target
       # resolution, console ownership, the Ctrl+C decision table, the child
-      # drain — lives in the BIN target (`launcher/src/main.rs` and its
+      # drain — lives in the BIN target (`launcher/src/main/mod.rs` and its
       # modules), so `--lib` alone silently skipped 123 tests of it.
       #
       # Still excluded: the broader integration suite (`tests/*.rs`). Those

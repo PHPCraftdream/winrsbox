@@ -16,7 +16,7 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "winrsbox"
-path = "src/main.rs"
+path = "src/main/mod.rs"
 
 [dependencies]
 policy = { package = "winrsbox-policy", path = "../winrsbox-policy" }
@@ -39,6 +39,9 @@ windows = { version = "0.61", features = [
     "Win32_System_JobObjects",
     "Win32_Security_WinTrust",
     "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_System_ProcessStatus",
     "Win32_NetworkManagement_WindowsFilteringPlatform",
     "Win32_System_Rpc",
     "Wdk_NetworkManagement_WindowsFilteringPlatform",

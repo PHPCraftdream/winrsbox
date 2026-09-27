@@ -2,7 +2,8 @@
 //
 // Uses WinVerifyTrust to check if an executable is signed by a publisher
 // whose cert chain roots in Windows' Trusted Root CA store.
-// NO hardcoded publisher list — Windows decides what is trusted.
+// The advisory API below has no publisher allowlist.
+// The image submodule separately verifies Microsoft-loaded images for the scan guard.
 //
 // DECISION (audit 2026-09-19): the verdict is ADVISORY ONLY. Nothing in the
 // launcher refuses to launch or to inject based on `TrustLevel`; it exists
@@ -19,6 +20,9 @@ use std::collections::HashMap;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+mod image;
+pub use image::verify_microsoft_mapping;
 
 // ---------------------------------------------------------------------------
 // Public types

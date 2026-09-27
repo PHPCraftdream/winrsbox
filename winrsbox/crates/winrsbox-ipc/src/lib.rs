@@ -248,6 +248,7 @@ pub enum Req {
     RegDeleteKey { key_path: String },
     NetDecide { host: String, port: u16 },
     MemDecide { target_pid: u32, op: String },
+    VerifyMicrosoftImage { base_address: u64 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -275,6 +276,7 @@ pub enum Resp {
     /// pipe_server): oversized listings come back truncated to a prefix,
     /// never as an error.
     OverlayChildren(Vec<policy::OverlayChildMeta>),
+    ImagePublisher { trusted: bool },
 }
 
 #[derive(Error, Debug)]
@@ -290,6 +292,20 @@ pub enum IpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_publisher_request_and_response_roundtrip() {
+        let mut wire = Vec::new();
+        write_msg(&mut wire, &Req::VerifyMicrosoftImage { base_address: 0x12345678 }).unwrap();
+        let decoded: Req = read_msg(&mut std::io::Cursor::new(wire)).unwrap();
+        assert!(matches!(decoded, Req::VerifyMicrosoftImage { base_address: 0x12345678 }));
+        for trusted in [false, true] {
+            let mut wire = Vec::new();
+            write_msg(&mut wire, &Resp::ImagePublisher { trusted }).unwrap();
+            let decoded: Resp = read_msg(&mut std::io::Cursor::new(wire)).unwrap();
+            assert!(matches!(decoded, Resp::ImagePublisher { trusted: actual } if actual == trusted));
+        }
+    }
 
     #[test]
     fn session_config_roundtrip_minimal() {

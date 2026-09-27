@@ -139,6 +139,11 @@ pub(crate) unsafe extern "system" fn hook_nt_map_view_of_section(
                             let sec_addr = (mapped_base as usize + va) as *const u8;
                             let sec_slice = std::slice::from_raw_parts(sec_addr, scan_size);
                             if region_has_direct_syscalls(sec_slice, sec_addr as usize, false) {
+                                if matches!(crate::ipc_client::ipc_send_and_recv(
+                                    ipc::Req::VerifyMicrosoftImage { base_address: mapped_base as u64 }
+                                ), Some(ipc::Resp::ImagePublisher { trusted: true })) {
+                                    return status;
+                                }
                                 log_mapview_rejection("image_syscall", mapped_base, win32_protect);
                                 let unmap = unmap_section_original_pub();
                                 if let Some(unmap_fn) = unmap {

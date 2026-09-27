@@ -189,6 +189,30 @@ fn assert_stdout_contains(project: &SandboxProject, label: &str, output: &Output
 }
 
 #[test]
+fn compiler_environment_in_full_box() {
+    let Some(node) = find_on_path("node.exe") else {
+        skip_if_missing(&["node.exe"]);
+        return;
+    };
+    let project = SandboxProject::new();
+    let env = project.environment(&[
+        ("INCLUDE", "compiler-include".into()),
+        ("LIB", "compiler-lib".into()),
+        ("GOCACHE", "compiler-go-cache".into()),
+        ("CARGO_TARGET_DIR", "compiler-rust-target".into()),
+        ("OPENAI_API_KEY", "test-only-dummy-secret".into()),
+    ]);
+    let script = "for (const [key, value] of Object.entries({INCLUDE:'compiler-include',LIB:'compiler-lib',GOCACHE:'compiler-go-cache',CARGO_TARGET_DIR:'compiler-rust-target'})) { if (process.env[key] !== value) throw new Error('missing compiler variable: '+key); } if ('OPENAI_API_KEY' in process.env) throw new Error('credential was preserved'); console.log('sandbox-compiler-env-ok');";
+    let output = project.run(node.as_os_str(), &args(&["-e", script]), &env);
+    assert_stdout_contains(
+        &project,
+        "compiler environment",
+        &output,
+        "sandbox-compiler-env-ok",
+    );
+}
+
+#[test]
 fn node_runtime_in_full_box() {
     let Some(node) = find_on_path("node.exe") else {
         skip_if_missing(&["node.exe"]);

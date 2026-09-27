@@ -37,6 +37,15 @@ fn is_whitelisted(upper: &str) -> bool {
         "LANG", "LC_ALL", "LC_CTYPE",
         "TERM", "SHELL", "EDITOR", "VISUAL",
         "RUST_BACKTRACE", "RUST_LOG", "CARGO_HOME", "RUSTUP_HOME",
+        "RUSTUP_TOOLCHAIN", "RUSTC", "RUSTDOC", "RUSTFLAGS", "RUSTDOCFLAGS",
+        "CARGO_TARGET_DIR", "CARGO_BUILD_JOBS", "CARGO_NET_OFFLINE", "CARGO_INCREMENTAL",
+        "INCLUDE", "LIB", "LIBPATH", "VCINSTALLDIR", "VCTOOLSINSTALLDIR",
+        "WINDOWSSDKDIR", "WINDOWSSDKVERSION", "UNIVERSALCRTSDKDIR", "UCRTVERSION",
+        "GOROOT", "GOPATH", "GOCACHE", "GOMODCACHE", "GOTMPDIR",
+        "GOENV", "GOWORK", "GOTOOLCHAIN", "GO111MODULE", "GOTELEMETRY",
+        "GOOS", "GOARCH", "CGO_ENABLED",
+        "JAVA_HOME", "JDK_HOME", "CLASSPATH",
+        "DOTNET_ROOT", "DOTNET_CLI_HOME", "DOTNET_NOLOGO", "NUGET_PACKAGES",
         "NODE_PATH", "NODE_ENV", "NPM_CONFIG_PREFIX",
         "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV",
         "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR",
@@ -96,6 +105,18 @@ mod tests {
         assert!(is_sensitive("MY_LICENSE_KEY"));
         assert!(is_sensitive("MONGO_URI"));
         assert!(is_sensitive("RANDOM_THING"));
+    }
+
+    #[test]
+    fn compiler_environment_is_preserved_without_credential_prefixes() {
+        for key in ["INCLUDE", "LIB", "LIBPATH", "GOCACHE", "GOMODCACHE", "GOTMPDIR",
+            "GOWORK", "GOENV", "GOTOOLCHAIN", "GOTELEMETRY", "CARGO_TARGET_DIR",
+            "CARGO_BUILD_JOBS", "CARGO_NET_OFFLINE", "JAVA_HOME", "DOTNET_ROOT"] {
+            assert!(!is_sensitive(key), "compiler configuration removed: {key}");
+        }
+        for key in ["CARGO_REGISTRIES_PRIVATE_TOKEN", "GOPROXY_TOKEN", "NUGET_API_KEY"] {
+            assert!(is_sensitive(key), "credential leaked: {key}");
+        }
     }
 
     #[test]

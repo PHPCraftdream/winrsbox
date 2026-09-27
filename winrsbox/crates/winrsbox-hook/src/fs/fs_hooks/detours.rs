@@ -38,6 +38,17 @@ use super::HOOK_NT_QUERY_ATTRIBUTES_FILE;
 use super::HOOK_NT_QUERY_FULL_ATTRIBUTES_FILE;
 use policy::Decision;
 
+fn log_open_failure(op: &str, path: &str, access: u32, options: u32, status: NTSTATUS) {
+    if status == STATUS_ACCESS_DENIED || status == 0xc0000274_u32 as i32 || status == 0xc0000043_u32 as i32 {
+        crate::ipc_client::ipc_log_violation(ipc::Req::Log {
+            // SAFETY: GetCurrentProcessId has no preconditions.
+            pid: unsafe { winapi::um::processthreadsapi::GetCurrentProcessId() },
+            level: ipc::LogLevel::Warn,
+            msg: format!("fs_open_failed op={op} path={path} access={access:#x} options={options:#x} status={status:#x}"),
+        });
+    }
+}
+
 mod passthrough_probe;
 pub(crate) use passthrough_probe::{PassthroughProbe, probe_passthrough, aliased_resolution_permits, passthrough_alias_decision, probe_passthrough_delete, passthrough_delete_alias_decision};
 mod query_attributes;
@@ -80,6 +91,8 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
 
     // Early-deny: path-traversal vectors (GLOBALROOT, FILE_OPEN_BY_FILE_ID, ADS)
     if let Some(status) = check_path_traversal(object_attributes as *const _, create_options) {
+        let raw = crate::hooks::extract_raw_nt_path(object_attributes as *const _).unwrap_or_default();
+        log_open_failure("traversal_create", &raw, desired_access, create_options, status);
         set_io_status(io_status_block, status);
         return status;
     }
@@ -342,15 +355,18 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
                 }
             };
             let attrs_ptr = copy.as_ptr_mut();
-            nt_call_original!(
+            let status = nt_call_original!(
                 &HOOK_NT_CREATE_FILE,
                 "NtCreateFile",
                 (file_handle, desired_access, attrs_ptr, io_status_block,
                  allocation_size, file_attributes, share_access, create_disposition,
                  create_options, ea_buffer, ea_length)
-            )
+            );
+            log_open_failure("passthrough_create", &dos, desired_access, create_options, status);
+            status
         }
         Mode::Deny => {
+            log_open_failure("policy_create", &dos, desired_access, create_options, STATUS_ACCESS_DENIED);
             if is_trace() {
                 ipc_log(ipc::LogLevel::Trace, format!("DENY NtCreateFile: {dos} write={write}"));
             }
@@ -471,6 +487,7 @@ pub(crate) unsafe extern "system" fn hook_nt_create_file(
                     format!("fs_cow_create_post status=0x{status:08x} dos={dos} disp={create_disposition:#x}"),
                 );
             }
+            log_open_failure("cow_create", &dos, desired_access, create_options, status);
             status
         }
         Mode::Mock => {
@@ -706,12 +723,14 @@ pub(crate) unsafe extern "system" fn hook_nt_open_file(
                 }
             };
             let attrs_ptr = copy.as_ptr_mut();
-            nt_call_original!(
+            let status = nt_call_original!(
                 &HOOK_NT_OPEN_FILE,
                 "NtOpenFile",
                 (file_handle, desired_access, attrs_ptr,
                  io_status_block, share_access, open_options)
-            )
+            );
+            log_open_failure("passthrough_open", &dos, desired_access, open_options, status);
+            status
         }
         Mode::Deny => {
             if !file_handle.is_null() {

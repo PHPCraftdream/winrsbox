@@ -95,6 +95,13 @@ All verified exit=0, violations=0:
 | Static | `-g static` | Full + ProhibitDynamicCode + Microsoft-signed-only DLLs. Hard containment that closes the direct-syscall / fresh-ntdll hook-bypass surface — **breaks JIT and unsigned `.pyd`/`.node`**. For pure-static signed targets only. |
 | None | `-g none` | FS sandbox only. No memory/inject/reg/net hooks |
 
+Loaded Microsoft-signed PE images may contain legitimate syscall sequences
+(for example MSVC's compiler DLL). When a DLL scan finds one, the launcher
+verifies the actual loaded image's Authenticode signature before accepting it.
+Unsigned images, anonymous executable mappings, and critical DLL remapping
+keep their existing checks. Signature verification uses local certificate
+information; see `docs/THREATMODEL.md` for the trust boundary.
+
 ## Policy (KTAV config)
 
 State directory: `<parent>/.winrsbox/<cwd-name>/`

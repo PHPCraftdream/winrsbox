@@ -265,6 +265,17 @@ CLSID denylist (14 entries):
 Content scanning detects `syscall`/`sysenter`/`int 2eh` instructions in
 executable memory before they can run.
 
+For loaded PE images in full/static mode, a syscall scan hit can be accepted
+when the broker verifies an embedded Authenticode signature from Microsoft.
+The broker resolves the image from the authenticated client's process and
+base address; the guest cannot choose a different signed file. Verification
+holds a read handle excluding writes/replacement, checks the verified signer's
+leaf certificate, and caches by content hash plus mtime. It uses cached local
+certificate information without network retrieval or revocation checks.
+This treats Microsoft compiler/runtime code as trusted; it is not a claim
+that signed code cannot contain or execute direct syscalls. Critical DLL
+remapping and anonymous executable mappings remain denied.
+
 **Hooks**: NtProtectVirtualMemory (RW->RX transition scan), NtMapViewOfSection
 (.text section scan for user DLLs), NtAllocateVirtualMemory (foreign-process
 exec alloc), NtWriteVirtualMemory (foreign-process write scan).
