@@ -46,21 +46,24 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 }
 
 fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
     let prefix = find_arg(args, "--prefix=").ok_or_else(|| anyhow::anyhow!("mockdir add: --prefix is required"))?;
     let prefix_lower = policy::path::nt_case_fold(prefix).into_owned();
     let id = find_arg(args, "--id=").map(String::from)
         .unwrap_or_else(|| crate::cli::id::generate_id("mockdir", &[&prefix_lower]));
 
-    policy::db::mockdir_upsert(&db, &prefix_lower)?;
+    backend.exec(policy::db::PolicyOp::MockDirUpsert(prefix_lower))?;
     println!("{}", id);
     Ok(())
 }
 
 fn run_remove(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
     if let Some(prefix) = find_arg(args, "--prefix=") {
-        let removed = policy::db::mockdir_remove_by_prefix(&db, prefix)?;
+        let removed = matches!(
+            backend.exec(policy::db::PolicyOp::MockDirRemoveByPrefix(prefix.to_string()))?,
+            policy::db::PolicyOpResult::Bool(true)
+        );
         if !removed { bail!("mockdir not found: {}", prefix); }
     } else {
         bail!("mockdir remove: --prefix required");
@@ -69,9 +72,11 @@ fn run_remove(args: &[String], state_dir: &std::path::Path) -> Result<()> {
 }
 
 fn run_list(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
     let json = has_flag(args, "--json");
-    let dirs = policy::db::mockdir_list(&db)?;
+    let policy::db::PolicyOpResult::Strings(dirs) = backend.exec(policy::db::PolicyOp::MockDirList)? else {
+        anyhow::bail!("mockdir list: unexpected backend response");
+    };
 
     if json {
         let out = serde_json::json!({

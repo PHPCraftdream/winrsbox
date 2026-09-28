@@ -3,13 +3,11 @@
 mod conn;
 mod ownership;
 mod records;
-// pub(crate): sandbox::launch_prep (R04-1b) reuses current_user_string_sid
-// and the raw ConvertStringSecurityDescriptorToSecurityDescriptorW binding
-// for the init-handshake events' explicit SDDL, following the same
-// technique this module proved for the IPC pipe.
+// pub(crate): sandbox::launch_prep (R04-1b) reuses current_user_string_sid and
+// the raw SDDL-conversion binding for the init-handshake events' explicit SDDL.
 pub(crate) mod security;
-#[cfg(test)]
-mod inflight_budget_tests;
+// pub(crate): MP-9 — reached from main::broker too.
+pub(crate) mod mutate;
 #[cfg(test)]
 mod tests;
 
@@ -51,8 +49,9 @@ pub(crate) use conn::PrefixedReader;
 #[cfg(test)]
 use std::io::Read;
 pub(crate) use ownership::{
-    decide_context, hello_exe_context, is_owned_client_pid, process_create_time_from_handle,
-    query_process_create_time, query_process_image_path, spawned_child_kinship,
+    decide_context, exe_paths_match, hello_exe_context, is_owned_client_pid, process_create_time_from_handle,
+    query_process_create_time, query_process_image_path, resolve_new_entry_depth,
+    spawned_child_kinship,
 };
 pub(crate) use records::{
     append_violation_record, escape_violation_record, handle_record_overlay,
@@ -98,29 +97,26 @@ pub(crate) async fn pipe_accept_loop(
     violations_log: PathBuf,
     hot_stats: Arc<HotStats>,
     flusher: Arc<ThrottledFlusher>,
-    // C3 Part 3: PID of the root sandboxed target. Cross-checked with
-    // GetNamedPipeClientProcessId on every new connection so an unrelated
-    // same-user process cannot impersonate the hooked target.
-    //
-    // Shared as `Arc<AtomicU32>` because the accept loop spawns BEFORE
-    // `launch_suspended` produces the root PID. The launcher publishes the
-    // PID via `store(.., Release)` after `CreateProcessW`, long before the
-    // root child can connect (it stays suspended until `ResumeThread`). A
-    // value of `0` here means "not yet known" and the validation falls
-    // back to a `global_proc_info` lookup; the root insertion in main.rs
-    // immediately before `ResumeThread` covers that path too.
+    // C3 Part 3: PID of the root sandboxed target, cross-checked with
+    // GetNamedPipeClientProcessId so an unrelated same-user process can't
+    // impersonate it. `Arc<AtomicU32>` since the accept loop starts before
+    // `launch_suspended` publishes the real PID (0 = "not yet known", falls
+    // back to `global_proc_info`). Ignored once `folder_job` is `Some` (MP-4).
     root_target_pid: Arc<AtomicU32>,
+    // MP-4: folder-level Job Object, broker-only; `None` = pre-MP-4 behavior.
+    folder_job: Option<Arc<winrsbox::contain::jobctl::FolderJob>>,
+    // MP-3: broker-only state for `Attach`; `None` disables it entirely.
+    attach_ctx: Option<crate::broker::AttachContext>,
 ) -> anyhow::Result<()> {
     let pipe_name_wide: Vec<u16> = OsStr::new(pipe_name)
         .encode_wide()
         .chain(Some(0))
         .collect();
 
-    // C3 Part 2: build the launcher-user-only DACL once at startup. The
-    // descriptor is referenced by every `CreateNamedPipeW` call below, so we
-    // wrap it in an Arc to keep the heap pointer stable for the loop's
-    // lifetime. Failure here is fail-closed — the launcher refuses to start
-    // the IPC server without a hardened SD.
+    // C3 Part 2: build the launcher-user-only DACL once at startup, Arc'd so
+    // the heap pointer stays stable for every `CreateNamedPipeW` call below.
+    // Failure here is fail-closed — refuse to start the IPC server without a
+    // hardened SD.
     let pipe_sec = Arc::new(
         build_pipe_security()
             .map_err(|e| anyhow::anyhow!("C3: pipe SD construction failed: {e}"))?,
@@ -130,8 +126,7 @@ pub(crate) async fn pipe_accept_loop(
     // acquires one permit before `spawn_blocking`; the permit drops when the
     // handler returns, freeing the slot. `acquire_owned().await` between
     // `ConnectNamedPipe` and the handler-side `spawn_blocking` gives natural
-    // backpressure on the accept loop without ever blocking the accept-side
-    // `spawn_blocking` itself.
+    // backpressure without ever blocking the accept-side `spawn_blocking`.
     let handler_sem = Arc::new(Semaphore::new(MAX_CONCURRENT_HANDLERS));
 
     // Audit: process-wide cap on total in-flight message-body bytes,
@@ -173,6 +168,8 @@ pub(crate) async fn pipe_accept_loop(
         let hot_stats = Arc::clone(&hot_stats);
         let flusher = Arc::clone(&flusher);
         let root_target_pid = Arc::clone(&root_target_pid);
+        let folder_job = folder_job.clone();
+        let attach_ctx = attach_ctx.clone();
         workers.push(tokio::spawn(accept_worker(
             initial,
             pipe_name_wide,
@@ -187,6 +184,8 @@ pub(crate) async fn pipe_accept_loop(
             hot_stats,
             flusher,
             root_target_pid,
+            folder_job,
+            attach_ctx,
         )));
     }
 
@@ -203,14 +202,11 @@ pub(crate) async fn pipe_accept_loop(
     Ok(())
 }
 
-/// One slot of the parallel accept pool. Owns a single pipe instance at a
-/// time: connects a client, validates it, hands the connection off to a
-/// blocking handler task (subject to `handler_sem`), then creates a fresh
-/// instance and waits for the next client.
-///
-/// The first worker takes the launcher-owned `FIRST_PIPE_INSTANCE` handle
-/// via `initial_ph`; subsequent workers (and every subsequent iteration of
-/// every worker) call `create_pipe_instance(.., false)`.
+/// One slot of the parallel accept pool: connects a client, validates it,
+/// hands the connection to a blocking handler (subject to `handler_sem`),
+/// then creates a fresh instance and waits for the next client. Worker 0
+/// takes the launcher-owned `FIRST_PIPE_INSTANCE` via `initial_ph`; every
+/// other call to `create_pipe_instance` passes `false`.
 #[allow(clippy::too_many_arguments)]
 async fn accept_worker(
     mut initial_ph: Option<isize>,
@@ -226,11 +222,12 @@ async fn accept_worker(
     hot_stats: Arc<HotStats>,
     flusher: Arc<ThrottledFlusher>,
     root_target_pid: Arc<AtomicU32>,
+    folder_job: Option<Arc<winrsbox::contain::jobctl::FolderJob>>,
+    attach_ctx: Option<crate::broker::AttachContext>,
 ) -> anyhow::Result<()> {
     loop {
-        // Acquire this iteration's pipe handle: either consume the seed
-        // FIRST_PIPE_INSTANCE handle (worker-0, very first iteration), or
-        // create a fresh instance.
+        // Acquire this iteration's pipe handle: consume the seed
+        // FIRST_PIPE_INSTANCE handle (worker-0, first iteration), else create a fresh instance.
         let ph: isize = if let Some(h) = initial_ph.take() {
             h
         } else {
@@ -306,26 +303,35 @@ async fn accept_worker(
             continue;
         }
         let root_pid_snapshot = root_target_pid.load(Ordering::Acquire);
-        if !is_owned_client_pid(client_pid, root_pid_snapshot) {
-            if jsonl_log::console_verbose() {
-                eprintln!(
-                    "[pipe] WARN: rejecting connection from non-owned pid={client_pid} \
-                     (root_target_pid={root_pid_snapshot})",
-                );
-            }
-            stats.violations.fetch_add(1, Ordering::Relaxed);
-            hot_stats
-                .totals
-                .violations
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            jsonl_log::log_immediate(jsonl_log::Event::violation(
-                client_pid,
-                "PipeClientNotOwned",
-                &format!("root_target_pid={root_pid_snapshot}"),
-            ));
-            // SAFETY: ph is the isize repr of our pipe handle.
-            unsafe { DisconnectNamedPipe(HANDLE(ph as *mut _)).ok() };
-            unsafe { CloseHandle(HANDLE(ph as *mut _)).ok() };
+        let has_folder_job = folder_job.is_some();
+        if !is_owned_client_pid(client_pid, root_pid_snapshot, folder_job.as_deref()) {
+            // MP-3/MP-9: one shot at Attach/PolicyMutate — mutate::handle_preadmission_connection.
+            let (attach_ctx, folder_job2) = (attach_ctx.clone(), folder_job.clone());
+            let (policy2, reg_policy2) = (Arc::clone(&policy), Arc::clone(&reg_policy));
+            let (stats2, hot_stats2) = (Arc::clone(&stats), Arc::clone(&hot_stats));
+            tokio::task::spawn_blocking(move || {
+                let _guard = PipeConnGuard { raw: ph };
+                let h = HANDLE(ph as *mut _);
+                let handled = folder_job2.as_deref().is_some_and(|job| mutate::handle_preadmission_connection(
+                    h, client_pid, job, attach_ctx.as_ref(), Some(policy2.as_ref()), Some(reg_policy2.as_ref()),
+                ));
+                if handled {
+                    return;
+                }
+                if jsonl_log::console_verbose() {
+                    eprintln!(
+                        "[pipe] WARN: rejecting connection from non-owned pid={client_pid} \
+                         (root_target_pid={root_pid_snapshot}, folder_job={has_folder_job})",
+                    );
+                }
+                stats2.violations.fetch_add(1, Ordering::Relaxed);
+                hot_stats2.totals.violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                jsonl_log::log_immediate(jsonl_log::Event::violation(
+                    client_pid,
+                    "PipeClientNotOwned",
+                    &format!("root_target_pid={root_pid_snapshot} folder_job={has_folder_job}"),
+                ));
+            });
             continue;
         }
 
@@ -428,10 +434,9 @@ fn handle_connection(
             }
         }
 
-        // Read one request with the in-flight byte budget applied (prefix
-        // read, budget reservation and PrefixedReader replay live in conn.rs).
-        // None → drop the connection; the reservation stays bound for the rest
-        // of this iteration, released at the next rebind / loop exit.
+        // Read one request with the in-flight byte budget applied (prefix read, budget
+        // reservation and PrefixedReader replay live in conn.rs). None → drop the connection;
+        // the reservation stays bound for the rest of this iteration, released at the next rebind / loop exit.
         let Some((req, _budget)) =
             conn::read_request_with_budget(&mut file, byte_budget, &mut recv_buf, client_pid)
         else {
@@ -510,9 +515,13 @@ fn handle_connection(
                             };
                             map.insert(client_pid, updated);
                         } else {
-                            // New process — insert with depth 0 (updated by SpawnedChild if child)
+                            // New process (MP-4): resolve depth via ancestor
+                            // walk, not a naive 0 — finds a tracked ancestor
+                            // (SpawnedChild race, or a job-admitted guest of
+                            // another session), else conservative u8::MAX.
+                            let depth = resolve_new_entry_depth(client_pid);
                             map.insert(client_pid, crate::sandbox::proc_table::ProcInfo {
-                                depth: 0,
+                                depth,
                                 exe_lower: Arc::from(exe_lower.as_str()),
                                 create_time: live_ct,
                             });
@@ -649,7 +658,7 @@ fn handle_connection(
                         Some(k) => {
                             // S11: canonical NTFS-identity fold, matching the db's when.exe key fold.
                             let kl = crate::fold_published(&k);
-                            let mismatch = kl != crate::fold_published(&child_exe);
+                            let mismatch = !exe_paths_match(&child_exe, &kl); // tolerates literal `..` (#107)
                             (kl, mismatch)
                         }
                         None => (crate::fold_published(&child_exe), false),
@@ -965,6 +974,13 @@ fn handle_connection(
                 }
                 Resp::MemDecision { allow: false }
             }
+            // MP-3/6/9: pre-admission only (mutate::handle_preadmission_connection).
+            Req::Attach { .. } => Resp::Err("attach: not valid on an admitted connection".into()),
+            Req::PolicyMutate { .. } => Resp::Err("policy mutate: not valid on an admitted connection".into()),
+            Req::LauncherLog { .. } | Req::SessionStats => Resp::Err("launcher_log/session_stats: not valid on a guest connection".into()),
+            // MP-8: Ping (Attach session loop or pre-admission) / BrokerStatus (pre-admission only) — neither valid here.
+            Req::Ping => Resp::Err("ping: not valid on a guest connection".into()),
+            Req::BrokerStatus => Resp::Err("broker_status: not valid on a guest connection".into()),
         };
 
         if ipc::write_msg_with_buf(&mut file, &resp, &mut enc_buf).is_err() {

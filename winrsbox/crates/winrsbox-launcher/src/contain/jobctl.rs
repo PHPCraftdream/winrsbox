@@ -5,6 +5,21 @@
 //   - Optional memory limit per-process
 //   - Optional DIE_ON_UNHANDLED_EXCEPTION
 //   - UI restrictions: block foreign window handles, clipboard, desktop access
+//
+// Also owns `FolderJob` (below `JobLimits`/`UiRestrictions`): the RAII
+// wrapper around the MP-1 folder-level Job Object
+// (`docs/multiprocess-broker-plan.md`) — same "Job Object" concern, just an
+// unconfigured, unnamed one used for kernel-truth membership checks
+// (`IsProcessInJob`) rather than limit enforcement.
+
+use anyhow::{Context, Result};
+use windows::core::{PCWSTR, BOOL};
+use windows::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_HANDLE_OPTIONS, HANDLE};
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JobObjectBasicAccountingInformation,
+    QueryInformationJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+};
+use windows::Win32::System::Threading::GetCurrentProcess;
 
 /// Configuration for Job Object limits.
 #[derive(Debug, Clone)]
@@ -177,9 +192,263 @@ impl UiRestrictions {
     }
 }
 
+// ─── Folder job (MP-1) ──────────────────────────────────────────────────────
+
+// windows-rs 0.61 doesn't expose JOB_OBJECT_* access-right constants (only
+// the limit-flag/UI-restriction types used above); raw bits from the
+// documented Job Object access rights, not limit flags.
+const JOB_OBJECT_ASSIGN_PROCESS: u32 = 0x0001;
+const JOB_OBJECT_QUERY: u32 = 0x0004;
+
+/// Access mask handed to a joining launcher's duplicated folder-job handle:
+/// `JOB_OBJECT_QUERY` for `IsProcessInJob` (`JOB_OBJECT_ASSIGN_PROCESS`
+/// alone yields `ERROR_ACCESS_DENIED` — confirmed empirically in MP-0 §3),
+/// `JOB_OBJECT_ASSIGN_PROCESS` to place its own guest in the folder job.
+pub const FOLDER_JOB_CLIENT_ACCESS: u32 = JOB_OBJECT_ASSIGN_PROCESS | JOB_OBJECT_QUERY;
+
+/// RAII owner of the folder's Job Object: no limits, no
+/// `KILL_ON_JOB_CLOSE`, no `BREAKAWAY_OK` — literally no
+/// `SetInformationJobObject` call at all (breakaway is denied by the OS
+/// default when nothing is configured, confirmed in MP-0 §1). Purpose is
+/// kernel-enforced "is this process one of ours" via `IsProcessInJob`,
+/// never process termination — that's the (nested) session job's role.
+pub struct FolderJob {
+    handle: HANDLE,
+}
+
+impl FolderJob {
+    /// Create a new, unnamed folder job with no limits configured.
+    pub fn create() -> Result<Self> {
+        // SAFETY: no security attributes, no name — a private job object
+        //         owned by this process.
+        let handle = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
+            .context("CreateJobObjectW(folder job)")?;
+        Ok(Self { handle })
+    }
+
+    /// The raw handle, valid only in this process.
+    pub fn handle(&self) -> HANDLE {
+        self.handle
+    }
+
+    /// Wrap an ALREADY-open job handle this process now owns exclusively
+    /// (e.g. one `Attach` duplicated in) instead of creating a new kernel
+    /// job object via [`create`](Self::create). MP-7: a failover winner
+    /// reuses the SAME folder job every client already held a working
+    /// handle to — job objects are independent kernel objects that outlive
+    /// whichever process created them for as long as any handle stays open
+    /// (confirmed MP-0 §1/§2), so wrapping, never re-creating, is correct.
+    ///
+    /// # Safety
+    /// `handle` must be a valid, currently-open job-object handle that this
+    /// process now owns exclusively — no other code path will close it.
+    /// `Drop` closes it exactly once.
+    pub unsafe fn from_raw_owned(handle: HANDLE) -> Self {
+        Self { handle }
+    }
+
+    /// Assign `process` into the folder job (nested alongside whatever job
+    /// it may already belong to — folder job -> session job is the
+    /// intended two-level nesting, MP-0 §1).
+    pub fn assign_process(&self, process: HANDLE) -> Result<()> {
+        // SAFETY: self.handle and process are both valid handles (caller's
+        //         contract for `process`).
+        unsafe { AssignProcessToJobObject(self.handle, process) }
+            .context("AssignProcessToJobObject(folder job)")
+    }
+
+    /// Kernel-truth membership check. Breakaway is denied by construction,
+    /// so membership cannot be faked by anything running inside the job.
+    pub fn contains(&self, process: HANDLE) -> Result<bool> {
+        let mut result = BOOL(0);
+        // SAFETY: self.handle is a valid job handle; process must be a
+        //         valid handle (caller's contract); result is a valid
+        //         out-pointer.
+        unsafe { IsProcessInJob(process, Some(self.handle), &mut result) }
+            .context("IsProcessInJob")?;
+        Ok(result.as_bool())
+    }
+
+    /// MP-8: kernel-truth count of live processes currently in this job
+    /// (`JobObjectBasicAccountingInformation.ActiveProcesses`) — used by
+    /// `winrsbox broker status` (`Req::BrokerStatus`) to report "processes
+    /// in this folder" without a self-reported counter anyone could get out
+    /// of sync with reality. Same query `sandbox::child_drain::drain_own_job`
+    /// already issues against a (session, not folder) job.
+    pub fn active_processes(&self) -> Result<u32> {
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        let mut returned = 0u32;
+        // SAFETY: self.handle is a valid job handle; info is sized for
+        //         JobObjectBasicAccountingInformation; returned is a valid
+        //         out-pointer.
+        unsafe {
+            QueryInformationJobObject(
+                Some(self.handle),
+                JobObjectBasicAccountingInformation,
+                &mut info as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                Some(&mut returned),
+            )
+        }
+        .context("QueryInformationJobObject(folder job, BasicAccounting)")?;
+        Ok(info.ActiveProcesses)
+    }
+
+    /// Duplicate this job handle into `target_process`'s handle table with
+    /// exactly `access` rights (see [`FOLDER_JOB_CLIENT_ACCESS`]). The
+    /// returned `HANDLE` value is only meaningful INSIDE `target_process` —
+    /// delivering it there is an IPC concern (MP-3), not this function's.
+    pub fn duplicate_into(&self, target_process: HANDLE, access: u32) -> Result<HANDLE> {
+        let mut dup = HANDLE::default();
+        // SAFETY: self.handle is a valid job handle owned by this process;
+        //         target_process must be a valid, open process handle
+        //         (caller's contract); dup is a valid out-pointer.
+        unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                self.handle,
+                target_process,
+                &mut dup,
+                access,
+                false,
+                DUPLICATE_HANDLE_OPTIONS(0),
+            )
+        }
+        .context("DuplicateHandle(folder job -> target process)")?;
+        Ok(dup)
+    }
+}
+
+/// Assign `process` into the job named by `job` — a free-function twin of
+/// [`FolderJob::assign_process`] for a caller that only has a raw handle
+/// (MP-6: a client's duplicated `folder_job_handle` from `Attach`, not an
+/// owned `FolderJob`). Same underlying call, same MP-0 §1 nesting contract
+/// (folder job assigned before the session job).
+///
+/// # Safety
+/// `job` must be a valid, open job-object handle with at least
+/// `JOB_OBJECT_ASSIGN_PROCESS` access for the duration of this call;
+/// `process` must be a valid, open process handle.
+pub unsafe fn assign_process_to_raw_job(job: HANDLE, process: HANDLE) -> Result<()> {
+    // SAFETY: forwarded from the caller's contract above.
+    unsafe { AssignProcessToJobObject(job, process) }.context("AssignProcessToJobObject(folder job)")
+}
+
+impl Drop for FolderJob {
+    fn drop(&mut self) {
+        if !self.handle.is_invalid() {
+            // SAFETY: handle was created by CreateJobObjectW above and is
+            //         closed exactly once here.
+            unsafe { CloseHandle(self.handle).ok() };
+        }
+    }
+}
+
+// SAFETY: a job object handle has no thread affinity; every operation above
+//         is a documented kernel call safe to issue from any thread.
+unsafe impl Send for FolderJob {}
+unsafe impl Sync for FolderJob {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Child, Command};
+    use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    // ─── FolderJob ───────────────────────────────────────────────────────
+
+    fn spawn_sleeper() -> Child {
+        // Real, short-lived child process with a live HANDLE we can assign
+        // to a job and probe with IsProcessInJob. No console window.
+        Command::new("cmd")
+            .args(["/C", "ping -n 3 127.0.0.1 >nul"])
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .spawn()
+            .expect("spawn ping child")
+    }
+
+    fn handle_of(child: &Child) -> HANDLE {
+        HANDLE(child.as_raw_handle())
+    }
+
+    fn kill_and_reap(mut child: Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn assigned_process_is_contained_unrelated_process_is_not() {
+        let job = FolderJob::create().expect("create folder job");
+        let member = spawn_sleeper();
+        let outsider = spawn_sleeper();
+
+        job.assign_process(handle_of(&member)).expect("assign member");
+
+        assert!(
+            job.contains(handle_of(&member)).expect("contains(member)"),
+            "assigned process must be reported as contained"
+        );
+        assert!(
+            !job.contains(handle_of(&outsider)).expect("contains(outsider)"),
+            "process never assigned to this job must not be reported as contained"
+        );
+
+        kill_and_reap(member);
+        kill_and_reap(outsider);
+    }
+
+    #[test]
+    fn active_processes_counts_assigned_members_only() {
+        let job = FolderJob::create().expect("create folder job");
+        assert_eq!(job.active_processes().expect("active_processes on empty job"), 0);
+
+        let member_a = spawn_sleeper();
+        let member_b = spawn_sleeper();
+        let outsider = spawn_sleeper();
+        job.assign_process(handle_of(&member_a)).expect("assign member_a");
+        job.assign_process(handle_of(&member_b)).expect("assign member_b");
+
+        assert_eq!(
+            job.active_processes().expect("active_processes with two members"),
+            2,
+            "count must reflect only processes actually assigned to this job"
+        );
+
+        kill_and_reap(member_a);
+        kill_and_reap(member_b);
+        kill_and_reap(outsider);
+    }
+
+    #[test]
+    fn duplicated_handle_with_client_access_still_answers_is_process_in_job() {
+        let job = FolderJob::create().expect("create folder job");
+        let member = spawn_sleeper();
+        job.assign_process(handle_of(&member)).expect("assign member");
+
+        // Duplicate into our OWN process (a stand-in for "a launcher
+        // process" — the duplicated value is only meaningful in the target
+        // process, and using ourselves as the target lets the test use it
+        // directly without a second real process).
+        let dup = job
+            .duplicate_into(unsafe { GetCurrentProcess() }, FOLDER_JOB_CLIENT_ACCESS)
+            .expect("duplicate_into(self, CLIENT_ACCESS)");
+
+        let mut result = BOOL(0);
+        // SAFETY: dup is the handle just duplicated above with QUERY rights;
+        //         member's handle is valid; result is a valid out-pointer.
+        unsafe { IsProcessInJob(handle_of(&member), Some(dup), &mut result) }
+            .expect("IsProcessInJob via duplicated QUERY handle");
+        assert!(result.as_bool());
+
+        // SAFETY: dup was returned by DuplicateHandle above and is closed
+        //         exactly once here.
+        unsafe { CloseHandle(dup).ok() };
+        kill_and_reap(member);
+    }
+
+    // ─── JobLimits / UiRestrictions ─────────────────────────────────────
 
     #[test]
     fn default_has_kill_on_close() {

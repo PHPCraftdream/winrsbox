@@ -36,6 +36,10 @@ pub(crate) struct EffectiveConfig {
     pub(crate) launcher_create_time: u64,
     pub(crate) allow_rwx: bool,
     pub(crate) disable_hooks: String,
+    /// Name of the per-folder broker section (MP-5). Empty ⇒ no folder
+    /// broker for this session — the hook uses `pipe_name`/`launcher_pid`
+    /// above (single-broker/legacy mode) instead of a live `snapshot()`.
+    pub(crate) folder_section_name: String,
 }
 
 /// Resolve the effective install-time configuration from the trusted session
@@ -62,6 +66,7 @@ pub(crate) fn resolve_effective_config(section: Option<&ipc::SessionConfig>) -> 
             launcher_create_time: cfg.launcher_create_time,
             allow_rwx: cfg.allow_rwx,
             disable_hooks: cfg.disable_hooks.clone(),
+            folder_section_name: cfg.folder_section_name.clone(),
         },
         None => fail_closed(),
     }
@@ -83,6 +88,7 @@ fn fail_closed() -> EffectiveConfig {
         launcher_create_time: 0,
         allow_rwx: false,
         disable_hooks: String::new(),
+        folder_section_name: String::new(),
     }
 }
 
@@ -102,20 +108,33 @@ pub(crate) static TRUSTED_LAUNCHER_PID: std::sync::atomic::AtomicU32 =
 pub(crate) static TRUSTED_LAUNCHER_CREATE_TIME: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Verify that the SERVER side of the connected pipe is the pinned launcher
-/// process before trusting anything it says (review XA 2026-09-20, S02 #1
-/// remainder). Without this, anything that can set the child's environment
-/// before hook install (a hostile parent) points the hook at an attacker
-/// pipe answering `Decision::Passthrough` to every path.
+/// Verify that the SERVER side of the connected pipe is trusted before
+/// trusting anything it says (review XA 2026-09-20, S02 #1 remainder;
+/// extended for MP-5's per-folder broker set). Without this, anything that
+/// can set the child's environment before hook install (a hostile parent)
+/// points the hook at an attacker pipe answering `Decision::Passthrough` to
+/// every path.
 ///
-/// Fails closed when: no identity is pinned, the server PID cannot be
-/// queried, the PID differs from the pin, or (PID-reuse defence) the live
-/// process's kernel creation time differs from the pinned one.
+/// Two disjoint paths, chosen by whether a folder section is configured for
+/// this session (`ipc_client::folder_section_view()`):
+///
+/// * **Folder section present (MP-5)**: the server must be the broker OR a
+///   tracked launcher in the freshest `snapshot()` of the trusted-launcher
+///   set — not the single PID pinned below. A snapshot read failure (torn
+///   section, stuck-odd seqlock) fails closed immediately: this is NOT a
+///   signal to fall back to the legacy pinned-PID path below, since that
+///   would trust a possibly-stale single identity instead of reporting the
+///   real failure.
+/// * **No folder section**: the original single pinned `(pid, create_time)`
+///   check — unchanged from before MP-5.
+///
+/// Fails closed when: no identity is pinned/trusted, the server PID cannot
+/// be queried, the PID isn't in the trusted set, or (PID-reuse defence) the
+/// live process's kernel creation time differs from every trusted entry —
+/// including the case where the live creation time reads back as zero,
+/// which must never be treated as a wildcard match against a similarly
+/// unpopulated/default section entry.
 pub(crate) fn verify_pipe_server_identity(client: &ipc::SyncClient) -> Result<(), String> {
-    let expected_pid = TRUSTED_LAUNCHER_PID.load(std::sync::atomic::Ordering::Relaxed);
-    if expected_pid == 0 {
-        return Err("no trusted launcher identity pinned — refusing to trust pipe server".into());
-    }
     let mut actual_pid: u32 = 0;
     // SAFETY: the raw handle is the client's own live pipe handle, valid for
     // the duration of the borrow; `actual_pid` is a valid out-pointer.
@@ -133,6 +152,22 @@ pub(crate) fn verify_pipe_server_identity(client: &ipc::SyncClient) -> Result<()
             "pipe server PID unqueryable (GetNamedPipeServerProcessId failed, ok={ok})"
         ));
     }
+
+    if let Some(view) = crate::ipc_client::folder_section_view() {
+        let snapshot = view
+            .snapshot()
+            .map_err(|e| format!("folder section snapshot failed: {e}"))?;
+        let actual_ct = match crate::process_tracker::query_process_create_time(actual_pid) {
+            None => return Err("pipe server process unqueryable".into()),
+            Some(ct) => ct,
+        };
+        return folder_section_trust_check(&snapshot, actual_pid, actual_ct);
+    }
+
+    let expected_pid = TRUSTED_LAUNCHER_PID.load(std::sync::atomic::Ordering::Relaxed);
+    if expected_pid == 0 {
+        return Err("no trusted launcher identity pinned — refusing to trust pipe server".into());
+    }
     if actual_pid != expected_pid {
         return Err(format!(
             "pipe server PID {actual_pid} != trusted launcher PID {expected_pid}"
@@ -149,6 +184,34 @@ pub(crate) fn verify_pipe_server_identity(client: &ipc::SyncClient) -> Result<()
             }
             Some(_) => {}
         }
+    }
+    Ok(())
+}
+
+/// The MP-5 trust decision against a folder-section snapshot, pulled out of
+/// [`verify_pipe_server_identity`] as a pure function (no Windows API calls)
+/// so the full match matrix — trusted broker, trusted launcher, PID outside
+/// the set, PID match with a mismatched create_time, and a zero create_time
+/// — is directly unit-testable without a live pipe/process for every case.
+///
+/// `actual_create_time == 0` is rejected unconditionally, even if some
+/// section entry also reads zero (e.g. an unpopulated/default slot): treating
+/// that as a match would be a silent wildcard, the exact bypass shape the
+/// pre-MP-5 `expected_ct == 0` skip allowed on the legacy single-PID path.
+fn folder_section_trust_check(
+    snapshot: &ipc::FolderSectionSnapshot,
+    actual_pid: u32,
+    actual_create_time: u64,
+) -> Result<(), String> {
+    if actual_create_time == 0 {
+        return Err("pipe server process reports zero creation time — refusing to trust".into());
+    }
+    if !snapshot.is_trusted_server(actual_pid, actual_create_time) {
+        return Err(format!(
+            "pipe server (pid={actual_pid}, create_time={actual_create_time:#018x}) not in \
+             folder section trusted set (generation {})",
+            snapshot.generation
+        ));
     }
     Ok(())
 }
@@ -189,6 +252,19 @@ pub(crate) fn apply_effective_config(cfg: &EffectiveConfig) {
     TRUSTED_LAUNCHER_PID.store(cfg.launcher_pid, std::sync::atomic::Ordering::Relaxed);
     TRUSTED_LAUNCHER_CREATE_TIME
         .store(cfg.launcher_create_time, std::sync::atomic::Ordering::Relaxed);
+    // MP-5: open+map the folder broker section once, here, at install time.
+    // Called from install_hooks under DllMain's loader lock — see
+    // `ipc_client::open_folder_section`'s doc for why that's safe (plain
+    // kernel32 calls, no LoadLibrary, same pattern the session section load
+    // one step earlier in install_hooks already uses). A failure here is
+    // logged and otherwise non-fatal: `folder_section_view()` stays `None`
+    // and every caller falls back to the pinned `TRUSTED_LAUNCHER_PID`/
+    // `PIPE_NAME` values set just above, from the same trusted section.
+    if !cfg.folder_section_name.is_empty() {
+        if let Err(e) = crate::ipc_client::open_folder_section(&cfg.folder_section_name) {
+            crate::ipc_client::fail_log(&format!("folder section open failed: {e}"));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -208,6 +284,7 @@ mod tests {
             launcher_create_time: 0,
             allow_rwx: true,
             disable_hooks: "reg,net".into(),
+            folder_section_name: r"Local\WinRsBoxFolder-test".into(),
         }
     }
 
@@ -231,6 +308,7 @@ mod tests {
         assert_eq!(eff.launcher_create_time, cfg.launcher_create_time);
         assert!(eff.allow_rwx);
         assert_eq!(eff.disable_hooks, "reg,net");
+        assert_eq!(eff.folder_section_name, cfg.folder_section_name);
     }
 
     /// Absent section ⇒ fail closed: strongest guard tier, everything empty
@@ -252,6 +330,7 @@ mod tests {
         assert_eq!(eff.launcher_create_time, 0);
         assert!(!eff.allow_rwx);
         assert!(eff.disable_hooks.is_empty());
+        assert!(eff.folder_section_name.is_empty());
     }
 }
 
@@ -270,8 +349,46 @@ mod pipe_server_identity_tests {
 
     static IDENTITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn identity_lock() -> std::sync::MutexGuard<'static, ()> {
-        IDENTITY_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    /// Holds BOTH the local atomics lock and the shared
+    /// `FOLDER_SECTION_OVERRIDE_LOCK` (see that static's doc in
+    /// `ipc_client::folder_section_client`): every test here calls
+    /// `verify_pipe_server_identity`, which reads `folder_section_view()`,
+    /// so even a legacy-path test that never touches the override must
+    /// still block a concurrent folder-section test in the other module
+    /// from flipping it mid-run.
+    fn identity_lock() -> (
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        (
+            IDENTITY_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+            crate::ipc_client::FOLDER_SECTION_OVERRIDE_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
+    }
+
+    /// Heap-backed, 8-byte-aligned stand-in for a mapped folder section —
+    /// same technique as `ipc_client::folder_section_client`'s own tests
+    /// (that module's doc explains why a `Vec<u64>` and not the private
+    /// `RawFolderSection` type).
+    fn folder_section_storage() -> Vec<u64> {
+        vec![0u64; ipc::FOLDER_SECTION_SIZE.div_ceil(8)]
+    }
+
+    fn folder_section_view_of(storage: &mut [u64]) -> ipc::FolderSectionView {
+        let ptr = storage.as_mut_ptr().cast::<u8>();
+        // SAFETY: storage holds ipc::FOLDER_SECTION_SIZE.div_ceil(8) u64
+        // words (>= FOLDER_SECTION_SIZE bytes), 8-byte aligned by Vec<u64>'s
+        // own allocation guarantee; the caller keeps `storage` alive for at
+        // least as long as the returned view is used.
+        unsafe { ipc::FolderSectionView::new(ptr) }
+    }
+
+    fn set_folder_section_override(view: Option<ipc::FolderSectionView>) {
+        *crate::ipc_client::FOLDER_SECTION_TEST_OVERRIDE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = view;
     }
 
     /// Create a live pipe-server instance with a unique-per-test name and
@@ -366,5 +483,183 @@ mod pipe_server_identity_tests {
         TRUSTED_LAUNCHER_CREATE_TIME.store(0, std::sync::atomic::Ordering::Relaxed);
         let err = verify_pipe_server_identity(&client).unwrap_err();
         assert!(err.contains("no trusted launcher identity pinned"), "got: {err}");
+    }
+
+    // ── MP-5: folder-section path ───────────────────────────────────────────
+    //
+    // These exercise verify_pipe_server_identity end-to-end (real pipe, real
+    // process) with a folder section installed via the ipc_client test seam
+    // (FOLDER_SECTION_TEST_OVERRIDE) instead of TRUSTED_LAUNCHER_PID/
+    // _CREATE_TIME — the folder-section branch never reads those atomics.
+
+    /// Trusted broker identity in the section ⇒ accept.
+    #[test]
+    fn verify_accepts_broker_from_folder_section() {
+        let _lock = identity_lock();
+        let (_server, client, _name) = connected_client(line!());
+        let mut storage = folder_section_storage();
+        let view = folder_section_view_of(&mut storage);
+        view.init(std::process::id(), own_create_time(), "p").expect("init");
+        set_folder_section_override(Some(view));
+
+        assert_eq!(verify_pipe_server_identity(&client), Ok(()));
+
+        set_folder_section_override(None);
+    }
+
+    /// A tracked launcher (not the broker) in the section's trusted set ⇒
+    /// accept — the whole point of MP-5's set-of-launchers over a single PID.
+    #[test]
+    fn verify_accepts_tracked_launcher_from_folder_section() {
+        let _lock = identity_lock();
+        let (_server, client, _name) = connected_client(line!());
+        let mut storage = folder_section_storage();
+        let view = folder_section_view_of(&mut storage);
+        // Broker is some other (non-existent) identity; the live test process
+        // is trusted only via the launcher-set entry.
+        view.init(0xFFFF_FFFE, 0xDEAD_BEEF, "p").expect("init");
+        view.add_launcher(std::process::id(), own_create_time()).expect("add_launcher");
+        set_folder_section_override(Some(view));
+
+        assert_eq!(verify_pipe_server_identity(&client), Ok(()));
+
+        set_folder_section_override(None);
+    }
+
+    /// The live PID is neither the broker nor any tracked launcher ⇒ reject.
+    #[test]
+    fn verify_rejects_pid_outside_folder_section_set() {
+        let _lock = identity_lock();
+        let (_server, client, _name) = connected_client(line!());
+        let mut storage = folder_section_storage();
+        let view = folder_section_view_of(&mut storage);
+        view.init(0xFFFF_FFFE, 0xDEAD_BEEF, "p").expect("init");
+        view.add_launcher(0xFFFF_FFFD, 0x00C0_FFEE).expect("add_launcher");
+        set_folder_section_override(Some(view));
+
+        let err = verify_pipe_server_identity(&client).unwrap_err();
+        assert!(err.contains("not in"), "got: {err}");
+
+        set_folder_section_override(None);
+    }
+
+    /// PID matches the broker but the live creation time doesn't (PID reuse,
+    /// folder-section flavor) ⇒ reject.
+    #[test]
+    fn verify_rejects_pid_match_create_time_mismatch_in_folder_section() {
+        let _lock = identity_lock();
+        let (_server, client, _name) = connected_client(line!());
+        let mut storage = folder_section_storage();
+        let view = folder_section_view_of(&mut storage);
+        view.init(std::process::id(), 0x0000_1234_5678_9abc, "p").expect("init");
+        set_folder_section_override(Some(view));
+
+        let err = verify_pipe_server_identity(&client).unwrap_err();
+        assert!(err.contains("not in"), "got: {err}");
+
+        set_folder_section_override(None);
+    }
+
+    /// A section stuck with an odd generation (writer crashed mid-write)
+    /// must fail closed on `snapshot()` — NOT silently fall back to the
+    /// legacy pinned-PID path, even if TRUSTED_LAUNCHER_PID happens to be
+    /// set to the live PID (proving the folder-section branch really is
+    /// exclusive of the legacy one, not merely additive).
+    #[test]
+    fn verify_rejects_when_folder_section_generation_stuck_odd() {
+        let _lock = identity_lock();
+        let (_server, client, _name) = connected_client(line!());
+        let mut storage = folder_section_storage();
+        let view = folder_section_view_of(&mut storage);
+        view.init(std::process::id(), own_create_time(), "p").expect("init");
+        // Force the seqlock generation permanently odd, as if a writer
+        // crashed mid-write. Offsets per folder_section's own module doc:
+        // magic:u32 @0, version:u32 @4, generation:u64 @8 (no padding).
+        // SAFETY: storage is a valid, live mapping for this view; offset 8
+        // is `generation`'s documented repr(C) position.
+        unsafe {
+            let gen_ptr = storage.as_mut_ptr().cast::<u8>().add(8).cast::<u64>();
+            std::sync::atomic::AtomicU64::from_ptr(gen_ptr)
+                .store(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        set_folder_section_override(Some(view));
+        TRUSTED_LAUNCHER_PID.store(std::process::id(), std::sync::atomic::Ordering::Relaxed);
+        TRUSTED_LAUNCHER_CREATE_TIME.store(own_create_time(), std::sync::atomic::Ordering::Relaxed);
+
+        let err = verify_pipe_server_identity(&client).unwrap_err();
+        assert!(
+            err.contains("snapshot failed"),
+            "a stuck seqlock must fail closed with a snapshot error, not fall back \
+             silently to the legacy pinned-PID path (which would have accepted \
+             this exact PID/create_time): got {err}"
+        );
+
+        set_folder_section_override(None);
+    }
+}
+
+#[cfg(test)]
+mod folder_section_trust_check_tests {
+    //! Pure unit coverage for `folder_section_trust_check` — no live pipe or
+    //! process needed, so the zero-create-time case (impossible to induce
+    //! against a REAL process via `query_process_create_time`, which never
+    //! returns 0 for a live process) is directly testable here.
+
+    use super::*;
+
+    fn snapshot_with(
+        broker: (u32, u64),
+        launchers: Vec<(u32, u64)>,
+    ) -> ipc::FolderSectionSnapshot {
+        let mut storage = vec![0u64; ipc::FOLDER_SECTION_SIZE.div_ceil(8)];
+        let ptr = storage.as_mut_ptr().cast::<u8>();
+        // SAFETY: storage is sized/aligned per FolderSectionView::new's
+        // contract and outlives the view built from it (both local to this
+        // function; the returned Snapshot is an owned copy).
+        let view = unsafe { ipc::FolderSectionView::new(ptr) };
+        view.init(broker.0, broker.1, "p").expect("init");
+        for (pid, ct) in launchers {
+            view.add_launcher(pid, ct).expect("add_launcher");
+        }
+        view.snapshot().expect("snapshot")
+    }
+
+    #[test]
+    fn trusts_the_broker() {
+        let snap = snapshot_with((10, 100), vec![]);
+        assert_eq!(folder_section_trust_check(&snap, 10, 100), Ok(()));
+    }
+
+    #[test]
+    fn trusts_a_tracked_launcher() {
+        let snap = snapshot_with((10, 100), vec![(20, 200)]);
+        assert_eq!(folder_section_trust_check(&snap, 20, 200), Ok(()));
+    }
+
+    #[test]
+    fn rejects_pid_outside_the_set() {
+        let snap = snapshot_with((10, 100), vec![(20, 200)]);
+        let err = folder_section_trust_check(&snap, 30, 300).unwrap_err();
+        assert!(err.contains("not in"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_matching_pid_with_mismatched_create_time() {
+        let snap = snapshot_with((10, 100), vec![]);
+        let err = folder_section_trust_check(&snap, 10, 999).unwrap_err();
+        assert!(err.contains("not in"), "got: {err}");
+    }
+
+    /// The bypass this function exists to close: a zero live creation time
+    /// must never be trusted, even against a snapshot whose own default/
+    /// unpopulated entries also read zero (which, absent this check, would
+    /// make `is_trusted_server(pid, 0)` a wildcard match).
+    #[test]
+    fn rejects_zero_actual_create_time_even_against_a_zeroed_default_entry() {
+        // A freshly-init'd-then-untouched slot pattern: broker_create_time
+        // left at 0 is achievable directly since init() takes it verbatim.
+        let snap = snapshot_with((10, 0), vec![]);
+        let err = folder_section_trust_check(&snap, 10, 0).unwrap_err();
+        assert!(err.contains("zero creation time"), "got: {err}");
     }
 }

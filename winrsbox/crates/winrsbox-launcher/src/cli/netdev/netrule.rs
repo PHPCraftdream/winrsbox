@@ -67,7 +67,7 @@ fn parse_net_mode(s: &str) -> Result<NetMode> {
 }
 
 fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
     let host = find_arg(args, "--host=")
         .ok_or_else(|| anyhow::anyhow!("netrule add: --host required"))?
         .to_lowercase();
@@ -79,23 +79,29 @@ fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         crate::cli::id::generate_id("netrule", &[&host, &port_str])
     });
     let rule = NetRule { id: id.clone(), host_pattern: host, port, mode };
-    policy::db::net_rule_upsert(&db, &rule)?;
+    backend.exec(policy::db::PolicyOp::NetRuleUpsert(rule))?;
     println!("{id}");
     Ok(())
 }
 
 fn run_remove(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
     let id = find_arg(args, "--id=").ok_or_else(|| anyhow::anyhow!("netrule remove: --id required"))?;
-    if !policy::db::net_rule_remove(&db, id)? {
+    let removed = matches!(
+        backend.exec(policy::db::PolicyOp::NetRuleRemove(id.to_string()))?,
+        policy::db::PolicyOpResult::Bool(true)
+    );
+    if !removed {
         bail!("netrule: rule '{}' not found", id);
     }
     Ok(())
 }
 
 fn run_list(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
-    let rules = policy::db::net_rule_list(&db)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
+    let policy::db::PolicyOpResult::NetRules(rules) = backend.exec(policy::db::PolicyOp::NetRuleList)? else {
+        anyhow::bail!("netrule list: unexpected backend response");
+    };
     if has_flag(args, "--json") {
         let out = serde_json::json!({
             "schema_version": 1,
@@ -116,8 +122,8 @@ fn run_list(args: &[String], state_dir: &std::path::Path) -> Result<()> {
 
 fn run_clear(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     if !has_flag(args, "--force") { bail!("netrule clear: requires --force"); }
-    let db = crate::cli::open_db(state_dir)?;
-    policy::db::net_rule_clear(&db)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
+    backend.exec(policy::db::PolicyOp::NetRuleClear)?;
     Ok(())
 }
 

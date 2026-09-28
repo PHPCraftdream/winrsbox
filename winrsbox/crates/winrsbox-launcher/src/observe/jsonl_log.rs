@@ -19,6 +19,9 @@ const MAX_BUFFER: usize = 256;
 
 static LOGGER: std::sync::OnceLock<JsonlLogger> = std::sync::OnceLock::new();
 static LOG_LEVEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2); // info
+/// MP-6: client-role alternative sink to `LOGGER` — see `init_remote`.
+static REMOTE_SENDER: std::sync::OnceLock<Mutex<Box<dyn FnMut(String) + Send>>> =
+    std::sync::OnceLock::new();
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -42,6 +45,47 @@ pub fn init(log_path: PathBuf, level: &str) {
 
 fn level_enabled(level: LogLevel) -> bool {
     level as u8 <= LOG_LEVEL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// MP-6: client-launcher alternative to `init` — this process owns no
+/// `sandbox.log.jsonl` of its own (only the broker does; see
+/// `docs/multiprocess-broker-plan.md`, "Логи и статистика"), so every event
+/// it would otherwise have buffered locally is instead handed to `sender`,
+/// pre-serialized to one JSON line, for the caller to forward to the broker
+/// (`ipc::Req::LauncherLog` over the Attach connection — see `main::client`).
+/// Level gating and `log_immediate`'s always-log behaviour are unchanged;
+/// only the sink differs. Like `init`, calling this a second time is a
+/// silent no-op (`OnceLock::set`).
+pub fn init_remote(sender: impl FnMut(String) + Send + 'static, level: &str) {
+    let lvl = match level.to_ascii_lowercase().as_str() {
+        "error" => LogLevel::Error,
+        "warn" => LogLevel::Warn,
+        "trace" => LogLevel::Trace,
+        _ => LogLevel::Info,
+    };
+    LOG_LEVEL.store(lvl as u8, std::sync::atomic::Ordering::Relaxed);
+    let _ = REMOTE_SENDER.set(Mutex::new(Box::new(sender)));
+}
+
+fn send_remote(event: Event) {
+    let Ok(line) = serde_json::to_string(&event) else { return };
+    if let Some(sender) = REMOTE_SENDER.get() {
+        if let Ok(mut f) = sender.lock() {
+            f(line);
+        }
+    }
+}
+
+/// MP-6: append one already-serialized JSONL line, verbatim, received from
+/// an attached client launcher (`ipc::Req::LauncherLog`) — the broker is the
+/// only process that owns `sandbox.log.jsonl`, so a client forwards its own
+/// events here instead of writing a second copy of the file. No-op if this
+/// process never called `init` (defensive only — should not happen: only a
+/// broker's pipe server ever receives `LauncherLog`).
+pub fn append_raw_line(line: &str) {
+    if let Some(logger) = LOGGER.get() {
+        logger.push_raw(line.to_string());
+    }
 }
 
 static CONSOLE_LOG: std::sync::atomic::AtomicBool =
@@ -71,14 +115,16 @@ pub fn console_verbose() -> bool {
 
 pub fn log(event: Event) {
     if !level_enabled(event.level()) { return; }
-    if let Some(logger) = LOGGER.get() {
-        logger.push(event);
+    match LOGGER.get() {
+        Some(logger) => logger.push(event),
+        None => send_remote(event),
     }
 }
 
 pub fn log_immediate(event: Event) {
-    if let Some(logger) = LOGGER.get() {
-        logger.push_and_flush(event);
+    match LOGGER.get() {
+        Some(logger) => logger.push_and_flush(event),
+        None => send_remote(event),
     }
 }
 
@@ -110,6 +156,16 @@ impl JsonlLogger {
             Ok(s) => s,
             Err(_) => return,
         };
+        {
+            let mut buf = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
+            buf.push(line);
+        }
+        self.maybe_flush();
+    }
+
+    /// MP-6: like `push`, but the caller already has a serialized JSON
+    /// line (a forwarded `ipc::Req::LauncherLog`) — no `Event` to encode.
+    fn push_raw(&self, line: String) {
         {
             let mut buf = self.buffer.lock().unwrap_or_else(|p| p.into_inner());
             buf.push(line);

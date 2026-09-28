@@ -64,28 +64,18 @@ fn run_set(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     };
 
     let pol = policy::mem::MemPolicy { cross_process: mode, allow_child_pids: allow_children };
-    let json = serde_json::to_vec(&pol)?;
 
-    let db = crate::cli::open_db(state_dir)?;
-    let txn = db.begin_write()?;
-    {
-        let mut t = txn.open_table(policy::db::DEFAULTS)?;
-        t.insert("mem_policy", json.as_slice())?;
-    }
-    txn.commit()?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
+    backend.exec(policy::db::PolicyOp::MemPolicySet(pol.clone()))?;
     println!("cross-process={:?} allow-children={}", pol.cross_process, pol.allow_child_pids);
     Ok(())
 }
 
 fn run_show(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
-    let txn = db.begin_read()?;
-    let pol = if let Ok(t) = txn.open_table(policy::db::DEFAULTS) {
-        if let Ok(Some(v)) = t.get("mem_policy") {
-            serde_json::from_slice::<policy::mem::MemPolicy>(v.value()).ok()
-        } else { None }
-    } else { None };
-    let pol = pol.unwrap_or_default();
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
+    let policy::db::PolicyOpResult::MemPolicy(pol) = backend.exec(policy::db::PolicyOp::MemPolicyGet)? else {
+        anyhow::bail!("memdefaults show: unexpected backend response");
+    };
 
     if has_flag(args, "--json") {
         println!("{}", serde_json::json!({

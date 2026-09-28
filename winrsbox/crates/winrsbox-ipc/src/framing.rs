@@ -862,6 +862,62 @@ mod tests {
         }
     }
 
+    /// MP-3: `Attach` carries plain u32/u64 fields — a trivial roundtrip, but
+    /// pinned like every other `Req` variant so a future field change can't
+    /// silently drift the wire shape.
+    #[test]
+    fn req_attach_roundtrip() {
+        let msg = Req::Attach { launcher_pid: 4242, launcher_create_time: 0xAAAA_BBBB_CCCC_DDDD };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Req = read_msg(&mut buf).unwrap();
+        match dec {
+            Req::Attach { launcher_pid, launcher_create_time } => {
+                assert_eq!(launcher_pid, 4242);
+                assert_eq!(launcher_create_time, 0xAAAA_BBBB_CCCC_DDDD);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// MP-3: `Attached` carries the handle values as plain `u64` — the
+    /// broker's own address space is irrelevant to the wire format, only the
+    /// numeric value the client will cast back to a `HANDLE`.
+    #[test]
+    fn resp_attached_roundtrip() {
+        let msg = Resp::Attached {
+            folder_job_handle: 0x1234,
+            folder_section_handle: 0x5678,
+            folder_section_name: r"Local\WinRsBoxFolder-deadbeef".into(),
+            broker_pid: 111,
+            broker_create_time: 222,
+            pipe_name: r"\\.\pipe\fs-sandbox-111".into(),
+            generation: 6,
+            has_net_rules: true,
+        };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Resp = read_msg(&mut buf).unwrap();
+        match dec {
+            Resp::Attached {
+                folder_job_handle, folder_section_handle, folder_section_name,
+                broker_pid, broker_create_time, pipe_name, generation, has_net_rules,
+            } => {
+                assert_eq!(folder_job_handle, 0x1234);
+                assert_eq!(folder_section_handle, 0x5678);
+                assert_eq!(folder_section_name, r"Local\WinRsBoxFolder-deadbeef");
+                assert_eq!(broker_pid, 111);
+                assert_eq!(broker_create_time, 222);
+                assert_eq!(pipe_name, r"\\.\pipe\fs-sandbox-111");
+                assert_eq!(generation, 6);
+                assert!(has_net_rules);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
     /// Mirror of `read_msg_oversized_returns_decode` on the buffer-reusing
     /// path: the guard fires before any big allocation into the scratch.
     #[test]
@@ -879,5 +935,44 @@ mod tests {
             other => panic!("expected Decode, got: {other:?}"),
         }
         assert_eq!(scratch.capacity(), 0, "guard must fire before any read into the scratch");
+    }
+    /// MP-9: `PolicyMutate` carries a `policy::db::PolicyOp` — pinned like
+    /// every other `Req` variant so a future field/variant change can't
+    /// silently drift the wire shape.
+    #[test]
+    fn req_policy_mutate_roundtrip() {
+        let row = policy::db::RuleRow {
+            id: "r1".into(),
+            prefix: "c:\\test".into(),
+            mode_read: policy::db::RuleMode::Passthrough,
+            mode_write: policy::db::RuleMode::Deny,
+            when: None,
+        };
+        let msg = Req::PolicyMutate { op: policy::db::PolicyOp::RuleUpsert(row) };
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Req = read_msg(&mut buf).unwrap();
+        match dec {
+            Req::PolicyMutate { op: policy::db::PolicyOp::RuleUpsert(row) } => {
+                assert_eq!(row.id, "r1");
+                assert_eq!(row.prefix, "c:\\test");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// MP-9: `PolicyMutated` carries a `policy::db::PolicyOpResult`.
+    #[test]
+    fn resp_policy_mutated_roundtrip() {
+        let msg = Resp::PolicyMutated(policy::db::PolicyOpResult::Bool(true));
+        let mut buf = Cursor::new(Vec::new());
+        write_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        let dec: Resp = read_msg(&mut buf).unwrap();
+        match dec {
+            Resp::PolicyMutated(policy::db::PolicyOpResult::Bool(b)) => assert!(b),
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 }

@@ -71,7 +71,7 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 }
 
 fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
     let prefix = find_arg(args, "--prefix=")
         .ok_or_else(|| anyhow::anyhow!("devrule add: --prefix required"))?;
     let prefix_lower = policy::path::nt_case_fold(prefix).into_owned();
@@ -81,25 +81,25 @@ fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     let id = explicit_id.unwrap_or_else(|| crate::cli::id::generate_id("devrule", &[&prefix_lower]));
 
     let row = db::RuleRow { id: id.clone(), prefix: prefix_lower, mode_read: read_mode, mode_write: write_mode, when: None };
-    db::dev_rule_upsert(&db, &row)?;
+    backend.exec(db::PolicyOp::DevRuleUpsert(row))?;
     println!("{id}");
     Ok(())
 }
 
 fn run_remove(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
     if let Some(id) = find_arg(args, "--id=") {
-        if !db::dev_rule_remove_by_id(&db, id)? {
+        let removed = matches!(
+            backend.exec(db::PolicyOp::DevRuleRemoveById(id.to_string()))?,
+            db::PolicyOpResult::Bool(true)
+        );
+        if !removed {
             bail!("devrule: rule '{}' not found", id);
         }
     } else if let Some(prefix) = find_arg(args, "--prefix=") {
-        // S11: fold with the same canonical NTFS-identity fold the db layer
-        // applies on upsert (policy::ensure_lower) — a locale to_lowercase
-        // diverges for İ/ß-class characters and the remove would miss the key.
-        let lower = policy::path::nt_case_fold(prefix);
-        let txn = db.begin_write()?;
-        { let mut t = txn.open_table(db::DEV_RULES)?; t.remove(lower.as_ref())?; }
-        txn.commit()?;
+        // `PolicyOp::DevRuleRemoveByPrefix` folds with the same canonical
+        // NTFS-identity fold the db layer applies on upsert (S11).
+        backend.exec(db::PolicyOp::DevRuleRemoveByPrefix(prefix.to_string()))?;
     } else {
         bail!("devrule remove: --id or --prefix required");
     }
@@ -107,8 +107,10 @@ fn run_remove(args: &[String], state_dir: &std::path::Path) -> Result<()> {
 }
 
 fn run_list(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
-    let rules = db::dev_rule_list(&db)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
+    let db::PolicyOpResult::Rules(rules) = backend.exec(db::PolicyOp::DevRuleList)? else {
+        anyhow::bail!("devrule list: unexpected backend response");
+    };
     if has_flag(args, "--json") {
         let out = serde_json::json!({
             "schema_version": 1,
@@ -130,8 +132,8 @@ fn run_list(args: &[String], state_dir: &std::path::Path) -> Result<()> {
 
 fn run_clear(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     if !has_flag(args, "--force") { bail!("devrule clear: requires --force"); }
-    let db = crate::cli::open_db(state_dir)?;
-    db::dev_rule_clear(&db)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
+    backend.exec(db::PolicyOp::DevRuleClear)?;
     Ok(())
 }
 

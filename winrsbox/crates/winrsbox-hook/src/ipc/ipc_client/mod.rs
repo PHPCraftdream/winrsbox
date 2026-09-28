@@ -149,6 +149,18 @@ pub(crate) static SANDBOX_ROOT: std::sync::OnceLock<String> = std::sync::OnceLoc
 /// from the matched root. Populated from SessionConfig.overlay_roots.
 pub(crate) static OVERLAY_ROOTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
+// Folder section (MP-5) — open/map/snapshot-select-pipe-name plumbing lives
+// in folder_section_client.rs (layout-guard: this file was already close to
+// MAX_FILE_LINES). Re-exported here so call sites read exactly as if the
+// functions were still local (`crate::ipc_client::open_folder_section` /
+// `folder_section_view` / `resolve_connect_pipe_name`, used below and from
+// `trusted_boot::verify_pipe_server_identity`).
+mod folder_section_client;
+pub(crate) use folder_section_client::{folder_section_view, open_folder_section};
+use folder_section_client::resolve_connect_pipe_name;
+#[cfg(test)]
+pub(crate) use folder_section_client::{FOLDER_SECTION_OVERRIDE_LOCK, FOLDER_SECTION_TEST_OVERRIDE};
+
 // ---------------------------------------------------------------------------
 // Install-error buffer (P2-5)
 //
@@ -430,12 +442,17 @@ pub(crate) fn ensure_ipc_and<R>(f: impl FnOnce(&mut Option<ipc::SyncClient>) -> 
         let mut opt_guard = pt.ipc.borrow_mut();
         let opt: &mut Option<ipc::SyncClient> = &mut *opt_guard;
         if opt.is_none() {
-            match PIPE_NAME.get() {
+            // MP-5: with a folder section this re-reads a fresh snapshot on
+            // every reconnect (broker pipe can change on failover); without
+            // one it's the fixed install-time PIPE_NAME, as before MP-5.
+            // Only reached here, in the reconnect branch — never on the
+            // per-call decide hot path.
+            match resolve_connect_pipe_name() {
                 None => {
-                    fail_log("IPC unavailable: PIPE_NAME not set");
+                    fail_log("IPC unavailable: no pipe name available");
                 }
                 Some(name) => {
-                    match ipc::SyncClient::connect(name) {
+                    match ipc::SyncClient::connect(&name) {
                         Ok(c) => {
                             // S02 #1 remainder: verify WHO owns the pipe server
                             // (GetNamedPipeServerProcessId + kernel creation

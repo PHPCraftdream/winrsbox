@@ -6,7 +6,10 @@ use windows::Win32::{
         GetTokenInformation, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
         TokenUser, TOKEN_QUERY, TOKEN_USER,
     },
-    System::Threading::{GetCurrentProcess, OpenProcessToken},
+    System::Threading::{
+        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_ACCESS_RIGHTS,
+        PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION,
+    },
 };
 
 // ─── C3 Part 2: raw advapi32 bindings for SDDL/SID conversion ─────────────────
@@ -83,12 +86,24 @@ unsafe impl Sync for PipeSecurity {}
 /// The returned `String` owns a copy; the LocalAlloc'd Win32 buffer is freed
 /// here on every path.
 pub(crate) fn current_user_string_sid() -> anyhow::Result<String> {
-    // ── 1. Get current process user SID ────────────────────────────────────
-    // SAFETY: GetCurrentProcess returns a pseudo-handle; OpenProcessToken with
-    //         TOKEN_QUERY is the documented way to query our own token.
+    // SAFETY: GetCurrentProcess returns a pseudo-handle, always a valid
+    //         PROCESS_QUERY_LIMITED_INFORMATION-equivalent handle for
+    //         OpenProcessToken.
+    token_string_sid_for_process(unsafe { GetCurrentProcess() })
+}
+
+/// [`current_user_string_sid`]'s probe, generalized to an ALREADY-OPEN
+/// process handle. MP-3's Attach authentication opens the connecting
+/// process exactly once (PID-reuse race avoidance) and reuses that single
+/// handle for every check, including the client's token SID — see
+/// `authenticate_attach_client`.
+pub(crate) fn token_string_sid_for_process(process: HANDLE) -> anyhow::Result<String> {
+    // SAFETY: `process` must be a valid process handle with
+    //         PROCESS_QUERY_LIMITED_INFORMATION access (caller's contract);
+    //         TOKEN_QUERY is read-only.
     let mut token = HANDLE::default();
     unsafe {
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+        OpenProcessToken(process, TOKEN_QUERY, &mut token)
             .map_err(|e| anyhow::anyhow!("OpenProcessToken failed: {e}"))?;
     }
     // Two-step GetTokenInformation: first call sizes the buffer.
@@ -238,6 +253,147 @@ pub(crate) fn build_pipe_security() -> anyhow::Result<PipeSecurity> {
         bInheritHandle: windows::core::BOOL(0),
     };
     Ok(PipeSecurity { sd: psd_ptr, sa })
+}
+
+// ─── MP-3: Attach authentication ────────────────────────────────────────────
+
+/// Access rights the broker requests on the connecting process for Attach
+/// authentication — opened ONCE and reused for every check (create time,
+/// job membership, SID, image path) and the post-attach exit wait, so a PID
+/// recycled mid-check can never inherit a partially-completed decision:
+/// PROCESS_QUERY_LIMITED_INFORMATION (create time / image path / token),
+/// PROCESS_DUP_HANDLE (`DuplicateHandle` source for the folder job/section
+/// handles), SYNCHRONIZE (`0x0010_0000` — a generic kernel-object right, not
+/// exposed on `PROCESS_ACCESS_RIGHTS` by windows-0.61; raw bit, mirroring the
+/// `PROCESS_ACCESS_RIGHTS(0x1000)` raw-literal pattern `pipe_server/mod.rs`
+/// already uses for PROCESS_QUERY_LIMITED_INFORMATION) for the post-attach
+/// exit wait that drives `remove_launcher`.
+pub(crate) const ATTACH_CLIENT_ACCESS: PROCESS_ACCESS_RIGHTS = PROCESS_ACCESS_RIGHTS(
+    PROCESS_QUERY_LIMITED_INFORMATION.0 | PROCESS_DUP_HANDLE.0 | 0x0010_0000,
+);
+
+/// Why an `Attach` request was rejected. Logged by the caller; never
+/// disclosed to the connection itself — every path closes the connection.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AttachRejection {
+    OpenFailed,
+    PidMismatch,
+    CreateTimeUnavailable,
+    CreateTimeMismatch,
+    InFolderJob,
+    SidUnavailable,
+    SidMismatch,
+    ImagePathUnavailable,
+    ImagePathMismatch,
+}
+
+impl std::fmt::Display for AttachRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::OpenFailed => "client process unopenable",
+            Self::PidMismatch => "launcher_pid != kernel client pid",
+            Self::CreateTimeUnavailable => "client creation time unqueryable",
+            Self::CreateTimeMismatch => "launcher_create_time mismatch (PID reused or spoofed)",
+            Self::InFolderJob => "client is a member of the folder job (a guest, not a launcher)",
+            Self::SidUnavailable => "client token SID unqueryable",
+            Self::SidMismatch => "client SID != broker SID",
+            Self::ImagePathUnavailable => "client image path unqueryable",
+            Self::ImagePathMismatch => "client image != broker image",
+        })
+    }
+}
+
+/// Pure decision core: every kernel fact is injected, so the full rejection
+/// matrix is unit-testable without a live job/process pair. `own_sid` /
+/// `own_image_path` are the broker's own identity to compare the client
+/// against; `own_image_path` is folded the same way `image_path` values are
+/// folded elsewhere for comparison (S11, `crate::fold_published`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn authenticate_attach_impl(
+    client_pid: u32,
+    req_launcher_pid: u32,
+    req_launcher_create_time: u64,
+    live_create_time: Option<u64>,
+    in_folder_job: bool,
+    client_sid: Option<&str>,
+    own_sid: &str,
+    client_image_path: Option<&str>,
+    own_image_path: &str,
+) -> Result<(), AttachRejection> {
+    if req_launcher_pid != client_pid {
+        return Err(AttachRejection::PidMismatch);
+    }
+    let live_ct = live_create_time.ok_or(AttachRejection::CreateTimeUnavailable)?;
+    if live_ct == 0 || live_ct != req_launcher_create_time {
+        return Err(AttachRejection::CreateTimeMismatch);
+    }
+    if in_folder_job {
+        return Err(AttachRejection::InFolderJob);
+    }
+    let sid = client_sid.ok_or(AttachRejection::SidUnavailable)?;
+    if sid != own_sid {
+        return Err(AttachRejection::SidMismatch);
+    }
+    let image = client_image_path.ok_or(AttachRejection::ImagePathUnavailable)?;
+    if crate::fold_published(image) != crate::fold_published(own_image_path) {
+        return Err(AttachRejection::ImagePathMismatch);
+    }
+    Ok(())
+}
+
+/// Production binding: opens the client process ONCE with
+/// [`ATTACH_CLIENT_ACCESS`] and runs every check against that single handle
+/// (task requirement: never re-open — a PID recycled between checks must
+/// never inherit a partially-completed decision). On success returns the
+/// STILL-OPEN handle — the caller now owns it, and reuses it next for
+/// `DuplicateHandle` and the post-attach exit wait. On rejection the handle
+/// (if one was opened) is closed here; the caller never sees it.
+pub(crate) fn authenticate_attach_client(
+    client_pid: u32,
+    req_launcher_pid: u32,
+    req_launcher_create_time: u64,
+    folder_job: &winrsbox::contain::jobctl::FolderJob,
+) -> Result<HANDLE, AttachRejection> {
+    if client_pid == 0 {
+        return Err(AttachRejection::OpenFailed);
+    }
+    // SAFETY: client_pid is a non-zero PID from GetNamedPipeClientProcessId
+    //         (kernel-vouched); bInheritHandle=false.
+    let h = unsafe { OpenProcess(ATTACH_CLIENT_ACCESS, false, client_pid) }
+        .map_err(|_| AttachRejection::OpenFailed)?;
+
+    let ct = super::ownership::process_create_time_from_handle(h);
+    let live_create_time = if ct == 0 { None } else { Some(ct) };
+    // Fail closed on an unqueryable job-membership result: treat "unknown"
+    // as "assume guest" (reject), never as "assume launcher" (admit).
+    let in_folder_job = folder_job.contains(h).unwrap_or(true);
+    let client_sid = token_string_sid_for_process(h).ok();
+    let own_sid = current_user_string_sid().unwrap_or_default();
+    let client_image_path = super::ownership::image_path_from_handle(h);
+    let own_image_path = std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    match authenticate_attach_impl(
+        client_pid,
+        req_launcher_pid,
+        req_launcher_create_time,
+        live_create_time,
+        in_folder_job,
+        client_sid.as_deref(),
+        &own_sid,
+        client_image_path.as_deref(),
+        &own_image_path,
+    ) {
+        Ok(()) => Ok(h),
+        Err(e) => {
+            // SAFETY: h was opened by us immediately above and is closed
+            //         exactly once here — the rejection path never returns it.
+            unsafe { CloseHandle(h).ok() };
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -530,5 +686,246 @@ mod tests {
         unsafe { CloseHandle(client).ok() };
         unsafe { CloseHandle(HANDLE(worker_raw_for_close as *mut _)).ok() };
         Ok(())
+    }
+
+    // ─── MP-3: authenticate_attach_impl (pure matrix) ─────────────────────
+
+    mod attach_impl_tests {
+        use super::super::{authenticate_attach_impl, AttachRejection};
+
+        const PID: u32 = 111;
+        const CT: u64 = 999;
+        const SID: &str = "S-1-5-21-1-2-3-1000";
+        const IMG: &str = r"c:\bin\winrsbox.exe";
+
+        fn accept(
+            client_pid: u32, req_pid: u32, req_ct: u64, live_ct: Option<u64>,
+            in_job: bool, sid: Option<&str>, img: Option<&str>,
+        ) -> Result<(), AttachRejection> {
+            authenticate_attach_impl(client_pid, req_pid, req_ct, live_ct, in_job, sid, SID, img, IMG)
+        }
+
+        #[test]
+        fn accepts_matching_identity() {
+            assert_eq!(accept(PID, PID, CT, Some(CT), false, Some(SID), Some(IMG)), Ok(()));
+        }
+
+        #[test]
+        fn rejects_pid_mismatch() {
+            assert_eq!(
+                accept(PID, PID + 1, CT, Some(CT), false, Some(SID), Some(IMG)),
+                Err(AttachRejection::PidMismatch)
+            );
+        }
+
+        #[test]
+        fn rejects_unqueryable_create_time() {
+            assert_eq!(
+                accept(PID, PID, CT, None, false, Some(SID), Some(IMG)),
+                Err(AttachRejection::CreateTimeUnavailable)
+            );
+        }
+
+        #[test]
+        fn rejects_create_time_mismatch() {
+            assert_eq!(
+                accept(PID, PID, CT, Some(CT + 1), false, Some(SID), Some(IMG)),
+                Err(AttachRejection::CreateTimeMismatch)
+            );
+        }
+
+        #[test]
+        fn rejects_zero_live_create_time_even_if_it_matches_the_claim() {
+            // A live creation time of zero must never be trusted, even
+            // against a request that (implausibly) also claims zero — the
+            // same "no wildcard zero" discipline as folder_section_trust_check.
+            assert_eq!(
+                accept(PID, PID, 0, Some(0), false, Some(SID), Some(IMG)),
+                Err(AttachRejection::CreateTimeMismatch)
+            );
+        }
+
+        #[test]
+        fn rejects_when_client_is_in_the_folder_job() {
+            // The plan's core distinction: a guest is always IN the folder
+            // job, a launcher never is. This is checked even when every
+            // other field matches — job membership overrides the rest.
+            assert_eq!(
+                accept(PID, PID, CT, Some(CT), true, Some(SID), Some(IMG)),
+                Err(AttachRejection::InFolderJob)
+            );
+        }
+
+        #[test]
+        fn rejects_unqueryable_sid() {
+            assert_eq!(
+                accept(PID, PID, CT, Some(CT), false, None, Some(IMG)),
+                Err(AttachRejection::SidUnavailable)
+            );
+        }
+
+        #[test]
+        fn rejects_sid_mismatch() {
+            assert_eq!(
+                accept(PID, PID, CT, Some(CT), false, Some("S-1-5-21-9-9-9-9999"), Some(IMG)),
+                Err(AttachRejection::SidMismatch)
+            );
+        }
+
+        #[test]
+        fn rejects_unqueryable_image_path() {
+            assert_eq!(
+                accept(PID, PID, CT, Some(CT), false, Some(SID), None),
+                Err(AttachRejection::ImagePathUnavailable)
+            );
+        }
+
+        #[test]
+        fn rejects_image_path_mismatch() {
+            assert_eq!(
+                accept(PID, PID, CT, Some(CT), false, Some(SID), Some(r"c:\bin\evil.exe")),
+                Err(AttachRejection::ImagePathMismatch)
+            );
+        }
+
+        #[test]
+        fn image_path_comparison_is_case_insensitive() {
+            // S11 fold: the same binary at a different case must still match.
+            assert_eq!(
+                accept(PID, PID, CT, Some(CT), false, Some(SID), Some(r"C:\BIN\WinRsBox.EXE")),
+                Ok(())
+            );
+        }
+    }
+
+    // ─── MP-3: authenticate_attach_client (live kernel) ────────────────────
+
+    mod attach_client_tests {
+        use super::super::{authenticate_attach_client, AttachRejection};
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
+        use std::process::{Child, Command};
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+        use winrsbox::contain::jobctl::FolderJob;
+
+        fn spawn_suspended() -> Child {
+            // A real, live process with a different image (cmd.exe) than the
+            // test binary — mirrors ownership.rs's mp4_folder_job_tests
+            // pattern. CREATE_SUSPENDED so it stays alive until killed.
+            Command::new("cmd")
+                .args(["/C", "ping -n 3 127.0.0.1 >nul"])
+                .creation_flags(CREATE_NO_WINDOW.0 | CREATE_SUSPENDED.0)
+                .spawn()
+                .expect("spawn suspended cmd child")
+        }
+
+        fn handle_of(child: &Child) -> HANDLE {
+            HANDLE(child.as_raw_handle())
+        }
+
+        fn kill_and_reap(mut child: Child) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        fn own_create_time() -> u64 {
+            super::super::super::ownership::query_process_create_time(std::process::id())
+                .expect("own process creation time must be queryable")
+        }
+
+        /// Happy path: the test binary itself stands in for a joining
+        /// launcher — same image, same SID (same process), not in any job,
+        /// correct create_time.
+        #[test]
+        fn accepts_self_as_a_joining_launcher() {
+            let job = FolderJob::create().expect("create folder job");
+            let pid = std::process::id();
+            let ct = own_create_time();
+            let h = authenticate_attach_client(pid, pid, ct, &job)
+                .expect("self must authenticate as a joining launcher");
+            // SAFETY: h was returned by authenticate_attach_client above.
+            unsafe { CloseHandle(h).ok() };
+        }
+
+        #[test]
+        fn rejects_launcher_pid_not_matching_kernel_client_pid() {
+            let job = FolderJob::create().expect("create folder job");
+            let pid = std::process::id();
+            let ct = own_create_time();
+            assert_eq!(
+                authenticate_attach_client(pid, pid + 1, ct, &job),
+                Err(AttachRejection::PidMismatch)
+            );
+        }
+
+        #[test]
+        fn rejects_claimed_create_time_mismatch() {
+            let job = FolderJob::create().expect("create folder job");
+            let pid = std::process::id();
+            assert_eq!(
+                authenticate_attach_client(pid, pid, 0x1234, &job),
+                Err(AttachRejection::CreateTimeMismatch)
+            );
+        }
+
+        /// The distinguishing MP-3 check: a process that IS a member of the
+        /// folder job (a guest) must be rejected even with every other field
+        /// correct — job membership overrides identity.
+        #[test]
+        fn rejects_a_process_that_is_in_the_folder_job() {
+            let job = FolderJob::create().expect("create folder job");
+            let guest = spawn_suspended();
+            let pid = guest.id();
+            job.assign_process(handle_of(&guest)).expect("assign guest to folder job");
+            let ct = super::super::super::ownership::process_create_time_from_handle(handle_of(&guest));
+
+            assert_eq!(
+                authenticate_attach_client(pid, pid, ct, &job),
+                Err(AttachRejection::InFolderJob)
+            );
+            kill_and_reap(guest);
+        }
+
+        /// A different image (cmd.exe, not this test binary) fails the
+        /// image-path check even outside the folder job.
+        #[test]
+        fn rejects_a_process_with_a_different_image() {
+            let job = FolderJob::create().expect("create folder job");
+            let other = spawn_suspended();
+            let pid = other.id();
+            let ct = super::super::super::ownership::process_create_time_from_handle(handle_of(&other));
+
+            assert_eq!(
+                authenticate_attach_client(pid, pid, ct, &job),
+                Err(AttachRejection::ImagePathMismatch)
+            );
+            kill_and_reap(other);
+        }
+
+        #[test]
+        fn rejects_dead_pid() {
+            let job = FolderJob::create().expect("create folder job");
+            let child = spawn_suspended();
+            let pid = child.id();
+            kill_and_reap(child);
+            // On a busy machine the PID can be recycled by an unrelated
+            // process in the window between reap and OpenProcess — the
+            // kernel-truth check then still rejects, just via
+            // CreateTimeMismatch (create_time=1 can never match a live
+            // process) instead of OpenFailed. Either is a correct rejection
+            // of the dead/reused identity; only "somehow accepted" is wrong.
+            let err = authenticate_attach_client(pid, pid, 1, &job).unwrap_err();
+            assert!(
+                matches!(err, AttachRejection::OpenFailed | AttachRejection::CreateTimeMismatch),
+                "got: {err:?}"
+            );
+        }
+
+        #[test]
+        fn rejects_zero_pid() {
+            let job = FolderJob::create().expect("create folder job");
+            assert_eq!(authenticate_attach_client(0, 0, 1, &job), Err(AttachRejection::OpenFailed));
+        }
     }
 }

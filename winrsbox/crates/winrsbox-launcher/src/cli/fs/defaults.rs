@@ -50,16 +50,18 @@ fn parse_mode(s: &str) -> Result<policy::db::RuleMode> {
 }
 
 fn run_set(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
     let read = find_arg(args, "--read=").map(parse_mode).transpose()?;
     let write = find_arg(args, "--write=").map(parse_mode).transpose()?;
-    policy::db::defaults_set(&db, read, write)?;
+    backend.exec(policy::db::PolicyOp::DefaultsSet { read, write })?;
     Ok(())
 }
 
 fn run_show(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
-    let defaults = policy::db::defaults_get(&db)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
+    let policy::db::PolicyOpResult::Defaults(defaults) = backend.exec(policy::db::PolicyOp::DefaultsGet)? else {
+        anyhow::bail!("defaults show: unexpected backend response");
+    };
     let json = has_flag(args, "--json");
 
     if json {

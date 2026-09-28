@@ -128,6 +128,61 @@ rules: [
 
 See [docs/RECIPES.md](docs/RECIPES.md) for common configurations.
 
+## Multiple sessions in the same folder
+
+Run a second `winrsbox` in a folder that already has one running and it
+attaches to the first instead of failing:
+
+```bash
+# terminal 1
+target/release/winrsbox -- claude -p "long-running task"
+
+# terminal 2, same folder — attaches to terminal 1's broker instead of
+# opening policy.redb itself
+target/release/winrsbox -- cargo build
+```
+
+The first `winrsbox` to start becomes the **broker**: it owns `policy.redb`,
+the CoW overlay index, and the log/stats files. Every later instance is a
+**client** — its own console, its own sandboxed target and job tree, but
+policy decisions and the CoW overlay are shared through the broker, so both
+sessions see the same overlay writes.
+
+Policy CLI commands work while a session is running — they're relayed to the
+broker and applied live, without stopping the running target:
+
+```bash
+winrsbox rule add --prefix=C:\path --write=deny   # rule/regrule/netrule/dev rule
+winrsbox mock add ...                             # mock/mockdir/regmock
+winrsbox defaults set ...                         # defaults/regdefaults/memdefaults
+```
+
+`why`, `what-if`, `regwhy`, `export`, and `import` are **not** relayed — they
+run a full decide/overlay/mock pass or dump the whole database, not a single
+mutation, and still require exclusive access to `policy.redb`. Run these
+after all sessions in the folder have exited.
+
+```bash
+winrsbox broker status    # broker pid/generation, pipe name, active guests
+winrsbox broker restart   # force a new broker (verifies the target's image before killing it)
+```
+
+If the broker process dies (killed, crashed, or its own sandboxed target
+just exited), one of the remaining clients in the folder automatically wins
+the redb lock and becomes the new broker; the others reconnect. Guests of
+the dead broker's own session die with it (as before); guests belonging to
+other sessions in the folder are unaffected.
+
+**Known limitations:**
+
+- Stats (`SessionStats`) are folder-wide, not per session — every attached
+  client sees combined counters for all guests in the folder.
+- After a failover, the new broker's own console output is not written to
+  `sandbox.log.jsonl` (the file belongs to whichever process was the
+  *original* broker); diagnostics degrade, containment does not.
+- `sandbox.ktav` is read once, by the broker, at startup — editing it while
+  a session is running does not reload it for already-attached clients.
+
 ## Observability
 
 - **hot-stats.json** — top-50 accessed paths, totals (flushed every 5s)

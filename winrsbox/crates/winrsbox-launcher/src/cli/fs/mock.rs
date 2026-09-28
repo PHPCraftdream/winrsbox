@@ -55,7 +55,7 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 }
 
 fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
     let path = find_arg(args, "--path=").ok_or_else(|| anyhow::anyhow!("mock add: --path is required"))?;
     let content_str = find_arg(args, "--content=");
     let file_path = find_arg(args, "--file=");
@@ -95,19 +95,22 @@ fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
             crate::cli::id::generate_id("mock", &[&path_lower])
         });
 
-    policy::db::mock_upsert(&db, &id, path, &payload)?;
+    backend.exec(policy::db::PolicyOp::MockUpsert { path: path.to_string(), payload })?;
     println!("{}", id);
     Ok(())
 }
 
 fn run_remove(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
     if let Some(_id) = find_arg(args, "--id=") {
         // Mocks are keyed by path; to remove by id we'd need an id→path index.
         // For now, require --path for removal.
         bail!("mock remove: --id not yet supported for mocks, use --path");
     } else if let Some(path) = find_arg(args, "--path=") {
-        let removed = policy::db::mock_remove_by_path(&db, path)?;
+        let removed = matches!(
+            backend.exec(policy::db::PolicyOp::MockRemoveByPath(path.to_string()))?,
+            policy::db::PolicyOpResult::Bool(true)
+        );
         if !removed { bail!("mock not found: {}", path); }
     } else {
         bail!("mock remove: --path required");
@@ -116,9 +119,11 @@ fn run_remove(args: &[String], state_dir: &std::path::Path) -> Result<()> {
 }
 
 fn run_list(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
     let json = has_flag(args, "--json");
-    let mocks = policy::db::mock_list(&db)?;
+    let policy::db::PolicyOpResult::Mocks(mocks) = backend.exec(policy::db::PolicyOp::MockList)? else {
+        anyhow::bail!("mock list: unexpected backend response");
+    };
 
     if json {
         let out = serde_json::json!({
@@ -143,8 +148,10 @@ fn run_show(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     let path = find_arg(args, "--path=");
     let id = find_arg(args, "--id=");
 
-    let db = crate::cli::open_db(state_dir)?;
-    let mocks = policy::db::mock_list(&db)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
+    let policy::db::PolicyOpResult::Mocks(mocks) = backend.exec(policy::db::PolicyOp::MockList)? else {
+        anyhow::bail!("mock show: unexpected backend response");
+    };
 
     if let Some(p) = path {
         let mock = mocks.iter().find(|(mp, _)| mp.eq_ignore_ascii_case(p));

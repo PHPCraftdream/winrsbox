@@ -9,28 +9,19 @@
 mod pipe_server;
 #[path = "../sandbox/mod.rs"]
 mod sandbox;
+mod broker;
+mod client;
+mod failover;
+mod session;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use policy::Policy;
 use winrsbox::cli;
 use winrsbox::observe::hot_stats::{HotStats, ThrottledFlusher};
 use winrsbox::observe::jsonl_log;
 use std::{
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
-};
-use windows::{
-    Win32::{
-        Foundation::{CloseHandle, HANDLE},
-        System::Threading::{
-            GetExitCodeProcess, ResumeThread, WaitForMultipleObjects, WaitForSingleObject,
-            INFINITE,
-        },
-    },
+    sync::{atomic::AtomicU32, Arc},
 };
 use sandbox::launch_prep::{build_delegation_command, is_nested_invocation};
 
@@ -325,7 +316,7 @@ async fn run() -> Result<()> {
     // carve-out in the hook (which allows absolute overlay-path reopens for
     // the process's own CoW files) would expose it — an agent could read or
     // corrupt its own policy database.
-    let state_dir = cfg_path.parent().unwrap_or(&sandbox_root);
+    let state_dir = cfg_path.parent().unwrap_or(&sandbox_root).to_path_buf();
     let db_path = state_dir.join("policy.redb");
     // Migration: move an existing DB from the old workdir-internal location.
     let old_db_path = sandbox_root.join("policy.redb");
@@ -363,14 +354,35 @@ async fn run() -> Result<()> {
             }
         }
     }
-    let policy = Arc::new(
-        Policy::open_or_create_with_layout(
-            &db_path,
-            overlay_layout,
-            mock_dirs_root.clone(),
-            project_root.clone(),
-        )?,
-    );
+    // MP-2/MP-6: whoever opens policy.redb first is this folder's broker
+    // for the rest of this run; DatabaseAlreadyOpen means a live broker
+    // already owns it. A client never opens the DB at all — no
+    // load_config, no C: overlay migration, no pipe server — everything it
+    // needs comes from Attach instead (`client::run_as_client`).
+    let policy = match broker::open_policy_or_decide_role(
+        &db_path,
+        overlay_layout.clone(),
+        mock_dirs_root.clone(),
+        project_root.clone(),
+        &state_dir,
+    )? {
+        broker::Role::Broker(policy) => Arc::new(policy),
+        broker::Role::Client { broker_pid } => {
+            let exit_code = client::run_as_client(
+                cli,
+                project_root,
+                sandbox_root,
+                cfg_path,
+                state_dir,
+                target_args,
+                overlay_layout,
+                mock_dirs_root,
+                broker_pid,
+            )
+            .await?;
+            std::process::exit(exit_code);
+        }
+    };
     policy.load_config(&cfg_path)?;
     if let Some((local_appdata, legacy, c_root)) = &c_root_migration {
         sandbox::complete_c_overlay_migration(&policy, local_appdata, legacy, c_root)?;
@@ -383,11 +395,50 @@ async fn run() -> Result<()> {
     std::fs::create_dir_all(&workreg_root)?;
     let reg_policy = Arc::new(policy::RegistryPolicy::open(policy.db(), workreg_root)?);
 
-    // Named pipe name — use launcher PID for uniqueness
-    let pipe_name = format!(r"\\.\pipe\fs-sandbox-{}", std::process::id());
+    // Named pipe name — random per MP-10 §A, not derived from the PID: a
+    // predictable name lets a guest pre-create a pipe under it (e.g. while
+    // waiting for failover) and win `FILE_FLAG_FIRST_PIPE_INSTANCE`, making
+    // the real broker's own first-instance bind fail (fatal).
+    let pipe_name = winrsbox::contain::session_section::random_pipe_name()
+        .context("generate broker pipe name")?;
+
+    // Own creation time — PID-reuse-safe self identity, shared by the
+    // folder section / broker.json below AND by SessionConfig's
+    // launcher_create_time further down (one query, one value).
+    let own_create_time = pipe_server::query_process_create_time(std::process::id()).unwrap_or(0);
+
+    // MP-2: broker-only folder objects — folder job (kernel-truth guest
+    // membership, `contain::jobctl::FolderJob`) and folder section (current
+    // pipe name published to every launcher/guest in this state dir,
+    // `contain::session_section::FolderSection`), plus broker.json (the
+    // entry point a joining launcher reads). Reaching this point means the
+    // role decision above already resolved to Broker — every Client exits
+    // earlier. Handles are held in `broker_folder`/`folder_job` for the
+    // launcher's whole runtime; dropping either tears the kernel object
+    // down immediately for every other reader.
+    let broker::BrokerFolderState {
+        folder_job,
+        folder_section,
+        folder_section_name,
+    } = broker::setup_broker_folder(&state_dir, &pipe_name, std::process::id(), own_create_time)
+        .context("set up broker folder objects")?;
+    // Shared with the pipe server for kernel job-membership admission (MP-4)
+    // and, via `AttachContext` below, MP-3's `Attach` handling.
+    let folder_job = Arc::new(folder_job);
+    let folder_section = Arc::new(folder_section);
 
     // Stats — shared between connection handlers (lock-free atomics)
     let stats = Arc::new(pipe_server::Stats::default());
+
+    let attach_ctx = broker::AttachContext {
+        folder_section: Arc::clone(&folder_section),
+        folder_section_name: folder_section_name.clone(),
+        broker_pid: std::process::id(),
+        broker_create_time: own_create_time,
+        pipe_name: pipe_name.clone(),
+        policy: Arc::clone(&policy),
+        stats: Arc::clone(&stats),
+    };
 
     // Child PIDs registered from hook via IPC RegisterChild
     let child_pids: Arc<crossbeam_queue::SegQueue<u32>> = Arc::new(crossbeam_queue::SegQueue::new());
@@ -472,6 +523,8 @@ async fn run() -> Result<()> {
         let hot_stats2 = Arc::clone(&hot_stats);
         let flusher2 = Arc::clone(&flusher);
         let root_pid_slot = Arc::clone(&root_target_pid);
+        let folder_job2 = Arc::clone(&folder_job);
+        let attach_ctx2 = attach_ctx.clone();
 
         tokio::spawn(async move {
             if let Err(e) = pipe_server::pipe_accept_loop(
@@ -484,6 +537,8 @@ async fn run() -> Result<()> {
                 hot_stats2,
                 flusher2,
                 root_pid_slot,
+                Some(folder_job2),
+                Some(attach_ctx2),
             )
             .await
             {
@@ -500,416 +555,32 @@ async fn run() -> Result<()> {
     // Small delay so the pipe server starts accepting before the child tries to connect.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // ── Launch target process ─────────────────────────────────────────────
-    let dll_path = sandbox::find_hook_dll()?;
-
-    // Sanitize sensitive variables and retired sandbox config before the
-    // target inherits them; the trusted session section carries that config.
-    let removed = winrsbox::contain::guest::env_guard::sanitize();
-    if removed > 0 && winrsbox::observe::jsonl_log::console_verbose() {
-        println!("[sandbox] env: sanitized {removed} sensitive variables");
-    }
-
-    // Help GUI terminal emulators (WezTerm, Windows Terminal) that ignore the inherited
-    // CWD and fall back to the home directory when spawning their shell.
-    let cwd_str = project_root.to_string_lossy().into_owned();
-    // Hook-side trace gate value — published ONLY in the session config
-    // below (chunk 3, review XA 2026-09-20 S02: the FS_SANDBOX_TRACE env
-    // export is retired; the trusted section is the hook's single source).
-    let hook_trace = cli.trace || effective_log_level.eq_ignore_ascii_case("trace");
-    let disable_hooks_effective = sandbox::launch_prep::set_sandbox_environment(
-        &cli,
-        &pipe_name,
-        std::path::Path::new(&dll_path),
-        &sandbox_root,
-        &project_root,
-        &cwd_str,
+    // ── Shared session tail (identical for broker and client) ─────────────
+    let exit_code = session::run_target_session(session::SessionParams {
+        cli: &cli,
+        project_root,
+        sandbox_root,
+        target_args,
+        violations_log,
+        pipe_name,
+        overlay_layout,
+        folder_section_name,
         net_guarded,
-        hook_trace,
-    );
-
-    // Publish a `SessionConfig` snapshot under a RANDOM per-session section
-    // name so hooked descendants whose environment was scrubbed (MSYS2
-    // first-run helpers in particular) can still discover the pipe name etc.
-    // The name is not guessable and travels only through the injection
-    // channel: it is exported as FS_SANDBOX_SECTION below (the root target
-    // inherits it via CreateProcessW's environment block), and the spawn hook
-    // patches it into every descendant's environment cross-process before
-    // the child runs. The returned handle is held for the launcher's whole
-    // lifetime — dropping it would destroy the section and break
-    // late-arriving readers.
-    let session_cfg = ipc::SessionConfig {
-        pipe_name: pipe_name.clone(),
-        dll_path: dll_path.clone(),
-        // S11: published PRE-FOLDED to the canonical NTFS-identity form (see
-        // `fold_published`). `cwd_str` itself stays raw — it also feeds the
-        // WEZTERM_EXECUTABLE_ARGS_CWD ergonomics env var above, which must
-        // preserve the operator's spelling.
-        cwd: fold_published(&cwd_str),
-        sandbox_root: fold_published(&sandbox_root.to_string_lossy()),
-        // Publish ALL overlay roots (per-drive same-volume layout) so the hook
-        // can mask paths against every root and derive the drive letter from
-        // the matched one. Empty = single-root legacy fallback in the hook.
-        overlay_roots: policy
-            .overlay_layout()
-            .all_roots()
-            .map(|(_drive, root)| fold_published(&root.to_string_lossy()))
-            .collect(),
-        trace: hook_trace,
-        guard: match cli.guard {
-            GuardLevel::None => ipc::GuardLevel::None,
-            GuardLevel::Scan => ipc::GuardLevel::Scan,
-            GuardLevel::Full => ipc::GuardLevel::Full,
-            GuardLevel::Static => ipc::GuardLevel::Static,
-        },
-        // Launcher identity for the hook's pipe-server verification (S02):
-        // the hook compares the pipe server's PID and its kernel creation
-        // time (PID-reuse defence) against these before trusting any
-        // response. The creation time goes through
-        // query_process_create_time(self-pid) rather than
-        // process_create_time_from_handle(GetCurrentProcess()): the helper's
-        // is_invalid() check rejects the (HANDLE)-1 current-process
-        // pseudo-handle (same bit pattern as INVALID_HANDLE_VALUE) and would
-        // return 0, so open a real self-handle via the existing query.
+        effective_log_level,
         launcher_pid: std::process::id(),
-        launcher_create_time: pipe_server::query_process_create_time(std::process::id())
-            .unwrap_or(0),
-        allow_rwx: cli.allow_rwx,
-        disable_hooks: disable_hooks_effective.clone(),
-    };
-    let (_session_section, section_name) = winrsbox::contain::session_section::publish(&session_cfg)
-        .context("publish session config section")?;
-    // The name IS the access control: the section exists under this random
-    // name only, so every process that must read the config has to be told
-    // the name through the injection channel. The root target receives it
-    // here, via the inherited environment (authored before any guest code
-    // runs, hence unforgeable at root start — and every hooked descendant
-    // has the same name patched in by the spawn hook).
-    std::env::set_var("FS_SANDBOX_SECTION", &section_name);
-
-    // Create kernel Event for hook.dll init signaling (H1 fix, random name).
-    let init_event = sandbox::launch_prep::create_init_event()?;
-    // The status event marks optional degradation or fatal DllMain failure.
-    let init_degraded_event = sandbox::launch_prep::create_degraded_event()?;
-    let init_error_buffer = sandbox::launch_prep::create_init_error_buffer()?;
-
-    // Guard level is taken verbatim — no trust-based downgrade. Full mode is
-    // now JIT-safe (no ProhibitDynamicCode / signed-only), so unsigned dev
-    // tools (node/python/cargo/git) run correctly under it; there is no longer
-    // any reason to drop signed targets to scan. Hard containment that breaks
-    // JIT is the explicit, opt-in `--guard static` tier. For `static` on an
-    // unsigned target we warn that third-party DLL loads will be blocked at
-    // runtime (hook.dll itself is exempt: stripped at create-time, re-applied
-    // after it loads).
-    let effective_guard = cli.guard;
-    if effective_guard == GuardLevel::Static {
-        // The trust verdict is ADVISORY — see contain/trust/mod.rs. It is shown so the
-        // operator knows what they are about to run, and is deliberately NOT
-        // enforced: unsigned OSS toolchains (cargo/node/python) are the
-        // sandbox's normal workload and hook.dll itself is unsigned in dev
-        // builds (its integrity is enforced by the digest manifest in
-        // find_hook_dll instead). Do not turn this into a launch gate
-        // without an opt-out for unsigned dev builds.
-        let trust = winrsbox::contain::trust::verify_signature(std::path::Path::new(&target_args[0]));
-        let mitigation_note = if trust.is_trusted() {
-            ""
-        } else {
-            "; JIT and unsigned native extensions (.pyd/.node) will be blocked by mitigation policy"
-        };
-        // stderr for the same reason as the exit summary below: launcher
-        // diagnostics must not land in the target's stdout.
-        if jsonl_log::console_verbose() {
-            eprintln!(
-                "[sandbox] guard: static (hard containment) — {}{mitigation_note}",
-                winrsbox::contain::trust::advisory_notice(&trust)
-            );
-        }
-    }
-
-    // Before the target exists: Ctrl+C in a shared console reaches the
-    // launcher too, and the launcher dying closes a job marked
-    // KILL_ON_JOB_CLOSE, which kills the whole sandboxed tree. Interactive
-    // agents use Ctrl+C to interrupt a turn, so that turned the first
-    // interrupt into "session destroyed".
-    sandbox::install_console_ctrl_handler();
-
-    let proc_info = sandbox::launch_suspended(
-        &project_root,
-        &target_args,
-        effective_guard,
-        [
-            init_event,
-            init_degraded_event,
-            init_error_buffer.handle(),
-        ],
-    )?;
-
-    // C3 Part 3: publish the root PID to the pipe accept loop so it can
-    // validate `GetNamedPipeClientProcessId` against our own target on every
-    // new IPC connection. This must happen BEFORE `ResumeThread` below; the
-    // target stays suspended until then, so no connection can reach the
-    // accept loop with this slot still set to 0.
-    root_target_pid.store(proc_info.dwProcessId, Ordering::Release);
-    sandbox::proc_table::publish_root_create_time(
-        pipe_server::process_create_time_from_handle(proc_info.hProcess),
-    );
-
-    // Pre-launch code integrity scan (full/static guard + not skipped).
-    // The direct-syscall scan matters most for `full` (which allows JIT and so
-    // can't rely on ProhibitDynamicCode); `static` runs it too as belt-and-suspenders.
-    if (effective_guard == GuardLevel::Full || effective_guard == GuardLevel::Static)
-        && !cli.no_pre_scan
-    {
-        if let Err(e) = sandbox::inject::pre_launch_scan(
-            proc_info.hProcess.0 as usize,
-            &target_args[0],
-            proc_info.dwProcessId,
-            &violations_log,
-        ).await {
-            // SAFETY: proc_info.hProcess is valid PROCESS handle from CreateProcessW.
-            unsafe {
-                windows::Win32::System::Threading::TerminateProcess(
-                    proc_info.hProcess,
-                    0xC000_0005,
-                )
-                .ok();
-                CloseHandle(proc_info.hThread).ok();
-                CloseHandle(proc_info.hProcess).ok();
-            }
-            eprintln!("pre-launch scan refused target: {e}");
-            // Exit immediately — don't wait for tokio runtime drop (pipe accept loop blocks).
-            std::process::exit(0xC000_0005u32 as i32);
-        }
-    }
-
-    // Inject hook.dll into target before resuming. On failure the child already
-    // exists (suspended, no user code has run) but is NOT yet in the Job Object —
-    // terminate and clean up rather than leaving an orphaned, uncontained,
-    // suspended process (mirrors the pre_launch_scan refusal path above).
-    if let Err(e) = sandbox::inject::inject_dll(proc_info.hProcess, proc_info.hThread, &dll_path) {
-        // SAFETY: proc_info handles are valid PROCESS/THREAD handles from CreateProcessW.
-        unsafe {
-            windows::Win32::System::Threading::TerminateProcess(proc_info.hProcess, 0xC000_0005).ok();
-            CloseHandle(proc_info.hThread).ok();
-            CloseHandle(proc_info.hProcess).ok();
-        }
-        eprintln!("hook.dll injection failed: {e}");
-        std::process::exit(0xC000_0005u32 as i32);
-    }
-
-    // Assign to Job Object — kernel auto-kills all children when launcher exits.
-    // Job handle must outlive the target process.
-    let _job_handle = sandbox::setup_job_object(
-        proc_info.hProcess,
-        cli.memory_limit,
-        cli.strict_clipboard,
-        cli.strict_ui,
-    )?;
-
-    // WFP kernel-level network filtering. Under `network: guarded` this is a
-    // hard requirement, not best-effort: if the kernel layer cannot be fully
-    // installed the launch is refused (fail-closed), mirroring the
-    // inject_dll refusal above — a guarded run never starts without the
-    // kernel enforcement SECURITY.md promises.
-    let _wfp = match winrsbox::contain::wfp::install_outbound_filters(
-        net_guarded,
-        cli.guard != GuardLevel::None,
-        cli.block_localhost,
-        std::path::Path::new(&target_args[0]),
-    ) {
-        winrsbox::contain::wfp::WfpInstall::Installed(engine) => Some(engine),
-        winrsbox::contain::wfp::WfpInstall::NotRequested => None,
-        winrsbox::contain::wfp::WfpInstall::Refused(reason) => {
-            // SAFETY: proc_info handles are valid PROCESS/THREAD handles from CreateProcessW.
-            unsafe {
-                windows::Win32::System::Threading::TerminateProcess(proc_info.hProcess, 0xC000_0005).ok();
-                CloseHandle(proc_info.hThread).ok();
-                CloseHandle(proc_info.hProcess).ok();
-            }
-            eprintln!("guarded network requested but kernel network enforcement could not be installed — refusing launch: {reason}");
-            // Exit immediately — don't wait for tokio runtime drop (pipe accept loop blocks).
-            std::process::exit(0xC000_0005u32 as i32);
-        }
-    };
-
-    // ETW Kernel-Process listener — monitoring layer (logs events, no enforcement).
-    let _etw = if cli.guard != GuardLevel::None {
-        let proc_info_ref = sandbox::proc_table::global_proc_info();
-        let pid_checker: Arc<dyn Fn(u32) -> bool + Send + Sync> = Arc::new(move |pid: u32| {
-            proc_info_ref.pin().get(&pid).is_some()
-        });
-        match winrsbox::observe::etw_listener::start(pid_checker) {
-            Ok(h) => {
-                if winrsbox::observe::jsonl_log::console_verbose() {
-                    println!("[sandbox] ETW: Kernel-Process listener active");
-                }
-                Some(h)
-            }
-            Err(e) => {
-                // Monitoring-only layer (etw_listener.rs) — commonly unavailable
-                // simply because the launcher isn't elevated. Not a containment
-                // gap, so keep it off the console unless --trace.
-                if winrsbox::observe::jsonl_log::console_verbose() {
-                    eprintln!("[sandbox] ETW unavailable: {e}");
-                }
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Insert root target into PROC_INFO BEFORE resume — ensures ETW listener
-    // sees this PID when kernel fires ImageLoad/ThreadStart during process startup.
-    let arg0_lower = target_args.first()
-        .map(|s| fold_published(s))
-        .unwrap_or_default();
-    sandbox::proc_table::global_proc_info().pin().insert(
-        proc_info.dwProcessId,
-        sandbox::proc_table::ProcInfo {
-            depth: 0,
-            exe_lower: Arc::from(arg0_lower.as_str()),
-            create_time: pipe_server::process_create_time_from_handle(proc_info.hProcess),
-        },
-    );
-
-    // Resume target main thread.
-    // SAFETY: proc_info.hThread is valid for the lifetime of the child process;
-    //         it was returned by CreateProcessW and has not yet been closed.
-    unsafe { ResumeThread(proc_info.hThread) };
-    // SAFETY: same — close the thread handle after use; the thread continues running.
-    unsafe { CloseHandle(proc_info.hThread).ok() };
-
-    // Wait for hook success or fatal DllMain failure via kernel Events.
-    // spawn_blocking moves the blocking wait to tokio's thread pool — the async
-    // runtime stays free to run pipe_accept_loop and other tasks.
-    let event_handles_raw = [init_event.0 as usize, init_degraded_event.0 as usize];
-    let wait_result = match tokio::task::spawn_blocking(move || unsafe {
-        let handles = event_handles_raw.map(|raw| HANDLE(raw as *mut _));
-        WaitForMultipleObjects(&handles, false, 5000)
-    }).await {
-        Ok(wr) => wr,
-        Err(e) => {
-            // The blocking wait task panicked / the runtime is shutting down. The
-            // child was already resumed (line above) — terminate it and close the
-            // handles instead of leaking them on a `?` early-return.
-            // SAFETY: proc_info.hProcess + init_event are valid here.
-            unsafe {
-                windows::Win32::System::Threading::TerminateProcess(proc_info.hProcess, 0xC000_0005).ok();
-                CloseHandle(proc_info.hProcess).ok();
-                CloseHandle(init_event).ok();
-                CloseHandle(init_degraded_event).ok();
-            }
-            anyhow::bail!("init-event wait task failed: {e}");
-        }
-    };
-
-    if wait_result.0 == 0 { // WAIT_OBJECT_0
-        if winrsbox::observe::jsonl_log::console_verbose() {
-            println!("[sandbox] hook.dll init confirmed (pid {})", proc_info.dwProcessId);
-        }
-        // S10 degraded-init probe: zero-timeout poll of the second event,
-        // signaled when hook.dll initialized DEGRADED (optional component
-        // install failures). Unconditional stderr warning — security-relevant,
-        // like the CRITICAL timeout path below, so NOT gated on verbose.
-        // SAFETY: init_degraded_event is valid and not yet closed.
-        let degraded = unsafe {
-            WaitForSingleObject(HANDLE(init_degraded_event.0 as *mut _), 0)
-        };
-        if degraded.0 == 0 { // WAIT_OBJECT_0
-            eprintln!(
-                "[sandbox] WARNING: hook.dll initialized DEGRADED (optional component install failures) — details in the sandbox log after the first hooked operation (pid {})",
-                proc_info.dwProcessId
-            );
-        }
-    } else {
-        let reason = match wait_result.0 {
-            1 => format!(
-                "hook.dll failed during initialization: {}",
-                init_error_buffer
-                    .read_message()
-                    .unwrap_or_else(|| "error detail unavailable".to_string())
-            ),
-            258 => "hook.dll did not signal init within 5s".to_string(),
-            code => format!("hook init wait failed (wait=0x{code:08x})"),
-        };
-        eprintln!(
-            "[sandbox] CRITICAL: {reason}, killing child pid={}",
-            proc_info.dwProcessId
-        );
-        unsafe {
-            windows::Win32::System::Threading::TerminateProcess(proc_info.hProcess, 0xC000_0005).ok();
-            CloseHandle(proc_info.hProcess).ok();
-        }
-        unsafe { CloseHandle(init_event).ok() };
-        unsafe { CloseHandle(init_degraded_event).ok() };
-        anyhow::bail!("hook.dll injection failed — child terminated (pid={})", proc_info.dwProcessId);
-    }
-    unsafe { CloseHandle(init_event).ok() };
-    unsafe { CloseHandle(init_degraded_event).ok() };
-
-    if winrsbox::observe::jsonl_log::console_verbose() {
-        println!("[sandbox] target started (pid {})", proc_info.dwProcessId);
-    }
-
-    // ── Wait for target process ───────────────────────────────────────────
-    // Offload the blocking wait to spawn_blocking so the tokio executor
-    // stays free to service hook IPC requests while the target runs.
-    // HANDLE (*mut c_void) is not Send; convert to isize to cross .await.
-    let target_isize = proc_info.hProcess.0 as isize;
-    tokio::task::spawn_blocking(move || {
-        // SAFETY: target_isize is the isize repr of a valid PROCESS_ALL_ACCESS
-        //         handle returned by CreateProcessW; INFINITE is correct here.
-        unsafe { WaitForSingleObject(HANDLE(target_isize as *mut _), INFINITE) };
+        launcher_create_time: own_create_time,
+        folder_job: folder_job.handle(),
+        root_target_pid,
+        stats,
+        exit_drain: session::ExitDrain::Broker(child_pids),
+        hot_stats_flusher: Some(flusher),
     })
-    .await
-    .unwrap_or_else(|e| eprintln!("[sandbox] target-wait task failed: {e}"));
-    let target_handle = proc_info.hProcess;
-
-    // Give any remaining child processes a brief window to finish.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    sandbox::child_drain::drain_registered_children(&child_pids).await;
-
-    // Read exit code and print summary.
-    let mut exit_code = 0u32;
-    // SAFETY: target_handle is valid; GetExitCodeProcess fills exit_code on success.
-    unsafe { GetExitCodeProcess(target_handle, &mut exit_code).ok() };
-    // SAFETY: target_handle — we are done with the process.
-    unsafe { CloseHandle(target_handle).ok() };
-
-    let s = &stats;
-    let viol = s.violations.load(Ordering::Relaxed);
-    let (etw_total, etw_sandbox) = winrsbox::observe::etw_listener::stats();
-    // stderr, not stdout: this is the launcher talking about itself, and the
-    // target's stdout belongs to the target. On stdout it corrupted every
-    // piped or redirected run — `winrsbox cx > out.txt` ended with a sandbox
-    // summary glued to the program's own output. Opt-in as well: the same
-    // numbers are in the JSONL `exit` event written a few lines below.
-    if jsonl_log::console_verbose() {
-    eprintln!(
-        "\n[sandbox] exit={exit_code}  decide={} redirect={} deny={} mock={} cow={} violations={viol} etw={etw_sandbox}/{etw_total}",
-        s.decide.load(Ordering::Relaxed),
-        s.redirect.load(Ordering::Relaxed),
-        s.deny.load(Ordering::Relaxed),
-        s.mock_.load(Ordering::Relaxed),
-        s.cow.load(Ordering::Relaxed),
-    );
-    }
-
-    // Final logs and stats
-    jsonl_log::log_immediate(jsonl_log::Event::exit(
-        exit_code,
-        s.decide.load(Ordering::Relaxed),
-        viol,
-    ));
-    jsonl_log::flush();
-    flusher.flush_now();
+    .await?;
 
     // Exit immediately rather than returning through the tokio runtime drop path.
     // The pipe-accept loop keeps a spawn_blocking thread blocked on ConnectNamedPipe;
     // if we let the runtime drop normally it waits 30 s for that thread to finish.
-    std::process::exit(exit_code as i32);
+    std::process::exit(exit_code);
 }
 
 #[cfg(test)]

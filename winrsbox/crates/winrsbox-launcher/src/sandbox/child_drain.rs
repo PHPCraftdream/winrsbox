@@ -5,6 +5,10 @@ use std::time::{Duration, Instant};
 use windows::{
     Win32::{
         Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
+        System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        },
         System::Threading::{OpenProcess, WaitForMultipleObjects, PROCESS_SYNCHRONIZE},
     },
 };
@@ -172,6 +176,54 @@ pub(crate) async fn drain_registered_children(child_pids: &crossbeam_queue::SegQ
             unsafe { CloseHandle(HANDLE(*h as *mut _)).ok() };
         }
     }
+}
+
+/// Poll interval for [`drain_own_job`] — cheap kernel query, no reason to
+/// wait longer than this between checks.
+const OWN_JOB_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// MP-6: client-role twin of `drain_registered_children`. A client runs no
+/// pipe server of its own, so no `RegisterChild`/`SpawnedChild` IPC ever
+/// reaches a `child_pids` queue on the client side — every guest in the
+/// folder, including the client's own, talks to the BROKER's pipe. Poll the
+/// client's own session job's `ActiveProcesses` count instead (kernel
+/// truth, no queue to trust) until it reaches zero or the same grace budget
+/// `drain_registered_children` uses elapses.
+pub(crate) async fn drain_own_job(session_job: HANDLE) {
+    let raw = session_job.0 as isize;
+    tokio::task::spawn_blocking(move || {
+        // SAFETY: raw is the isize repr of a valid, still-open job-object
+        //         handle for this whole call — the caller's session job,
+        //         kept alive for the launcher's process lifetime.
+        let job = HANDLE(raw as *mut _);
+        let deadline = Instant::now() + CHILD_DRAIN_GRACE;
+        loop {
+            let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            let mut returned = 0u32;
+            // SAFETY: job is valid per above; info is sized for
+            //         JobObjectBasicAccountingInformation; returned is a
+            //         valid out-pointer.
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    Some(job),
+                    JobObjectBasicAccountingInformation,
+                    &mut info as *mut _ as *mut std::ffi::c_void,
+                    std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    Some(&mut returned),
+                )
+            };
+            // A query failure is treated as "nothing left to wait for" —
+            // fail-open on the DIAGNOSTIC wait, not on containment: the
+            // session job itself (KILL_ON_JOB_CLOSE) already tears down any
+            // remaining children when this launcher's process exits.
+            if ok.is_err() || info.ActiveProcesses == 0 || Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(OWN_JOB_POLL_INTERVAL);
+        }
+    })
+    .await
+    .unwrap_or_else(|e| eprintln!("[sandbox] own-job drain task failed: {e}"));
 }
 
 #[cfg(test)]
@@ -366,5 +418,29 @@ mod child_queue_tests {
         }
         assert!(!queue_child_pid(&q, CHILD_PID_QUEUE_CAP as u32 + 1));
         assert_eq!(q.len(), CHILD_PID_QUEUE_CAP);
+    }
+}
+
+#[cfg(test)]
+mod own_job_drain_tests {
+    use super::*;
+    use windows::core::PCWSTR;
+    use windows::Win32::System::JobObjects::CreateJobObjectW;
+
+    /// A freshly created job with nothing ever assigned to it reports
+    /// `ActiveProcesses == 0` on the very first query — `drain_own_job`
+    /// must return immediately, not wait out the whole grace window.
+    #[tokio::test]
+    async fn empty_job_drains_immediately() {
+        // SAFETY: no name, no security attributes — private job object.
+        let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }.expect("CreateJobObjectW");
+        let started = Instant::now();
+        drain_own_job(job).await;
+        assert!(
+            started.elapsed() < CHILD_DRAIN_GRACE,
+            "an empty job must not wait out the whole grace window"
+        );
+        // SAFETY: job was created above and is closed exactly once here.
+        unsafe { CloseHandle(job).ok() };
     }
 }

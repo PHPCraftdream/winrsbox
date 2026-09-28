@@ -6,6 +6,13 @@ use thiserror::Error;
 mod guard_level;
 pub use guard_level::GuardLevel;
 
+mod folder_section;
+pub use folder_section::{
+    FolderSectionError, FolderSectionSnapshot, FolderSectionView, FOLDER_SECTION_MAGIC,
+    FOLDER_SECTION_SEQLOCK_MAX_RETRIES, FOLDER_SECTION_SIZE, FOLDER_SECTION_VERSION,
+    MAX_LAUNCHERS, PIPE_NAME_WCHARS,
+};
+
 mod sync_client;
 mod timed_pipe;
 pub use sync_client::{CONNECT_RETRY_ATTEMPTS, CONNECT_RETRY_INTERVAL_MS, SEND_TIMEOUT, SyncClient};
@@ -67,6 +74,10 @@ pub struct SessionConfig {
     pub launcher_create_time: u64,
     pub allow_rwx: bool,
     pub disable_hooks: String,
+    /// Name of the per-folder broker section (`folder_section`). Empty =
+    /// no folder broker; the hook uses `pipe_name`/`launcher_pid` above.
+    #[serde(default)]
+    pub folder_section_name: String,
 }
 
 impl SessionConfig {
@@ -250,6 +261,49 @@ pub enum Req {
     MemDecide { target_pid: u32, op: String },
     VerifyMicrosoftImage { base_address: u64 },
     DeviceDriveMap,
+    /// MP-3: sent by a joining launcher process (never a guest — a launcher
+    /// is never a member of the folder job by construction) to join this
+    /// folder's broker. Authenticated by the broker from KERNEL facts alone
+    /// (client PID from `GetNamedPipeClientProcessId`, NOT folder-job
+    /// membership, matching token SID, matching image path) — `launcher_pid`/
+    /// `launcher_create_time` are cross-checked against those facts, never
+    /// trusted on their own. A connection that fails the normal job-based
+    /// admission check gets exactly one shot at this request; anything else
+    /// (wrong variant, second request) is a fail-closed disconnect.
+    Attach { launcher_pid: u32, launcher_create_time: u64 },
+    /// MP-6: sent by an attached client launcher, on the SAME connection its
+    /// `Attach` succeeded on, to forward one already-serialized
+    /// `sandbox.log.jsonl` line for the broker (the sole owner of that file)
+    /// to append verbatim. Rejected on any other (guest) connection.
+    LauncherLog { line: String },
+    /// MP-6: sent by an attached client launcher, on its Attach connection,
+    /// to fetch the folder's decision counters for its own exit summary — a
+    /// client runs no pipe server of its own, so every guest in the folder
+    /// (including the client's) is already counted by the broker. Rejected
+    /// on any other (guest) connection.
+    SessionStats,
+    /// MP-9: a CLI process (`winrsbox rule add ...`, same image, never a
+    /// job-papки member — same admission class as `Attach` above) applying
+    /// a policy mutation/read while a broker already owns `policy.redb`.
+    /// Valid as the first request on a connection that failed the normal
+    /// job-membership admission check, exactly like `Attach` — see
+    /// `pipe_server::mutate`'s pre-admission dispatcher. No job/section
+    /// handles are exchanged; the connection closes after one response.
+    PolicyMutate { op: policy::db::PolicyOp },
+    /// MP-8: liveness probe. Valid in two places (see
+    /// `docs/multiprocess-broker-plan.md`, "Зависание брокера"): (a) sent
+    /// periodically by an attached launcher over its long-lived `Attach`
+    /// connection (`main::session::run_launcher_session_loop`), and (b) a
+    /// one-shot pre-admission exchange — same admission class as
+    /// `PolicyMutate` above — for a caller (e.g. `winrsbox broker status`)
+    /// that only wants to know whether the broker is alive and answering,
+    /// without a full `Attach`.
+    Ping,
+    /// MP-8: `winrsbox broker status`. Pre-admission, one-shot, same
+    /// admission class as `PolicyMutate`/`Ping` — asks the broker for its
+    /// own identity/health snapshot: pid, generation, pipe, trusted
+    /// launchers, and how many processes are currently in the folder job.
+    BrokerStatus,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -279,6 +333,60 @@ pub enum Resp {
     OverlayChildren(Vec<policy::OverlayChildMeta>),
     ImagePublisher { trusted: bool },
     DeviceDriveMap(Vec<(u8, String)>),
+    /// MP-3: successful `Attach`. The handle VALUES are already valid in the
+    /// caller's own address space — the broker duplicated them there via
+    /// `DuplicateHandle` before sending this response, so no further IPC
+    /// round-trip is needed to use them.
+    Attached {
+        folder_job_handle: u64,
+        folder_section_handle: u64,
+        folder_section_name: String,
+        broker_pid: u32,
+        broker_create_time: u64,
+        pipe_name: String,
+        generation: u64,
+        /// MP-6: snapshot of "this folder has at least one configured net
+        /// rule" at Attach time, so a client can compute its own
+        /// `net_guarded` without opening the policy DB (see `main::client`).
+        /// Taken once, not live — same staleness class as every other value
+        /// this response hands out.
+        has_net_rules: bool,
+    },
+    /// MP-6: `Req::SessionStats` reply. Folder-wide counters (the broker's
+    /// pipe server is shared by every session in the folder) — not scoped to
+    /// the requesting launcher's own guest tree; see `Req::SessionStats`.
+    SessionStats {
+        decide: u64,
+        redirect: u64,
+        deny: u64,
+        mock: u64,
+        cow: u64,
+        violations: u64,
+    },
+    /// MP-9: result of a `Req::PolicyMutate`. `Resp::Err` covers both a
+    /// rejected/unsupported connection (no live `Policy` on this
+    /// connection — never happens on a real broker) and a `PolicyError`
+    /// from executing the op — same shape the CLI already prints for a
+    /// direct-mode failure.
+    PolicyMutated(policy::db::PolicyOpResult),
+    /// MP-8: `Req::Ping` reply — the answering broker's own identity and
+    /// current folder-section generation, read fresh on every ping (not
+    /// cached), so a stuck writer (odd generation) is visible to the
+    /// prober too, and so a caller that raced a failover can tell WHICH
+    /// broker just answered.
+    Pong { broker_pid: u32, broker_create_time: u64, generation: u64 },
+    /// MP-8: `Req::BrokerStatus` reply.
+    BrokerStatus {
+        broker_pid: u32,
+        broker_create_time: u64,
+        generation: u64,
+        pipe_name: String,
+        trusted_launchers: Vec<(u32, u64)>,
+        /// Kernel-truth `JobObjectBasicAccountingInformation.ActiveProcesses`
+        /// of the folder job — every guest currently running in this state
+        /// dir, across every session, broker's own included.
+        active_processes: u32,
+    },
 }
 
 #[derive(Error, Debug)]
@@ -309,6 +417,88 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    /// MP-6: launcher-only requests round-trip like any other `Req`/`Resp`.
+    #[test]
+    fn launcher_log_and_session_stats_roundtrip() {
+        let mut wire = Vec::new();
+        write_msg(&mut wire, &Req::LauncherLog { line: r#"{"event":"exit"}"#.into() }).unwrap();
+        let req: Req = read_msg(&mut std::io::Cursor::new(wire)).unwrap();
+        match req {
+            Req::LauncherLog { line } => assert_eq!(line, r#"{"event":"exit"}"#),
+            other => panic!("expected LauncherLog, got {other:?}"),
+        }
+
+        let mut wire = Vec::new();
+        write_msg(&mut wire, &Req::SessionStats).unwrap();
+        let req: Req = read_msg(&mut std::io::Cursor::new(wire)).unwrap();
+        assert!(matches!(req, Req::SessionStats));
+
+        let mut wire = Vec::new();
+        write_msg(&mut wire, &Resp::SessionStats {
+            decide: 1, redirect: 2, deny: 3, mock: 4, cow: 5, violations: 6,
+        }).unwrap();
+        let resp: Resp = read_msg(&mut std::io::Cursor::new(wire)).unwrap();
+        match resp {
+            Resp::SessionStats { decide, redirect, deny, mock, cow, violations } => {
+                assert_eq!((decide, redirect, deny, mock, cow, violations), (1, 2, 3, 4, 5, 6));
+            }
+            other => panic!("expected SessionStats, got {other:?}"),
+        }
+    }
+
+    /// MP-8: `Ping`/`Pong` and `BrokerStatus`/`Resp::BrokerStatus` round-trip
+    /// like any other `Req`/`Resp` pair.
+    #[test]
+    fn ping_pong_roundtrip() {
+        let mut wire = Vec::new();
+        write_msg(&mut wire, &Req::Ping).unwrap();
+        let req: Req = read_msg(&mut std::io::Cursor::new(wire)).unwrap();
+        assert!(matches!(req, Req::Ping));
+
+        let mut wire = Vec::new();
+        write_msg(&mut wire, &Resp::Pong { broker_pid: 42, broker_create_time: 0xAABB, generation: 6 })
+            .unwrap();
+        let resp: Resp = read_msg(&mut std::io::Cursor::new(wire)).unwrap();
+        match resp {
+            Resp::Pong { broker_pid, broker_create_time, generation } => {
+                assert_eq!((broker_pid, broker_create_time, generation), (42, 0xAABB, 6));
+            }
+            other => panic!("expected Pong, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn broker_status_roundtrip() {
+        let mut wire = Vec::new();
+        write_msg(&mut wire, &Req::BrokerStatus).unwrap();
+        let req: Req = read_msg(&mut std::io::Cursor::new(wire)).unwrap();
+        assert!(matches!(req, Req::BrokerStatus));
+
+        let mut wire = Vec::new();
+        write_msg(&mut wire, &Resp::BrokerStatus {
+            broker_pid: 7,
+            broker_create_time: 0x1234_5678,
+            generation: 2,
+            pipe_name: r"\\.\pipe\fs-sandbox-7".into(),
+            trusted_launchers: vec![(7, 0x1234_5678), (9, 0x9999)],
+            active_processes: 3,
+        }).unwrap();
+        let resp: Resp = read_msg(&mut std::io::Cursor::new(wire)).unwrap();
+        match resp {
+            Resp::BrokerStatus {
+                broker_pid, broker_create_time, generation, pipe_name, trusted_launchers, active_processes,
+            } => {
+                assert_eq!(broker_pid, 7);
+                assert_eq!(broker_create_time, 0x1234_5678);
+                assert_eq!(generation, 2);
+                assert_eq!(pipe_name, r"\\.\pipe\fs-sandbox-7");
+                assert_eq!(trusted_launchers, vec![(7, 0x1234_5678), (9, 0x9999)]);
+                assert_eq!(active_processes, 3);
+            }
+            other => panic!("expected BrokerStatus, got {other:?}"),
+        }
+    }
+
     #[test]
     fn image_publisher_request_and_response_roundtrip() {
         let mut wire = Vec::new();
@@ -337,6 +527,7 @@ mod tests {
             launcher_create_time: 0,
             allow_rwx: false,
             disable_hooks: String::new(),
+            folder_section_name: String::new(),
         };
         let bytes = cfg.to_section_bytes().unwrap();
         let dec = SessionConfig::from_section_bytes(&bytes).unwrap();

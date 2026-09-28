@@ -1,5 +1,8 @@
     use super::*;
 
+    mod inflight_budget;
+    mod pipe_accept_loop_tests;
+
     // ─── audit Critical #2: RecordOverlay rejection is counted + surfaced ───
 
     #[test]
@@ -496,6 +499,7 @@
             0x01D9_0000_0000_0001,
             &|pid| if pid == 12345 { Some(0x01D9_0000_0000_0001) } else { None },
             &|_| None,
+            None,
         ));
         // Unknown pinned fingerprint (0) → fail-closed even for the root PID.
         assert!(!is_owned_client_pid_impl(
@@ -504,6 +508,7 @@
             0,
             &|pid| if pid == 12345 { Some(0x01D9_0000_0000_0001) } else { None },
             &|_| None,
+            None,
         ));
         // Mismatched creation time (recycled root PID) → rejected.
         assert!(!is_owned_client_pid_impl(
@@ -512,15 +517,16 @@
             0x01D9_0000_0000_0001,
             &|pid| if pid == 12345 { Some(42) } else { None },
             &|_| None,
+            None,
         ));
     }
 
     /// `is_owned_client_pid` rejects PID 0 and any unknown PID when no map entry.
     #[test]
     fn c3_owned_pid_rejects_zero_and_unknown() {
-        assert!(!is_owned_client_pid(0, 12345));
+        assert!(!is_owned_client_pid(0, 12345, None));
         // 99999 is neither root nor in the map.
-        assert!(!is_owned_client_pid(99999, 12345));
+        assert!(!is_owned_client_pid(99999, 12345, None));
     }
 
     // ─── PID-reuse hardening: map & parent-walk paths (root path covered by ──
@@ -550,6 +556,7 @@
             0,
             &|p: u32| if p == pid { Some(t1 + 7) } else { None },
             &|_| None,
+            None,
         ));
         assert!(
             crate::sandbox::proc_table::global_proc_info().pin().get(&pid).is_none(),
@@ -577,6 +584,7 @@
             0,
             &|_| None, // kernel probe finds nothing — the process is gone
             &|_| None,
+            None,
         ));
         assert!(
             crate::sandbox::proc_table::global_proc_info().pin().get(&pid).is_none(),
@@ -605,6 +613,7 @@
             0,
             &|p: u32| if p == pid { Some(t3) } else { None },
             &|_| None,
+            None,
         ));
         assert!(
             crate::sandbox::proc_table::global_proc_info().pin().get(&pid).is_some(),
@@ -634,6 +643,7 @@
             0,
             &|_| Some(0x1234),
             &|_| None,
+            None,
         ));
         crate::sandbox::proc_table::global_proc_info().pin().remove(&pid);
     }
@@ -648,6 +658,7 @@
             0,
             &|_| Some(0x01D9_0000_0000_0099),
             &|_| None,
+            None,
         ));
     }
 
@@ -673,6 +684,7 @@
             0,
             &|p: u32| if p == parent { Some(t6) } else { None },
             &|p: u32| if p == child { Some(parent) } else { None },
+            None,
         ));
         crate::sandbox::proc_table::global_proc_info().pin().remove(&parent);
     }
@@ -700,6 +712,7 @@
             0,
             &|p: u32| if p == parent { Some(t7b) } else { None },
             &|p: u32| if p == child { Some(parent) } else { None },
+            None,
         ));
         assert!(
             crate::sandbox::proc_table::global_proc_info().pin().get(&parent).is_none(),
@@ -728,6 +741,7 @@
             0,
             &|_| None, // parent probe finds nothing — the parent is gone
             &|p: u32| if p == child { Some(parent) } else { None },
+            None,
         ));
         assert!(
             crate::sandbox::proc_table::global_proc_info().pin().get(&parent).is_none(),
@@ -763,6 +777,7 @@
             0,
             &query_process_create_time,
             &|_| None,
+            None,
         ));
         crate::sandbox::proc_table::global_proc_info().pin().remove(&self_pid);
         assert!(crate::sandbox::proc_table::global_proc_info().pin().get(&self_pid).is_none());
@@ -783,6 +798,7 @@
             0,
             &query_process_create_time,
             &|_| None,
+            None,
         ));
         assert!(
             crate::sandbox::proc_table::global_proc_info().pin().get(&self_pid).is_none(),

@@ -55,7 +55,7 @@ fn parse_mode(s: &str) -> Result<db::RuleMode> {
 }
 
 fn run_set(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
     let read = find_arg(args, "--read=").map(parse_mode).transpose()?;
     let write = find_arg(args, "--write=").map(parse_mode).transpose()?;
     if read.is_none() && write.is_none() {
@@ -68,22 +68,16 @@ fn run_set(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         mode_write: write.unwrap_or(db::RuleMode::Cow),
         when: None,
     };
-    db::reg_rule_upsert(&db, &row)?;
+    backend.exec(db::PolicyOp::RegRuleUpsert(row))?;
     Ok(())
 }
 
 fn run_show(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
-    let txn = db.begin_read()?;
-    let t = txn.open_table(db::REG_RULES)?;
-    let defaults = if let Some(v) = t.get("")? {
-        db::decode_rule(v.value())
-    } else {
-        None
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
+    let db::PolicyOpResult::Defaults(d) = backend.exec(db::PolicyOp::RegDefaultsGet)? else {
+        anyhow::bail!("regdefaults show: unexpected backend response");
     };
-    let (r, w) = defaults
-        .map(|d| (d.mode_read, d.mode_write))
-        .unwrap_or((db::RuleMode::Passthrough, db::RuleMode::Cow));
+    let (r, w) = (d.read, d.write);
 
     if has_flag(args, "--json") {
         println!("{}", serde_json::json!({

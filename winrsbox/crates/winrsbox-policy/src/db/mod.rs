@@ -2,6 +2,11 @@ use crate::path::{pattern_matches_exact, pattern_matches_prefix, pattern_specifi
 use redb::{ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
+// MP-9: generic op/result pair used by both a direct CLI db handle and the
+// folder broker's CLI-mutation IPC path (`docs/multiprocess-broker-plan.md`).
+mod ops;
+pub use ops::{exec, PolicyOp, PolicyOpResult};
+
 pub const RULES: TableDefinition<&str, &[u8]> = TableDefinition::new("rules");
 pub const MOCKS: TableDefinition<&str, &[u8]> = TableDefinition::new("mocks");
 pub const MOCK_DIRS: TableDefinition<&str, ()> = TableDefinition::new("mock_dirs");
@@ -590,6 +595,23 @@ pub fn reg_rule_remove_by_id(db: &redb::Database, id: &str) -> Result<bool, crat
     Ok(found)
 }
 
+/// MP-9: mirrors the CLI's previous inline `REG_RULES`-table removal
+/// (`cli/reg/regrule.rs`'s `--prefix` branch) as a proper `policy::db`
+/// function so it can be relayed through a `PolicyOp` like every other
+/// mutation. Keys are stored NTFS-identity-folded (S11), same fold applied
+/// here.
+pub fn reg_rule_remove_by_prefix(db: &redb::Database, prefix: &str) -> Result<bool, crate::PolicyError> {
+    let key = crate::ensure_lower(prefix).into_owned();
+    let txn = db.begin_write()?;
+    let removed = {
+        let mut t = txn.open_table(REG_RULES)?;
+        let x = t.remove(key.as_str())?.is_some();
+        x
+    };
+    txn.commit()?;
+    Ok(removed)
+}
+
 pub fn reg_rule_list(db: &redb::Database) -> Result<Vec<RuleRow>, crate::PolicyError> {
     let txn = db.begin_read()?;
     let t = txn.open_table(REG_RULES)?;
@@ -613,6 +635,22 @@ pub fn reg_rule_clear(db: &redb::Database) -> Result<(), crate::PolicyError> {
     }
     txn.commit()?;
     Ok(())
+}
+
+/// MP-9: mirrors the CLI's previous inline `REG_RULES`-default-key read
+/// (`cli/reg/regdefaults.rs`'s `run_show`) as a proper `policy::db`
+/// function so it can be relayed through a `PolicyOp` like every other
+/// read/mutation. The default row is stored at the empty-string key, same
+/// as `defaults_get`'s FS-domain counterpart.
+pub fn reg_defaults_get(db: &redb::Database) -> Result<DefaultsRow, crate::PolicyError> {
+    let txn = db.begin_read()?;
+    let t = txn.open_table(REG_RULES)?;
+    if let Some(v) = t.get("")? {
+        if let Some(row) = decode_rule(v.value()) {
+            return Ok(DefaultsRow { read: row.mode_read, write: row.mode_write });
+        }
+    }
+    Ok(DefaultsRow { read: RuleMode::Passthrough, write: RuleMode::Cow })
 }
 
 pub fn reg_mock_upsert(db: &redb::Database, path: &str, payload: &[u8]) -> Result<(), crate::PolicyError> {
@@ -669,6 +707,23 @@ pub fn dev_rule_remove_by_id(db: &redb::Database, id: &str) -> Result<bool, crat
     }
     txn.commit()?;
     Ok(found)
+}
+
+/// MP-9: mirrors the CLI's previous inline `DEV_RULES`-table removal
+/// (`cli/netdev/devrule.rs`'s `--prefix` branch) as a proper `policy::db`
+/// function so it can be relayed through a `PolicyOp` like every other
+/// mutation. Keys are stored NTFS-identity-folded (S11), same fold applied
+/// here.
+pub fn dev_rule_remove_by_prefix(db: &redb::Database, prefix: &str) -> Result<bool, crate::PolicyError> {
+    let key = crate::ensure_lower(prefix).into_owned();
+    let txn = db.begin_write()?;
+    let removed = {
+        let mut t = txn.open_table(DEV_RULES)?;
+        let x = t.remove(key.as_str())?.is_some();
+        x
+    };
+    txn.commit()?;
+    Ok(removed)
 }
 
 pub fn dev_rule_list(db: &redb::Database) -> Result<Vec<RuleRow>, crate::PolicyError> {

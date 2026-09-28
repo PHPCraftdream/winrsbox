@@ -365,6 +365,10 @@ path = "src/bin/clean/clean_write_one_file.rs"
 name = "spawn_two_children"
 path = "src/bin/clean/benign/spawn_two_children.rs"
 
+[[bin]]
+name = "escape_broker_attach_from_guest"
+path = "src/bin/broker/service/escape_broker_attach_from_guest.rs"
+
 [[test]]
 name = "mock_integration"
 path = "tests/mock_integration.rs"
@@ -380,6 +384,46 @@ path = "tests/real_world.rs"
 [[test]]
 name = "concurrent_children"
 path = "tests/concurrent_children.rs"
+
+[[test]]
+name = "broker_client_conflict"
+path = "tests/cli/broker/broker_client_conflict.rs"
+
+[[test]]
+name = "broker_attach"
+path = "tests/cli/broker/broker_attach.rs"
+
+[[test]]
+name = "broker_client_session"
+path = "tests/cli/broker/broker_client_session.rs"
+
+[[test]]
+name = "broker_mutate"
+path = "tests/cli/broker/broker_mutate.rs"
+
+[[test]]
+name = "broker_failover_kill"
+path = "tests/cli/broker/failover/broker_failover_kill.rs"
+
+[[test]]
+name = "broker_failover_graceful_exit"
+path = "tests/cli/broker/failover/broker_failover_graceful_exit.rs"
+
+[[test]]
+name = "broker_status_restart"
+path = "tests/cli/broker/broker_status_restart.rs"
+
+[[test]]
+name = "broker_shared_cow"
+path = "tests/cli/broker/mp10/broker_shared_cow.rs"
+
+[[test]]
+name = "broker_pipe_squat"
+path = "tests/cli/broker/mp10/broker_pipe_squat.rs"
+
+[[test]]
+name = "broker_guest_attach_denied"
+path = "tests/cli/broker/mp10/broker_guest_attach_denied.rs"
 
 [[test]]
 name = "net_installer"
@@ -406,6 +450,9 @@ policy = { package = "winrsbox-policy", path = "../winrsbox-policy" }
 serde_json = "1"
 winapi = { version = "0.3", features = ["memoryapi", "winnt", "processthreadsapi", "libloaderapi", "errhandlingapi", "tlhelp32", "handleapi", "winreg", "minwindef", "fileapi", "ioapiset", "processenv", "winuser", "synchapi", "winbase", "jobapi2", "combaseapi", "winsvc", "namedpipeapi", "securitybaseapi"] }
 ntapi = "0.4"
+# MP-10: bin escape_broker_attach_from_guest (and read-only FolderSectionView
+# in tests) use the workspace-internal ipc crate.
+ipc = { package = "winrsbox-ipc", path = "../winrsbox-ipc" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

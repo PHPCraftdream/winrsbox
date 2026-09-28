@@ -24,6 +24,7 @@
             launcher_create_time: 0,
             allow_rwx: false,
             disable_hooks: String::new(),
+            folder_section_name: String::new(),
         }
     }
 

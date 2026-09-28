@@ -693,32 +693,44 @@ fn create_dir_tree_no_reparse(base: &Path, relative: &Path) -> Result<()> {
     let mut cur = base.to_path_buf();
     for comp in relative.components() {
         cur.push(comp);
-        match std::fs::symlink_metadata(&cur) {
-            Ok(md) => {
-                let ft = md.file_type();
-                if ft.is_symlink()
-                    || (md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
-                {
-                    anyhow::bail!(
-                        "refusing to use sandbox state path: component {} is a \
-                         symlink/junction (reparse point) — possible TOCTOU redirection",
+        // MP-2: two winrsbox processes can race this component on a
+        // brand-new folder; loop back to re-stat on AlreadyExists instead
+        // of failing, re-validating the no-reparse invariant either way.
+        loop {
+            match std::fs::symlink_metadata(&cur) {
+                Ok(md) => {
+                    let ft = md.file_type();
+                    if ft.is_symlink()
+                        || (md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                    {
+                        anyhow::bail!(
+                            "refusing to use sandbox state path: component {} is a \
+                             symlink/junction (reparse point) — possible TOCTOU redirection",
+                            cur.display()
+                        );
+                    }
+                    anyhow::ensure!(
+                        ft.is_dir(),
+                        "sandbox state path component {} exists but is not a directory",
                         cur.display()
                     );
+                    break;
                 }
-                anyhow::ensure!(
-                    ft.is_dir(),
-                    "sandbox state path component {} exists but is not a directory",
-                    cur.display()
-                );
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&cur)
-                    .with_context(|| format!("create state dir {}", cur.display()))?;
-            }
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("stat sandbox state path component {}", cur.display())
-                });
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    match std::fs::create_dir(&cur) {
+                        Ok(()) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(e) => {
+                            return Err(e)
+                                .with_context(|| format!("create state dir {}", cur.display()));
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("stat sandbox state path component {}", cur.display())
+                    });
+                }
             }
         }
     }
@@ -757,9 +769,27 @@ pub(crate) fn ensure_state(project_root: &Path) -> Result<(PathBuf, PathBuf, Pat
     create_dir_tree_no_reparse(&state_dir, Path::new("mock-dirs"))
         .with_context(|| format!("create mock-dirs {}", mock_dirs.display()))?;
 
-    if !cfg_path.exists() {
-        std::fs::write(&cfg_path, DEFAULT_CONFIG_KTAV)
-            .with_context(|| format!("write default config {}", cfg_path.display()))?;
+    // MP-2: two processes can race a brand-new state dir's sandbox.ktav.
+    // create_new (CREATE_NEW) makes exactly one winner write the whole
+    // file; the loser sees AlreadyExists instead of racing plain
+    // std::fs::write (CREATE_ALWAYS) to truncate-and-overwrite it.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&cfg_path)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            f.write_all(DEFAULT_CONFIG_KTAV.as_bytes())
+                .with_context(|| format!("write default config {}", cfg_path.display()))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another winrsbox process created it first — nothing to do.
+        }
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("create default config {}", cfg_path.display()));
+        }
     }
 
     Ok((cfg_path, workdir, mock_dirs))

@@ -53,7 +53,7 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 }
 
 fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
     let path = find_arg(args, "--path=")
         .ok_or_else(|| anyhow::anyhow!("regmock add: --path required"))
         .map(|s| policy::path::nt_case_fold(s).into_owned())?;
@@ -79,25 +79,31 @@ fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
 
     let val = RegValue { typ, data };
     let payload = serde_json::to_vec(&val)?;
-    db::reg_mock_upsert(&db, &path, &payload)?;
+    backend.exec(db::PolicyOp::RegMockUpsert { path: path.clone(), payload })?;
     println!("mock added: {path}");
     Ok(())
 }
 
 fn run_remove(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
     let path = find_arg(args, "--path=")
         .ok_or_else(|| anyhow::anyhow!("regmock remove: --path required"))
         .map(|s| policy::path::nt_case_fold(s).into_owned())?;
-    if !db::reg_mock_remove(&db, &path)? {
+    let removed = matches!(
+        backend.exec(db::PolicyOp::RegMockRemove(path.clone()))?,
+        db::PolicyOpResult::Bool(true)
+    );
+    if !removed {
         bail!("regmock: mock '{}' not found", path);
     }
     Ok(())
 }
 
 fn run_list(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
-    let mocks = db::reg_mock_list(&db)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
+    let db::PolicyOpResult::Mocks(mocks) = backend.exec(db::PolicyOp::RegMockList)? else {
+        anyhow::bail!("regmock list: unexpected backend response");
+    };
     let json = has_flag(args, "--json");
     if json {
         let out = serde_json::json!({

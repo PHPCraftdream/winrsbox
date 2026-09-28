@@ -227,6 +227,17 @@ impl Policy {
         Ok(())
     }
 
+    /// MP-9: public entry point for a caller that mutated this `Policy`'s
+    /// backing db through some OTHER path than the `rule_upsert`/
+    /// `rule_remove_by_prefix`/`defaults_set` forwarders above — namely the
+    /// broker applying a `db::PolicyOp` on behalf of a CLI process
+    /// (`db::PolicyOp::touches_fs_snapshot`). Same effect as those
+    /// forwarders' own refresh: reload the decide snapshot, drop cached
+    /// decisions.
+    pub fn invalidate_snapshot(&self) -> Result<(), PolicyError> {
+        self.refresh_after_mutation()
+    }
+
     /// Upsert a filesystem rule into this policy's backing store.
     pub fn rule_upsert(&self, row: &db::RuleRow) -> Result<(), PolicyError> {
         db::rule_upsert(&self.inner.db, row)?;

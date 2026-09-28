@@ -380,6 +380,128 @@ Whitelisted: PATH, TEMP, HOME, USERPROFILE, SystemRoot, FS_SANDBOX_*.
 
 **Code**: `launcher/src/env_guard.rs`.
 
+### Multi-process broker (shared folder)
+
+Several `winrsbox` instances started in the same folder share one state
+directory (`<parent>\.winrsbox\<name>\`) and coordinate through a single
+**broker** process instead of opening `policy.redb` concurrently. Design
+rationale and staged implementation notes: `docs/multiprocess-broker-plan.md`.
+
+**Roles.** The first `winrsbox` to win the exclusive lock on `policy.redb`
+(`Database::create`) is the **broker**: it owns the database, in-memory
+caches, `sandbox.log.jsonl`/`violations.log`/`hot-stats.json`, and the IPC
+pipe server. Every later `winrsbox` in the same folder is a **launcher
+client**: its own console, guest token, job tree and spawn path, but no
+database of its own — it `Attach`es to the broker's pipe and forwards policy
+mutations, log lines, and periodic health checks over that connection.
+
+**Folder objects** (`contain::jobctl::FolderJob`,
+`contain::session_section::{FolderSection, BrokerJson}`):
+
+| Object | Primitive | Who holds it | Purpose |
+|---|---|---|---|
+| Folder job | Unnamed Job Object with no limits set (breakaway stays denied — nothing ever turns on `BREAKAWAY_OK`) | broker + every attached launcher, each with a duplicated handle (`FOLDER_JOB_CLIENT_ACCESS = JOB_OBJECT_ASSIGN_PROCESS \| JOB_OBJECT_QUERY`) | Kernel-enforced test (`IsProcessInJob`) for "this connecting process is a sandboxed guest of *some* session in this folder," independent of which launcher spawned it |
+| Session job | Per-launcher Job Object with the existing limits (`KILL_ON_JOB_CLOSE`, UI/memory), nested inside the folder job | that launcher only | Session semantics unchanged: killing one launcher's tree does not touch another session's guests |
+| Folder section | Named shared-memory section with a random name (`Local\WinRsBoxFolder-<32 hex>`), seqlock-protected | broker + attached launchers: read-write; guests: read-only | Current broker `(pid, create_time)`, pipe name, generation counter, up to 32 trusted launcher `(pid, create_time)` entries |
+| `broker.json` | Plaintext file in the state dir | written by the broker only | Entry point for a joining launcher: broker pid/create_time, pipe name, folder-section name. Not a capability — knowing its contents grants nothing; every admission decision below is re-verified against the kernel |
+| Broker pipe | `\\.\pipe\fs-sandbox-<32 hex>`, `FILE_FLAG_FIRST_PIPE_INSTANCE` | broker | Guest IPC (protocol unchanged) plus `Attach`/`PolicyMutate`/`Ping`/`BrokerStatus` from launchers |
+
+**Who checks what, and when:**
+
+- **Guest admission to the pipe server** (`pipe_server::ownership::is_owned_client_pid`):
+  when the broker has a folder job, the *only* admission test for a
+  connecting PID is `IsProcessInJob(folder_job)` — a kernel fact, not PID
+  lineage tracked by this one process. This is what lets the broker's pipe
+  server also serve guests spawned by *other* launchers in the folder. A
+  brand-new entry with no prior `Hello`/`SpawnedChild` record gets its
+  policy depth resolved by walking its kernel-vouched parent chain for a
+  tracked ancestor (`resolve_new_entry_depth`); if none is found, depth is
+  fail-closed to `u8::MAX` (consistent with `when.depth` filters being
+  minimum bounds — it can never be mistaken for a trusted root).
+- **`Attach` / `PolicyMutate` / `Ping` / `BrokerStatus` from a launcher**
+  (`pipe_server::security::authenticate_attach_client`,
+  `pipe_server::mutate::handle_preadmission_connection`): authenticated
+  **before the request is read** — a connection that sends nothing, or sends
+  the wrong first message, never occupies a worker slot beyond one read. The
+  broker opens the client process exactly **once**
+  (`PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_DUP_HANDLE | SYNCHRONIZE`)
+  and runs every check against that single handle, so a PID recycled between
+  checks cannot inherit a partial decision: claimed PID equals the kernel PID
+  from `GetNamedPipeClientProcessId`; live `create_time` equals the claimed
+  one (`0` never matches); the client is **not** a member of the folder job
+  (an unqueryable result is treated as "is a guest" — fail-closed, never
+  admitted); token SID equals the broker's own SID; image path equals the
+  broker's own `winrsbox.exe` (folded, S11 identity fold). Any missing or
+  failing check closes the connection without a response.
+- **Guest-side pipe verification**
+  (`hook::ipc::trusted_boot::verify_pipe_server_identity`): once a folder
+  section is mapped, trust is decided by
+  `FolderSectionSnapshot::is_trusted_server(pid, create_time)` against the
+  broker/launcher set published in the section, instead of one hardcoded
+  PID. A `create_time` of `0` is never accepted as a wildcard match. A
+  corrupted or mid-write section (seqlock retries exhausted) is fail-closed —
+  rejected outright, with **no** fallback to the older single-PID check even
+  if that PID is still alive.
+- **Folder-job membership itself** is kernel-enforced, not application
+  logic: the unnamed folder job never has `BREAKAWAY_OK`/
+  `SILENT_BREAKAWAY_OK` set, so no descendant of a member can leave it;
+  assignment order is always folder job, then session job (nesting), so a
+  guest is a folder-job member from the moment it is created.
+
+**Why a guest cannot become, or impersonate, the broker:**
+
+- The pipe name is random for every broker instance, including each failover
+  winner, and claimed with `FIRST_PIPE_INSTANCE` — there is no predictable
+  name to squat in advance. If a hostile process pre-registers the name a
+  future broker will pick anyway, pipe creation for that name fails
+  **closed**: the accept loop returns an error rather than silently
+  continuing with fewer workers.
+- A guest of another session in the same folder is, by construction, a
+  folder-job member, so it is routed through the ordinary guest connection
+  handler, not the pre-admission dispatcher — `Req::Attach`/
+  `Req::PolicyMutate` sent on that path are rejected outright ("not valid on
+  an admitted connection"); the broker stays up and other sessions are
+  unaffected.
+- Becoming broker requires winning the OS-level exclusive lock on
+  `policy.redb`, which lives under the hidden `.winrsbox` state directory —
+  unreadable through the guest's own hooked path.
+
+**T1 boundary — what this does *not* cover:**
+
+1. **Token model.** The guest token is the same user SID with no restricting
+   SIDs (`CreateRestrictedToken`, Medium IL) — DACLs cannot distinguish a
+   guest process from a launcher process. Every check above therefore keys
+   off folder-job membership, which the kernel enforces, not a DACL.
+2. **A guest of a *different* sandbox that drives a real `winrsbox.exe`.**
+   If a guest can get a process outside its own job tree to launch a genuine
+   `winrsbox.exe` — for example via the pre-existing IPC-spawn-proxy gap
+   documented above — and it can direct that process's behavior, the result
+   is a real `winrsbox.exe` with the same user SID, the real image path, and
+   no folder-job membership: it passes `Attach` exactly as a legitimate
+   second launcher would. This is outside the guarantees of T1 (a
+   misbehaving agent making ordinary API calls, not hand-rolled native code
+   directing an external process — see "Tier model & limitations" above).
+   Once attached, it gets the same trust as any launcher: a read-write
+   folder-section handle, `PolicyMutate` (can weaken policy for every
+   session in the folder), and a shot at becoming the next broker on
+   failover.
+3. **Folder-wide visibility.** `SessionStats` reports pipe-server counters
+   for the whole folder (every guest of every session sharing this broker),
+   not per session — any attached launcher sees folder-wide totals, not just
+   its own guest's.
+4. **`Ping` is diagnostic only.** A timed-out ping prints a warning in the
+   client's console and JSONL log; the broker is never killed automatically
+   (its terminal belongs to a user who may be mid-operation). `winrsbox
+   broker restart` is the only way to force a new broker, and it verifies
+   the target process's image path before terminating it.
+
+**Code**: `launcher/src/main/broker.rs`, `launcher/src/main/client.rs`,
+`launcher/src/main/failover.rs`, `launcher/src/main/session.rs`,
+`launcher/src/pipe_server/{mutate,security,ownership}.rs`,
+`launcher/src/contain/{jobctl,session_section}.rs`,
+`ipc/src/folder_section.rs`, `hook/src/ipc/trusted_boot.rs`,
+`hook/src/ipc/ipc_client/folder_section_client.rs`.
+
 ## Out-of-scope threats
 
 | Threat | Why out-of-scope |

@@ -64,7 +64,7 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 }
 
 fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
     let prefix = find_arg(args, "--prefix=")
         .or_else(|| find_arg(args, "--prefix="))
         .ok_or_else(|| anyhow::anyhow!("rule add: --prefix is required"))?;
@@ -84,6 +84,7 @@ fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         None
     };
 
+    let id_out = id.clone();
     let row = db::RuleRow {
         id,
         prefix: prefix_lower,
@@ -92,18 +93,24 @@ fn run_add(args: &[String], state_dir: &std::path::Path) -> Result<()> {
         when,
     };
 
-    db::rule_upsert(&db, &row)?;
-    println!("{}", row.id);
+    backend.exec(db::PolicyOp::RuleUpsert(row))?;
+    println!("{}", id_out);
     Ok(())
 }
 
 fn run_remove(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
     if let Some(id) = find_arg(args, "--id=") {
-        let removed = db::rule_remove_by_id(&db, id)?;
+        let removed = matches!(
+            backend.exec(db::PolicyOp::RuleRemoveById(id.to_string()))?,
+            db::PolicyOpResult::Bool(true)
+        );
         if !removed { bail!("rule not found: {}", id); }
     } else if let Some(prefix) = find_arg(args, "--prefix=") {
-        let removed = db::rule_remove_by_prefix(&db, prefix)?;
+        let removed = matches!(
+            backend.exec(db::PolicyOp::RuleRemoveByPrefix(prefix.to_string()))?,
+            db::PolicyOpResult::Bool(true)
+        );
         if !removed { bail!("rule not found with prefix: {}", prefix); }
     } else {
         bail!("rule remove: --id or --prefix required");
@@ -112,12 +119,14 @@ fn run_remove(args: &[String], state_dir: &std::path::Path) -> Result<()> {
 }
 
 fn run_list(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
     let json = has_flag(args, "--json");
     let write_filter = find_arg(args, "--write=");
     let depth_min = find_arg(args, "--depth-min=").map(|s| s.parse::<u8>()).transpose()?;
 
-    let mut rules = db::rule_list(&db)?;
+    let db::PolicyOpResult::Rules(mut rules) = backend.exec(db::PolicyOp::RuleList)? else {
+        anyhow::bail!("rule list: unexpected backend response");
+    };
     // Sort by prefix for stable output
     rules.sort_by(|a, b| a.prefix.cmp(&b.prefix));
 
@@ -162,11 +171,13 @@ fn run_list(args: &[String], state_dir: &std::path::Path) -> Result<()> {
 }
 
 fn run_show(args: &[String], state_dir: &std::path::Path) -> Result<()> {
-    let db = crate::cli::open_db(state_dir)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
     let id = find_arg(args, "--id=").ok_or_else(|| anyhow::anyhow!("rule show: --id required"))?;
     let json = has_flag(args, "--json");
 
-    let rules = db::rule_list(&db)?;
+    let db::PolicyOpResult::Rules(rules) = backend.exec(db::PolicyOp::RuleList)? else {
+        anyhow::bail!("rule show: unexpected backend response");
+    };
     let rule = rules.iter().find(|r| r.id == id)
         .ok_or_else(|| anyhow::anyhow!("rule not found: {}", id))?;
 
@@ -202,8 +213,8 @@ fn run_clear(args: &[String], state_dir: &std::path::Path) -> Result<()> {
     if !has_flag(args, "--force") {
         bail!("rule clear: --force required to prevent accidental data loss");
     }
-    let db = crate::cli::open_db(state_dir)?;
-    db::rule_clear(&db)?;
+    let mut backend = crate::cli::PolicyBackend::open(state_dir)?;
+    backend.exec(db::PolicyOp::RuleClear)?;
     Ok(())
 }
 

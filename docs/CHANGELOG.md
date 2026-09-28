@@ -4,6 +4,60 @@ All notable changes to winrsbox are documented in this file.
 
 ## [Unreleased]
 
+### Features
+
+- **Multi-process broker (shared folder)** — multiple `winrsbox` instances started
+  in the same folder now share one `policy.redb`, CoW overlay index, and log/stats
+  files through a single broker process instead of failing with `DatabaseAlreadyOpen`.
+  The first instance becomes the broker; later instances attach as clients over an
+  authenticated named pipe (folder Job Object + folder section + `broker.json`,
+  random pipe name). Policy CLI mutation commands (`rule`, `mock`, `mockdir`,
+  `defaults`, `regrule`, `regmock`, `regdefaults`, `netrule`, `devrule`,
+  `memdefaults`) work while a session is running, relayed to the broker.
+  `winrsbox broker status`/`broker restart`. If the broker process dies, one of
+  the remaining clients automatically wins the database lock and becomes the new
+  broker (failover); guests of other sessions in the folder are unaffected.
+  See `winrsbox/docs/THREATMODEL.md` ("Multi-process broker") and
+  `docs/multiprocess-broker-plan.md` for the trust boundary and design.
+
+### Fixes
+
+- **`FS_SANDBOX_NO_TRACK` no longer stripped from the guest environment** —
+  `env_guard` was silently removing it, which broke `memory_guard` tests that
+  rely on it to make external processes appear foreign under test mode.
+- **Strict direct-syscall scan for memory turned executable via `NtProtect`**
+  (`policy::scan::has_direct_syscall_strict`) — heap/JIT allocations no longer go
+  through the data-context heuristic meant for compiler byte tables, which let an
+  invalid byte placed right before shellcode hide a following `syscall`.
+- **False `HelloExeSpoof`/`SpawnedChildExeSpoof` violations for git-bash** —
+  Git for Windows relaunches through a literal `..` path segment
+  (`bin\..\usr\bin\bash.exe`); `exe_paths_match` now collapses `.`/`..` before
+  comparing the guest-claimed exe path against the kernel-truth path (#107).
+- **Env-patch delivery to spawned children** — the check compared
+  `RTL_USER_PROCESS_PARAMETERS.Length` against a fixed `0x400`, but `Length`
+  also spans the packed argument/environment strings, so the patch silently
+  skipped every child and `FS_SANDBOX_SECTION` was never delivered to processes
+  launched with an explicit, scrubbed environment (e.g. codex's MCP servers).
+  Now requires `Length >= 0x400` and skips WOW64 explicitly.
+- **`NtAssignProcessToJobObject` allowed for an owned child** — nested jobs now
+  work for a process our own launcher spawned (needed for breakaway-safe child
+  job assignment); the child is identified by kernel object identity
+  (`NtCompareObjects`), not by PID, since the caller's handle may lack query rights.
+- **System certificate store reads under Cow** — `NtCreateKey` with write bits or
+  `MAXIMUM_ALLOWED` now opens an existing registry key read-only instead of
+  denying it; the previous deny left the root cert store empty for crypt32,
+  breaking TLS (`UnknownIssuer`). Explicit write masks are still denied.
+- **MSVC-signed PE images pass the direct-syscall scan** — in full/static mode,
+  a syscall-scan hit on a loaded image is accepted once the broker verifies its
+  embedded Authenticode signature from Microsoft; explicit compiler
+  include/library/cache environment variables are now preserved instead of
+  being stripped.
+- **Guest volume resolution through the broker** — a restricted guest that
+  cannot map a kernel volume path to a drive letter now falls back to a bounded
+  device-to-drive map supplied by the authenticated launcher; filesystem policy
+  is unaffected. `ProcessDeviceMap` mutation is denied for every target to
+  prevent drive-namespace retargeting.
+
 ## [0.1.1] — 2026-09-24
 
 ### Features
