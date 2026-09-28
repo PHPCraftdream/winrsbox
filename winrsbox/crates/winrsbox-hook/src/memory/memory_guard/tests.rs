@@ -779,6 +779,30 @@ fn s06_rounded_scan_finds_syscall_outside_caller_range_same_page() {
     unsafe { s03_free(page) };
 }
 
+#[test]
+fn protect_request_scan_decodes_from_requested_start() {
+    // Heap shape: a stray 0x05 before the payload makes the page-start sweep
+    // swallow `B8 imm32 0F 05` as `add eax, imm32` operands.
+    let page = s03_alloc_rw_pages(1);
+    unsafe { std::ptr::write_bytes(page, 0x90, 4096) };
+    let payload = [0xB8u8, 0x18, 0, 0, 0, 0x0F, 0x05, 0xC3];
+    unsafe {
+        page.add(2000).write(0x05);
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), page.add(2001), payload.len());
+    }
+    assert_eq!(
+        guarded_scan_region(page, 4096, true),
+        GuardedScanVerdict::Clean,
+        "pre-condition: the page-start sweep must miss the desynced payload"
+    );
+    assert_eq!(
+        scan_protect_request(page as usize + 2001, 64),
+        ProtectScanResponse::Kill
+    );
+    assert_eq!(scan_protect_request(page as usize, 4096), ProtectScanResponse::Proceed);
+    unsafe { s03_free(page) };
+}
+
 const S06_TOCTOU_LIMITATION_MARKER: &str = "KNOWN LIMITATION (TOCTOU)";
 
 /// S06 gap 5: the TOCTOU residual on the scan itself must stay recorded in

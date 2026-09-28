@@ -17,10 +17,12 @@ use quick_cache::sync::Cache;
 use xxhash_rust::xxh3::Xxh3;
 
 // Test-only instrumentation: lets memory_guard::tests prove the scan call
-// site hashes each chunk exactly once (counter is process-global).
+// site hashes each chunk exactly once. Per-thread: parallel tests that also
+// hash (any cached scan) must not leak into the measuring thread's count.
 #[cfg(test)]
-static COMPUTE_KEY_CALLS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static COMPUTE_KEY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Serializes exact-delta measurements of COMPUTE_KEY_CALLS across parallel
 /// test threads. compute_key itself never takes this gate — the production
@@ -41,7 +43,7 @@ impl ScanCache {
 
     pub(crate) fn compute_key(addr: usize, size: usize, bytes: &[u8]) -> u128 {
         #[cfg(test)]
-        COMPUTE_KEY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        COMPUTE_KEY_CALLS.with(|c| c.set(c.get() + 1));
         let mut h = Xxh3::new();
         h.update(&addr.to_le_bytes());
         h.update(&size.to_le_bytes());
@@ -77,12 +79,12 @@ impl ScanCache {
 
 #[cfg(test)]
 pub(crate) fn compute_key_calls() -> usize {
-    COMPUTE_KEY_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+    COMPUTE_KEY_CALLS.with(|c| c.get())
 }
 
 #[cfg(test)]
 pub(crate) fn reset_compute_key_calls() {
-    COMPUTE_KEY_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    COMPUTE_KEY_CALLS.with(|c| c.set(0));
 }
 
 /// Run `f` while holding the measurement gate — see COMPUTE_KEY_GATE.

@@ -55,7 +55,13 @@ fn is_whitelisted(upper: &str) -> bool {
         "AI_AGENT",
     ];
     // These switches only make the child more restrictive.
-    if matches!(upper, "FS_SANDBOX_BLOCK_LOCALHOST" | "FS_SANDBOX_STRICT_CLIPBOARD") { return true; }
+    // NO_TRACK makes children foreign to the guest (no tracking, no ownership).
+    if matches!(
+        upper,
+        "FS_SANDBOX_BLOCK_LOCALHOST" | "FS_SANDBOX_STRICT_CLIPBOARD" | "FS_SANDBOX_NO_TRACK"
+    ) {
+        return true;
+    }
     // WINRSBOX_* vars always kept
     if upper.starts_with("WINRSBOX_") { return true; }
     WHITELIST.contains(&upper)
@@ -84,6 +90,7 @@ mod tests {
         assert!(!is_sensitive("SYSTEMROOT"));
         assert!(!is_sensitive("FS_SANDBOX_BLOCK_LOCALHOST"));
         assert!(!is_sensitive("FS_SANDBOX_STRICT_CLIPBOARD"));
+        assert!(!is_sensitive("FS_SANDBOX_NO_TRACK"));
         assert!(!is_sensitive("RUST_BACKTRACE"));
         assert!(!is_sensitive("CARGO_HOME"));
         assert!(!is_sensitive("NO_COLOR"));
@@ -129,7 +136,6 @@ mod tests {
         assert!(is_sensitive("FS_SANDBOX_ALLOW_RWX"));
         assert!(is_sensitive("FS_SANDBOX_DISABLE_HOOKS"));
         assert!(is_sensitive("FS_SANDBOX_SECTION"));
-        assert!(is_sensitive("FS_SANDBOX_NO_TRACK"));
         assert!(!is_sensitive("WINRSBOX_CUSTOM"));
     }
 }

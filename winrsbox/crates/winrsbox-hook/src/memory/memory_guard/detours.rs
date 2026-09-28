@@ -245,13 +245,35 @@ pub(crate) fn region_has_direct_syscalls(bytes: &[u8], base_addr: usize, use_cac
     region_has_direct_syscalls_with(bytes, base_addr, use_cache, SCAN_CHUNK_BYTES)
 }
 
+/// [`region_has_direct_syscalls`] with the strict scanner: runtime memory
+/// made executable gets no data-table suppression (see
+/// `policy::scan::has_direct_syscall_strict`).
+pub(crate) fn region_has_direct_syscalls_strict(bytes: &[u8], base_addr: usize, use_cache: bool) -> bool {
+    region_scan(bytes, base_addr, use_cache, SCAN_CHUNK_BYTES, true)
+}
+
 pub(crate) fn region_has_direct_syscalls_with(
     bytes: &[u8],
     base_addr: usize,
     use_cache: bool,
     chunk_size: usize,
 ) -> bool {
+    region_scan(bytes, base_addr, use_cache, chunk_size, false)
+}
+
+fn region_scan(
+    bytes: &[u8],
+    base_addr: usize,
+    use_cache: bool,
+    chunk_size: usize,
+    strict: bool,
+) -> bool {
     debug_assert!(chunk_size > 0);
+    let scan = if strict {
+        policy::scan::has_direct_syscall_strict
+    } else {
+        policy::scan::has_direct_syscall
+    };
     let mut off = 0usize;
     while off < bytes.len() {
         let chunk_len = chunk_size.min(bytes.len() - off);
@@ -266,11 +288,13 @@ pub(crate) fn region_has_direct_syscalls_with(
             // clean insert (the old lookup+insert pair hashed the bytes
             // twice on a miss; the miss path itself scans via the bool
             // predicate and never re-hashes).
-            let key = crate::scan_cache::ScanCache::compute_key(chunk_addr, chunk.len(), chunk);
+            // Strict and relaxed verdicts differ: keep their cache keys apart.
+            let key_len = chunk.len() | if strict { 1 << (usize::BITS - 1) } else { 0 };
+            let key = crate::scan_cache::ScanCache::compute_key(chunk_addr, key_len, chunk);
             match scan_cache().lookup_keyed(key) {
                 Some(clean) => !clean,
                 None => {
-                    let dirty = policy::scan::has_direct_syscall(chunk, chunk_addr as u64);
+                    let dirty = scan(chunk, chunk_addr as u64);
                     if !dirty {
                         scan_cache().insert_keyed(key, true);
                     }
@@ -278,7 +302,7 @@ pub(crate) fn region_has_direct_syscalls_with(
                 }
             }
         } else {
-            policy::scan::has_direct_syscall(chunk, chunk_addr as u64)
+            scan(chunk, chunk_addr as u64)
         };
         if dirty {
             return true;
@@ -417,7 +441,7 @@ pub(crate) fn guarded_scan_region(
         if !guarded_region_copy(chunk, &mut buf[..ext]) {
             return GuardedScanVerdict::Unreadable;
         }
-        if region_has_direct_syscalls(&buf[..ext], addr as usize + off, use_cache) {
+        if region_has_direct_syscalls_strict(&buf[..ext], addr as usize + off, use_cache) {
             return GuardedScanVerdict::SyscallsFound;
         }
         off += n;
@@ -455,6 +479,22 @@ pub(crate) fn guarded_scan_region_twice(
         return first;
     }
     guarded_scan_region(addr, size, use_cache)
+}
+
+/// Scan of a protect request: the kernel-flipped pages, then the requested
+/// range itself. A sweep from the page start can desync on bytes preceding
+/// the payload (heap headers) and swallow its `syscall` into an operand;
+/// the requested start is the payload's natural entry, so it is decoded
+/// from there too. Identical ranges (page-aligned requests) scan once.
+pub(crate) fn scan_protect_request(addr: usize, size: usize) -> ProtectScanResponse {
+    let Some((page_addr, page_size)) = page_round_scan_range(addr, size) else {
+        return ProtectScanResponse::Deny;
+    };
+    let pages = protect_scan_response(guarded_scan_region_twice(page_addr as *const u8, page_size, true));
+    if pages != ProtectScanResponse::Proceed || (page_addr, page_size) == (addr, size) {
+        return pages;
+    }
+    protect_scan_response(guarded_scan_region_twice(addr as *const u8, size, true))
 }
 
 // ---------------------------------------------------------------------------
@@ -708,13 +748,7 @@ pub(crate) unsafe extern "system" fn hook_nt_protect_virtual_memory(
                 // fails closed through the existing Unreadable → Deny path.
                 // S06 gap 5: the second pass re-verifies the bytes right
                 // before the syscall (see `guarded_scan_region_twice`).
-                let scanned = match page_round_scan_range(addr as usize, size) {
-                    Some((scan_addr, scan_size)) => protect_scan_response(
-                        guarded_scan_region_twice(scan_addr as *const u8, scan_size, true),
-                    ),
-                    None => ProtectScanResponse::Deny,
-                };
-                match scanned {
+                match scan_protect_request(addr as usize, size) {
                     ProtectScanResponse::Kill => {
                         report_and_terminate(ipc::AllocKind::Protect, new_protect, size as u64, addr as u64);
                     }

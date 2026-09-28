@@ -148,7 +148,8 @@ macro_rules! assert_killed {
         let r = run_payload($name, "full");
         assert!(!r.status.success(), "{} should have been killed\nstderr: {}", $name, r.stderr);
         let v = r.read_violations();
-        assert!(v.contains($kind), "{}: violations should contain {}\nlog: {}\nstderr: {}", $name, $kind, v, r.stderr);
+        assert!(v.contains($kind), "{}: violations should contain {}\nexit={:?}\nlog: {}\nstdout: {}\nstderr: {}",
+            $name, $kind, r.status.code(), v, r.stdout, r.stderr);
     }};
 }
 

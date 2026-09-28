@@ -229,8 +229,9 @@ pub fn find_direct_syscalls(bytes: &[u8], base_addr: u64) -> Vec<SyscallHit> {
 
 /// Early-exiting variant of the [`find_direct_syscalls`] sweep, used only
 /// by [`has_direct_syscall`]; classification is shared via [`DataContext`].
-fn sweep_has_direct_syscall(bytes: &[u8], base_addr: u64) -> bool {
+fn sweep_has_direct_syscall(bytes: &[u8], base_addr: u64, data_context: bool) -> bool {
     let mut ctx = DataContext::new(bytes.len());
+    ctx.exempt |= !data_context;
     let mut decoder = Decoder::with_ip(64, bytes, base_addr, DecoderOptions::NONE);
     while decoder.can_decode() {
         if ctx.hit(&decoder.decode()).is_some() {
@@ -253,7 +254,19 @@ fn sweep_has_direct_syscall(bytes: &[u8], base_addr: u64) -> bool {
 /// found, so it can never skip an undecoded region; the win is that the
 /// remaining passes after a hit are not decoded and no Vec is built.
 pub fn has_direct_syscall(bytes: &[u8], base_addr: u64) -> bool {
-    if sweep_has_direct_syscall(bytes, base_addr) {
+    has_direct_syscall_with(bytes, base_addr, true)
+}
+
+/// [`has_direct_syscall`] without the [`DATA_CONTEXT_LOOKBACK`] suppression.
+/// For runtime memory turned executable (heap, JIT, shellcode): there is no
+/// compiler byte table to protect, and a leading INVALID byte must not hide
+/// a following `syscall`.
+pub fn has_direct_syscall_strict(bytes: &[u8], base_addr: u64) -> bool {
+    has_direct_syscall_with(bytes, base_addr, false)
+}
+
+fn has_direct_syscall_with(bytes: &[u8], base_addr: u64, data_context: bool) -> bool {
+    if sweep_has_direct_syscall(bytes, base_addr, data_context) {
         return true;
     }
     if canonical_stub_syscalls(bytes).next().is_some() {
@@ -263,7 +276,7 @@ pub fn has_direct_syscall(bytes: &[u8], base_addr: u64) -> bool {
     let window = 2 * MAX_INSTRUCTION_LEN;
     for entry in 1..entries {
         let end = (entry + window).min(bytes.len());
-        if sweep_has_direct_syscall(&bytes[entry..end], base_addr + entry as u64) {
+        if sweep_has_direct_syscall(&bytes[entry..end], base_addr + entry as u64, data_context) {
             return true;
         }
     }
@@ -698,6 +711,10 @@ mod tests {
         assert!(find_direct_syscalls(&CODEX_TABLE, 0).is_empty());
         assert!(find_direct_syscalls_multi_entry(&CODEX_TABLE, 0).is_empty());
         assert!(!has_direct_syscall(&CODEX_TABLE, 0));
+        assert!(has_direct_syscall_strict(&CODEX_TABLE, 0));
+        // Invalid byte right before `mov eax, imm32; syscall` (heap shellcode).
+        let shellcode = [0x06, 0xB8, 0x18, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90];
+        assert!(has_direct_syscall_strict(&shellcode, 0));
     }
 
     #[test]
